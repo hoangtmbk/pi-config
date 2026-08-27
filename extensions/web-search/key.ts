@@ -22,12 +22,11 @@
 import { execSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { errorText, WebSearchError } from "./brave.ts";
+import { DASHBOARD_URL, errorText, WebSearchError } from "./brave.ts";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const ENV_FILE = join(EXTENSION_DIR, ".env");
 
-const DASHBOARD_URL = "https://api-dashboard.search.brave.com/";
 
 /** A keychain lookup answers in milliseconds; anything slower is stuck. */
 const COMMAND_TIMEOUT_MS = 10_000;

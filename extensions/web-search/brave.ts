@@ -58,7 +58,7 @@ const MAX_ERROR_BODY_CHARS = 500;
 export const RETRY_DELAY_MS = 1_100;
 
 /** Where a key is issued, checked and topped up — every key failure points here. */
-const DASHBOARD_URL = "https://api-dashboard.search.brave.com/";
+export const DASHBOARD_URL = "https://api-dashboard.search.brave.com/";
 
 export class WebSearchError extends Error {}
 
