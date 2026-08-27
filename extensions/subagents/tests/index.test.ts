@@ -18,7 +18,7 @@ import type { RunChild } from "../child.ts";
 import { spawnRun } from "../child.ts";
 import { registerSubagents } from "../index.ts";
 import { ASK_QUESTION_TOOL, type QuestionDetails } from "../supervisor.ts";
-import { AGENT_END, AGENT_START, asked, SETTLED } from "./child-events.ts";
+import { AGENT_END, AGENT_START, asked, said, SETTLED } from "./child-events.ts";
 
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CHILD = join(TESTS_DIR, "fake-rpc-child.ts");
@@ -163,13 +163,13 @@ async function answer(tool: RegisteredTool, params: SubagentAnswerParams): Promi
 	return result.content.map((part) => (part.type === "text" ? part.text : "")).join("");
 }
 
-/** Wait until `sent` has a message, or give up loudly. */
-async function nextMessage(sent: SentMessage[]): Promise<SentMessage> {
+/** Wait until `sent` has an `index`th message, or give up loudly. */
+async function messageAt(sent: SentMessage[], index = 0): Promise<SentMessage> {
 	for (let attempt = 0; attempt < 200; attempt++) {
-		if (sent.length > 0) return sent[0];
+		if (sent.length > index) return sent[index];
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
-	throw new Error("no Delivery arrived within 2s");
+	throw new Error(`no message ${index + 1} arrived within 2s; got ${sent.length}`);
 }
 
 describe("subagent registration", () => {
@@ -232,7 +232,7 @@ describe("subagent", () => {
 		const { subagent, sent } = fakeSession();
 
 		await run(subagent, { agent: "scout", task: "count the call sites" });
-		const delivered = await nextMessage(sent);
+		const delivered = await messageAt(sent);
 
 		assert.match(delivered.content, /Run `scout`/);
 		assert.match(delivered.content, /Result for: count the call sites/);
@@ -329,7 +329,7 @@ describe("a Run that asks", () => {
 		const { subagent, sent } = fakeSession(ROSTER, { FAKE_RPC_EVENTS: JSON.stringify(events) });
 
 		await run(subagent, { agent: "scout", task: "look around" });
-		const question = await nextMessage(sent);
+		const question = await messageAt(sent);
 
 		assert.equal(question.customType, "subagent-question");
 		assert.match(question.content, /Which auth module do you mean\?/);
@@ -347,5 +347,47 @@ describe("subagent_answer", () => {
 
 		assert.deepEqual(spawned[0].prompts, ["The one in src/auth.ts."]);
 		assert.match(acknowledged, /scout/);
+	});
+
+	it("carries a Run all the way from a Question to a Delivery, over a real RPC child", async () => {
+		const turns = [
+			[AGENT_START, asked("Which auth module do you mean?"), AGENT_END, SETTLED],
+			[AGENT_START, said("Three call sites in src/auth.ts."), AGENT_END, SETTLED],
+		];
+		const { subagent, subagentAnswer, sent } = fakeSession(ROSTER, { FAKE_RPC_TURNS: JSON.stringify(turns) });
+		await run(subagent, { agent: "scout", task: "count the call sites" });
+
+		const question = await messageAt(sent);
+		await answer(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
+		const delivered = await messageAt(sent, 1);
+
+		assert.equal(question.customType, "subagent-question");
+		assert.equal(delivered.customType, "subagent-delivery");
+		assert.match(delivered.content, /Run `scout`/);
+		assert.match(delivered.content, /Three call sites in src\/auth\.ts\./);
+	});
+
+	it("goes around the loop as often as the Run needs to", async () => {
+		const turns = [
+			[AGENT_START, asked("Which auth module do you mean?"), AGENT_END, SETTLED],
+			[AGENT_START, asked("Should I include the tests?"), AGENT_END, SETTLED],
+			[AGENT_START, said("Three call sites, tests included."), AGENT_END, SETTLED],
+		];
+		const { subagent, subagentAnswer, sent } = fakeSession(ROSTER, { FAKE_RPC_TURNS: JSON.stringify(turns) });
+		await run(subagent, { agent: "scout", task: "count the call sites" });
+
+		await messageAt(sent);
+		await answer(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
+		const second = await messageAt(sent, 1);
+		await answer(subagentAnswer, { name: "scout", answer: "Yes, include the tests." });
+		const delivered = await messageAt(sent, 2);
+
+		assert.deepEqual(sent.map((message) => message.customType), [
+			"subagent-question",
+			"subagent-question",
+			"subagent-delivery",
+		]);
+		assert.match(second.content, /Should I include the tests\?/);
+		assert.match(delivered.content, /Three call sites, tests included\./);
 	});
 });
