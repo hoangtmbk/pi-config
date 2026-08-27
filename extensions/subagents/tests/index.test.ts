@@ -57,6 +57,10 @@ interface SubagentAnswerParams {
 	answer: string;
 }
 
+interface SubagentWaitParams {
+	names?: string[];
+}
+
 interface RegisteredTool {
 	name: string;
 	label: string;
@@ -65,7 +69,7 @@ interface RegisteredTool {
 	parameters: { properties: Record<string, unknown>; required?: string[] };
 	execute: (
 		toolCallId: string,
-		params: SubagentParams | AskQuestionParams | SubagentAnswerParams,
+		params: SubagentParams | AskQuestionParams | SubagentAnswerParams | SubagentWaitParams,
 		signal: AbortSignal | undefined,
 		onUpdate: undefined,
 		ctx: ExtensionContext,
@@ -156,6 +160,7 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>) {
 
 	return {
 		subagent: requireTool(tools, "subagent"),
+		subagentWait: requireTool(tools, "subagent_wait"),
 		subagentAnswer: requireTool(tools, "subagent_answer"),
 		tools,
 		sent,
@@ -191,6 +196,7 @@ function stubbedSession() {
 
 	return {
 		subagent: requireTool(tools, "subagent"),
+		subagentWait: requireTool(tools, "subagent_wait"),
 		subagentAnswer: requireTool(tools, "subagent_answer"),
 		sent,
 		spawned,
@@ -199,7 +205,7 @@ function stubbedSession() {
 }
 
 /** Call a registered tool the way pi would, and read its text back. */
-async function call(tool: RegisteredTool, params: SubagentParams | SubagentAnswerParams): Promise<string> {
+async function call(tool: RegisteredTool, params: SubagentParams | SubagentAnswerParams | SubagentWaitParams): Promise<string> {
 	const result = await tool.execute("call-1", params, undefined, undefined, CTX);
 	return result.content
 		.map((part) => (part.type === "text" ? part.text : ""))
@@ -216,15 +222,17 @@ async function messageAt(sent: SentMessage[], index = 0): Promise<SentMessage> {
 }
 
 describe("subagent registration", () => {
-	it("registers a tool to delegate with and a tool to answer with", () => {
-		const { subagent, subagentAnswer, tools } = fakeSession();
+	it("registers a tool to delegate with, one to wait on and one to answer with", () => {
+		const { subagent, subagentWait, subagentAnswer, tools } = fakeSession();
 
 		assert.deepEqual(
 			tools.map((tool) => tool.name),
-			["subagent", "subagent_answer"],
+			["subagent", "subagent_wait", "subagent_answer"],
 		);
 		assert.deepEqual(Object.keys(subagent.parameters.properties).sort(), ["agent", "model", "name", "task"]);
 		assert.deepEqual(subagent.parameters.required?.slice().sort(), ["agent", "task"]);
+		assert.deepEqual(Object.keys(subagentWait.parameters.properties), ["names"]);
+		assert.deepEqual(subagentWait.parameters.required ?? [], [], "waiting for everything in play takes no arguments");
 		assert.deepEqual(Object.keys(subagentAnswer.parameters.properties).sort(), ["answer", "name"]);
 		assert.deepEqual(subagentAnswer.parameters.required?.slice().sort(), ["answer", "name"]);
 	});
@@ -360,7 +368,7 @@ describe("ask_question", () => {
 		registerSubagents(collect(parentTools) as unknown as ExtensionAPI, { roster: ROSTER });
 		registerSubagents(collect(childTools) as unknown as ExtensionAPI, { roster: ROSTER, runName: "scout" });
 
-		assert.deepEqual(parentTools.map((tool) => tool.name), ["subagent", "subagent_answer"]);
+		assert.deepEqual(parentTools.map((tool) => tool.name), ["subagent", "subagent_wait", "subagent_answer"]);
 		assert.deepEqual(childTools.map((tool) => tool.name), [ASK_QUESTION_TOOL]);
 	});
 
@@ -543,5 +551,21 @@ describe("subagent_answer", () => {
 
 		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "   " }));
 		assert.deepEqual(spawned[0].prompts, []);
+	});
+});
+
+describe("subagent_wait", () => {
+	it("returns a named Run's result once it settles, and lets nothing else deliver it", async () => {
+		const { subagent, subagentWait, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		const joined = call(subagentWait, { names: ["scout"] });
+		spawned[0].emit(said("Found three call sites."));
+		spawned[0].emit(SETTLED);
+		const collected = await joined;
+
+		assert.match(collected, /Run `scout`/);
+		assert.match(collected, /Found three call sites\./);
+		assert.deepEqual(sent, [], "a joined result re-enters the conversation once, as the join's own result");
 	});
 });

@@ -15,7 +15,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type Agent, discoverAgents, type Roster } from "./agents.ts";
 import { type RunChild, RUN_NAME_ENV, type SpawnOptions, spawnRun } from "./child.ts";
-import { ASK_QUESTION_TOOL, type QuestionDetails, type Run, Supervisor } from "./supervisor.ts";
+import { ASK_QUESTION_TOOL, type QuestionDetails, type Run, type RunState, Supervisor } from "./supervisor.ts";
 
 const SubagentParams = Type.Object({
 	agent: Type.String({ description: "Which agent to run — one of the names listed in this tool's description." }),
@@ -39,6 +39,14 @@ const SubagentAnswerParams = Type.Object({
 	}),
 });
 
+const SubagentWaitParams = Type.Object({
+	names: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "The runs to wait for, by name. Omit to wait for every run that is still in play.",
+		}),
+	),
+});
+
 const AskQuestionParams = Type.Object({
 	question: Type.String({
 		description:
@@ -53,18 +61,37 @@ interface SubagentDetails {
 	task: string;
 }
 
+/** Metadata for the transcript — which Runs a join collected, and how each stopped. */
+interface SubagentWaitDetails {
+	runs: { run: string; agent: string; state: RunState }[];
+}
+
 /**
- * Why a name cannot be answered, said with the Runs that could have been.
+ * Why a name cannot be addressed, said with the Runs that could have been.
  *
  * The states come along because they are the difference between a name the
  * caller mistyped and one it addressed too late: listing bare names would make a
  * Run that has already delivered look like a Run still waiting to be answered.
  */
-function unanswerableRun(name: string, run: Run | undefined, runs: Run[]): Error {
-	if (run) return new Error(`Run \`${name}\` is ${run.state}, not waiting for an answer. Only a waiting run can be answered.`);
-
+function unknownRun(name: string, runs: Run[]): Error {
 	const known = runs.map((candidate) => `\`${candidate.name}\` (${candidate.state})`).join(", ");
 	return new Error(`Unknown run \`${name}\`. ${known ? `Runs in this session: ${known}.` : "No runs have been started in this session."}`);
+}
+
+/**
+ * The Runs a join with no names waits on: everything still in play.
+ *
+ * A Waiting Run counts as in play — it is alive, and a join that passed over it
+ * would say nothing at all about a session whose only Run needs an answer.
+ */
+function inPlay(runs: Run[]): Run[] {
+	return runs.filter((run) => run.state !== "done");
+}
+
+/** Why a name cannot be answered: the wrong state, or no such Run at all. */
+function unanswerableRun(name: string, run: Run | undefined, runs: Run[]): Error {
+	if (run) return new Error(`Run \`${name}\` is ${run.state}, not waiting for an answer. Only a waiting run can be answered.`);
+	return unknownRun(name, runs);
 }
 
 export interface SubagentsOptions {
@@ -185,19 +212,24 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 					const message = supervisor.observe(run.name, event);
 					if (!message) return;
 
-					pi.sendMessage(
-						{
-							customType: message.kind === "question" ? "subagent-question" : "subagent-delivery",
-							content: message.text,
-							display: true,
-							details: { run: message.run.name, agent: message.run.agent, task: message.run.task },
-						},
-						// Both halves of ADR-0002's Delivery policy in one call, because
-						// which one happens is pi's decision, not this file's: an idle
-						// parent is woken, and a streaming one takes it as a steer, which
-						// pi lands at a turn boundary rather than mid-tool-call.
-						{ triggerTurn: true, deliverAs: "steer" },
-					);
+					// A `subagent_wait` that named this Run collects the message instead,
+					// and returns it as its own result. Saying it here as well would say
+					// it twice, which is the whole of the no-double-delivery rule.
+					if (supervisor.post(message) === "conversation") {
+						pi.sendMessage(
+							{
+								customType: message.kind === "question" ? "subagent-question" : "subagent-delivery",
+								content: message.text,
+								display: true,
+								details: { run: message.run.name, agent: message.run.agent, task: message.run.task },
+							},
+							// Both halves of ADR-0002's Delivery policy in one call, because
+							// which one happens is pi's decision, not this file's: an idle
+							// parent is woken, and a streaming one takes it as a steer, which
+							// pi lands at a turn boundary rather than mid-tool-call.
+							{ triggerTurn: true, deliverAs: "steer" },
+						);
+					}
 
 					// A Waiting Run keeps its child: the process stays up, doing nothing but
 					// holding the context an answer lands in. Nothing is killed or reaped.
@@ -224,6 +256,46 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 						text: `Started run \`${run.name}\` (agent \`${agent.name}\`). Keep working; its result will arrive in this conversation on its own.`,
 					},
 				],
+				details,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_wait",
+		label: "Wait for subagents",
+		description: [
+			"Wait for runs to finish and collect their results here, rather than letting them arrive in this conversation on their own.",
+			"Blocks until every run you name — or every run still in play, if you name none — is done or waiting on a question, then returns what each has to say.",
+			"A run that is waiting comes back with its question: answer it with subagent_answer and wait again.",
+			"A result collected here is not also delivered on its own, so nothing is said twice.",
+			"Use it when you have nothing to do until the runs come back; otherwise keep working and let their results arrive.",
+		].join(" "),
+		promptSnippet: "Wait for subagent runs to come back and collect their results",
+		parameters: SubagentWaitParams,
+
+		async execute(_toolCallId, params) {
+			const named = (params.names ?? []).map((name) => name.trim()).filter(Boolean);
+			// Checked here rather than in the Supervisor, because this is the side
+			// that can say which names would have worked.
+			for (const name of named) if (!supervisor.get(name)) throw unknownRun(name, supervisor.list());
+
+			const waited = named.length > 0 ? named : inPlay(supervisor.list()).map((run) => run.name);
+			if (waited.length === 0) {
+				const details: SubagentWaitDetails = { runs: [] };
+				return {
+					content: [{ type: "text", text: "No runs are in play, so there is nothing to wait for." }],
+					details,
+				};
+			}
+
+			const collected = await supervisor.join(waited);
+
+			const details: SubagentWaitDetails = {
+				runs: collected.map((message) => ({ run: message.run.name, agent: message.run.agent, state: message.run.state })),
+			};
+			return {
+				content: [{ type: "text", text: collected.map((message) => message.text).join("\n\n") }],
 				details,
 			};
 		},
