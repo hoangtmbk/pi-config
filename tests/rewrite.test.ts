@@ -20,17 +20,40 @@ const CASES: Case[] = [
 	{
 		name: "github blob → raw",
 		url: "https://github.com/openai/whisper/blob/main/README.md",
-		expect: { url: "https://raw.githubusercontent.com/openai/whisper/main/README.md", note: "github blob → raw" },
+		expect: {
+			url: "https://raw.githubusercontent.com/openai/whisper/main/README.md",
+			note: "github blob → raw",
+			fallback: "https://github.com/openai/whisper/blob/main/README.md",
+		},
 	},
 	{
 		name: "github blob keeps line fragments",
 		url: "https://github.com/nodejs/node/blob/v22.x/lib/fs.js#L10-L20",
-		expect: { url: "https://raw.githubusercontent.com/nodejs/node/v22.x/lib/fs.js#L10-L20", note: "github blob → raw" },
+		expect: {
+			url: "https://raw.githubusercontent.com/nodejs/node/v22.x/lib/fs.js#L10-L20",
+			note: "github blob → raw",
+			fallback: "https://github.com/nodejs/node/blob/v22.x/lib/fs.js#L10-L20",
+		},
 	},
 	{
 		name: "github blob with a nested path and a sha ref",
 		url: "https://github.com/o/r/blob/0a1b2c3/src/deep/file.ts?plain=1",
-		expect: { url: "https://raw.githubusercontent.com/o/r/0a1b2c3/src/deep/file.ts", note: "github blob → raw" },
+		expect: {
+			url: "https://raw.githubusercontent.com/o/r/0a1b2c3/src/deep/file.ts",
+			note: "github blob → raw",
+			fallback: "https://github.com/o/r/blob/0a1b2c3/src/deep/file.ts?plain=1",
+		},
+	},
+	{
+		// The ref/path split is a guess here: `release/1.0` is a branch, not a directory,
+		// so the raw URL 404s and only the fallback saves the fetch.
+		name: "github blob on a slash-containing branch keeps a fallback",
+		url: "https://github.com/o/r/blob/release/1.0/src/file.ts",
+		expect: {
+			url: "https://raw.githubusercontent.com/o/r/release/1.0/src/file.ts",
+			note: "github blob → raw",
+			fallback: "https://github.com/o/r/blob/release/1.0/src/file.ts",
+		},
 	},
 	{ name: "github tree is untouched", url: "https://github.com/openai/whisper/tree/main/whisper" },
 	{ name: "github issues are untouched", url: "https://github.com/openai/whisper/issues/42" },

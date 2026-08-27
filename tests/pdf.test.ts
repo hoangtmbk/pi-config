@@ -12,7 +12,7 @@ import { describe, it } from "node:test";
 import { pdfToText } from "../pdf.ts";
 
 /** A one-line PDF per page, each drawn with `Tj` so it lands in the text layer. */
-function makePdf(pageTexts: string[]): Uint8Array {
+function makePdf(pageTexts: string[], title?: string): Uint8Array {
 	// Object ids: 1 catalog, 2 page tree, 3 font, then page/content pairs.
 	const pageIds = pageTexts.map((_, index) => 4 + index * 2);
 	const objects = [
@@ -29,6 +29,9 @@ function makePdf(pageTexts: string[]): Uint8Array {
 		);
 	}
 
+	if (title !== undefined) objects.push(`<< /Title (${title}) >>`);
+	const infoId = title === undefined ? undefined : objects.length;
+
 	// ASCII only, so string length is the byte offset each xref entry needs.
 	let pdf = "%PDF-1.4\n";
 	const offsets = objects.map((object, index) => {
@@ -39,7 +42,8 @@ function makePdf(pageTexts: string[]): Uint8Array {
 	const startxref = pdf.length;
 	pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
 	for (const offset of offsets) pdf += `${String(offset).padStart(10, "0")} 00000 n \n`;
-	pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${startxref}\n%%EOF\n`;
+	const info = infoId === undefined ? "" : ` /Info ${infoId} 0 R`;
+	pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R${info} >>\nstartxref\n${startxref}\n%%EOF\n`;
 	return new TextEncoder().encode(pdf);
 }
 
@@ -69,6 +73,13 @@ describe("pdfToText", () => {
 		assert.ok(result.text.includes("Hello PDF"), result.text);
 		assert.ok(!result.text.includes("<!-- page 2 -->"), "the dropped page leaves no separator");
 		assert.ok(!result.text.includes("page two"), result.text);
+	});
+
+	it("reports the document title when the metadata carries one", async () => {
+		const titled = await pdfToText(makePdf([PAGE_ONE], "My Title"));
+		assert.equal(titled.title, "My Title");
+		const untitled = await pdfToText(makePdf([PAGE_ONE]));
+		assert.equal(untitled.title, undefined);
 	});
 
 	it("rejects a document with no text layer", async () => {

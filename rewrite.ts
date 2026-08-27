@@ -13,9 +13,10 @@ export interface Rewrite {
 	/** One-line explanation, surfaced to the caller so the swap is never silent. */
 	note: string;
 	/**
-	 * Fetch this if `url` answers non-2xx. Set wherever the machine-readable
-	 * variant may plausibly not exist (arXiv HTML, an API that rate-limits);
-	 * absent where the rewrite is a pure address change that cannot 404 on its own.
+	 * Fetch this if `url` answers non-2xx. Every rule sets it to the original
+	 * URL: a rewrite is a guess about where the content lives — an API can
+	 * rate-limit, an arXiv paper can have no HTML rendering, and a raw-file
+	 * address can be wrong — and losing the page beats showing an error.
 	 */
 	fallback?: URL;
 }
@@ -63,7 +64,10 @@ function github(url: URL, path: string[]): Rewrite | undefined {
 	// Line fragments survive the swap: they are what the user was pointing at.
 	const raw = new URL(`https://raw.githubusercontent.com/${owner}/${repo}/${rest.join("/")}`);
 	raw.hash = url.hash;
-	return { url: raw, note: "github blob → raw" };
+	// A ref may contain slashes (`release/1.0`, `dependabot/npm_and_yarn/...`), and
+	// nothing in the URL says where the ref ends and the path begins — so the split
+	// above is a guess, and a wrong guess 404s. The blob page catches those.
+	return { url: raw, note: "github blob → raw", fallback: url };
 }
 
 /** `{site}.stackexchange.com`, minus the API host itself. */

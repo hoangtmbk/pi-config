@@ -128,6 +128,21 @@ describe("renderKnownJson: npm registry", () => {
 		assert.equal(markdown, "# left-pad 1.3.0\n\nString left pad\n\n## Dependencies\n- safe-buffer ^5.1.1");
 	});
 
+	it("puts a deprecation notice under the title", () => {
+		const packumentMarkdown = render("https://registry.npmjs.org/left-pad", {
+			...packument,
+			versions: { ...packument.versions, "1.3.0": { deprecated: "use String.prototype.padStart" } },
+		});
+		assert.match(packumentMarkdown ?? "", /^# left-pad 1\.3\.0\n\n\*\*Deprecated:\*\* use String\.prototype\.padStart\n\nString left pad/);
+
+		const versionMarkdown = render("https://registry.npmjs.org/left-pad/1.3.0", {
+			name: "left-pad",
+			version: "1.3.0",
+			deprecated: "unmaintained",
+		});
+		assert.equal(versionMarkdown, "# left-pad 1.3.0\n\n**Deprecated:** unmaintained");
+	});
+
 	it("returns undefined when the payload is not a registry document", () => {
 		assert.equal(render("https://registry.npmjs.org/nope", { error: "Not found" }), undefined);
 		assert.equal(render("https://registry.npmjs.org/nope", { name: "nope" }), undefined);
@@ -175,6 +190,21 @@ describe("renderKnownJson: pypi", () => {
 			},
 		});
 		assert.equal(markdown, "# tiny 0.1\n\nhttps://tiny.test\n\n## Description\n\nPlain RST prose\n===============");
+	});
+
+	it("flags a yanked release under the title", () => {
+		const withReason = render("https://pypi.org/pypi/broken/json", {
+			info: { name: "broken", version: "1.0.1", yanked: true, yanked_reason: "ships a broken wheel" },
+		});
+		assert.equal(withReason, "# broken 1.0.1\n\n**Yanked:** ships a broken wheel");
+
+		const withoutReason = render("https://pypi.org/pypi/broken/json", {
+			info: { name: "broken", version: "1.0.1", yanked: true },
+		});
+		assert.equal(withoutReason, "# broken 1.0.1\n\n**Yanked:** yes");
+
+		const live = render("https://pypi.org/pypi/broken/json", { info: { name: "broken", version: "1.0.2", yanked: false } });
+		assert.equal(live, "# broken 1.0.2");
 	});
 
 	it("returns undefined without an info object", () => {

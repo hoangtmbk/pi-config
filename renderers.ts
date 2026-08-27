@@ -89,9 +89,21 @@ function npm(json: Record<string, unknown>): string | undefined {
 
 	const distTags = isRecord(json["dist-tags"]) ? json["dist-tags"] : undefined;
 	const version = str(distTags?.latest) ?? str(json.version);
-	const sections = [`# ${name}${version === undefined ? "" : ` ${version}`}`, str(json.description)];
+	const versions = isRecord(json.versions) ? json.versions : undefined;
 
-	if (!isRecord(json.versions)) {
+	// A deprecation lives on the version manifest — inside `versions` for a
+	// packument, at the top level for a single-version document. It outranks
+	// everything else on the page, so it goes directly under the title.
+	const manifest: unknown = version === undefined ? undefined : versions?.[version];
+	const deprecated = str((isRecord(manifest) ? manifest : json).deprecated);
+
+	const sections = [
+		`# ${name}${version === undefined ? "" : ` ${version}`}`,
+		deprecated === undefined ? undefined : `**Deprecated:** ${deprecated}`,
+		str(json.description),
+	];
+
+	if (versions === undefined) {
 		// Single-version document: no README, no history, just what it depends on.
 		if (str(json.version) === undefined) return undefined;
 		const dependencies = isRecord(json.dependencies) ? Object.entries(json.dependencies) : [];
@@ -109,7 +121,7 @@ function npm(json: Record<string, unknown>): string | undefined {
 	);
 
 	const time = isRecord(json.time) ? json.time : {};
-	const released = Object.keys(json.versions)
+	const released = Object.keys(versions)
 		.map((v) => ({ version: v, date: str(time[v]) }))
 		.filter((entry) => entry.date !== undefined)
 		.sort((a, b) => b.date!.localeCompare(a.date!))
@@ -130,7 +142,9 @@ function pypi(json: Record<string, unknown>): string | undefined {
 	if (info === undefined || name === undefined) return undefined;
 
 	const version = str(info.version);
-	const sections = [`# ${name}${version === undefined ? "" : ` ${version}`}`, str(info.summary)];
+	// A yanked release is one a reader must not copy into a requirements file.
+	const yanked = info.yanked === true ? `**Yanked:** ${str(info.yanked_reason) ?? "yes"}` : undefined;
+	const sections = [`# ${name}${version === undefined ? "" : ` ${version}`}`, yanked, str(info.summary)];
 
 	const requiresPython = str(info.requires_python);
 	if (requiresPython !== undefined) sections.push(`Requires Python ${requiresPython}`);
