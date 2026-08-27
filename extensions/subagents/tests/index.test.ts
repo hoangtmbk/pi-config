@@ -598,7 +598,17 @@ describe("subagent_wait", () => {
 		});
 	});
 
-	it("says so plainly when nothing is in play, rather than waiting on nothing", async () => {
+	it("rejects a blank name rather than quietly waiting for everything instead", async () => {
+		const { subagent, subagentWait } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		await assert.rejects(call(subagentWait, { names: ["   "] }), (error: Error) => {
+			assert.match(error.message, /Unknown run/);
+			return true;
+		});
+	});
+
+	it("says so plainly when no Run is active, rather than waiting on nothing", async () => {
 		const { subagent, subagentWait, spawned } = stubbedSession();
 		await call(subagent, { agent: "scout", task: "look around" });
 		spawned[0].emit(SETTLED);
@@ -606,7 +616,7 @@ describe("subagent_wait", () => {
 		assert.match(await call(subagentWait, {}), /nothing to wait for/);
 	});
 
-	it("waits on every Run in play when it is given no names", async () => {
+	it("waits on every Run that has not finished when it is given no names", async () => {
 		const { subagent, subagentWait, sent, spawned } = stubbedSession();
 		await call(subagent, { agent: "scout", task: "one" });
 		await call(subagent, { agent: "worker", task: "two" });

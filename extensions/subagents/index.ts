@@ -3,8 +3,10 @@
  *
  * `subagent` spawns a Run in a child pi process and returns its name straight
  * away; when the Run settles, its result is delivered back into this
- * conversation on its own (ADR-0002). The tool's description carries the whole
- * roster, so choosing an Agent costs no round trip.
+ * conversation on its own — unless a `subagent_wait` named that Run, in which
+ * case the join collects it and it is not said twice (ADR-0002). The `subagent`
+ * tool's description carries the whole roster, so choosing an Agent costs no
+ * round trip.
  *
  * This file is wiring and nothing else. The lifecycle lives in `supervisor.ts`,
  * which is pure; the subprocess lives in `child.ts`, which is the only thing
@@ -42,7 +44,7 @@ const SubagentAnswerParams = Type.Object({
 const SubagentWaitParams = Type.Object({
 	names: Type.Optional(
 		Type.Array(Type.String(), {
-			description: "The runs to wait for, by name. Omit to wait for every run that is still in play.",
+			description: "The runs to wait for, by name. Omit to wait for every run that has not finished.",
 		}),
 	),
 });
@@ -76,16 +78,6 @@ interface SubagentWaitDetails {
 function unknownRun(name: string, runs: Run[]): Error {
 	const known = runs.map((candidate) => `\`${candidate.name}\` (${candidate.state})`).join(", ");
 	return new Error(`Unknown run \`${name}\`. ${known ? `Runs in this session: ${known}.` : "No runs have been started in this session."}`);
-}
-
-/**
- * The Runs a join with no names waits on: everything still in play.
- *
- * A Waiting Run counts as in play — it is alive, and a join that passed over it
- * would say nothing at all about a session whose only Run needs an answer.
- */
-function inPlay(runs: Run[]): Run[] {
-	return runs.filter((run) => run.state !== "done");
 }
 
 /** Why a name cannot be answered: the wrong state, or no such Run at all. */
@@ -267,7 +259,7 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 		label: "Wait for subagents",
 		description: [
 			"Wait for runs to finish and collect their results here, rather than letting them arrive in this conversation on their own.",
-			"Blocks until every run you name — or every run still in play, if you name none — is done or waiting on a question, then returns what each has to say.",
+			"Waits until every run you name — or every run that has not finished, if you name none — is done or waiting on a question, then returns what each has to say.",
 			"A run that is waiting comes back with its question: answer it with subagent_answer and wait again.",
 			"A result collected here is not also delivered on its own, so nothing is said twice.",
 			"Use it when you have nothing to do until the runs come back; otherwise keep working and let their results arrive.",
@@ -277,28 +269,24 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 
 		async execute(_toolCallId, params) {
 			// Deduped, because a name given twice is one Run, and collecting it twice
-			// would report the same result twice inside a single join.
-			const named = [...new Set((params.names ?? []).map((name) => name.trim()).filter(Boolean))];
+			// would report the same result twice inside a single join. Nothing is
+			// filtered out: a blank name is rejected below rather than quietly
+			// turning a named join into a join on everything.
+			const named = [...new Set((params.names ?? []).map((name) => name.trim()))];
 			// Checked here rather than in the Supervisor, because this is the side
 			// that can say which names would have worked.
 			for (const name of named) if (!supervisor.get(name)) throw unknownRun(name, supervisor.list());
 
-			const waited = named.length > 0 ? named : inPlay(supervisor.list()).map((run) => run.name);
-			if (waited.length === 0) {
-				const details: SubagentWaitDetails = { runs: [] };
-				return {
-					content: [{ type: "text", text: "No runs are in play, so there is nothing to wait for." }],
-					details,
-				};
-			}
-
-			const collected = await supervisor.join(waited);
+			// Joining on nothing settles at once with nothing, which is the honest
+			// answer to a session with no Runs left to wait for.
+			const collected = await supervisor.join(named.length > 0 ? named : supervisor.active().map((run) => run.name));
 
 			const details: SubagentWaitDetails = {
 				runs: collected.map((message) => ({ run: message.run.name, agent: message.run.agent, state: message.run.state })),
 			};
+			const text = collected.map((message) => message.text).join("\n\n");
 			return {
-				content: [{ type: "text", text: collected.map((message) => message.text).join("\n\n") }],
+				content: [{ type: "text", text: text || "No runs are active, so there is nothing to wait for." }],
 				details,
 			};
 		},

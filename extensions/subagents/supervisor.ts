@@ -112,6 +112,16 @@ export class Supervisor {
 	}
 
 	/**
+	 * Every Run that has not finished — what a join with no names waits on.
+	 *
+	 * A Waiting Run counts as active: it is alive, and a join that passed over it
+	 * would say nothing at all about a session whose only Run needs an answer.
+	 */
+	active(): Run[] {
+		return this.list().filter((run) => run.state !== "done");
+	}
+
+	/**
 	 * Feed one event from a Run's child. Returns a Question on the event that
 	 * moves the Run to Waiting, a Delivery on the event that finishes it, and
 	 * nothing on every other event.

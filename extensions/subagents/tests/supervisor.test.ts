@@ -106,6 +106,16 @@ describe("Supervisor lifecycle", () => {
 		assert.match(delivery?.text ?? "", /without producing a result/);
 	});
 
+	it("counts a Waiting Run as active and a finished one as not", () => {
+		const supervisor = new Supervisor();
+		const finished = supervisor.register("scout", "one");
+		const asking = supervisor.register("worker", "two");
+		feed(supervisor, finished.name, [said("done"), SETTLED]);
+		feed(supervisor, asking.name, [asked("Which one?"), SETTLED]);
+
+		assert.deepEqual(supervisor.active().map((run) => run.name), ["worker"]);
+	});
+
 	it("has nothing to say about a name it never registered", () => {
 		const supervisor = new Supervisor();
 
