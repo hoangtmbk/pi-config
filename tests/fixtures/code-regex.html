@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+<head><title>Code regex hazards</title></head>
+<body>
+<h1>Code regex hazards</h1>
+<p>Snippets whose text collides with the markdown post-processing regexes.</p>
+<pre><code class="language-cpp">auto f = [](int a) { return a; };
+arr[i]();
+
+// -----
+int x = 1;
+</code></pre>
+<p>The block below is a bare pre with no code child.</p>
+<pre>let v = vec![1, 2];
+&gt;&gt;&gt; print("hi")
+</pre>
+</body>
+</html>

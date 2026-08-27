@@ -43,8 +43,10 @@ function configureBase(turndown: TurndownService): TurndownService {
 	});
 
 	// Non-content elements Readability sometimes leaves behind.
+	// Names rather than a tag list: Turndown's typed tag filter has no "svg".
+	const NON_CONTENT = ["SCRIPT", "STYLE", "NOSCRIPT", "IFRAME", "FORM", "BUTTON", "SVG", "CANVAS"];
 	turndown.addRule("dropNonContent", {
-		filter: ["script", "style", "noscript", "iframe", "form", "button", "svg", "canvas"],
+		filter: (node) => NON_CONTENT.includes(node.nodeName),
 		replacement: () => "",
 	});
 
