@@ -268,7 +268,9 @@ describe("subagent registration", () => {
 
 describe("subagent", () => {
 	it("returns a Run's name immediately, without waiting for its result", async () => {
-		const { subagent, sent } = fakeSession();
+		// A child scripted to say nothing on its first prompt, so "nothing has been
+		// delivered yet" is a fact rather than a race against a fast subprocess.
+		const { subagent, sent } = fakeSession(ROSTER, { FAKE_RPC_TURNS: JSON.stringify([[]]) });
 
 		const result = await call(subagent, { agent: "scout", task: "look around" });
 
