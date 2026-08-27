@@ -12,8 +12,12 @@ import type { Extracted } from "./extract.ts";
 /** Below this share of the page's text, extraction is worth flagging. */
 const KEPT_RATIO_FLOOR = 0.9;
 
-/** Paths that mean the fetch landed on a gate rather than on the content. */
-const GATE_PATH = /login|signin|sign-in|consent|captcha/i;
+/**
+ * Last path segments that mean the fetch landed on a gate rather than on the
+ * content. Matched whole: `/docs/authentication` and `/blog/login-flows` are
+ * pages *about* logging in, not login pages.
+ */
+const GATE_SEGMENT = /^(login|signin|sign-in|sign_in|consent|captcha|challenge)$/i;
 
 /** A page this big that yields less markdown than this was never really text. */
 const WALL_MIN_HTML_BYTES = 50 * 1024;
@@ -56,9 +60,11 @@ export function buildHeader(input: HeaderInput, formatSize: (bytes: number) => s
 	if (input.title) lines.push(`# ${input.title}`);
 	lines.push(`source: ${input.finalUrl} (${input.status} · ${input.contentType || "unknown type"})`);
 
-	// The URL fetched was not the URL asked for — say which, and why.
-	if (input.note) lines.push(`note: ${input.note}`);
-	else if (input.requestedUrl && input.requestedUrl !== input.finalUrl) {
+	// The URL fetched was not the URL asked for — say which, and why. `via:`
+	// rather than `note:`, so the untrusted-content note stays the only `note:`.
+	if (input.note) {
+		lines.push(`via: ${input.note}`);
+	} else if (input.requestedUrl && input.requestedUrl !== input.finalUrl) {
 		lines.push(`redirected from: ${input.requestedUrl}`);
 	}
 
@@ -96,7 +102,7 @@ export function buildHeader(input: HeaderInput, formatSize: (bytes: number) => s
 
 	if (input.truncatedAtBytes) lines.push("warning: body cut at 10 MB");
 
-	if (GATE_PATH.test(pathOf(input.finalUrl))) {
+	if (GATE_SEGMENT.test(lastSegment(input.finalUrl))) {
 		lines.push("warning: final URL looks like a login/consent page");
 	} else if (cut.totalBytes < WALL_MAX_MARKDOWN_BYTES && input.bytes > WALL_MIN_HTML_BYTES) {
 		lines.push(
@@ -111,12 +117,16 @@ export function buildHeader(input: HeaderInput, formatSize: (bytes: number) => s
 	return lines.join("\n");
 }
 
-function pathOf(url: string): string {
+/** Last path segment of a URL, without its extension. `""` when there is none. */
+function lastSegment(url: string): string {
+	let path: string;
 	try {
-		return new URL(url).pathname;
+		path = new URL(url).pathname;
 	} catch {
-		return url;
+		path = url;
 	}
+	const segment = path.split("/").filter(Boolean).pop() ?? "";
+	return segment.replace(/\.[^.]*$/, "");
 }
 
 /** Filesystem-safe slice of arbitrary text, or `fallback` if nothing survives. */

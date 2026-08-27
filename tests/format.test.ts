@@ -134,8 +134,10 @@ describe("buildHeader", () => {
 			lines[0],
 			"source: https://raw.githubusercontent.com/mozilla/readability/main/README.md (200 · text/html)",
 		);
-		assert.equal(lines[1], "note: github blob → raw");
+		assert.equal(lines[1], "via: github blob → raw");
 		assert.ok(!lines.some((line) => line.startsWith("redirected from:")));
+		// `note:` belongs to the untrusted-content line alone.
+		assert.equal(lines.filter((line) => line.startsWith("note:")).length, 1);
 	});
 
 	it("reports a plain redirect when no rewrite explains the different URL", () => {
@@ -157,13 +159,28 @@ describe("buildHeader", () => {
 			"https://example.com/login",
 			"https://example.com/users/sign-in",
 			"https://example.com/accounts/signin?next=/docs",
-			"https://consent.example.com/consent/choice",
+			"https://example.com/gate/consent.html",
 			"https://example.com/captcha",
 		]) {
 			assert.ok(
 				header({ finalUrl: url, requestedUrl: url }).includes(
 					"warning: final URL looks like a login/consent page",
 				),
+				url,
+			);
+		}
+	});
+
+	it("does not call a page about logging in a login page", () => {
+		// The gate word has to be the whole last segment, not a substring of the path.
+		for (const url of [
+			"https://example.com/docs/authentication/overview",
+			"https://example.com/blog/login-flows-explained",
+			"https://consent.example.com/docs/api",
+			"https://example.com/guides/captcha-alternatives",
+		]) {
+			assert.ok(
+				!header({ finalUrl: url, requestedUrl: url }).some((line) => line.startsWith("warning:")),
 				url,
 			);
 		}
@@ -197,6 +214,22 @@ describe("buildHeader", () => {
 			lines[2],
 			"full: /tmp/pi-web-fetch/s/ab12cd34-example.com-intro.md — read with offset=221 to continue, or grep it",
 		);
+	});
+
+	it("reports the totals without a full: line when the save failed", () => {
+		const lines = header({ truncation: truncated(637, 137_113, 220, 49_971) });
+
+		assert.equal(lines[1], "637 lines · 133.9KB → showing 220 lines (48.8KB)");
+		assert.ok(!lines.some((line) => line.startsWith("full:")));
+		assert.equal(lines.at(-1), UNTRUSTED);
+	});
+
+	it("omits the full: line for an over-long first line with no saved file", () => {
+		const cut: TruncationResult = { ...truncated(1, 130_000, 0, 0), firstLineExceedsLimit: true };
+		const lines = header({ truncation: cut, shownBytes: MAX_BYTES });
+
+		assert.equal(lines[1], "1 lines · 127.0KB → showing the first 50.0KB of line 1");
+		assert.ok(!lines.some((line) => line.startsWith("full:")));
 	});
 
 	it("shows the head of an over-long first line instead of nothing", () => {

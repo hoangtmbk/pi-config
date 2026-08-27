@@ -33,7 +33,7 @@ Output starts with a provenance header, then `---`, then the markdown:
 ```
 # Transformer (deep learning)
 source: https://en.wikipedia.org/w/rest.php/v1/page/Transformer_%28deep_learning%29/html (200 · text/html)
-note: wikipedia → Parsoid HTML
+via: wikipedia → Parsoid HTML
 656 lines · 189.8KB → showing 178 lines (50.0KB)
 full: /var/folders/.../pi-web-fetch/01a04239/ab12cd34-en.wikipedia.org-html.md — read with offset=179 to continue, or grep it
 extracted: 76% of page text (article) — use raw=true if something is missing
@@ -47,7 +47,7 @@ Every line is something the model cannot infer from the content below it, and ev
 |---|---|
 | `# <title>` | The document declared one |
 | `source:` | Always — the **final** URL, after redirects and rewrites, with status and type |
-| `note:` | The URL fetched was not the URL asked for (see [URL rewrites](#url-rewrites)) |
+| `via:` | The URL fetched was not the URL asked for (see [URL rewrites](#url-rewrites)) |
 | `redirected from:` | Plain redirect, with no rewrite to explain it |
 | `author:`, `published:` | The page's metadata had them |
 | `N lines · size` | Always; gains `→ showing …` and a `full:` line when truncated |
@@ -64,7 +64,9 @@ consistently with the rest of pi.
 
 Nothing is lost when that cap is hit: the complete markdown is written to a temp file and its path is
 reported with the offset that continues the output. The model reads it with `read` or searches it
-with `grep`, pulling in only the part it needs rather than re-fetching.
+with `grep`, pulling in only the part it needs rather than re-fetching. If the save itself fails (a
+full or unwritable `$TMPDIR`), the fetch still succeeds: the header reports the totals without a
+`full:` line, and `details.saveError` says why.
 
 One page shape defeats offsets: a minified document whose *first line* alone exceeds 50 KB. pi's
 `truncateHead` returns an empty body for it, so `web_fetch` shows the first 50 KB of that line
@@ -73,7 +75,8 @@ instead (cut on a character boundary) and the header says to grep the file rathe
 ### Temp file lifecycle
 
 Saved pages live in `$TMPDIR/pi-web-fetch/<session-id>/`, named
-`ab12cd34-en.wikipedia.org-Transformer.md` — the tool-call id, the host, and the last path segment —
+`ab12cd34-docs.python.org-asyncio.html.md` — the tool-call id, and the host and last path segment of
+the **final** URL —
 so a directory listing stays readable. The call id, rather than a counter, is what makes the name
 unique: pi re-evaluates the extension module on `/reload`, and a counter would restart while the
 files a transcript still cites stay on disk.
@@ -121,7 +124,7 @@ is reported in the header's `note:` line.
 | `github.com/…/blob/…` | `raw.githubusercontent.com/…` — the file itself |
 | Stack Overflow / Stack Exchange question | `api.stackexchange.com` question document, plus one extra request for its top 10 answers, merged into the same payload |
 | `npmjs.com/package/…` | `registry.npmjs.org/…` — the packument (deprecation notices included) |
-| `*.wikipedia.org/wiki/…` | `…/rest.php/v1/page/…/html` — Parsoid HTML, without the site chrome |
+| `*.wikipedia.org/wiki/{Title}` | `{lang}.wikipedia.org/api/rest_v1/page/html/{Title}` — Parsoid HTML, without the site chrome |
 | `arxiv.org/abs/…` | `arxiv.org/html/…` — the HTML rendering, not the abstract page |
 | `pypi.org/project/…` | `pypi.org/pypi/…/json` (yank notices included) |
 

@@ -50,6 +50,8 @@ interface WebFetchDetails {
 	elapsedMs: number;
 	/** Where the complete markdown was saved; absent when nothing was truncated. */
 	path?: string;
+	/** Why the save failed, when it did. The shown markdown is returned regardless. */
+	saveError?: string;
 }
 
 const SCRATCH_ROOT = join(tmpdir(), "pi-web-fetch");
@@ -134,9 +136,17 @@ export default function (pi: ExtensionAPI) {
 
 			// Preserve the full document so truncation never loses information.
 			// Removed when the session ends; see the session_shutdown handler.
-			const path = truncation.truncated
-				? await saveFullPage(ctx, toolCallId, page.url, extracted.markdown)
-				: undefined;
+			// A full temp dir must not turn a good fetch into an error: the markdown
+			// in hand is still worth returning, just without a path to the rest.
+			let path: string | undefined;
+			let saveError: string | undefined;
+			if (truncation.truncated) {
+				try {
+					path = await saveFullPage(ctx, toolCallId, page.url, extracted.markdown);
+				} catch (error) {
+					saveError = error instanceof Error ? error.message : String(error);
+				}
+			}
 
 			const header = buildHeader(
 				{
@@ -167,10 +177,11 @@ export default function (pi: ExtensionAPI) {
 				keptRatio: extracted.keptRatio,
 				totalLines: truncation.totalLines,
 				totalBytes: truncation.totalBytes,
-				shownLines: truncation.firstLineExceedsLimit ? 1 : truncation.outputLines,
+				shownLines: truncation.outputLines,
 				shownBytes,
 				elapsedMs: Date.now() - startedAt,
 				path,
+				saveError,
 			};
 
 			return {
@@ -195,18 +206,22 @@ export default function (pi: ExtensionAPI) {
 				return new Text(content?.type === "text" ? content.text : "", 0, 0);
 			}
 
-			// The saved file exists only when something was cut.
-			const truncated = details.path !== undefined;
+			const truncated = details.shownBytes < details.totalBytes;
 			let mode = details.mode as string;
 			if (details.keptRatio < 1) mode += ` ${Math.round(details.keptRatio * 100)}%`;
 
 			let text = theme.fg("success", mode);
-			text += theme.fg(
-				"muted",
-				truncated
-					? ` · ${details.shownLines}/${details.totalLines} lines · ${formatSize(details.shownBytes)}`
-					: ` · ${details.totalLines} lines · ${formatSize(details.totalBytes)}`,
-			);
+			if (!truncated) {
+				text += theme.fg("muted", ` · ${details.totalLines} lines · ${formatSize(details.totalBytes)}`);
+			} else if (details.shownLines === 0) {
+				// One line too long to show whole: line counts say nothing useful.
+				text += theme.fg("muted", ` · ${formatSize(details.shownBytes)} of ${formatSize(details.totalBytes)}`);
+			} else {
+				text += theme.fg(
+					"muted",
+					` · ${details.shownLines}/${details.totalLines} lines · ${formatSize(details.shownBytes)}`,
+				);
+			}
 			if (truncated) text += theme.fg("warning", " · truncated");
 
 			if (expanded) {
@@ -217,6 +232,9 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 				if (details.path) text += `\n${theme.fg("dim", `Full page: ${details.path}`)}`;
+				else if (details.saveError) {
+					text += `\n${theme.fg("warning", `Could not save the full page: ${details.saveError}`)}`;
+				}
 			}
 
 			return new Text(text, 0, 0);
