@@ -11,7 +11,12 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	type AgentToolResult,
+	DEFAULT_MAX_BYTES,
+	type ExtensionAPI,
+	type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import register from "../index.ts";
 import { fakeFetch, jsonResponse, rejection } from "./helpers.ts";
 
@@ -112,6 +117,28 @@ describe("the web-search extension", () => {
 		assert.match(content?.type === "text" ? content.text : "", /^search: "go generics" — 3 results \(Brave\)$/m);
 		assert.match(content?.type === "text" ? content.text : "", /^1\. An Introduction To Generics/m);
 		assert.deepEqual(result.details, { query: "go generics", resultCount: 3 });
+	});
+
+	it("keeps a wide search inside pi's tool output limit, whole results only", async () => {
+		const tool = registeredTools()[0] as unknown as RegisteredTool;
+		// Far more text than one tool result may carry, so the budget has to fire.
+		const results = Array.from({ length: 200 }, (_unused, index) => ({
+			title: `Result ${index + 1}`,
+			url: `https://example.com/${index + 1}`,
+			description: "lorem ipsum ".repeat(60).trim(),
+		}));
+		const { fetch } = fakeFetch(() => jsonResponse({ web: { results } }));
+
+		const result = await withEnvKey("test-key", () =>
+			withFetch(fetch, () => tool.execute("call-1", { query: "wide" }, undefined, undefined, CTX)),
+		);
+
+		const content = result.content[0];
+		const text = content?.type === "text" ? content.text : "";
+		assert.ok(Buffer.byteLength(text, "utf8") <= DEFAULT_MAX_BYTES, `${Buffer.byteLength(text, "utf8")} bytes`);
+		assert.match(text, /^search: "wide" — showing \d+ of 200 results \(Brave\)$/m);
+		// Whatever the last entry is, it is a whole one: its description is intact.
+		assert.ok(text.endsWith("lorem ipsum ".repeat(60).trim()), text.slice(-40));
 	});
 
 	it("fails a search with no key rather than calling Brave", async () => {

@@ -24,6 +24,10 @@ describe("buildSearchUrl", () => {
 		assert.equal(url.searchParams.get("result_filter"), "web");
 	});
 
+	it("asks for the extra snippets, the excerpts a result is triaged on", () => {
+		assert.equal(new URL(buildSearchUrl("hello")).searchParams.get("extra_snippets"), "true");
+	});
+
 	it("escapes operators and punctuation rather than sending them raw", () => {
 		const url = buildSearchUrl('site:rust-lang.org "async fn" -tokio');
 		assert.ok(!url.includes(" "), url);

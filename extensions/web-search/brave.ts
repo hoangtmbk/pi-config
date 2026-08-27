@@ -35,6 +35,12 @@ export interface BraveResult {
 	url?: string;
 	description?: string;
 	meta_url?: { hostname?: string };
+	/**
+	 * Alternative excerpts from the page, up to 5. Historically a paid-plan
+	 * field, so its absence is ordinary and must degrade the entry to its
+	 * description rather than fail the search.
+	 */
+	extra_snippets?: string[];
 }
 
 /** The slice of Brave's response this tool reads. */
@@ -54,6 +60,9 @@ export function buildSearchUrl(query: string): string {
 	url.searchParams.set("q", query);
 	url.searchParams.set("count", String(DEFAULT_COUNT));
 	url.searchParams.set("result_filter", "web");
+	// The alternative excerpts a result is triaged on — every one that prevents a
+	// wrong `web_fetch` saves 50 KB of context.
+	url.searchParams.set("extra_snippets", "true");
 	return url.toString();
 }
 

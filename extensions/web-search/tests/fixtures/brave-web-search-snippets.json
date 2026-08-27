@@ -1,0 +1,28 @@
+{
+  "query": { "original": "rust async fn in traits" },
+  "type": "search",
+  "web": {
+    "type": "search",
+    "results": [
+      {
+        "title": "Async fn and return-position impl Trait in traits",
+        "url": "https://blog.rust-lang.org/2023/12/21/async-fn-rpit-in-traits.html",
+        "description": "Rust 1.75 stabilizes <strong>async fn</strong> and return-position impl Trait in <strong>traits</strong>.",
+        "meta_url": { "scheme": "https", "netloc": "blog.rust-lang.org", "hostname": "blog.rust-lang.org" },
+        "extra_snippets": [
+          "Rust 1.75 stabilizes async fn and return-position impl Trait in traits.",
+          "<strong>dyn Trait</strong> is still unsupported; dynamic dispatch needs a crate such as async-trait.",
+          "The desugaring produces an anonymous associated type, which is why the bound cannot be named yet.",
+          "A fourth snippet that is never shown."
+        ]
+      },
+      {
+        "title": "async-trait",
+        "url": "https://crates.io/crates/async-trait",
+        "description": "Type erasure for async trait methods.",
+        "meta_url": { "scheme": "https", "netloc": "crates.io", "hostname": "crates.io" },
+        "extra_snippets": ["The macro boxes the returned future, so each call costs one allocation."]
+      }
+    ]
+  }
+}

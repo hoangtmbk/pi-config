@@ -7,10 +7,10 @@
  * `web_fetch` still works on a machine with no API key.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { search } from "./brave.ts";
-import { formatResults, usableResults } from "./format.ts";
+import { MAX_EXCERPTS, formatResults, usableResults } from "./format.ts";
 import { resolveApiKey } from "./key.ts";
 
 const WebSearchParams = Type.Object({
@@ -31,7 +31,7 @@ export default function (pi: ExtensionAPI) {
 		name: "web_search",
 		label: "Web Search",
 		description:
-			"Search the web with Brave and return ranked results: title, host, URL and description for each. " +
+			`Search the web with Brave and return ranked results: title, host, URL, description and up to ${MAX_EXCERPTS} extra excerpts for each. ` +
 			"Results are for triage — pick the promising URLs and read them with web_fetch. " +
 			"Requires a Brave Search API key in BRAVE_API_KEY or in a .env beside the extension.",
 		promptSnippet: "Search the web and get ranked results with snippets",
@@ -49,7 +49,12 @@ export default function (pi: ExtensionAPI) {
 				resultCount: usableResults(response).length,
 			};
 
-			return { content: [{ type: "text", text: formatResults(params.query, response) }], details };
+			// The budget is pi's tool output limit, applied whole result by whole
+			// result — a wide search must not flood the context window, and half an
+			// entry is a URL the model cannot fetch.
+			const text = formatResults(params.query, response, { maxBytes: DEFAULT_MAX_BYTES });
+
+			return { content: [{ type: "text", text }], details };
 		},
 	});
 }
