@@ -1,0 +1,17 @@
+{
+  "name": "pi-extension-web-fetch",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Context-lean web fetch tool for pi: fetches a URL and returns clean markdown",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "linkedom": "^0.18.13",
+    "turndown": "^7.2.4"
+  }
+}
