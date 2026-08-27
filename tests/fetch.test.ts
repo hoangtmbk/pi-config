@@ -378,6 +378,24 @@ describe("content-type gate", () => {
 		assert.equal(page.bytes, pdf.length);
 	});
 
+	it("treats an octet-stream .pdf as a PDF when the caller opted in", async () => {
+		const pdf = Buffer.from("%PDF-1.4\n%âãÏÓ\n1 0 obj\n");
+		const serve: Handler = (_req, res) => {
+			res.writeHead(200, { "content-type": "application/octet-stream", "content-length": String(pdf.length) });
+			res.end(pdf);
+		};
+
+		const page = await withServer(serve, (base) =>
+			fetchPage(`http://${base}/paper.pdf`, undefined, { allowPdf: true }),
+		);
+		assert.equal(page.body, "");
+		assert.deepEqual(Buffer.from(page.bytesBody as Uint8Array), pdf);
+
+		// Without the opt-in it is still binary, and still refused before the read.
+		const error = await withServer(serve, (base) => rejection(fetchPage(`http://${base}/paper.pdf`)));
+		assert.match(error.message, /Refusing binary content \(application\/octet-stream/);
+	});
+
 	it("leaves bytesBody unset for ordinary pages", async () => {
 		const page = await withServer(text(200, "text/plain", "hello"), (base) => fetchPage(`http://${base}/`));
 		assert.equal(page.bytesBody, undefined);
@@ -567,6 +585,42 @@ describe("StackExchange answers", () => {
 		const merged = JSON.parse(page.body) as { items: unknown[]; answers?: unknown };
 		assert.equal(merged.items.length, 1);
 		assert.equal(merged.answers, undefined);
+	});
+
+	it("propagates a cancellation during the answers request", async () => {
+		const started = deferred();
+		const error = await withServer(
+			(req, res) => {
+				if ((req.url ?? "").startsWith("/questions/1/answers")) {
+					// Headers and nothing else: the client is cancelled mid-read.
+					res.writeHead(200, { "content-type": "application/json" });
+					res.write('{"items":[');
+					started.resolve();
+					return;
+				}
+				serve(req, res);
+			},
+			async (base) => {
+				const controller = new AbortController();
+				const pending = rejection(
+					fetchPage(`http://${base}/q/1`, controller.signal, {
+						rewrite: () => ({
+							url: new URL(`http://${base}/questions/1?site=test&filter=withbody`),
+							note: "stackoverflow → StackExchange API",
+							fallback: new URL(`http://${base}/q/1`),
+						}),
+					}),
+				);
+				await started.promise;
+				await delay(50);
+				controller.abort();
+				return pending;
+			},
+		);
+
+		assert.ok(error instanceof WebFetchError, `expected a WebFetchError, got ${error.constructor.name}`);
+		// Reported against the page the caller asked for, not the answers endpoint.
+		assert.match(error.message, /^Cancelled: http:\/\/127\.0\.0\.1:\d+\/q\/1$/);
 	});
 
 	it("asks for no answers when the rewrite was abandoned for its fallback", async () => {

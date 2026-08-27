@@ -60,6 +60,9 @@ const BINARY_EXACT_TYPES = new Set(["application/zip", "application/gzip", "appl
 const BINARY_EXTENSION_PATTERN =
 	/\.(zip|gz|tgz|tar|rar|7z|bz2|xz|exe|dmg|pkg|deb|rpm|iso|bin|so|dylib|dll|class|wasm|png|jpe?g|gif|webp|avif|bmp|ico|tiff?|mp[34]|m4a|wav|flac|ogg|opus|webm|mov|avi|mkv|woff2?|ttf|otf|eot|pdf|docx?|xlsx?|pptx?)$/i;
 
+/** A path that names a PDF, for the servers that declare `application/octet-stream`. */
+const PDF_EXTENSION_PATTERN = /\.pdf$/i;
+
 /** Types we are happy to decode as text even when the body looks unusual. */
 const TEXT_TYPE_PATTERN =
 	/^text\/|\+xml$|\+json$|^application\/(json|xml|xhtml\+xml|javascript|ecmascript|x-yaml|yaml|toml)$/;
@@ -303,6 +306,9 @@ function classifyContent(type: string, url: string, allowPdf: boolean): ContentK
 				return url;
 			}
 		})();
+		// Servers that shrug about the type still name the file: a `.pdf` path is
+		// as good a declaration as the header would have been.
+		if (PDF_EXTENSION_PATTERN.test(path)) return allowPdf ? "pdf" : "binary";
 		return BINARY_EXTENSION_PATTERN.test(path) ? "binary" : "unknown";
 	}
 	if (TEXT_TYPE_PATTERN.test(type)) return "text";
@@ -362,6 +368,7 @@ async function attachAnswers(
 	questionUrl: URL,
 	page: FetchedPage,
 	get: (url: string) => Promise<Response>,
+	signal: AbortSignal | undefined,
 ): Promise<void> {
 	const site = questionUrl.searchParams.get("site");
 	if (site === null) return;
@@ -391,6 +398,10 @@ async function attachAnswers(
 		page.body = JSON.stringify({ ...question, answers: items });
 		page.bytes = Buffer.byteLength(page.body);
 	} catch {
+		// Esc means stop, not "stop after one more document": a cancellation here
+		// ends the whole fetch rather than being absorbed as a missing extra. It is
+		// reported against the URL the caller asked for, as every other abort is.
+		if (signal?.aborted) throw new WebFetchError(`Cancelled: ${shortUrl(page.requestedUrl)}`);
 		// Rate limit, malformed JSON, dead connection — proceed with the question.
 	}
 }
@@ -515,7 +526,7 @@ export async function fetchPage(rawUrl: string, signal?: AbortSignal, options: F
 	// second request. Skipped when the rewrite was abandoned for its fallback.
 	const rewritten = resolved.rewrite !== undefined && url === resolved.url ? new URL(url) : undefined;
 	if (rewritten && type.includes("json") && QUESTION_PATH_PATTERN.test(rewritten.pathname)) {
-		await attachAnswers(rewritten, page, (target) => send(target, USER_AGENT));
+		await attachAnswers(rewritten, page, (target) => send(target, USER_AGENT), signal);
 	}
 	return page;
 }

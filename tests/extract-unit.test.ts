@@ -9,8 +9,18 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { extract, type Extracted } from "../extract.ts";
-import type { FetchedPage } from "../fetch.ts";
+import { type FetchedPage, WebFetchError } from "../fetch.ts";
 import { headings, makePdf } from "./helpers.ts";
+
+/** The error a promise rejects with, so the assertion can be about the error itself. */
+async function rejection(promise: Promise<unknown>): Promise<Error> {
+	try {
+		await promise;
+	} catch (error) {
+		return error as Error;
+	}
+	throw new Error("expected the call to reject");
+}
 
 /** The full extraction result for an inline page body. */
 async function extractOf(body: string, raw = false): Promise<Extracted> {
@@ -471,15 +481,80 @@ describe("PDF bytes become text", async () => {
 
 	it("reports a PDF with no text layer as a fetch error", async () => {
 		const blank = makePdf(["hi"]);
-		await assert.rejects(extract(pageOf("https://example.test/scan.pdf", "application/pdf", "", blank), false), {
-			name: "Error",
-			message: /Could not read the PDF at https:\/\/example\.test\/scan\.pdf: .*no extractable text/,
-		});
+		const error = await rejection(
+			extract(pageOf("https://example.test/scan.pdf", "application/pdf", "", blank), false),
+		);
+		assert.ok(error instanceof WebFetchError, `expected a WebFetchError, got ${error.constructor.name}`);
+		assert.match(error.message, /Could not read the PDF at https:\/\/example\.test\/scan\.pdf: .*no extractable text/);
 	});
 
 	it("refuses a PDF response that carried no bytes", async () => {
-		await assert.rejects(extract(pageOf("https://example.test/empty.pdf", "application/pdf", ""), false), {
-			message: /No PDF data at https:\/\/example\.test\/empty\.pdf/,
-		});
+		const error = await rejection(extract(pageOf("https://example.test/empty.pdf", "application/pdf", ""), false));
+		assert.ok(error instanceof WebFetchError, `expected a WebFetchError, got ${error.constructor.name}`);
+		assert.match(error.message, /No PDF data at https:\/\/example\.test\/empty\.pdf/);
+	});
+});
+
+describe("a PDF cut off at the byte ceiling says so", async () => {
+	/** A page whose download hit the 10 MB ceiling, so the bytes are a prefix of the document. */
+	function cutPage(bytes: Uint8Array): FetchedPage {
+		const page = pageOf("https://example.test/huge.pdf", "application/pdf", "", bytes);
+		page.truncatedAtBytes = true;
+		return page;
+	}
+
+	it("warns above the text when the prefix still parses", async () => {
+		const extracted = await extract(cutPage(makePdf(["Hello PDF, this is page one."])), false);
+
+		assert.equal(extracted.mode, "pdf");
+		assert.equal(
+			extracted.markdown.split("\n")[0],
+			"warning: PDF download cut at 10 MB — text below is partial",
+		);
+		assert.match(extracted.markdown, /Hello PDF, this is page one\./);
+	});
+
+	it("blames the size, not the file, when the prefix cannot be parsed", async () => {
+		// PDF.js reads the cross-reference table at the end of the file, which is
+		// exactly what a truncated download is missing.
+		const whole = makePdf(["Hello PDF, this is page one."]);
+		const error = await rejection(extract(cutPage(whole.subarray(0, Math.floor(whole.length / 2))), false));
+
+		assert.ok(error instanceof WebFetchError, `expected a WebFetchError, got ${error.constructor.name}`);
+		assert.equal(error.message, "PDF download cut at 10 MB and could not be parsed: https://example.test/huge.pdf");
+	});
+
+	it("still says the file is unreadable when nothing was cut", async () => {
+		const whole = makePdf(["Hello PDF, this is page one."]);
+		const half = pageOf("https://example.test/broken.pdf", "application/pdf", "", whole.subarray(0, 40));
+		const error = await rejection(extract(half, false));
+
+		assert.match(error.message, /^Could not read the PDF at https:\/\/example\.test\/broken\.pdf/);
+	});
+});
+
+describe("a renderer that fails costs only the rendering", async () => {
+	it("pretty-prints rather than dropping to text mode", async () => {
+		// The renderer stage is reached with the page's own URL; when anything in
+		// it throws — here, a URL that cannot be parsed at all — the document is
+		// still JSON and must still be presented as JSON.
+		const extracted = await extract(pageOf("not a url", "application/json", '{"name":"turndown"}'), false);
+
+		assert.equal(extracted.mode, "json");
+		assert.equal(extracted.markdown, '{\n  "name": "turndown"\n}');
+	});
+
+	it("renders around a field it cannot use rather than throwing", async () => {
+		// StackExchange host and shape, but the body is an object where the
+		// renderer expects HTML. The field is dropped; the question is not.
+		const payload = { items: [{ title: "Half a question", body: { not: "html" } }] };
+		const extracted = await extract(
+			pageOf("https://api.stackexchange.com/2.3/questions/1", "application/json", JSON.stringify(payload)),
+			false,
+		);
+
+		assert.equal(extracted.mode, "json");
+		assert.equal(extracted.title, "Half a question");
+		assert.ok(!extracted.markdown.includes("[object Object]"), extracted.markdown);
 	});
 });

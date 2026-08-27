@@ -801,21 +801,30 @@ function leadHeading(markdown: string): string | undefined {
 	return /^# (.+)$/m.exec(markdown)?.[1]?.trim() || undefined;
 }
 
+/**
+ * The rendered form of a payload we recognise, or undefined for everything else.
+ *
+ * Guarded on its own rather than sharing the JSON parse's `catch`: a renderer
+ * that throws — on a shape it half-recognises, or on markup deep enough to
+ * exhaust the stack in the fragment converter — must cost the reader nothing
+ * more than the rendering. The pretty-printed document is still right there.
+ */
+function renderJson(page: FetchedPage, parsed: unknown): string | undefined {
+	try {
+		const finalUrl = new URL(page.url);
+		return renderKnownJson(finalUrl, parsed, (html) => fragmentToMarkdown(html, page.url));
+	} catch {
+		return undefined;
+	}
+}
+
 function extractJson(page: FetchedPage): Extracted {
 	try {
 		const parsed = JSON.parse(page.body);
 
 		// A packument or an answer dump is mostly punctuation by weight. When the
 		// payload is one we know, render the few fields a reader wants instead.
-		const finalUrl = ((): URL | undefined => {
-			try {
-				return new URL(page.url);
-			} catch {
-				return undefined;
-			}
-		})();
-		const rendered =
-			finalUrl && renderKnownJson(finalUrl, parsed, (html) => fragmentToMarkdown(html, page.url));
+		const rendered = renderJson(page, parsed);
 		if (rendered !== undefined) {
 			return {
 				title: leadHeading(rendered),
@@ -848,12 +857,21 @@ function extractJson(page: FetchedPage): Extracted {
 	}
 }
 
+/** What the fetch layer's byte ceiling did to the document, in the reader's terms. */
+const PDF_CUT_WARNING = "warning: PDF download cut at 10 MB — text below is partial";
+
 /**
  * PDF text, with the page count stated when the document was longer than we read.
  *
  * `unpdf` packages the whole of PDF.js — about two megabytes — so it is imported
  * here rather than at module scope: every non-PDF fetch would otherwise pay for
  * loading it.
+ *
+ * A PDF cut off at the fetch layer's 10 MB ceiling is the case worth spelling
+ * out. PDF.js reads the cross-reference table at the *end* of the file, so a
+ * truncated document either parses to a fraction of its pages — indistinguishable
+ * from a short paper, since the page cap is the only thing the page line reports
+ * — or fails to parse at all, which reads as a corrupt file rather than a big one.
  */
 async function extractPdf(page: FetchedPage): Promise<Extracted> {
 	const bytes = page.bytesBody;
@@ -863,6 +881,9 @@ async function extractPdf(page: FetchedPage): Promise<Extracted> {
 
 	const { pdfToText } = await import("./pdf.ts");
 	const pdf = await pdfToText(bytes).catch((error: unknown) => {
+		if (page.truncatedAtBytes) {
+			throw new WebFetchError(`PDF download cut at 10 MB and could not be parsed: ${page.url}`);
+		}
 		throw new WebFetchError(
 			`Could not read the PDF at ${page.url}: ${error instanceof Error ? error.message : String(error)}`,
 		);
@@ -871,11 +892,16 @@ async function extractPdf(page: FetchedPage): Promise<Extracted> {
 	// Every page after the first is announced by a marker, so they count the
 	// pages actually rendered without pdf.ts having to report it.
 	const shown = (pdf.text.match(/<!-- page \d+ -->/g)?.length ?? 0) + 1;
+	const notices = [
+		page.truncatedAtBytes ? PDF_CUT_WARNING : undefined,
+		pdf.truncatedPages ? `pages: ${pdf.pages} (showing first ${shown})` : undefined,
+	].filter((notice) => notice !== undefined);
+
 	return {
 		title: pdf.title,
 		byline: undefined,
 		publishedTime: undefined,
-		markdown: pdf.truncatedPages ? `pages: ${pdf.pages} (showing first ${shown})\n\n${pdf.text}` : pdf.text,
+		markdown: notices.length === 0 ? pdf.text : `${notices.join("\n")}\n\n${pdf.text}`,
 		mode: "pdf",
 		keptRatio: 1,
 	};

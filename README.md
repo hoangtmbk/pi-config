@@ -130,8 +130,9 @@ is also no SSRF blocking — fetching `localhost:3000` docs is a thing you want 
 npx tsx test.ts
 ```
 
-Hits six real sites and five error cases (404, dead host, bad protocol, malformed URL, binary
-content).
+Hits nine real URLs — including a github blob, an npm package and an arXiv PDF, so the rewrite,
+renderer and PDF paths are all covered — and five error cases (404, dead host, bad protocol,
+malformed URL, binary content).
 
 ## Layout
 
