@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { extract } from "../extract.ts";
-import { escapedFences, fences, hasEscapedMarkdownInFences, headings, loadFixture } from "./helpers.ts";
+import { escapedFences, type Fence, fences, hasEscapedMarkdownInFences, headings, loadFixture } from "./helpers.ts";
 
 /** Article-mode markdown for a fixture — the default path `web_fetch` takes. */
 function markdownOf(name: string): string {
@@ -30,15 +30,19 @@ function assertNoEscapesInFences(markdown: string): void {
 
 /** Assert every line of a snippet survives as its own line inside a single fence. */
 function assertFenceHasLines(markdown: string, lines: string[]): void {
-	const match = fences(markdown).find((fence) => fence.code.includes(lines[0] as string));
-	assert.ok(match, `no fence contains ${JSON.stringify(lines[0])}`);
-	const body = match.code.split("\n");
-	for (const line of lines) {
-		assert.ok(
-			body.some((candidate) => candidate.trimEnd() === line.trimEnd()),
-			`fence line ${JSON.stringify(line)} missing or merged; fence was:\n${match.code}`,
-		);
-	}
+	// Any one fence has to hold all of them: matching on the first line alone
+	// would fail a page that repeats that line in an earlier, unrelated block.
+	const holdsAll = (fence: Fence) => {
+		const body = fence.code.split("\n").map((candidate) => candidate.trimEnd());
+		return lines.every((line) => body.includes(line.trimEnd()));
+	};
+	const match = fences(markdown).find(holdsAll);
+	assert.ok(
+		match,
+		`no single fence holds every line of ${JSON.stringify(lines)}; fences were:\n${fences(markdown)
+			.map((fence) => fence.code)
+			.join("\n---\n")}`,
+	);
 }
 
 describe("code-regex — markdown post-processing must not rewrite code (defects 1.1, 1.2)", () => {

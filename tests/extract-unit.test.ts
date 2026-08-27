@@ -13,7 +13,7 @@ import type { FetchedPage } from "../fetch.ts";
 import { headings } from "./helpers.ts";
 
 /** The full extraction result for an inline page body. */
-function extractOf(body: string): Extracted {
+function extractOf(body: string, raw = false): Extracted {
 	const page: FetchedPage = {
 		url: "https://example.test/page",
 		status: 200,
@@ -23,7 +23,7 @@ function extractOf(body: string): Extracted {
 		bytes: Buffer.byteLength(body),
 		truncatedAtBytes: false,
 	};
-	return extract(page, false);
+	return extract(page, raw);
 }
 
 /** Article-mode markdown for an inline page body. */
@@ -222,33 +222,52 @@ describe("tables — layout is unwrapped, data becomes GFM", () => {
 	});
 });
 
-describe("heading text loses its permalink debris", () => {
+describe("heading text loses its permalink debris but keeps its own punctuation", () => {
 	const markdown = markdownOf(`<!doctype html>
 <html><head><title>Debris</title></head><body>
 <h1>Debris</h1>
 ${FILLER}
-<h2>Hash heading#</h2>
-<h2>Pilcrow heading\u00b6</h2>
+<h2>C#</h2>
+<h2>F#</h2>
+<h2>C# #</h2>
+<h2>Issue#</h2>
+<h2>Spaced hash #</h2>
+<h2>Spaced pilcrow \u00b6</h2>
 <h2>Zero width heading\u200b</h2>
+<h2>Anchored heading<a class="anchor" href="#anchored">#</a></h2>
+<h2>Spanned heading<span class="permalink">#</span></h2>
 <h2>Editable heading<span class="mw-editsection">[edit]</span></h2>
 <h2>Sphinx heading<a class="headerlink" href="#sphinx">\u00b6</a></h2>
 ${FILLER}
 </body></html>`);
 
-	for (const text of [
-		"Hash heading",
-		"Pilcrow heading",
-		"Zero width heading",
-		"Editable heading",
-		"Sphinx heading",
-	]) {
-		it(`ends "${text}" cleanly`, () => {
+	// A `#` welded to a word is part of the word. A `#` the text sets off with a
+	// space, or one sitting alone in its own element, is a permalink label.
+	for (const [source, expected] of [
+		["C#", "C#"],
+		["F#", "F#"],
+		["C# #", "C#"],
+		["Issue#", "Issue#"],
+		["Spaced hash #", "Spaced hash"],
+		["Spaced pilcrow \u00b6", "Spaced pilcrow"],
+		["Zero width heading\u200b", "Zero width heading"],
+		["Anchored heading#", "Anchored heading"],
+		["Spanned heading#", "Spanned heading"],
+		["Editable heading[edit]", "Editable heading"],
+		["Sphinx heading\u00b6", "Sphinx heading"],
+	] as const) {
+		it(`renders ${JSON.stringify(source)} as ${JSON.stringify(expected)}`, () => {
 			assert.ok(
-				headings(markdown).some((heading) => heading.text === text),
+				headings(markdown).some((heading) => heading.text === expected),
 				`headings: ${JSON.stringify(headings(markdown))}`,
 			);
 		});
 	}
+
+	it("invents no heading that lost its text", () => {
+		const empty = headings(markdown).filter((heading) => heading.text === "");
+		assert.deepEqual(empty, []);
+	});
 });
 
 describe("kept ratio", () => {
@@ -281,6 +300,53 @@ describe("kept ratio", () => {
 </body></html>`);
 		assert.equal(extracted.mode, "full-page");
 		assert.ok(extracted.markdown.includes("Related story 39"), `sidebar text lost; got:\n${extracted.markdown}`);
+	});
+});
+
+describe("raw mode converts the whole body", () => {
+	// An index page: the navigation *is* the content, which is the case `raw`
+	// exists for. The automatic fallback is allowed to drop it; `raw` is not.
+	const INDEX_PAGE = `<!doctype html>
+<html><head><title>Directory</title></head><body>
+<header><p>Example Directory</p></header>
+<nav><a href="/pages/alpha">Alpha page</a> <a href="/pages/beta">Beta page</a></nav>
+<main><p>Two pages are listed.</p></main>
+<footer><p>Footer contact line.</p></footer>
+</body></html>`;
+
+	it("keeps the nav links and the footer", () => {
+		const extracted = extractOf(INDEX_PAGE, true);
+		assert.equal(extracted.mode, "full-page");
+		assert.ok(
+			extracted.markdown.includes("[Alpha page](https://example.test/pages/alpha)"),
+			`nav link lost; got:\n${extracted.markdown}`,
+		);
+		assert.ok(extracted.markdown.includes("Footer contact line."), `footer lost; got:\n${extracted.markdown}`);
+		assert.ok(extracted.markdown.includes("Example Directory"), `header lost; got:\n${extracted.markdown}`);
+		assert.equal(extracted.keptRatio, 1);
+	});
+
+	it("still cleans what is markup rather than content", () => {
+		const extracted = extractOf(
+			`<!doctype html><html><head><title>Raw</title></head><body>
+<script>var tracking = 1;</script><h1>Raw</h1><pre class="language-js">const x = 1;</pre>
+<a href="/docs?utm_source=news">Docs</a></body></html>`,
+			true,
+		);
+		assert.equal(extracted.markdown.includes("var tracking"), false, `script leaked; got:\n${extracted.markdown}`);
+		assert.ok(extracted.markdown.includes("```js\nconst x = 1;\n```"), `code mangled; got:\n${extracted.markdown}`);
+		assert.ok(
+			extracted.markdown.includes("[Docs](https://example.test/docs)"),
+			`link not cleaned; got:\n${extracted.markdown}`,
+		);
+	});
+
+	it("is the only path that keeps chrome — the automatic fallback drops it", () => {
+		const extracted = extractOf(INDEX_PAGE);
+		assert.equal(extracted.mode, "full-page");
+		assert.ok(extracted.markdown.includes("Two pages are listed."), `content lost; got:\n${extracted.markdown}`);
+		assert.equal(extracted.markdown.includes("Alpha page"), false, `nav kept; got:\n${extracted.markdown}`);
+		assert.equal(extracted.markdown.includes("Footer contact"), false, `footer kept; got:\n${extracted.markdown}`);
 	});
 });
 

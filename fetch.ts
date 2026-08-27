@@ -218,7 +218,7 @@ async function readBoundedBody(response: Response, limit: number): Promise<{ byt
 
 /**
  * `<meta charset=x>` and `<meta http-equiv="Content-Type" content="...; charset=x">`.
- * One pattern covers both: the label is whatever follows the last `charset=` in
+ * One pattern covers both: the label is whatever follows the first `charset=` in
  * the tag, quoted or not.
  */
 const META_CHARSET_PATTERN = /<meta\b[^>]*?\bcharset\s*=\s*["']?\s*([\w:.+-]+)/i;

@@ -478,8 +478,18 @@ const SKIP_LINK_SELECTOR = '.mw-jump-link, [class*="skip-to"]';
 
 const HEADING_SELECTOR = "h1, h2, h3, h4, h5, h6";
 
-/** Permalink glyphs and zero-width padding left at the end of a heading's text. */
-const HEADING_SUFFIX_PATTERN = /[\s#¶\u200b\ufeff]+$/;
+/**
+ * A heading's trailing permalink glyph, and only that.
+ *
+ * The run has to be set off from the words before it by whitespace, because a
+ * `#` welded to a word is part of the word: `C#`, `F#`, `Issue#`. Stripping
+ * those was silent information loss — `## C` is not the heading `C#`.
+ */
+const DETACHED_GLYPH_PATTERN = /\s+[#¶]+\s*$/;
+
+/** A text node that is nothing but permalink glyphs — an anchor's whole label. */
+const GLYPH_ONLY_PATTERN = /^[#¶]+$/;
+
 const ZERO_WIDTH_PATTERN = /[\u200b\ufeff]/g;
 
 /** Every text node under an element, in document order. */
@@ -523,11 +533,16 @@ function cleanHeadings(document: Document): void {
 		const texts = textNodesOf(heading);
 		for (const text of texts) text.nodeValue = (text.nodeValue ?? "").replace(ZERO_WIDTH_PATTERN, "");
 
-		const last = texts.filter((text) => (text.nodeValue ?? "").trim() !== "").pop();
+		const spoken = texts.filter((text) => (text.nodeValue ?? "").trim() !== "");
+		const last = spoken[spoken.length - 1];
 		if (!last) continue;
-		// A heading that *is* a `#` keeps it — there would be nothing left otherwise.
-		if ((heading.textContent ?? "").replace(HEADING_SUFFIX_PATTERN, "").trim() === "") continue;
-		last.nodeValue = (last.nodeValue ?? "").replace(HEADING_SUFFIX_PATTERN, "");
+
+		const value = last.nodeValue ?? "";
+		// A glyph on its own — the label of a permalink anchor or span — is debris,
+		// unless it is the only thing the heading says, in which case it is the
+		// heading. Otherwise only a glyph the text sets off with a space goes.
+		const glyphIsAllThisNodeSays = GLYPH_ONLY_PATTERN.test(value.trim()) && spoken.length > 1;
+		last.nodeValue = (glyphIsAllThisNodeSays ? "" : value.replace(DETACHED_GLYPH_PATTERN, "")).replace(/\s+$/, "");
 	}
 }
 
@@ -738,10 +753,14 @@ function extractHtml(page: FetchedPage, raw: boolean): Extracted {
 	}
 
 	// Convert the page itself. This is the robustness guarantee: listing pages,
-	// app shells and anything Readability mishandled still produce output. The
-	// page's own content region is preferred when it marked one.
-	const source = region ?? body;
-	if (source) stripChromeRegions(source);
+	// app shells and anything Readability mishandled still produce output.
+	//
+	// Narrowing to the content region and dropping chrome belong to the automatic
+	// fallback only. `raw` is what the model reaches for when the nav *is* the
+	// content — an index, a listing, a search-result page — so it gets the whole
+	// body, cleaned but not curated.
+	const source = raw ? body : (region ?? body);
+	if (!raw && source) stripChromeRegions(source);
 	const markdown = turndown.turndown(source?.innerHTML || page.body).trim();
 
 	return {
