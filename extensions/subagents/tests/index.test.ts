@@ -390,4 +390,61 @@ describe("subagent_answer", () => {
 		assert.match(second.content, /Should I include the tests\?/);
 		assert.match(delivered.content, /Three call sites, tests included\./);
 	});
+
+	it("refuses a Run that has already finished, saying which state it is in", async () => {
+		const { subagent, subagentAnswer, spawned } = stubbedSession();
+		await run(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(SETTLED);
+
+		await assert.rejects(answer(subagentAnswer, { name: "scout", answer: "too late" }), (error: Error) => {
+			assert.match(error.message, /scout/);
+			assert.match(error.message, /done/);
+			return true;
+		});
+		assert.deepEqual(spawned[0].prompts, []);
+	});
+
+	it("refuses a Run that is still working, saying which state it is in", async () => {
+		const { subagent, subagentAnswer, spawned } = stubbedSession();
+		await run(subagent, { agent: "scout", task: "look around" });
+
+		await assert.rejects(answer(subagentAnswer, { name: "scout", answer: "unasked for" }), (error: Error) => {
+			assert.match(error.message, /running/);
+			return true;
+		});
+		assert.deepEqual(spawned[0].prompts, []);
+	});
+
+	it("rejects an unknown name with the Runs that would have worked", async () => {
+		const { subagent, subagentAnswer, spawned } = stubbedSession();
+		await run(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+
+		await assert.rejects(answer(subagentAnswer, { name: "nobody", answer: "hello" }), (error: Error) => {
+			assert.match(error.message, /nobody/);
+			assert.match(error.message, /scout/);
+			assert.match(error.message, /waiting/);
+			return true;
+		});
+	});
+
+	it("says so plainly when nothing has been started to answer", async () => {
+		const { subagentAnswer } = stubbedSession();
+
+		await assert.rejects(answer(subagentAnswer, { name: "scout", answer: "hello" }), (error: Error) => {
+			assert.match(error.message, /no runs/i);
+			return true;
+		});
+	});
+
+	it("refuses an empty answer, leaving the Run waiting rather than resuming it on nothing", async () => {
+		const { subagent, subagentAnswer, spawned } = stubbedSession();
+		await run(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+
+		await assert.rejects(answer(subagentAnswer, { name: "scout", answer: "   " }));
+		assert.deepEqual(spawned[0].prompts, []);
+	});
 });
