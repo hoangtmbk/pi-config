@@ -7,7 +7,11 @@
   "keywords": ["pi-package"],
   "repository": "github:hoangtmbk/pi-config",
   "pi": {
-    "extensions": ["./extensions/web-fetch/index.ts", "./extensions/web-search/index.ts"],
+    "extensions": [
+      "./extensions/subagents/index.ts",
+      "./extensions/web-fetch/index.ts",
+      "./extensions/web-search/index.ts"
+    ],
     "skills": ["./skills"],
     "prompts": ["./prompts"],
     "themes": ["./themes"]
