@@ -20,6 +20,7 @@ function markdownOf(body: string): string {
 		charset: "utf-8",
 		body,
 		bytes: Buffer.byteLength(body),
+		truncatedAtBytes: false,
 	};
 	const extracted: Extracted = extract(page, false);
 	return extracted.markdown;
