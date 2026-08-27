@@ -15,7 +15,8 @@ import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { Agent } from "../agents.ts";
-import { type RunChild, runPreamble, spawnRun } from "../child.ts";
+import { type RunChild, RUN_NAME_ENV, runPreamble, spawnRun } from "../child.ts";
+import { ASK_QUESTION_TOOL } from "../supervisor.ts";
 
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CHILD = join(TESTS_DIR, "fake-rpc-child.ts");
@@ -91,10 +92,24 @@ describe("spawnRun", () => {
 		assert.ok(argv.indexOf("--no-extensions") < argv.indexOf("-e"), "the -e must come after --no-extensions");
 	});
 
-	it("passes the Agent's exact tool allowlist", async () => {
+	it("passes the Agent's exact tool allowlist, plus the one tool every Run has", async () => {
 		const argv = await spawnAndReadArgv();
 
-		assert.equal(flagValue(argv, "--tools"), "read,grep");
+		assert.equal(flagValue(argv, "--tools"), `read,grep,${ASK_QUESTION_TOOL}`);
+	});
+
+	it("lists ask_question once, however the Agent spelled its own allowlist", async () => {
+		const argv = await spawnAndReadArgv({ agent: { ...SCOUT, tools: ["read", ASK_QUESTION_TOOL] } });
+
+		assert.equal(flagValue(argv, "--tools"), `read,${ASK_QUESTION_TOOL}`);
+	});
+
+	it("tells the child which Run it is, which is how the child knows to register ask_question", async () => {
+		const envPath = join(mkdtempSync(join(tmpdir(), "subagents-env-")), "env.json");
+		await spawnFake({ name: "scout-2", env: { FAKE_RPC_ENV_OUT: envPath } });
+
+		const env = JSON.parse(readFileSync(envPath, "utf-8")) as Record<string, string>;
+		assert.equal(env[RUN_NAME_ENV], "scout-2");
 	});
 
 	it("passes a model only when there is one, preferring the caller's over the Agent's", async () => {

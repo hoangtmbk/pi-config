@@ -14,8 +14,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type Agent, discoverAgents, type Roster } from "./agents.ts";
-import { type RunChild, type SpawnOptions, spawnRun } from "./child.ts";
-import { Supervisor } from "./supervisor.ts";
+import { type RunChild, RUN_NAME_ENV, type SpawnOptions, spawnRun } from "./child.ts";
+import { ASK_QUESTION_TOOL, type QuestionDetails, Supervisor } from "./supervisor.ts";
 
 const SubagentParams = Type.Object({
 	agent: Type.String({ description: "Which agent to run — one of the names listed in this tool's description." }),
@@ -31,6 +31,13 @@ const SubagentParams = Type.Object({
 	model: Type.Optional(Type.String({ description: "Override the model the agent asked for." })),
 });
 
+const AskQuestionParams = Type.Object({
+	question: Type.String({
+		description:
+			"What you need to know, in full. Whoever answers cannot see your session, so include the context that makes the question answerable and say what you would do with each likely answer.",
+	}),
+});
+
 /** Metadata for the transcript — the Run's identity, not its result. */
 interface SubagentDetails {
 	run: string;
@@ -43,6 +50,11 @@ export interface SubagentsOptions {
 	roster?: Roster;
 	/** Defaults to spawning a real child. Injected by tests, and by nothing else. */
 	spawn?: (options: SpawnOptions) => Promise<RunChild>;
+	/**
+	 * The Run this session is, when it is itself one. Defaults to what the parent
+	 * put in the environment. Injected by tests, and by nothing else.
+	 */
+	runName?: string;
 }
 
 /**
@@ -73,7 +85,55 @@ function unknownAgent(name: string, roster: Roster): Error {
 	return new Error(`Unknown agent \`${name}\`. Available agents: ${known}.`);
 }
 
+/**
+ * The child half of the extension: the one tool a Run has that its Agent's
+ * allowlist did not ask for.
+ *
+ * It answers nothing itself. All it does is put the Question where the parent's
+ * Supervisor will see it — in a tool result, on a `tool_execution_end` event —
+ * and hand the turn back, so the child stops without blocking on anyone.
+ */
+function registerAskQuestion(pi: ExtensionAPI): void {
+	pi.registerTool({
+		name: ASK_QUESTION_TOOL,
+		label: "Ask question",
+		description: [
+			"Ask the session that delegated this task a question, when the task is ambiguous enough that guessing would waste the work.",
+			"Returns immediately and does not wait for an answer: say everything you need to say, then end your turn. The answer arrives as your next prompt, and you carry on from there.",
+			"Use it for decisions only the delegating session can make, not for anything you could find out yourself.",
+		].join(" "),
+		promptSnippet: "Ask the delegating session a question when the task is genuinely ambiguous",
+		parameters: AskQuestionParams,
+
+		async execute(_toolCallId, params) {
+			const question = params.question.trim();
+			// A Question nobody can read would still stop the Run, so refuse it here
+			// and let the turn carry on: a failed ask never reaches the parent.
+			if (!question) throw new Error("A question cannot be empty. Say what you need to know.");
+
+			const details: QuestionDetails = { question };
+			return {
+				content: [
+					{
+						type: "text",
+						text: "Your question is on its way to the session that delegated this task. End your turn now; the answer will arrive as your next prompt.",
+					},
+				],
+				details,
+			};
+		},
+	});
+}
+
 export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = {}): void {
+	// A Run loads this same extension, and the two halves are disjoint: a child
+	// can ask and cannot delegate, a parent can delegate and has nothing to ask.
+	const runName = options.runName ?? process.env[RUN_NAME_ENV];
+	if (runName) {
+		registerAskQuestion(pi);
+		return;
+	}
+
 	const roster = options.roster ?? discoverAgents();
 	const spawn = options.spawn ?? spawnRun;
 	const supervisor = new Supervisor();
@@ -100,27 +160,32 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 				task: params.task,
 				model: params.model,
 				onEvent(event) {
-					const delivery = supervisor.observe(run.name, event);
-					if (!delivery) return;
+					const message = supervisor.observe(run.name, event);
+					if (!message) return;
 
 					pi.sendMessage(
 						{
-							customType: "subagent-delivery",
-							content: delivery.text,
+							customType: message.kind === "question" ? "subagent-question" : "subagent-delivery",
+							content: message.text,
 							display: true,
-							details: { run: delivery.run.name, agent: delivery.run.agent, task: delivery.run.task },
+							details: { run: message.run.name, agent: message.run.agent, task: message.run.task },
 						},
 						// The parent may well be idle, and a result nobody reads is a
-						// wasted run. Landing it while the parent is streaming is 05's job.
+						// wasted run — as is a question nobody answers. Landing either
+						// while the parent is streaming is 05's job.
 						{ triggerTurn: true },
 					);
+
+					// A Waiting Run is alive and idle by design: its child holds the whole
+					// context the answer will land in, so nothing here is killed or reaped.
+					if (message.kind === "question") return;
 
 					// A done Run has nothing left to say, and an idle pi child is a
 					// process burning nothing but still holding a slot. Reaping a child
 					// that never settles — SIGTERM on parent abort and on
 					// `session_shutdown`, per ADR-0001 — is 07's job.
-					const finished = children.get(delivery.run.name);
-					children.delete(delivery.run.name);
+					const finished = children.get(message.run.name);
+					children.delete(message.run.name);
 					// Nothing is waiting on this: the Delivery has already landed, and a
 					// child that dies before it can be asked to is no worse off.
 					finished?.stop().catch(() => {});

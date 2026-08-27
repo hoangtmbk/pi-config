@@ -12,11 +12,12 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext, JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { Agent, Roster } from "../agents.ts";
 import type { RunChild } from "../child.ts";
 import { spawnRun } from "../child.ts";
 import { registerSubagents } from "../index.ts";
+import { ASK_QUESTION_TOOL, type QuestionDetails } from "../supervisor.ts";
 
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CHILD = join(TESTS_DIR, "fake-rpc-child.ts");
@@ -46,6 +47,10 @@ interface SubagentParams {
 	model?: string;
 }
 
+interface AskQuestionParams {
+	question: string;
+}
+
 interface RegisteredTool {
 	name: string;
 	label: string;
@@ -54,7 +59,7 @@ interface RegisteredTool {
 	parameters: { properties: Record<string, unknown>; required?: string[] };
 	execute: (
 		toolCallId: string,
-		params: SubagentParams,
+		params: SubagentParams | AskQuestionParams,
 		signal: AbortSignal | undefined,
 		onUpdate: undefined,
 		ctx: ExtensionContext,
@@ -101,6 +106,54 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>) {
 }
 
 const CTX = {} as ExtensionContext;
+
+/** A parent session whose Runs are stubs: no process, and events pushed by hand. */
+function stubbedSession() {
+	const tools: RegisteredTool[] = [];
+	const sent: SentMessage[] = [];
+	const spawned: { name: string; emit: (event: JsonAgentSessionEvent) => void; stops: number }[] = [];
+
+	const pi = {
+		registerTool(tool: unknown) {
+			tools.push(tool as RegisteredTool);
+		},
+		sendMessage(message: { customType: string; content: string }, options?: { triggerTurn?: boolean }) {
+			sent.push({ customType: message.customType, content: message.content, triggerTurn: options?.triggerTurn });
+		},
+	};
+
+	registerSubagents(pi as unknown as ExtensionAPI, {
+		roster: ROSTER,
+		async spawn(options) {
+			const child = { name: options.name, emit: options.onEvent, stops: 0 };
+			spawned.push(child);
+			return {
+				prompt: async () => {},
+				stop: async () => {
+					child.stops++;
+				},
+			};
+		},
+	});
+
+	const subagent = tools.find((tool) => tool.name === "subagent");
+	assert.ok(subagent, "expected a subagent tool");
+	return { subagent, sent, spawned };
+}
+
+/** A completed `ask_question` execution, as the parent sees it in the child's stream. */
+function asked(question: string): JsonAgentSessionEvent {
+	const details: QuestionDetails = { question };
+	return {
+		type: "tool_execution_end",
+		toolCallId: "call-ask",
+		toolName: ASK_QUESTION_TOOL,
+		result: { content: [{ type: "text", text: "Sent." }], details },
+		isError: false,
+	} as unknown as JsonAgentSessionEvent;
+}
+
+const SETTLED = { type: "agent_settled" } as JsonAgentSessionEvent;
 
 async function run(tool: RegisteredTool, params: SubagentParams): Promise<string> {
 	const result = await tool.execute("call-1", params, undefined, undefined, CTX);
@@ -192,5 +245,101 @@ describe("subagent", () => {
 			assert.match(error.message, /worker/);
 			return true;
 		});
+	});
+});
+
+describe("ask_question", () => {
+	it("exists in a Run's own session and nowhere else", () => {
+		const parentTools: RegisteredTool[] = [];
+		const childTools: RegisteredTool[] = [];
+		const collect = (into: RegisteredTool[]) => ({
+			registerTool: (tool: unknown) => into.push(tool as RegisteredTool),
+			sendMessage: () => {},
+		});
+
+		registerSubagents(collect(parentTools) as unknown as ExtensionAPI, { roster: ROSTER });
+		registerSubagents(collect(childTools) as unknown as ExtensionAPI, { roster: ROSTER, runName: "scout" });
+
+		assert.deepEqual(parentTools.map((tool) => tool.name), ["subagent"]);
+		assert.deepEqual(childTools.map((tool) => tool.name), [ASK_QUESTION_TOOL]);
+	});
+
+	it("returns straight away, carrying the Question for the Supervisor to read", async () => {
+		const tools: RegisteredTool[] = [];
+		const pi = { registerTool: (tool: unknown) => tools.push(tool as RegisteredTool), sendMessage: () => {} };
+		registerSubagents(pi as unknown as ExtensionAPI, { roster: ROSTER, runName: "scout" });
+		const askQuestion = tools[0];
+
+		const result = await askQuestion.execute(
+			"call-1",
+			{ question: "Which auth module do you mean?" },
+			undefined,
+			undefined,
+			CTX,
+		);
+
+		assert.deepEqual(result.details, { question: "Which auth module do you mean?" } satisfies QuestionDetails);
+		assert.equal(Object.keys(askQuestion.parameters.properties).join(), "question");
+	});
+
+	it("refuses an empty question, so the Run keeps working rather than waiting on nothing", async () => {
+		const tools: RegisteredTool[] = [];
+		const pi = { registerTool: (tool: unknown) => tools.push(tool as RegisteredTool), sendMessage: () => {} };
+		registerSubagents(pi as unknown as ExtensionAPI, { roster: ROSTER, runName: "scout" });
+
+		await assert.rejects(
+			tools[0].execute("call-1", { question: "   " }, undefined, undefined, CTX),
+		);
+	});
+});
+
+describe("a Run that asks", () => {
+	it("delivers the Question into the parent conversation, attributed to the Run", async () => {
+		const { subagent, sent, spawned } = stubbedSession();
+		await run(subagent, { agent: "scout", task: "look around" });
+
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0].customType, "subagent-question");
+		assert.match(sent[0].content, /Run `scout`/);
+		assert.match(sent[0].content, /Which auth module do you mean\?/);
+		assert.equal(sent[0].triggerTurn, true);
+	});
+
+	it("leaves its child alive while it waits, and stops it only once it is done", async () => {
+		const { subagent, spawned } = stubbedSession();
+		await run(subagent, { agent: "scout", task: "look around" });
+
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+		assert.equal(spawned[0].stops, 0, "a Waiting Run's child is neither killed nor reaped");
+
+		spawned[0].emit({ type: "agent_start" } as unknown as JsonAgentSessionEvent);
+		spawned[0].emit(SETTLED);
+		assert.equal(spawned[0].stops, 1);
+	});
+
+	it("carries a real child's Question all the way through the RPC stream", async () => {
+		const events = [
+			{ type: "agent_start" },
+			{
+				type: "tool_execution_end",
+				toolCallId: "call-ask",
+				toolName: ASK_QUESTION_TOOL,
+				result: { content: [{ type: "text", text: "Sent." }], details: { question: "Which auth module do you mean?" } },
+				isError: false,
+			},
+			{ type: "agent_end", messages: [], willRetry: false },
+			{ type: "agent_settled" },
+		];
+		const { subagent, sent } = fakeSession(ROSTER, { FAKE_RPC_EVENTS: JSON.stringify(events) });
+
+		await run(subagent, { agent: "scout", task: "look around" });
+		const question = await nextMessage(sent);
+
+		assert.equal(question.customType, "subagent-question");
+		assert.match(question.content, /Which auth module do you mean\?/);
 	});
 });

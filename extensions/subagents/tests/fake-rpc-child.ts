@@ -12,6 +12,8 @@
  *    a JSON array, so a test can assert on them.
  *  - `FAKE_RPC_EVENTS` — a JSON array of events to emit on every prompt, in
  *    place of the default settle-with-one-answer sequence.
+ *  - `FAKE_RPC_ENV_OUT` — a path to write its own `PI_*` environment to, as a
+ *    JSON object, so a test can assert on what the child was told.
  *
  * Not a `.test.ts` file, so `npm test` never runs it directly.
  */
@@ -20,6 +22,12 @@ import { writeFileSync } from "node:fs";
 
 const argvOut = process.env.FAKE_RPC_ARGV_OUT;
 if (argvOut) writeFileSync(argvOut, JSON.stringify(process.argv.slice(2)), "utf-8");
+
+const envOut = process.env.FAKE_RPC_ENV_OUT;
+if (envOut) {
+	const piEnv = Object.entries(process.env).filter(([name]) => name.startsWith("PI_"));
+	writeFileSync(envOut, JSON.stringify(Object.fromEntries(piEnv)), "utf-8");
+}
 
 const scripted: unknown[] | undefined = process.env.FAKE_RPC_EVENTS ? JSON.parse(process.env.FAKE_RPC_EVENTS) : undefined;
 

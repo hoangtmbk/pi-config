@@ -13,10 +13,26 @@ import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 /**
  * Where a Run is in its lifecycle.
  *
- * `waiting` (a Run suspended on an unanswered Question) and `failed` arrive with
- * the tickets that introduce them; today a Run only ever runs and finishes.
+ * `failed` arrives with the ticket that introduces it; today a Run runs, may
+ * wait on an unanswered Question, and finishes.
  */
-export type RunState = "running" | "done";
+export type RunState = "running" | "waiting" | "done";
+
+/**
+ * The child-only tool a Run escalates with, and the whole of what tells a
+ * settling turn apart.
+ *
+ * `agent_settled` fires for a Run that is finished and for one that has just
+ * asked a Question, because a Question ends the turn. The Supervisor tells them
+ * apart by whether the settling turn ran this tool — nothing else in the event
+ * stream distinguishes them.
+ */
+export const ASK_QUESTION_TOOL = "ask_question";
+
+/** What `ask_question` puts in its tool result for the Supervisor to read. */
+export interface QuestionDetails {
+	question: string;
+}
 
 export interface Run {
 	/** Unique within the session, and how every tool addresses this Run. */
@@ -30,14 +46,37 @@ export interface Run {
 	 * child settled without saying anything.
 	 */
 	result?: string;
+	/**
+	 * What the Run asked, while it is Waiting. Absent otherwise, and absent when
+	 * a Run parked without saying what it wanted to know.
+	 */
+	question?: string;
 }
 
 /** A settled Run's result, ready to re-enter the parent conversation. */
 export interface Delivery {
+	kind: "delivery";
 	run: Run;
 	/** The message body the parent session receives. */
 	text: string;
 }
+
+/** A Waiting Run's unanswered Question, ready to re-enter the parent conversation. */
+export interface Question {
+	kind: "question";
+	run: Run;
+	/** The message body the parent session receives. */
+	text: string;
+}
+
+/**
+ * What an observed event asks the parent session to say, when it asks anything.
+ *
+ * A Question and a Delivery both land in the conversation the same way and
+ * differ in one thing that matters upstream: a Delivery ends the Run, a Question
+ * leaves its child alive and waiting to be answered.
+ */
+export type ParentMessage = Delivery | Question;
 
 export class Supervisor {
 	private readonly byName = new Map<string, RunRecord>();
@@ -65,27 +104,57 @@ export class Supervisor {
 	}
 
 	/**
-	 * Feed one event from a Run's child. Returns a Delivery on the event that
-	 * finishes the Run, and nothing on every other event.
+	 * Feed one event from a Run's child. Returns a Question on the event that
+	 * parks the Run, a Delivery on the event that finishes it, and nothing on
+	 * every other event.
 	 *
 	 * The done-signal is `agent_settled`, **not** `agent_end`: `agent_end` can be
 	 * followed by an automatic retry or a compaction, so a Run that ended on it
-	 * would deliver a half-finished answer and then keep working.
+	 * would deliver a half-finished answer and then keep working. A settling turn
+	 * that ran `ask_question` parks the Run instead of finishing it — see
+	 * `ASK_QUESTION_TOOL`.
 	 */
-	observe(name: string, event: JsonAgentSessionEvent): Delivery | undefined {
+	observe(name: string, event: JsonAgentSessionEvent): ParentMessage | undefined {
 		const record = this.byName.get(name);
 		if (!record || record.run.state === "done") return undefined;
+
+		if (event.type === "agent_start") {
+			// A Waiting Run whose child has started another turn has been answered,
+			// so its Question is spent. Sending that answer is another ticket's job.
+			record.run.state = "running";
+			record.run.question = undefined;
+			return undefined;
+		}
 
 		if (event.type === "message_end") {
 			if (isResultBearing(event.message)) record.lastAssistant = event.message;
 			return undefined;
 		}
 
+		if (event.type === "tool_execution_end") {
+			// An `ask_question` that failed never reached the parent, so the child is
+			// still working and this turn settles like any other. A second Question in
+			// one turn replaces the first: only the last one is still unanswered.
+			if (event.toolName === ASK_QUESTION_TOOL && !event.isError) record.asked = { question: questionText(event.result) };
+			return undefined;
+		}
+
 		if (event.type !== "agent_settled") return undefined;
+
+		const asked = record.asked;
+		if (asked) {
+			record.asked = undefined;
+			// The question turn's own message is an appeal for help, not a result;
+			// leaving it behind would let it be delivered as one later.
+			record.lastAssistant = undefined;
+			record.run.state = "waiting";
+			record.run.question = asked.question;
+			return { kind: "question", run: record.run, text: questionMessageText(record.run) };
+		}
 
 		record.run.state = "done";
 		record.run.result = record.lastAssistant && assistantText(record.lastAssistant);
-		return { run: record.run, text: deliveryText(record.run) };
+		return { kind: "delivery", run: record.run, text: deliveryText(record.run) };
 	}
 
 	/**
@@ -107,6 +176,12 @@ interface RunRecord {
 	run: Run;
 	/** The newest assistant message seen, which becomes the result on settling. */
 	lastAssistant?: AssistantMessage;
+	/**
+	 * The Question this turn ran `ask_question` with, if it did. Present means the
+	 * turn parks the Run rather than finishing it; the `question` inside can still
+	 * be absent, for a child that asked without saying what it wanted to know.
+	 */
+	asked?: { question?: string };
 }
 
 /** The parts of an assistant message a result is read from. */
@@ -131,6 +206,36 @@ function assistantText(message: AssistantMessage): string | undefined {
 		.map((part) => part.text ?? "")
 		.join("");
 	return text.trim() || undefined;
+}
+
+/**
+ * What the child passed to `ask_question`, read back out of its tool result.
+ *
+ * `details` is where `ask_question` puts it; the result text is a fallback, so a
+ * Question is still legible if that ever stops being true.
+ */
+function questionText(result: unknown): string | undefined {
+	const toolResult = result as { details?: { question?: unknown }; content?: { type?: string; text?: string }[] } | undefined;
+	const asked = toolResult?.details?.question;
+	if (typeof asked === "string" && asked.trim()) return asked.trim();
+
+	const text = (toolResult?.content ?? [])
+		.filter((part) => part.type === "text")
+		.map((part) => part.text ?? "")
+		.join("")
+		.trim();
+	return text || undefined;
+}
+
+/**
+ * The message body a Question arrives in.
+ *
+ * Named after the Run rather than the Agent's persona: the parent answers a Run,
+ * and the Run's name is what addresses it.
+ */
+function questionMessageText(run: Run): string {
+	const header = `Run \`${run.name}\` (agent \`${run.agent}\`) has a question and is waiting for an answer.`;
+	return run.question ? `${header}\n\n${run.question}` : `${header}\n\nIt did not say what it wanted to know.`;
 }
 
 /**

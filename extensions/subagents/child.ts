@@ -17,9 +17,21 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type JsonAgentSessionEvent, RpcClient } from "@earendil-works/pi-coding-agent";
 import type { Agent } from "./agents.ts";
+import { ASK_QUESTION_TOOL } from "./supervisor.ts";
 
 /** This extension, re-added to the child so its subagent tools exist there. */
 const EXTENSION_PATH = join(dirname(fileURLToPath(import.meta.url)), "index.ts");
+
+/**
+ * The environment variable naming the Run a child pi process is.
+ *
+ * A child loads this same extension, so this is how the extension knows which
+ * side of the relationship it is on: set means register `ask_question`, unset
+ * means register `subagent`. It is inherited, not passed, because the child is
+ * started by `RpcClient` and there is no other channel into it before its first
+ * turn.
+ */
+export const RUN_NAME_ENV = "PI_SUBAGENT_RUN";
 
 /** A Run's child process, seen from the parent. */
 export interface RunChild {
@@ -56,13 +68,16 @@ export interface SpawnOptions {
  * What the child is told about being a Run, ahead of its Agent's own body.
  *
  * The last assistant message is the result, so the child has to know that: a
- * child that trails off after its final tool call delivers nothing.
+ * child that trails off after its final tool call delivers nothing. Asking is
+ * named here too, because `ask_question`'s own description cannot say what the
+ * turn after the question looks like from inside the Run.
  */
 export function runPreamble(name: string): string {
 	return [
 		`You are \`${name}\`, one run of a subagent: a child session carrying out a single task delegated by a parent pi session.`,
 		"You cannot delegate further; there is no subagent tool here.",
 		"Your last assistant message is the whole of what the parent session receives, so end by stating your result in full, in the shape your instructions below ask for. Nothing else you do is visible there.",
+		`If the task is ambiguous enough that guessing would waste the work, call \`${ASK_QUESTION_TOOL}\` and then end your turn: the parent session answers it as your next prompt, and you carry on from there. That turn's message is not your result.`,
 	].join("\n\n");
 }
 
@@ -71,9 +86,12 @@ export function runPreamble(name: string): string {
  *
  * Tool access is a strict allowlist with no default, and `--no-extensions`
  * before `-e` is what makes this extension the one deliberate exception to it.
+ * The allowlist filters extension tools too, so `ask_question` has to be in it
+ * for a Run to be able to escalate at all.
  */
 function childArgs(spec: { tools: string[]; model?: string; systemPromptPath: string }): string[] {
-	const args = ["--no-session", "--no-extensions", "-e", EXTENSION_PATH, "--tools", spec.tools.join(",")];
+	const tools = [...new Set([...spec.tools, ASK_QUESTION_TOOL])];
+	const args = ["--no-session", "--no-extensions", "-e", EXTENSION_PATH, "--tools", tools.join(",")];
 	if (spec.model) args.push("--model", spec.model);
 	args.push("--append-system-prompt", spec.systemPromptPath);
 	return args;
@@ -106,7 +124,7 @@ export async function spawnRun(options: SpawnOptions): Promise<RunChild> {
 	const client = new RpcClient({
 		cliPath: options.cliPath ?? defaultCliPath(),
 		cwd: options.cwd,
-		env: options.env,
+		env: { ...options.env, [RUN_NAME_ENV]: options.name },
 		args: childArgs({
 			tools: options.agent.tools,
 			model: options.model ?? options.agent.model,
