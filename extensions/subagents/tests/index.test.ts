@@ -568,4 +568,81 @@ describe("subagent_wait", () => {
 		assert.match(collected, /Found three call sites\./);
 		assert.deepEqual(sent, [], "a joined result re-enters the conversation once, as the join's own result");
 	});
+
+	it("returns a Run that finished before the join was placed, straight from the mailbox", async () => {
+		const { subagent, subagentWait, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(said("Found three call sites."));
+		spawned[0].emit(SETTLED);
+
+		const collected = await call(subagentWait, { names: ["scout"] });
+
+		assert.match(collected, /Found three call sites\./);
+	});
+
+	it("rejects an unknown name with the Runs that would have worked, waiting for nothing", async () => {
+		const { subagent, subagentWait } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		await assert.rejects(call(subagentWait, { names: ["scout", "nobody"] }), (error: Error) => {
+			assert.match(error.message, /nobody/);
+			assert.match(error.message, /scout/);
+			assert.match(error.message, /running/);
+			return true;
+		});
+	});
+
+	it("says so plainly when nothing is in play, rather than waiting on nothing", async () => {
+		const { subagent, subagentWait, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(SETTLED);
+
+		assert.match(await call(subagentWait, {}), /nothing to wait for/);
+	});
+
+	it("waits on every Run in play when it is given no names", async () => {
+		const { subagent, subagentWait, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "one" });
+		await call(subagent, { agent: "worker", task: "two" });
+
+		const joined = call(subagentWait, {});
+		spawned[0].emit(said("first result"));
+		spawned[0].emit(SETTLED);
+		spawned[1].emit(said("second result"));
+		spawned[1].emit(SETTLED);
+		const collected = await joined;
+
+		assert.match(collected, /Run `scout`.*first result/s);
+		assert.match(collected, /Run `worker`.*second result/s);
+		assert.deepEqual(sent, [], "both results are the join's own, so neither is delivered again");
+	});
+
+	it("ends on a Waiting Run with its Question, which can be answered and waited on again", async () => {
+		const { subagent, subagentWait, subagentAnswer, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		const joined = call(subagentWait, { names: ["scout"] });
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+
+		assert.match(await joined, /Which auth module do you mean\?/);
+
+		await call(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
+		spawned[0].emit(AGENT_START);
+		const rejoined = call(subagentWait, { names: ["scout"] });
+		spawned[0].emit(said("Three call sites."));
+		spawned[0].emit(SETTLED);
+
+		assert.match(await rejoined, /Three call sites\./);
+	});
+
+	it("collects a real child's result over the RPC stream", async () => {
+		const { subagent, subagentWait } = fakeSession();
+		await call(subagent, { agent: "scout", task: "count the call sites" });
+
+		const collected = await call(subagentWait, { names: ["scout"] });
+
+		assert.match(collected, /Run `scout`/);
+		assert.match(collected, /Result for: count the call sites/);
+	});
 });
