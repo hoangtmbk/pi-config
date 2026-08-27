@@ -56,16 +56,21 @@ export function fences(markdown: string): Fence[] {
 	const lines = markdown.split("\n");
 
 	for (let index = 0; index < lines.length; index++) {
-		const open = /^(```+)(.*)$/.exec(lines[index] ?? "");
+		// A fence inside a list item is indented to the item's content column,
+		// and its body is indented with it.
+		const open = /^([ \t]*)(```+)(.*)$/.exec(lines[index] ?? "");
 		if (!open) continue;
 
-		const delimiter = open[1] as string;
-		const lang = (open[2] as string).trim();
+		const indent = open[1] as string;
+		const delimiter = open[2] as string;
+		const lang = (open[3] as string).trim();
+		const close = new RegExp(`^[ \\t]*${delimiter}\\s*$`);
 		const body: string[] = [];
 		index++;
 
-		while (index < lines.length && !new RegExp(`^${delimiter}\\s*$`).test(lines[index] ?? "")) {
-			body.push(lines[index] as string);
+		while (index < lines.length && !close.test(lines[index] ?? "")) {
+			const line = lines[index] as string;
+			body.push(line.startsWith(indent) ? line.slice(indent.length) : line);
 			index++;
 		}
 		blocks.push({ lang, code: body.join("\n") });

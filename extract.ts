@@ -2,10 +2,14 @@
  * Content extraction for web_fetch.
  *
  * Routes by content type, and for HTML runs Readability to drop nav/ads/
- * sidebars before converting to markdown. The cleanup rules afterwards exist
- * because each one was observed wasting real tokens on real pages: tracking
- * query params, image URLs the model can never use, and the empty `[](#anchor)`
- * links GitHub emits next to every heading.
+ * sidebars before converting to markdown. The cleanup exists because each rule
+ * was observed wasting real tokens on real pages: tracking query params, image
+ * URLs the model can never use, and the empty `[](#anchor)` links GitHub emits
+ * next to every heading.
+ *
+ * All of that cleanup happens on the DOM, never on the markdown. A regex over
+ * the finished markdown cannot tell prose from the inside of a code fence, and
+ * code must come out of this pipeline byte for byte.
  */
 
 import { Readability } from "@mozilla/readability";
@@ -31,7 +35,171 @@ const TEXT_TYPE_PATTERN =
 
 const TRACKING_PARAM_PATTERN = /^(utm_[a-z_]+|fbclid|gclid|mc_[a-z]+|ref|ref_src|source|_hs[a-z]+|igshid|si)$/i;
 
+/** Info-string values that explicitly mean "this block has no language". */
+const PLAIN_LANGUAGES = new Set(["default", "text", "none"]);
+
+/**
+ * Languages accepted from a bare `hljs <token>` pair. Unlike `language-x`, the
+ * token beside `hljs` is only sometimes a language, so it needs a whitelist.
+ */
+const HLJS_LANGUAGES = new Set(
+	`bash c cpp csharp css diff go graphql html ini java javascript js json jsx kotlin less lua makefile
+	 markdown md objectivec perl php plaintext python py r ruby rb rust rs scala scss shell sh sql swift
+	 toml ts tsx typescript vbnet xml yaml yml`.split(/\s+/),
+);
+
+/** `language-js`, `lang-js`, `highlight-python3`, `highlight-source-shell`. */
+const LANGUAGE_CLASS_PATTERN = /^(?:language|lang|highlight-source|highlight)-([\w+#.]+)$/i;
+
+/** A plausible info string — guards against class soup being emitted as a language. */
+const LANGUAGE_PATTERN = /^[\w+#.]+$/;
+
+/** The language a single `class` attribute declares, if any. */
+function languageFromClass(className: string | null | undefined): string | undefined {
+	const tokens = (className ?? "").split(/\s+/).filter(Boolean);
+
+	for (const [index, token] of tokens.entries()) {
+		// `class="brush: js"` (MDN, SyntaxHighlighter) and `class="sourceCode python"`
+		// (Pandoc) both name the language in the *next* token.
+		if (/^brush:?$/i.test(token) || token === "sourceCode") {
+			const next = tokens[index + 1];
+			if (next) return next;
+			continue;
+		}
+		const brush = /^brush:(.+)$/i.exec(token);
+		if (brush) return brush[1];
+
+		if (token === "hljs") {
+			const next = tokens[index + 1]?.toLowerCase();
+			if (next && HLJS_LANGUAGES.has(next)) return next;
+			continue;
+		}
+
+		const match = LANGUAGE_CLASS_PATTERN.exec(token);
+		if (match) return match[1];
+	}
+
+	return undefined;
+}
+
+/**
+ * The info string for a `<pre>`, from wherever the page happens to declare it:
+ * the `<pre>` itself, its `<code>` child, or the wrapper Sphinx, GitHub and
+ * Docusaurus put the class on instead.
+ */
+function fenceLanguage(pre: Element): string {
+	const sources = [pre, pre.querySelector("code"), pre.parentNode, pre.parentNode?.parentNode];
+
+	for (const source of sources) {
+		const declared = languageFromClass((source as Element | null | undefined)?.getAttribute?.("class"));
+		if (!declared) continue;
+		const language = declared.toLowerCase();
+		if (PLAIN_LANGUAGES.has(language)) return "";
+		if (LANGUAGE_PATTERN.test(language)) return language;
+	}
+
+	// `<pre lang=python>`, which is what GitHub-flavoured markdown renders to and
+	// therefore what PyPI, GitLab and countless READMEs ship.
+	const attribute = pre.getAttribute("lang")?.toLowerCase();
+	if (attribute && LANGUAGE_PATTERN.test(attribute) && !PLAIN_LANGUAGES.has(attribute)) return attribute;
+
+	return "";
+}
+
+/** Elements that end a line of code when a highlighter uses one per line. */
+const LINE_BREAKING_TAGS = new Set(["DIV", "P", "LI", "TR"]);
+
+/** `class="line"`, `class="cm-line"` — a highlighter's per-line wrapper. */
+const LINE_CLASS_PATTERN = /(?:^|\s)(?:\w+-)*line(?:\s|$)/;
+
+/**
+ * The text of a `<pre>`, with its line structure intact.
+ *
+ * Syntax highlighters rebuild code as one element per line — `<div class="cm-line">`
+ * on react.dev, `<span class="line">` under Shiki, bare `<br>` elsewhere — and
+ * `textContent` alone collapses the whole block onto a single line.
+ */
+function preText(pre: Element): string {
+	let out = "";
+	let pendingNewline = false;
+
+	const push = (text: string) => {
+		if (!text) return;
+		if (pendingNewline) {
+			if (!text.startsWith("\n")) out += "\n";
+			pendingNewline = false;
+		}
+		out += text;
+	};
+
+	const walk = (parent: Node) => {
+		for (const child of Array.from(parent.childNodes)) {
+			if (child.nodeType === 3) {
+				push(child.nodeValue ?? "");
+				continue;
+			}
+			if (child.nodeType !== 1) continue;
+
+			const element = child as Element;
+			if (element.nodeName === "BR") {
+				push("\n");
+				continue;
+			}
+
+			walk(element);
+
+			// Defer the newline: the markup often supplies its own right after, and
+			// two would turn every line of code into a paragraph.
+			const breaksLine =
+				LINE_BREAKING_TAGS.has(element.nodeName) ||
+				LINE_CLASS_PATTERN.test(element.getAttribute("class") ?? "");
+			if (breaksLine && !out.endsWith("\n")) pendingNewline = true;
+		}
+	};
+
+	walk(pre);
+	return out;
+}
+
+/**
+ * Reduce every `<pre>` to its text, and record the language it declared.
+ *
+ * This runs before Readability because Readability rewrites markup it considers
+ * layout: react.dev's per-line `<div class="cm-line">` become `<p>`, and the
+ * whitespace-only text nodes holding the indentation are dropped on the way.
+ * Flattening first means the code is a single text node it cannot restructure,
+ * and re-stamping the language keeps it from depending on wrapper elements
+ * surviving.
+ */
+function flattenPreBlocks(document: Document): void {
+	for (const pre of Array.from(document.querySelectorAll("pre"))) {
+		const language = fenceLanguage(pre);
+		pre.textContent = preText(pre);
+		if (language) pre.setAttribute("class", `language-${language}`);
+	}
+}
+
 function configureBase(turndown: TurndownService): TurndownService {
+	// Every `<pre>` becomes a fence, whether or not it has a `<code>` child, and
+	// its body is returned raw so Turndown's markdown escaping never sees it.
+	// Turndown's own fenced-code rule only handles `<pre><code>` and hands the
+	// text through the escaper, which rewrites `[`, `*`, `>` and `_` inside code.
+	turndown.addRule("preBlock", {
+		filter: "pre",
+		replacement: (_content, node) => {
+			const pre = node as unknown as Element;
+			const code = preText(pre)
+				.replace(/^\n+/, "")
+				.replace(/\s+$/, "");
+			if (!code) return "";
+
+			// A fence has to outrun any backtick run in the code it wraps.
+			const longestRun = Math.max(0, ...(code.match(/`+/g) ?? []).map((run) => run.length));
+			const fence = "`".repeat(Math.max(3, longestRun + 1));
+			return `\n\n${fence}${fenceLanguage(pre)}\n${code}\n${fence}\n\n`;
+		},
+	});
+
 	// Image URLs are pure cost: the model cannot fetch them and they are often
 	// hundreds of characters of CDN parameters. Keep the alt text, drop the URL.
 	turndown.addRule("imageAltOnly", {
@@ -42,20 +210,11 @@ function configureBase(turndown: TurndownService): TurndownService {
 		},
 	});
 
-	// Non-content elements Readability sometimes leaves behind.
-	// Names rather than a tag list: Turndown's typed tag filter has no "svg".
-	const NON_CONTENT = ["SCRIPT", "STYLE", "NOSCRIPT", "IFRAME", "FORM", "BUTTON", "SVG", "CANVAS"];
-	turndown.addRule("dropNonContent", {
-		filter: (node) => NON_CONTENT.includes(node.nodeName),
-		replacement: () => "",
-	});
-
 	return turndown;
 }
 
 const TURNDOWN_OPTIONS = {
 	headingStyle: "atx",
-	codeBlockStyle: "fenced",
 	bulletListMarker: "-",
 	hr: "---",
 	emDelimiter: "*",
@@ -171,54 +330,103 @@ function absolutizeLinks(document: Document, baseUrl: string): void {
 	}
 }
 
-function cleanMarkdown(markdown: string): string {
-	return (
-		markdown
-			// Links with no visible text carry no information — GitHub emits one
-			// per heading, Wikipedia one per citation marker.
-			.replace(/\[\s*\]\([^)]*\)/g, "")
-			// Anchors whose target we removed above.
-			.replace(/\[([^\]]*)\]\(\s*\)/g, "$1")
-			.replace(/[ \t]+$/gm, "")
-			.replace(/\n{3,}/g, "\n\n")
-			// Runs of separators left behind by stripped elements.
-			.replace(/^(\s*[-*_]\s*){3,}$/gm, "---")
-			.replace(/(\n---\n)+/g, "\n---\n")
-			.trim()
-	);
+/**
+ * Drop links that would render as nothing, and unwrap the ones defused above.
+ *
+ * GitHub emits an empty anchor beside every heading and Wikipedia one per
+ * citation marker; both come out as `[](…)`. Cleaning them here rather than in
+ * the markdown also means Readability scores the real link density.
+ *
+ * An image with no alt text counts as nothing to render, because `imageAltOnly`
+ * drops it — otherwise Wikipedia's figures leave twenty bare `[](…)` behind.
+ */
+function cleanLinks(document: Document): void {
+	for (const anchor of Array.from(document.querySelectorAll("a"))) {
+		const showsImage = Array.from(anchor.querySelectorAll("img")).some(
+			(image) => (image.getAttribute("alt") ?? "").trim() !== "",
+		);
+		if (anchor.textContent?.trim() === "" && !showsImage) {
+			anchor.remove();
+			continue;
+		}
+		if (anchor.hasAttribute("href")) continue;
+		while (anchor.firstChild) anchor.parentNode?.insertBefore(anchor.firstChild, anchor);
+		anchor.remove();
+	}
 }
 
-function extractHtml(page: FetchedPage, raw: boolean): Extracted {
-	const { document } = parseHTML(page.body);
+/** Chrome sites hang off code blocks: copy buttons, language labels, block titles. */
+const CODE_CHROME_CLASS_PATTERN =
+	/(?:^|[\s_-])(?:copy|clipboard)(?:btn|button|[\s_-]|$)|lang(?:uage)?[-_](?:label|name)|code-?block-?title/i;
 
-	// Strip before parsing so Readability never scores non-content, and so the
-	// full-page fallback does not drag in script bodies.
+/**
+ * Remove everything that is markup rather than content.
+ *
+ * Doing it before Readability keeps it from scoring nav and script bodies, and
+ * keeps the copy-button labels sites put next to a `<pre>` from surfacing as a
+ * stray `js` or `bash` line above the code.
+ */
+function stripNonContent(document: Document): void {
 	for (const element of Array.from(
-		document.querySelectorAll("script, style, noscript, svg, canvas, iframe, template"),
+		document.querySelectorAll("script, style, noscript, svg, canvas, iframe, template, form, button"),
 	)) {
 		element.remove();
 	}
 
+	for (const element of Array.from(document.querySelectorAll("[class]"))) {
+		if (!CODE_CHROME_CLASS_PATTERN.test(element.getAttribute("class") ?? "")) continue;
+		// A wrapper holding the code block is content; only the controls go.
+		if (element.querySelector("pre")) continue;
+		element.remove();
+	}
+}
+
+/**
+ * Where Readability reads the page title from, all of which is withheld from it.
+ *
+ * Readability deletes the article's first heading whenever it merely *resembles*
+ * the title, on the assumption that the reader UI shows the title separately.
+ * The resemblance test is loose: mozilla/readability's README loses its own
+ * `<h1>Readability.js</h1>` to the GitHub page title. Taking the title from the
+ * source document ourselves keeps Readability out of that judgement, and costs
+ * nothing — every heading it would have deleted is a heading we want.
+ */
+const TITLE_METADATA_SELECTOR = 'title, meta[property$="title"], meta[name$="title"]';
+
+function extractHtml(page: FetchedPage, raw: boolean): Extracted {
+	const { document } = parseHTML(page.body);
+
+	stripNonContent(document);
+	flattenPreBlocks(document);
 	absolutizeLinks(document, page.url);
+	cleanLinks(document);
 	unwrapLayoutTables(document);
 
-	const documentTitle = document.querySelector("title")?.textContent?.trim() || undefined;
+	const documentTitle =
+		document.querySelector("title")?.textContent?.trim() ||
+		document.querySelector('meta[property="og:title"]')?.getAttribute("content")?.trim() ||
+		undefined;
 	const metaContent = (selector: string) =>
 		document.querySelector(selector)?.getAttribute("content")?.trim() || undefined;
 
 	const turndown = createTurndown();
 
 	if (!raw) {
-		// Readability mutates the document, so hand it a clone.
+		// Readability mutates the document, so hand it a clone — with the title
+		// metadata withheld, see TITLE_METADATA_SELECTOR.
 		const article = (() => {
 			try {
-				return new Readability(document.cloneNode(true) as Document, { charThreshold: 100 }).parse();
+				const clone = document.cloneNode(true) as Document;
+				for (const element of Array.from(clone.querySelectorAll(TITLE_METADATA_SELECTOR))) {
+					element.remove();
+				}
+				return new Readability(clone, { charThreshold: 100, keepClasses: true }).parse();
 			} catch {
 				return null;
 			}
 		})();
 
-		const articleMarkdown = article?.content ? cleanMarkdown(turndown.turndown(article.content)) : "";
+		const articleMarkdown = article?.content ? turndown.turndown(article.content).trim() : "";
 
 		// Fall back when Readability returns nothing usable. This is the main
 		// robustness guarantee: listing pages and app shells still produce output.
@@ -236,7 +444,7 @@ function extractHtml(page: FetchedPage, raw: boolean): Extracted {
 	}
 
 	const body = document.querySelector("body") ?? document.documentElement;
-	const markdown = cleanMarkdown(turndown.turndown((body as Element)?.innerHTML ?? page.body));
+	const markdown = turndown.turndown((body as Element)?.innerHTML ?? page.body).trim();
 
 	return {
 		title: documentTitle,
