@@ -52,6 +52,11 @@ interface AskQuestionParams {
 	question: string;
 }
 
+interface SubagentAnswerParams {
+	name: string;
+	answer: string;
+}
+
 interface RegisteredTool {
 	name: string;
 	label: string;
@@ -60,7 +65,7 @@ interface RegisteredTool {
 	parameters: { properties: Record<string, unknown>; required?: string[] };
 	execute: (
 		toolCallId: string,
-		params: SubagentParams | AskQuestionParams,
+		params: SubagentParams | AskQuestionParams | SubagentAnswerParams,
 		signal: AbortSignal | undefined,
 		onUpdate: undefined,
 		ctx: ExtensionContext,
@@ -77,6 +82,12 @@ const started: RunChild[] = [];
 after(async () => {
 	await Promise.all(started.map((child) => child.stop()));
 });
+
+function requireTool(tools: RegisteredTool[], name: string): RegisteredTool {
+	const tool = tools.find((candidate) => candidate.name === name);
+	assert.ok(tool, `expected a ${name} tool, got ${tools.map((registered) => registered.name).join(", ") || "none"}`);
+	return tool;
+}
 
 /** A parent session that records what the extension does to it. */
 function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>) {
@@ -101,9 +112,7 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>) {
 		},
 	});
 
-	const subagent = tools.find((tool) => tool.name === "subagent");
-	assert.ok(subagent, `expected a subagent tool, got ${tools.map((t) => t.name).join(", ") || "none"}`);
-	return { subagent, tools, sent };
+	return { subagent: requireTool(tools, "subagent"), subagentAnswer: requireTool(tools, "subagent_answer"), tools, sent };
 }
 
 const CTX = {} as ExtensionContext;
@@ -112,7 +121,7 @@ const CTX = {} as ExtensionContext;
 function stubbedSession() {
 	const tools: RegisteredTool[] = [];
 	const sent: SentMessage[] = [];
-	const spawned: { name: string; emit: (event: JsonAgentSessionEvent) => void; stops: number }[] = [];
+	const spawned: { name: string; emit: (event: JsonAgentSessionEvent) => void; prompts: string[]; stops: number }[] = [];
 
 	const pi = {
 		registerTool(tool: unknown) {
@@ -126,10 +135,12 @@ function stubbedSession() {
 	registerSubagents(pi as unknown as ExtensionAPI, {
 		roster: ROSTER,
 		async spawn(options) {
-			const child = { name: options.name, emit: options.onEvent, stops: 0 };
+			const child = { name: options.name, emit: options.onEvent, prompts: [] as string[], stops: 0 };
 			spawned.push(child);
 			return {
-				prompt: async () => {},
+				prompt: async (message: string) => {
+					child.prompts.push(message);
+				},
 				stop: async () => {
 					child.stops++;
 				},
@@ -137,9 +148,7 @@ function stubbedSession() {
 		},
 	});
 
-	const subagent = tools.find((tool) => tool.name === "subagent");
-	assert.ok(subagent, "expected a subagent tool");
-	return { subagent, sent, spawned };
+	return { subagent: requireTool(tools, "subagent"), subagentAnswer: requireTool(tools, "subagent_answer"), sent, spawned };
 }
 
 async function run(tool: RegisteredTool, params: SubagentParams): Promise<string> {
@@ -147,6 +156,11 @@ async function run(tool: RegisteredTool, params: SubagentParams): Promise<string
 	return result.content
 		.map((part) => (part.type === "text" ? part.text : ""))
 		.join("");
+}
+
+async function answer(tool: RegisteredTool, params: SubagentAnswerParams): Promise<string> {
+	const result = await tool.execute("call-1", params, undefined, undefined, CTX);
+	return result.content.map((part) => (part.type === "text" ? part.text : "")).join("");
 }
 
 /** Wait until `sent` has a message, or give up loudly. */
@@ -159,15 +173,17 @@ async function nextMessage(sent: SentMessage[]): Promise<SentMessage> {
 }
 
 describe("subagent registration", () => {
-	it("registers one tool taking an agent, a task and optional name and model", () => {
-		const { subagent, tools } = fakeSession();
+	it("registers a tool to delegate with and a tool to answer with", () => {
+		const { subagent, subagentAnswer, tools } = fakeSession();
 
 		assert.deepEqual(
 			tools.map((tool) => tool.name),
-			["subagent"],
+			["subagent", "subagent_answer"],
 		);
 		assert.deepEqual(Object.keys(subagent.parameters.properties).sort(), ["agent", "model", "name", "task"]);
 		assert.deepEqual(subagent.parameters.required?.slice().sort(), ["agent", "task"]);
+		assert.deepEqual(Object.keys(subagentAnswer.parameters.properties).sort(), ["answer", "name"]);
+		assert.deepEqual(subagentAnswer.parameters.required?.slice().sort(), ["answer", "name"]);
 	});
 
 	it("embeds the roster in its description, so there is no list-the-agents round trip", () => {
@@ -247,7 +263,7 @@ describe("ask_question", () => {
 		registerSubagents(collect(parentTools) as unknown as ExtensionAPI, { roster: ROSTER });
 		registerSubagents(collect(childTools) as unknown as ExtensionAPI, { roster: ROSTER, runName: "scout" });
 
-		assert.deepEqual(parentTools.map((tool) => tool.name), ["subagent"]);
+		assert.deepEqual(parentTools.map((tool) => tool.name), ["subagent", "subagent_answer"]);
 		assert.deepEqual(childTools.map((tool) => tool.name), [ASK_QUESTION_TOOL]);
 	});
 
@@ -317,5 +333,19 @@ describe("a Run that asks", () => {
 
 		assert.equal(question.customType, "subagent-question");
 		assert.match(question.content, /Which auth module do you mean\?/);
+	});
+});
+
+describe("subagent_answer", () => {
+	it("resumes a Waiting Run by sending the answer to its child as a fresh prompt", async () => {
+		const { subagent, subagentAnswer, spawned } = stubbedSession();
+		await run(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+
+		const acknowledged = await answer(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
+
+		assert.deepEqual(spawned[0].prompts, ["The one in src/auth.ts."]);
+		assert.match(acknowledged, /scout/);
 	});
 });

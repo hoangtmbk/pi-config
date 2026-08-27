@@ -31,6 +31,14 @@ const SubagentParams = Type.Object({
 	model: Type.Optional(Type.String({ description: "Override the model the agent asked for." })),
 });
 
+const SubagentAnswerParams = Type.Object({
+	name: Type.String({ description: "The run to answer — the name it was announced with when it asked." }),
+	answer: Type.String({
+		description:
+			"The answer, in full. It arrives as the run's next prompt, so restate anything from this conversation the run needs; it still cannot see this conversation.",
+	}),
+});
+
 const AskQuestionParams = Type.Object({
 	question: Type.String({
 		description:
@@ -43,6 +51,22 @@ interface SubagentDetails {
 	run: string;
 	agent: string;
 	task: string;
+}
+
+/**
+ * Why a name cannot be answered, said with the Runs that could have been.
+ *
+ * The states come along because they are the difference between a name the
+ * caller mistyped and one it addressed too late: listing bare names would make a
+ * Run that has already delivered look like a Run still waiting to be answered.
+ */
+function unanswerableRun(name: string, supervisor: Supervisor): Error {
+	const run = supervisor.get(name);
+	if (run) return new Error(`Run \`${name}\` is ${run.state}, not waiting for an answer. Only a waiting run can be answered.`);
+
+	const runs = supervisor.list();
+	const known = runs.map((candidate) => `\`${candidate.name}\` (${candidate.state})`).join(", ");
+	return new Error(`Unknown run \`${name}\`. ${known ? `Runs in this session: ${known}.` : "No runs have been started in this session."}`);
 }
 
 export interface SubagentsOptions {
@@ -199,6 +223,50 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 					{
 						type: "text",
 						text: `Started run \`${run.name}\` (agent \`${agent.name}\`). Keep working; its result will arrive in this conversation on its own.`,
+					},
+				],
+				details,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_answer",
+		label: "Answer subagent",
+		description: [
+			"Answer a run that asked a question and is waiting for an answer.",
+			"The answer starts a fresh turn in that run: it carries on from there and its result is delivered into this conversation on its own, exactly as it would have been without the question.",
+			"Only a run that is waiting can be answered.",
+		].join(" "),
+		promptSnippet: "Answer a subagent run that is waiting on a question",
+		parameters: SubagentAnswerParams,
+
+		async execute(_toolCallId, params) {
+			const name = params.name.trim();
+			const run = supervisor.get(name);
+			if (!run || run.state !== "waiting") throw unanswerableRun(name, supervisor);
+
+			const answer = params.answer.trim();
+			// An answer saying nothing would start a turn anyway and let the Run
+			// settle on a guess. Refusing leaves it waiting, and still answerable.
+			if (!answer) throw new Error(`An answer cannot be empty. Say what run \`${name}\` needs to know.`);
+
+			// A waiting Run's child is deliberately still up, so this is a guard
+			// against a lifecycle bug rather than something a caller can provoke.
+			const child = children.get(name);
+			if (!child) throw new Error(`Run \`${name}\` is waiting, but its child is gone, so the answer cannot be delivered.`);
+
+			// The Run leaves waiting when its child starts the turn this prompt
+			// begins, which the Supervisor hears as `agent_start`. Nothing here
+			// touches the lifecycle.
+			await child.prompt(answer);
+
+			const details: SubagentDetails = { run: run.name, agent: run.agent, task: run.task };
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Answered run \`${run.name}\` (agent \`${run.agent}\`). It has resumed; its result will arrive in this conversation on its own.`,
 					},
 				],
 				details,
