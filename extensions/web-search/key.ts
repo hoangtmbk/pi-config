@@ -65,7 +65,7 @@ function loadEnvFileIfPresent(path: string): void {
 	}
 }
 
-/** The default runner: a shell, with stderr left to the terminal it came from. */
+/** The default runner: a shell, with only stdout read back. */
 function runInShell(command: string): string {
 	return execSync(command, {
 		encoding: "utf-8",

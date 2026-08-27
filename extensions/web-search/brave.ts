@@ -272,7 +272,10 @@ function failureMessage(status: number, statusText: string, body: string): strin
 let pending: Promise<unknown> = Promise.resolve();
 
 function serialized<T>(work: () => Promise<T>): Promise<T> {
-	const result = pending.then(work, work);
+	const result = pending.then(work);
+	// The queue tracks only when the search ahead finished, never how it went:
+	// a rejected search that stayed on the chain would reject every search behind
+	// it with someone else's error.
 	pending = result.then(
 		() => undefined,
 		() => undefined,

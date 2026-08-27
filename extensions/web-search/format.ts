@@ -360,9 +360,9 @@ export function formatResults(query: string, response: BraveResponse, options: F
 	const maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY;
 	const { freshness } = options;
 
-	const totals = sections.map((section) => section.results.length);
 	if (sections.length === 0) return noResults(query, freshness);
 
+	const totals = sections.map((section) => section.results.length);
 	const chunks = chunksOf(sections);
 	const fullHeader = header(query, countPhrase(sections, totals), freshness);
 	const whole = `${fullHeader}${RULE}${chunks.map((chunk) => chunk.text).join(SEPARATOR)}`;
