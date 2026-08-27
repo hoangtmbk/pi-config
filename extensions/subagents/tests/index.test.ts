@@ -83,6 +83,7 @@ after(async () => {
 	await Promise.all(started.map((child) => child.stop()));
 });
 
+/** The tool a test is about, named so a missing registration fails loudly. */
 function requireTool(tools: RegisteredTool[], name: string): RegisteredTool {
 	const tool = tools.find((candidate) => candidate.name === name);
 	assert.ok(tool, `expected a ${name} tool, got ${tools.map((registered) => registered.name).join(", ") || "none"}`);
