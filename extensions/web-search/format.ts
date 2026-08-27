@@ -219,35 +219,58 @@ function sectionsOf(response: BraveResponse): Section[] {
 }
 
 /**
- * The results worth showing, across both sections, in the order they render.
+ * How many hits of one kind a search returned, and how many of them the budget
+ * left room to show.
  *
- * The caller counts them to report the size of the search, so this is the same
- * list the numbering runs over — one hit, one number, one count.
+ * The kind is the noun the header uses, already resolved: "web" and
+ * "discussions" when both are in play, plain "results" when the web list is the
+ * whole search. Resolving it here is what keeps the header and anything a caller
+ * renders from the same numbers saying the same words.
  */
-export function usableResults(response: BraveResponse): BraveResult[] {
-	return sectionsOf(response).flatMap((section) => section.results);
+export interface KindCount {
+	kind: string;
+	shown: number;
+	total: number;
+}
+
+/**
+ * The counts behind the header, in the order the sections render.
+ *
+ * The kinds are named only when there is more than the web list to name: with
+ * discussions in play, "10 web, 3 discussions" says which part of the list is
+ * which, and without them a search reads as the plain "10 results" it always
+ * has.
+ */
+function countsOf(sections: Section[], shown: number[]): KindCount[] {
+	// A heading means a kind other than the leading web list is in play.
+	const named = sections.some((section) => section.heading !== undefined);
+
+	return sections.map((section, index) => {
+		const total = section.results.length;
+		return {
+			kind: named ? section.label(total) : `result${total === 1 ? "" : "s"}`,
+			shown: shown[index] ?? 0,
+			total,
+		};
+	});
 }
 
 /**
  * How many hits there are of each kind, and — when the budget dropped some —
  * how many of each are shown.
  *
- * The kinds are named only when there is more than the web list to name: with
- * discussions in play, "10 web, 3 discussions" says which part of the list is
- * which, and without them a search reads as the plain "10 results" it always
- * has. `showing` is forced when the widest the phrase could ever get is being
- * measured rather than rendered.
+ * Exported because the header is not the only place a search reports its size:
+ * a transcript renderer reading the same counts must not invent a second way of
+ * saying them. `showing` is forced when the widest the phrase could ever get is
+ * being measured rather than rendered.
  */
-function countPhrase(sections: Section[], shown: number[], forceShowing = false): string {
-	// A heading means a kind other than the leading web list is in play.
-	const named = sections.some((section) => section.heading !== undefined);
-	const complete = !forceShowing && sections.every((section, index) => shown[index] === section.results.length);
+export function countPhrase(counts: KindCount[], forceShowing = false): string {
+	if (counts.length === 0) return "no results";
 
-	const parts = sections.map((section, index) => {
-		const total = section.results.length;
-		const noun = named ? section.label(total) : `result${total === 1 ? "" : "s"}`;
-		return complete ? `${total} ${noun}` : `${shown[index]} of ${total} ${noun}`;
-	});
+	const complete = !forceShowing && counts.every((count) => count.shown === count.total);
+	const parts = counts.map((count) =>
+		complete ? `${count.total} ${count.kind}` : `${count.shown} of ${count.total} ${count.kind}`,
+	);
 
 	return `${complete ? "" : "showing "}${parts.join(", ")}`;
 }
@@ -294,7 +317,7 @@ function noResults(query: string, freshness?: string): string {
 		nudges.push(`The search was limited to freshness=${freshness}; widen or remove it to search all of time.`);
 	}
 
-	return `${header(query, "no results", freshness, false)}\n\n${nudges.join(" ")}`;
+	return `${header(query, countPhrase([]), freshness, false)}\n\n${nudges.join(" ")}`;
 }
 
 function bytes(text: string): number {
@@ -314,6 +337,33 @@ export interface FormatOptions {
 	 * header so the model reads the list as the narrowed one it is.
 	 */
 	freshness?: string;
+}
+
+/**
+ * One search, rendered: the bytes the model reads, and what they are made of.
+ *
+ * The counts travel with the text rather than being recovered from the response
+ * afterwards, because only the render knows how many entries the budget left
+ * room for. A caller that counted the response instead would report the size of
+ * the search Brave answered, not the size of the list it is looking at.
+ */
+export interface FormattedResults {
+	/** The tool output: header block, rule, numbered list. */
+	text: string;
+	/** Per kind, in the order the sections render. Empty when nothing matched. */
+	counts: KindCount[];
+	/** Entries the list carries, across every kind. */
+	shown: number;
+	/** Entries Brave returned, across every kind. */
+	total: number;
+}
+
+function sum(counts: KindCount[], of: "shown" | "total"): number {
+	return counts.reduce((running, count) => running + count[of], 0);
+}
+
+function formatted(text: string, counts: KindCount[]): FormattedResults {
+	return { text, counts, shown: sum(counts, "shown"), total: sum(counts, "total") };
 }
 
 /** One entry as it renders, and which section it belongs to. */
@@ -356,23 +406,26 @@ function chunksOf(sections: Section[]): Chunk[] {
  * how many of how many survived — the remedy for a full list is a narrower
  * query, so there is nothing to rescue.
  */
-export function formatResults(query: string, response: BraveResponse, options: FormatOptions = {}): string {
+export function formatResults(query: string, response: BraveResponse, options: FormatOptions = {}): FormattedResults {
 	const sections = sectionsOf(response);
 	const maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY;
 	const { freshness } = options;
 
-	if (sections.length === 0) return noResults(query, freshness);
+	if (sections.length === 0) return formatted(noResults(query, freshness), []);
 
-	const totals = sections.map((section) => section.results.length);
+	const everything = countsOf(
+		sections,
+		sections.map((section) => section.results.length),
+	);
 	const chunks = chunksOf(sections);
-	const fullHeader = header(query, countPhrase(sections, totals), freshness);
+	const fullHeader = header(query, countPhrase(everything), freshness);
 	const whole = `${fullHeader}${RULE}${chunks.map((chunk) => chunk.text).join(SEPARATOR)}`;
-	if (bytes(whole) <= maxBytes) return whole;
+	if (bytes(whole) <= maxBytes) return formatted(whole, everything);
 
 	// Dropping any hit lengthens the header, so the room it will need is reserved
 	// before the entries are measured. The `showing x of y` form at full counts is
 	// the widest that phrase can get, whatever survives below.
-	let used = bytes(header(query, countPhrase(sections, totals, true), freshness)) + bytes(RULE);
+	let used = bytes(header(query, countPhrase(everything, true), freshness)) + bytes(RULE);
 	const shown = sections.map(() => 0);
 	const kept: string[] = [];
 	for (const chunk of chunks) {
@@ -383,7 +436,37 @@ export function formatResults(query: string, response: BraveResponse, options: F
 		shown[chunk.section] += 1;
 	}
 
-	const head = header(query, countPhrase(sections, shown), freshness);
+	const counts = countsOf(sections, shown);
+	const head = header(query, countPhrase(counts), freshness);
 	// A rule over an empty list would promise results that are not there.
-	return kept.length === 0 ? head : `${head}${RULE}${kept.join(SEPARATOR)}`;
+	return formatted(kept.length === 0 ? head : `${head}${RULE}${kept.join(SEPARATOR)}`, counts);
+}
+
+/**
+ * How many entries an expanded search shows before the list is cut.
+ *
+ * Ten, because a default search returns ten: an ordinary search expands to its
+ * whole list, and only a deliberately wide one is trimmed. The alternative — a
+ * cap high enough for every search — is a twenty-four line block in the middle
+ * of a conversation, which is the thing custom rendering exists to prevent.
+ */
+export const MAX_RENDERED_HITS = 10;
+
+/**
+ * The hit list, read back out of the rendered markdown.
+ *
+ * A renderer needs the hits and the model needs the whole entries, and those are
+ * the same information: putting the list in the tool's metadata as well would
+ * ship every title twice, once for each reader. So the text stays the single
+ * copy and this reads the titles off it — which lives here because this module
+ * is the one that decided what a title line looks like.
+ *
+ * A search that matched nothing has no numbered lines at all, and its prose is
+ * what a reader expanding it wants to see, so that is what comes back instead.
+ */
+export function hitLines(text: string, limit = MAX_RENDERED_HITS): string[] {
+	const lines = text.split("\n");
+	const hits = lines.filter((line) => /^\d+\. /.test(line));
+	const shown = hits.length > 0 ? hits : lines.filter((line) => line.trim() !== "");
+	return shown.slice(0, limit);
 }

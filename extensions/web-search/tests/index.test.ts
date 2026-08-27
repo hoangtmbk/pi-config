@@ -17,7 +17,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import register from "../index.ts";
+import register, { type WebSearchDetails } from "../index.ts";
 import { clearResolvedKey } from "../key.ts";
 import { fakeFetch, jsonResponse, rejection } from "./helpers.ts";
 
@@ -38,7 +38,7 @@ interface RegisteredTool {
 		signal: AbortSignal | undefined,
 		onUpdate: undefined,
 		ctx: ExtensionContext,
-	) => Promise<AgentToolResult<{ query: string; resultCount: number }>>;
+	) => Promise<AgentToolResult<WebSearchDetails>>;
 }
 
 /** The tools the extension registers when loaded. */
@@ -121,7 +121,11 @@ describe("the web-search extension", () => {
 		assert.equal(content?.type, "text");
 		assert.match(content?.type === "text" ? content.text : "", /^search: "go generics" — 3 results \(Brave\)$/m);
 		assert.match(content?.type === "text" ? content.text : "", /^1\. An Introduction To Generics/m);
-		assert.deepEqual(result.details, { query: "go generics", resultCount: 3 });
+		// The counts describe the list that was rendered; the query is not repeated
+		// here, because a renderer reads it off the call's own arguments.
+		assert.deepEqual(result.details?.counts, [{ kind: "results", shown: 3, total: 3 }]);
+		assert.equal(result.details?.shown, 3);
+		assert.equal(result.details?.total, 3);
 	});
 
 	it("renders discussion threads under their own heading, numbered on from the web list", async () => {
@@ -144,7 +148,10 @@ describe("the web-search extension", () => {
 		assert.match(text, /^search: "rust async fn in traits" — 2 web, 2 discussions \(Brave\)$/m);
 		assert.match(text, /^## Discussions$/m);
 		assert.match(text, /^3\. Why is async in traits still painful/m);
-		assert.deepEqual(result.details, { query: "rust async fn in traits", resultCount: 4 });
+		assert.deepEqual(result.details?.counts, [
+			{ kind: "web", shown: 2, total: 2 },
+			{ kind: "discussions", shown: 2, total: 2 },
+		]);
 	});
 
 	it("keeps a wide search inside pi's tool output limit, whole results only", async () => {
@@ -167,6 +174,32 @@ describe("the web-search extension", () => {
 		assert.match(text, /^search: "wide" — showing \d+ of 200 results \(Brave\)$/m);
 		// Whatever the last entry is, it is a whole one: its description is intact.
 		assert.ok(text.endsWith("lorem ipsum ".repeat(60).trim()), text.slice(-40));
+
+		// What the renderer is told matches what the model was told: the number of
+		// hits on screen, not the number Brave found.
+		assert.equal(result.details?.total, 200);
+		assert.ok((result.details?.shown ?? 0) < 200, `${result.details?.shown} shown`);
+		assert.match(text, new RegExp(`showing ${result.details?.shown} of 200 results`));
+	});
+
+	it("attaches what the renderer needs and nothing the model already has", async () => {
+		const tool = registeredTools()[0] as unknown as RegisteredTool;
+		const response = JSON.parse(readFileSync(join(FIXTURE_DIR, "brave-web-search.json"), "utf8")) as unknown;
+		const { fetch } = fakeFetch(() => jsonResponse(response));
+
+		const result = await withEnvKey("test-key", () =>
+			withFetch(fetch, () => tool.execute("call-1", { query: "go generics" }, undefined, undefined, CTX)),
+		);
+
+		assert.deepEqual(Object.keys(result.details ?? {}).sort(), ["counts", "elapsedMs", "shown", "total"]);
+		assert.equal(typeof result.details?.elapsedMs, "number");
+
+		// The elapsed time is the renderer's alone: it is nowhere in the markdown,
+		// and the markdown's own list is nowhere in the metadata.
+		const content = result.content[0];
+		const text = content?.type === "text" ? content.text : "";
+		assert.ok(!/elapsed|\bms\b/i.test(text), text.split("\n")[0]);
+		assert.ok(!JSON.stringify(result.details).includes("An Introduction To Generics"));
 	});
 
 	it("fails a search with no key rather than calling Brave", async () => {
@@ -297,7 +330,8 @@ describe("a search that goes wrong, and one that simply finds nothing", () => {
 		const content = result.content[0];
 		const text = content?.type === "text" ? content.text : "";
 		assert.match(text, /^No results for "quorble frimbus"\./m);
-		assert.deepEqual(result.details, { query: "quorble frimbus", resultCount: 0 });
+		assert.deepEqual(result.details?.counts, []);
+		assert.equal(result.details?.total, 0);
 	});
 
 	it("tells the model what to do about a rejected key", async () => {

@@ -185,6 +185,30 @@ export function normalizeFreshness(freshness?: string): string | undefined {
 }
 
 /**
+ * How a recency filter reads to a human, or `undefined` when there is none.
+ *
+ * `normalizeFreshness` produces what Brave is sent; this produces what the
+ * transcript shows, which is not the same string: `pw` is the wire form and
+ * "the past week" is the thing it means. A renderer runs on arguments that have
+ * not been through `normalizeFreshness` yet — and must never throw — so a value
+ * this module does not recognise is named as it was written rather than
+ * rejected. The search itself will reject it a moment later, with the
+ * vocabulary attached.
+ */
+export function describeFreshness(freshness?: string): string | undefined {
+	if (freshness === undefined) return undefined;
+	const value = freshness.trim().toLowerCase();
+	if (!value) return undefined;
+
+	if (Object.hasOwn(FRESHNESS_WINDOWS, value)) return FRESHNESS_WINDOWS[value];
+
+	const range = DATE_RANGE.exec(value);
+	if (range) return `${range[1]} to ${range[2]}`;
+
+	return freshness.trim();
+}
+
+/**
  * The exact URL a search sends, exported so the request shape can be asserted.
  *
  * Also where `params` are validated: every request goes through here, so a
