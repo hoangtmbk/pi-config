@@ -54,6 +54,11 @@ const LANGUAGE_CLASS_PATTERN = /^(?:language|lang|highlight-source|highlight)-([
 /** A plausible info string — guards against class soup being emitted as a language. */
 const LANGUAGE_PATTERN = /^[\w+#.]+$/;
 
+/** Common `lang` attribute values that name a human language and nothing else. */
+const NATURAL_LANGUAGE_TAGS = new Set(
+	"ar bg de el en es fa fi fr he hi hu id it ja ko ms nl no pt ro ru sv th tr uk vi zh".split(" "),
+);
+
 /** The language a single `class` attribute declares, if any. */
 function languageFromClass(className: string | null | undefined): string | undefined {
 	const tokens = (className ?? "").split(/\s+/).filter(Boolean);
@@ -99,9 +104,19 @@ function fenceLanguage(pre: Element): string {
 	}
 
 	// `<pre lang=python>`, which is what GitHub-flavoured markdown renders to and
-	// therefore what PyPI, GitLab and countless READMEs ship.
+	// therefore what PyPI, GitLab and countless READMEs ship. `lang` is a natural
+	// language everywhere else on the web, so the common tags are refused — but
+	// only the ones no language is named after (`r`, `ts`, `sh`, `go` and `pl`
+	// are all both).
 	const attribute = pre.getAttribute("lang")?.toLowerCase();
-	if (attribute && LANGUAGE_PATTERN.test(attribute) && !PLAIN_LANGUAGES.has(attribute)) return attribute;
+	if (
+		attribute &&
+		LANGUAGE_PATTERN.test(attribute) &&
+		!PLAIN_LANGUAGES.has(attribute) &&
+		!NATURAL_LANGUAGE_TAGS.has(attribute)
+	) {
+		return attribute;
+	}
 
 	return "";
 }
@@ -173,6 +188,9 @@ function preText(pre: Element): string {
  */
 function flattenPreBlocks(document: Document): void {
 	for (const pre of Array.from(document.querySelectorAll("pre"))) {
+		// An image-only `<pre>` has no text to preserve and everything to lose.
+		if ((pre.textContent ?? "").trim() === "" && pre.querySelector("img")) continue;
+
 		const language = fenceLanguage(pre);
 		pre.textContent = preText(pre);
 		if (language) pre.setAttribute("class", `language-${language}`);
@@ -181,17 +199,18 @@ function flattenPreBlocks(document: Document): void {
 
 function configureBase(turndown: TurndownService): TurndownService {
 	// Every `<pre>` becomes a fence, whether or not it has a `<code>` child, and
-	// its body is returned raw so Turndown's markdown escaping never sees it.
-	// Turndown's own fenced-code rule only handles `<pre><code>` and hands the
-	// text through the escaper, which rewrites `[`, `*`, `>` and `_` inside code.
+	// its body is the text `flattenPreBlocks` left behind, returned raw so that
+	// Turndown's markdown escaping never sees it. Turndown's own fenced-code rule
+	// only handles `<pre><code>` and hands the text through the escaper, which
+	// rewrites `[`, `*`, `>` and `_` inside code.
 	turndown.addRule("preBlock", {
 		filter: "pre",
-		replacement: (_content, node) => {
+		replacement: (content, node) => {
 			const pre = node as unknown as Element;
-			const code = preText(pre)
-				.replace(/^\n+/, "")
-				.replace(/\s+$/, "");
-			if (!code) return "";
+			const code = (pre.textContent ?? "").replace(/^\n+/, "").replace(/\s+$/, "");
+			// No code to fence: a `<pre>` holding only a diagram image still has
+			// its alt text to give, so hand back what the child rules made of it.
+			if (!code) return content;
 
 			// A fence has to outrun any backtick run in the code it wraps.
 			const longestRun = Math.max(0, ...(code.match(/`+/g) ?? []).map((run) => run.length));
@@ -355,9 +374,18 @@ function cleanLinks(document: Document): void {
 	}
 }
 
-/** Chrome sites hang off code blocks: copy buttons, language labels, block titles. */
+/**
+ * Class tokens that only ever name a control beside a code block: copy buttons,
+ * language labels, block titles.
+ *
+ * Every alternative has to be a whole class token, and every alternative has to
+ * be unmistakably a control. A bare `copy` was tried and is wrong: `copy`,
+ * `body-copy` and `hero-copy` are how CMS and marketing templates name body
+ * text, and this sweep runs over the whole document, so matching them deletes
+ * prose outright.
+ */
 const CODE_CHROME_CLASS_PATTERN =
-	/(?:^|[\s_-])(?:copy|clipboard)(?:btn|button|[\s_-]|$)|lang(?:uage)?[-_](?:label|name)|code-?block-?title/i;
+	/(?:^|[\s_-])(?:copy[-_]?(?:button|btn|icon|code|link)|copy[-_]to[-_]clipboard|clipboard|lang(?:uage)?[-_](?:label|name)|code[-_]?block[-_]?title)(?:[\s_-]|$)/i;
 
 /**
  * Remove everything that is markup rather than content.
@@ -381,17 +409,42 @@ function stripNonContent(document: Document): void {
 	}
 }
 
+/** Regions whose heading names the site, not the article. */
+const CHROME_REGIONS = "header, nav, footer, aside";
+
+/** Text of a heading, whitespace-normalised, for comparing one against another. */
+function headingText(html: string): string {
+	return html
+		.replace(/<[^>]*>/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
 /**
- * Where Readability reads the page title from, all of which is withheld from it.
+ * Put back the article's own top heading when Readability deleted it.
  *
- * Readability deletes the article's first heading whenever it merely *resembles*
- * the title, on the assumption that the reader UI shows the title separately.
- * The resemblance test is loose: mozilla/readability's README loses its own
- * `<h1>Readability.js</h1>` to the GitHub page title. Taking the title from the
- * source document ourselves keeps Readability out of that judgement, and costs
- * nothing — every heading it would have deleted is a heading we want.
+ * Readability drops the first `<h1>`/`<h2>` whose text resembles the page title
+ * (Readability.js `_headerDuplicatesTitle`), on the assumption that the reader
+ * UI shows the title separately. The resemblance test is loose — mozilla's
+ * README loses its `<h1>Readability.js</h1>` to the GitHub page title — and the
+ * heading is unrecoverable afterwards, so we re-insert it whenever no heading of
+ * that text survived. Headings inside page chrome are skipped: those name the
+ * site, and Readability dropped them for the right reason.
  */
-const TITLE_METADATA_SELECTOR = 'title, meta[property$="title"], meta[name$="title"]';
+function restoreLeadHeading(content: string, document: Document): string {
+	const outsideChrome = (selector: string) =>
+		Array.from(document.querySelectorAll(selector)).find(
+			(heading) => !heading.closest(CHROME_REGIONS) && (heading.textContent?.trim() ?? "") !== "",
+		);
+	const lead = outsideChrome("h1") ?? outsideChrome("h2");
+	if (!lead) return content;
+
+	const wanted = headingText(lead.innerHTML ?? "");
+	const survives = (content.match(/<h[1-6][^>]*>[\s\S]*?<\/h[1-6]>/gi) ?? []).some(
+		(heading) => headingText(heading) === wanted,
+	);
+	return survives ? content : `<h1>${lead.innerHTML}</h1>${content}`;
+}
 
 function extractHtml(page: FetchedPage, raw: boolean): Extracted {
 	const { document } = parseHTML(page.body);
@@ -412,21 +465,21 @@ function extractHtml(page: FetchedPage, raw: boolean): Extracted {
 	const turndown = createTurndown();
 
 	if (!raw) {
-		// Readability mutates the document, so hand it a clone — with the title
-		// metadata withheld, see TITLE_METADATA_SELECTOR.
+		// Readability mutates the document, so hand it a clone.
 		const article = (() => {
 			try {
-				const clone = document.cloneNode(true) as Document;
-				for (const element of Array.from(clone.querySelectorAll(TITLE_METADATA_SELECTOR))) {
-					element.remove();
-				}
-				return new Readability(clone, { charThreshold: 100, keepClasses: true }).parse();
+				return new Readability(document.cloneNode(true) as Document, {
+					charThreshold: 100,
+					keepClasses: true,
+				}).parse();
 			} catch {
 				return null;
 			}
 		})();
 
-		const articleMarkdown = article?.content ? turndown.turndown(article.content).trim() : "";
+		const articleMarkdown = article?.content
+			? turndown.turndown(restoreLeadHeading(article.content, document)).trim()
+			: "";
 
 		// Fall back when Readability returns nothing usable. This is the main
 		// robustness guarantee: listing pages and app shells still produce output.
