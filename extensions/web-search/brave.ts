@@ -243,9 +243,13 @@ function failureMessage(status: number, statusText: string, body: string): strin
 		);
 	}
 	if (status === 429) {
+		// No plan numbers: the perpetual free plan (1 request per second, 2,000 a
+		// month) was retired in February 2026 and metered keys are allowed more,
+		// so quoting either set would misdirect half the accounts that read this.
 		return (
 			`Brave is rate-limiting this key (${label})${quoted}. ` +
-			"The free plan allows one search per second and 2,000 a month; wait a moment before searching again."
+			"This search already waited and tried again; wait a little longer, or check the plan's rate at " +
+			`${DASHBOARD_URL}`
 		);
 	}
 	if (status === 422 || status === 400) {
@@ -288,19 +292,24 @@ function realSleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** One request and the reading of its response. Throws `WebSearchError`. */
+/**
+ * One request and the reading of its response. Throws `WebSearchError`.
+ *
+ * `timeout` is the whole search's deadline rather than this attempt's, so a
+ * retried search cannot quietly cost twice the budget the caller was promised.
+ */
 async function attempt(
 	url: string,
 	query: string,
 	key: string,
 	signal: AbortSignal | undefined,
+	timeout: AbortSignal,
 	deps: SearchDeps,
 ): Promise<{ ok: true; body: BraveResponse } | { ok: false; status: number; message: string }> {
 	const send = deps.fetch ?? globalThis.fetch;
 	const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-	// Combine pi's cancellation with our own timeout so either can abort.
-	const timeout = AbortSignal.timeout(timeoutMs);
+	// Combine pi's cancellation with the deadline so either can abort.
 	const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
 
 	let response: Response;
@@ -332,6 +341,10 @@ async function attempt(
 	try {
 		return { ok: true, body: (await response.json()) as BraveResponse };
 	} catch (error) {
+		// A body cut off mid-read is a cancelled or timed-out search, not a
+		// malformed one — saying "not JSON" would point at the wrong culprit.
+		if (signal?.aborted) throw new WebSearchError(`Cancelled: ${query}`);
+		if (timeout.aborted) throw new WebSearchError(`Search timed out after ${timeoutMs / 1000}s: ${query}`);
 		throw new WebSearchError(`Brave returned a body that is not JSON: ${errorText(error)}`);
 	}
 }
@@ -363,7 +376,12 @@ export async function search(
 	const sleep = deps.sleep ?? realSleep;
 
 	return serialized(async () => {
-		const first = await attempt(url, trimmed, key, signal, deps);
+		// Started here rather than at the call, and shared by both attempts: a
+		// search queued behind another must not spend its budget waiting its turn,
+		// and a retried one must not spend twice the budget it was promised.
+		const timeout = AbortSignal.timeout(deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+
+		const first = await attempt(url, trimmed, key, signal, timeout, deps);
 		if (first.ok) return first.body;
 		if (first.status !== 429) throw new WebSearchError(first.message);
 
@@ -372,7 +390,7 @@ export async function search(
 		// not be spent on a second request nobody is waiting for.
 		if (signal?.aborted) throw new WebSearchError(`Cancelled: ${trimmed}`);
 
-		const second = await attempt(url, trimmed, key, signal, deps);
+		const second = await attempt(url, trimmed, key, signal, timeout, deps);
 		if (second.ok) return second.body;
 		throw new WebSearchError(second.message);
 	});

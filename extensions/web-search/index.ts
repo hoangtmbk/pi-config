@@ -56,9 +56,14 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Search the web and get ranked results with snippets",
 		parameters: WebSearchParams,
 		// pi runs tools in parallel by default, and two concurrent searches on a
-		// plan that allows one request per second is a guaranteed 429. Serialising
-		// costs a few hundred milliseconds on the rare double search and removes a
-		// whole class of flaky failure.
+		// plan that allows one request per second is a guaranteed 429.
+		//
+		// Read what this really costs before copying it: pi serialises the *whole*
+		// batch when any tool in it is sequential, so a turn that searches also
+		// runs its reads and fetches one at a time. `brave.ts` already queues
+		// searches against each other in-process, so this flag is the belt to that
+		// braces — kept because the design asks for it, and because a search shares
+		// a turn with other tools rarely enough for the latency not to show.
 		executionMode: "sequential",
 
 		async execute(_toolCallId, params, signal) {
@@ -70,7 +75,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Resolved per call rather than at load time, so a session without a
 			// key still starts — and reports the problem only if a search is run.
-			const startedAt = Date.now();
+			// After the first success this is a cached read, not a keychain prompt.
 			const key = resolveApiKey();
 			const response = await search(params.query, key, { count, freshness }, signal);
 

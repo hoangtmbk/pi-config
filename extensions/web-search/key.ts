@@ -27,7 +27,6 @@ import { DASHBOARD_URL, errorText, WebSearchError } from "./brave.ts";
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const ENV_FILE = join(EXTENSION_DIR, ".env");
 
-
 /** A keychain lookup answers in milliseconds; anything slower is stuck. */
 const COMMAND_TIMEOUT_MS = 10_000;
 
@@ -46,6 +45,10 @@ export interface KeyDeps {
  *
  * Only ever written after a successful resolution — a failure must stay
  * repeatable so that setting the key fixes the next search.
+ *
+ * Keyed on nothing, because there is only ever one key per process: the `deps`
+ * a caller passes are a test seam, not a second configuration, and a test that
+ * varies them clears the cache first.
  */
 let resolved: string | undefined;
 
@@ -54,7 +57,15 @@ export function clearResolvedKey(): void {
 	resolved = undefined;
 }
 
-/** Load a `.env` if there is one. Its absence is the normal case, not a failure. */
+/**
+ * Load a `.env` if there is one. Its absence is the normal case, not a failure.
+ *
+ * Note what this costs: the loader writes into `process.env`, so a plain key in
+ * the file is inherited by every process pi spawns — an agent that runs `env`
+ * in a shell prints it into the transcript. The `!command` form avoids that
+ * entirely: only the command string is exported, and the key it prints stays in
+ * this module's memory.
+ */
 function loadEnvFileIfPresent(path: string): void {
 	try {
 		process.loadEnvFile(path);
@@ -83,6 +94,16 @@ function runInShell(command: string): string {
  * that output is the key.
  */
 function keyFromCommand(command: string, run: CommandRunner): string {
+	// A bare `!` is a value someone started writing and did not finish. Left to
+	// the shell it fails as "the argument 'file' cannot be empty", which names
+	// nothing the reader can act on.
+	if (!command) {
+		throw new WebSearchError(
+			"BRAVE_API_KEY is just `!`, which names no command to run. " +
+				"Write the command after it, or the key itself instead.",
+		);
+	}
+
 	let output: string;
 	try {
 		output = run(command);
@@ -109,7 +130,10 @@ function keyFromCommand(command: string, run: CommandRunner): string {
  * What a configured value actually means: a command to run, or the key itself.
  *
  * `$!` is the escape rather than `\!`, because a backslash in a `.env` file is
- * already the file format's own escape and would not survive the loader.
+ * already the file format's own escape and would not survive the loader. The
+ * escape is one level deep and stays that way: a key that genuinely begins with
+ * `$!` cannot be written, which costs nothing, because a Brave key is
+ * hexadecimal.
  */
 function keyFromValue(value: string, run: CommandRunner): string {
 	if (value.startsWith("!")) return keyFromCommand(value.slice(1).trim(), run);

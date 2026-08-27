@@ -334,6 +334,13 @@ describe("what a failed search tells the model to do", () => {
 		assert.match(error.message, /parameter/i);
 	});
 
+	it("reads a 400 as a rejected parameter too, quoting what Brave objected to", async () => {
+		const error = await failing(400, '{"error":"q is required"}').error();
+
+		assert.match(error.message, /q is required/);
+		assert.match(error.message, /parameter/i);
+	});
+
 	it("says a server error is Brave's end, not the query's, on a 5xx", async () => {
 		const error = await failing(503, "upstream unavailable", "Service Unavailable").error();
 
@@ -414,15 +421,55 @@ describe("a rate-limited search", () => {
 
 		assert.equal(calls.length, 2);
 		assert.ok(error instanceof WebSearchError);
-		assert.match(error.message, /429|rate/i);
+		assert.match(error.message, /429/);
 		assert.match(error.message, /rate limit exceeded/);
-		assert.match(error.message, /second/i);
+		// It says the retry has already been spent, so the reader waits rather
+		// than searching straight back into the same limit.
+		assert.match(error.message, /already waited/i);
+	});
+
+	it("reports the second failure when the retry fails differently", async () => {
+		let attempts = 0;
+		const { fetch, calls } = fakeFetch(() => {
+			attempts += 1;
+			return attempts === 1 ? limited() : new Response("upstream unavailable", { status: 503 });
+		});
+		const error = await rejection(search("hello", "k", {}, undefined, { fetch, sleep: async () => {} }));
+
+		assert.equal(calls.length, 2);
+		// The 429 is history; what the search actually died of is the 503.
+		assert.match(error.message, /503/);
+		assert.match(error.message, /upstream unavailable/);
+		assert.ok(!error.message.includes("429"), error.message);
 	});
 
 	it("does not retry a failure that a second attempt cannot fix", async () => {
 		const { fetch, calls } = fakeFetch(() => new Response("Subscription token invalid", { status: 401 }));
 		await rejection(search("hello", "k", {}, undefined, { fetch, sleep: async () => {} }));
 		assert.equal(calls.length, 1);
+	});
+
+	it("spends one timeout across both attempts rather than one each", async () => {
+		let attempts = 0;
+		const stall = stalledFetch();
+		const fetch = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+			attempts += 1;
+			if (attempts === 1) return limited();
+			return stall(input, init);
+		}) as typeof globalThis.fetch;
+
+		const error = await rejection(
+			search("hello", "k", {}, undefined, {
+				fetch,
+				timeoutMs: 20,
+				// A real wait, long enough to outlast the deadline the first attempt
+				// started under — the point is that the second attempt inherits it.
+				sleep: () => new Promise((resolve) => setTimeout(resolve, 40)),
+			}),
+		);
+
+		assert.equal(attempts, 2);
+		assert.match(error.message, /timed out after/i);
 	});
 
 	it("abandons the retry when pi cancels the search while it waits", async () => {
@@ -478,14 +525,24 @@ describe("two searches in one turn", () => {
 	});
 
 	it("lets the next search through even when the one before it failed", async () => {
-		const gate = gatedFetch();
-		const failed = rejection(search("   ", "k", {}, undefined, { fetch: gate.fetch }));
-		const next = search("after", "k", {}, undefined, { fetch: gate.fetch });
-		await failed;
-		await settle();
+		// The first search has to fail *inside* the queue for this to mean
+		// anything: a query rejected before it is enqueued never touches the chain
+		// the next search is waiting on.
+		let attempts = 0;
+		const { fetch, calls } = fakeFetch(() => {
+			attempts += 1;
+			return attempts === 1 ? new Response("Subscription token invalid", { status: 401 }) : json(okBody);
+		});
 
-		assert.deepEqual(gate.started, ["after"]);
-		gate.release();
-		await next;
+		const failed = rejection(search("first", "k", {}, undefined, { fetch }));
+		const next = search("second", "k", {}, undefined, { fetch });
+
+		assert.match((await failed).message, /rejected the API key/);
+		// The second search gets its own answer rather than the first one's error.
+		assert.equal((await next).web?.results?.[0]?.url, "https://a.test/");
+		assert.deepEqual(
+			calls.map((call) => new URL(call.url).searchParams.get("q")),
+			["first", "second"],
+		);
 	});
 });

@@ -119,6 +119,22 @@ describe("a key that lives in a command", () => {
 		assert.match(error.message, /could not be found in the keychain/);
 	});
 
+	it("reports a bare ! as the unfinished value it is", () => {
+		process.env.BRAVE_API_KEY = "!";
+		const error = thrown(() =>
+			resolveApiKey({ envFile: envFile(""), run: () => assert.fail("there is no command to run") }),
+		);
+		assert.match(error.message, /names no command/i);
+	});
+
+	it("takes $! out of the .env file as an escape too", () => {
+		const key = resolveApiKey({
+			envFile: envFile("BRAVE_API_KEY=$!literal-from-file\n"),
+			run: () => assert.fail("an escaped value must not run anything"),
+		});
+		assert.equal(key, "!literal-from-file");
+	});
+
 	it("reports a command that prints nothing rather than searching with an empty key", () => {
 		process.env.BRAVE_API_KEY = "!print-key";
 		const error = thrown(() => resolveApiKey({ envFile: envFile(""), run: () => " \n" }));
