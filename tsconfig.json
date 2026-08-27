@@ -8,19 +8,8 @@
 		"noEmit": true,
 		"strict": true,
 		"skipLibCheck": true,
-		"types": ["node"],
-		"baseUrl": ".",
-		"paths": {
-			"@earendil-works/pi-coding-agent": [
-				"/Users/hoangta/.nvm/versions/node/v22.22.2/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
-			],
-			"@earendil-works/pi-tui": [
-				"/Users/hoangta/.nvm/versions/node/v22.22.2/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui/dist/index.d.ts"
-			],
-			"typebox": [
-				"/Users/hoangta/.nvm/versions/node/v22.22.2/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/typebox/build/index.d.mts"
-			]
-		}
+		"types": ["node"]
 	},
-	"include": ["*.ts", "tests/**/*.ts"]
+	"include": ["extensions/**/*.ts"],
+	"exclude": ["node_modules"]
 }

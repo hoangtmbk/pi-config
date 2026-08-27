@@ -1,17 +1,21 @@
 {
-  "name": "pi-extension-web-fetch",
+  "name": "pi-config",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Context-lean web fetch tool for pi: fetches a URL and returns clean markdown",
+  "description": "hoangtmbk's pi package: extensions, skills, prompts and themes, synced across machines via `pi install`",
+  "keywords": ["pi-package"],
+  "repository": "github:hoangtmbk/pi-config",
   "pi": {
-    "extensions": [
-      "./index.ts"
-    ]
+    "extensions": ["./extensions/web-fetch/index.ts"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"],
+    "themes": ["./themes"]
   },
   "scripts": {
-    "test": "tsx --test tests/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "test": "tsx --test extensions/*/tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "live:web-fetch": "tsx extensions/web-fetch/test.ts"
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
@@ -19,7 +23,13 @@
     "turndown": "^7.2.4",
     "unpdf": "^1.8.1"
   },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.3",
     "@types/node": "^22.15.3",
     "@types/turndown": "^5.0.5",
     "tsx": "^4.19.3",

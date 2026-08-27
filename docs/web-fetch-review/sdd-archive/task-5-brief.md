@@ -1,0 +1,15 @@
+## Task 5: URL rewrites + PDF (Phase 2.3, 2.4) — new rewrite.ts, pdf.ts; wire into fetch/extract/index
+
+1. `rewrite.ts`: `export function rewriteUrl(url: URL): { url: URL; note?: string } | undefined` — pure function, unit-tested in `tests/rewrite.test.ts`:
+   - `github.com/{owner}/{repo}/blob/{ref}/{path}` → `raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}` (note `"github blob → raw"`); `github.com/{owner}/{repo}/tree/...` untouched.
+   - `stackoverflow.com/questions/{id}[/slug]` and `stackoverflow.com/q/{id}` → `https://api.stackexchange.com/2.3/questions/{id}?site=stackoverflow&filter=withbody` … BUT the JSON must be readable: instead of raw JSON, add to `extract.ts` a tiny `stackexchange` JSON renderer: title as `#`, body_markdown (request `filter=!9_bDE(fI5` is not allowed — use `filter=withbody` and convert `body` HTML through the existing HTML→markdown path), then fetch answers via `.../questions/{id}/answers?site=stackoverflow&filter=withbody&order=desc&sort=votes&pagesize=10` — keep this simple: ONE extra request, answers rendered as `## Answer (score N, accepted)` sections. If this exceeds ~80 lines total, implement only the question+answers rendering without pagination.
+   - `www.npmjs.com/package/{name}` → `https://registry.npmjs.org/{name}` with a `npmRegistry` JSON renderer: name, description, latest version, `dist-tags`, homepage/repository, README (`readme` field is markdown — pass through), last 10 versions with dates. (Registry JSON for popular packages is multi-MB; the renderer keeps it lean.)
+   - `en.wikipedia.org/wiki/{Title}` (any language subdomain) → `https://{lang}.wikipedia.org/api/rest_v1/page/html/{Title}` (Parsoid HTML, no chrome, then normal HTML→markdown path); fall back to the original URL on non-2xx.
+   - `arxiv.org/abs/{id}` → `https://arxiv.org/html/{id}` with fallback to the abs page on 404 (older papers have no HTML); `arxiv.org/pdf/{id}` → PDF path (item 2).
+   - `pypi.org/project/{name}` → `https://pypi.org/pypi/{name}/json` with a `pypi` JSON renderer: name, version, summary, homepage/project_urls, requires_python, `description` (markdown or RST passthrough).
+   The rewrite is applied in `fetchPage` after normalization; `FetchedPage` gets `rewrittenFrom?: string` and `note?: string`; on fallback the original URL is fetched and `note` says so.
+2. `pdf.ts`: add dependency `unpdf`; `export async function pdfToText(bytes: Uint8Array, opts: {maxPages: number}): Promise<{text: string; pages: number; truncatedPages: boolean}>` using `extractText` with `mergePages: false`, join pages with `\n\n---\n\n<!-- page N -->\n\n`; `maxPages = 200`. `extract.ts` routes `application/pdf` (and `FetchedPage.bytesBody`) to it with `mode: "pdf"`; `index.ts`: `fetchPage(url, signal, {allowPdf: true})`. Test with a small PDF generated in the test (hand-written minimal PDF bytes with one text object "Hello PDF") — no network.
+3. Update `test.ts` (live) URL list to include one rewrite case and the arXiv PDF, still opt-in.
+
+Run `npm test`, `npm run typecheck`. Commit: `feat: URL rewrites (github/SO/npm/wikipedia/arxiv/pypi) and PDF text via unpdf`.
+

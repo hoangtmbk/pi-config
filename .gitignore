@@ -1,3 +1,10 @@
 node_modules/
 .superpowers/
-fixtures/*.tmp
+**/fixtures/*.tmp
+.DS_Store
+
+# never let pi state or credentials in, even if someone runs this from ~/.pi/agent
+auth.json
+models-store.json
+sessions/
+trust.json

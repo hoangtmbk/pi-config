@@ -1,0 +1,12 @@
+## Task 2: Code-block fidelity (Phase 1.1–1.4) — extract.ts
+
+Make these pass: code-regex, python-asyncio, github-readability, react-learn, div-code, go-tutorial, pypi-requests, mdn-fetch (and keep every other currently-passing test passing).
+
+1. Delete the regex post-processing in `cleanMarkdown()` (`extract.ts:171-188`) except a final `.trim()`; optionally collapse ≥3 consecutive blank lines ONLY if done in a way that cannot touch fenced blocks (e.g. not at all — prefer not at all). Move the "empty link" cleanup to the DOM: before Turndown, remove `<a>` elements whose `textContent.trim() === ""` and that contain no `<img>`; unwrap `<a>` with no `href`. Trailing-whitespace stripping is dropped (it was destroying `<br>` hard breaks).
+2. Pass `keepClasses: true` to `new Readability(...)` so language classes survive.
+3. Add a single Turndown rule `preBlock` with `filter: "pre"` that emits a fenced block: language from, in order, `class` on the `<pre>`, its first `<code>` child, its parent/grandparent (Sphinx `div.highlight-python`, GitHub `div.highlight-source-js`, Docusaurus/Shiki `language-x`), matching `language-x`, `lang-x`, `highlight-x`, `highlight-source-x`, `brush: x`, `hljs x`(only when x is a known language token), `sourceCode x`; strip `-default`/`-text`/`-none` to no language; body from a line-preserving text extraction: walk the `<pre>` DOM, emitting `\n` for `<br>` and after each block-level child (`div`, `p`, `li`, `tr`) and for elements with `display: block`-ish classes like `.line` only if a newline is not already present; then `textContent` semantics otherwise. Fence with a run of backticks longer than any run inside the body. Remove the existing `fencedCodeBlock` default behavior conflict by ensuring this rule is added after defaults (addRule takes precedence). Delete anything in the code that this rule makes redundant.
+4. `configureBase`: the label spans that leak as stray `js`/`bash` lines (QA #2) are `<span>`/`<button>` copy-buttons or language labels inside `<pre>`/`div.highlight` — remove `button` elements and elements with classes matching `/copy|clipboard|lang(uage)?-label|code-block-title/` at DOM level before conversion.
+5. Keep `extract.ts` minimal: remove the now-unused pieces (`pass < 100` loop if present, redundant `dropNonContent` tags already stripped at DOM level, unused `FetchedPage.charset` reads).
+
+Run `npm test` and `npm run typecheck`. Commit: `fix(extract): preserve code verbatim — DOM-level cleanup, keepClasses, universal pre rule`.
+
