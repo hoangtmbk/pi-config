@@ -117,7 +117,7 @@ characters; unknown labels fall back to UTF-8.
 
 Some pages have a machine-readable twin, and fetching that instead costs a fraction of the tokens.
 Every rewrite is a guess, so a non-2xx answer falls back to the original URL, and either way the swap
-is reported in the header's `note:` line.
+is reported in the header's `via:` line.
 
 | Asked for | Fetched instead |
 |---|---|
