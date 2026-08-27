@@ -74,8 +74,12 @@ export interface WebSearchDetails {
 	elapsedMs: number;
 }
 
-/** A duration as a reader scans it: sub-second searches in milliseconds, the rest in seconds. */
-function formatElapsed(ms: number): string {
+/**
+ * A duration as a reader scans it: sub-second searches in milliseconds, the
+ * rest in seconds. Exported so a test asserting the markdown states no duration
+ * can look for the exact string this would have written.
+ */
+export function formatElapsed(ms: number): string {
 	return ms < 1_000 ? `${ms}ms` : `${(ms / 1_000).toFixed(1)}s`;
 }
 

@@ -17,7 +17,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import register, { type WebSearchDetails } from "../index.ts";
+import register, { formatElapsed, type WebSearchDetails } from "../index.ts";
 import { clearResolvedKey } from "../key.ts";
 import { fakeFetch, jsonResponse, rejection } from "./helpers.ts";
 
@@ -199,10 +199,11 @@ describe("the web-search extension", () => {
 		// and the markdown's own list is nowhere in the metadata.
 		const content = result.content[0];
 		const text = content?.type === "text" ? content.text : "";
-		// Checked as "the markdown states no duration" rather than as "the markdown
-		// does not contain this exact number": a fast search elapses in one digit,
-		// and one digit appears in any prose that counts anything.
-		assert.doesNotMatch(text, /\b\d+(\.\d+)?\s*(ms|s)\b/, text.split("\n")[0]);
+		// Checked against the string the renderer would have written rather than
+		// against a bare number: a fast search elapses in one digit, and one digit
+		// appears in any prose that counts anything.
+		const duration = formatElapsed(result.details?.elapsedMs ?? 0);
+		assert.ok(!text.includes(duration), `${duration} leaked into: ${text.split("\n")[0]}`);
 		assert.ok(!JSON.stringify(result.details).includes("An Introduction To Generics"));
 	});
 
@@ -222,14 +223,16 @@ describe("the web-search extension", () => {
 
 	it("tells the model to search for URLs and then fetch them, treating snippets as triage", () => {
 		const tool = registeredTools()[0] as unknown as RegisteredTool;
-		const guidance = [tool.description, ...(tool.promptGuidelines ?? [])].join("\n");
+		// The guidelines alone: the tool description says much of this too, and a
+		// test that reads both would pass with the guidance deleted.
+		const guidance = (tool.promptGuidelines ?? []).join("\n");
 
 		assert.ok(tool.promptGuidelines?.length, "a tool with no promptGuidelines steers nothing");
 		assert.match(guidance, /web_fetch/);
 		assert.match(guidance, /triage/i);
 		// The failure mode this guards: answering out of the snippet list without
 		// ever opening the page it came from.
-		assert.match(guidance, /\bread\b/i);
+		assert.match(guidance, /before answering|never cite/i);
 	});
 
 	it("tells the model to reach for operators rather than a second search", () => {

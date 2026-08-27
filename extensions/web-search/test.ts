@@ -14,6 +14,11 @@
  *   npm run live:web-search -- --capture # …and overwrite tests/fixtures/*.json
  *                                        #   with the responses just received
  *
+ * A key is required to start: the five error cases need only a *syntactically*
+ * present one, so `BRAVE_API_KEY=junk npm run live:web-search` exercises them
+ * (a rejected key, a timeout, and three values rejected before a request is
+ * spent) without a subscription. The seven query cases need a real key.
+ *
  * `--capture` is how the hand-written fixtures get replaced with real ones: it
  * writes the exact JSON Brave answered, pretty-printed, to the three files the
  * offline suite reads. Expect to re-pin the assertions that name a specific
@@ -24,6 +29,7 @@
 import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import {
 	type BraveResponse,
 	type SearchParams,
@@ -214,7 +220,6 @@ try {
 let failures = 0;
 
 console.log("--- live queries ---");
-const responses = new Map<string, BraveResponse>();
 
 for (const testCase of cases) {
 	try {
@@ -225,17 +230,23 @@ for (const testCase of cases) {
 		};
 		const response = await search(testCase.query, key, params);
 		const elapsed = Date.now() - startedAt;
-		responses.set(testCase.name, response);
 
-		const { text, shown, total } = formatResults(testCase.query, response, { freshness: params.freshness });
+		// Rendered under the same budget `index.ts` applies, so the size this
+		// prints is the size a session would have paid.
+		const { text, shown, total } = formatResults(testCase.query, response, {
+			maxBytes: DEFAULT_MAX_BYTES,
+			freshness: params.freshness,
+		});
 		const problem = testCase.check(response, text);
 
 		const web = response.web?.results?.length ?? 0;
 		const discussions = response.discussions?.results?.length ?? 0;
 		const snippets = hits(response).filter((result) => (result.extra_snippets?.length ?? 0) > 0).length;
+		// Counted in bytes rather than in characters, because the budget is.
+		const size = Buffer.byteLength(text, "utf8");
 		const stats =
 			`${web} web + ${discussions} discussions, ${snippets} with extra_snippets, ` +
-			`${shown}/${total} rendered, ${text.length}B (~${Math.round(text.length / 4)} tok), ${elapsed}ms`;
+			`${shown}/${total} rendered, ${size}B (~${Math.round(size / 4)} tok), ${elapsed}ms`;
 
 		if (problem) {
 			failures++;
@@ -283,6 +294,14 @@ if (process.argv.includes("--capture")) {
 			const web = response.web?.results?.length ?? 0;
 			const discussions = response.discussions?.results?.length ?? 0;
 			console.log(`wrote ${spec.file}\n      "${spec.query}" → ${web} web + ${discussions} discussions`);
+			// A fixture exists to carry a shape. Capturing a response that lacks it
+			// leaves the suite testing nothing, quietly, so say so at capture time.
+			if (spec.file.includes("discussions") && discussions === 0) {
+				console.log("      warning: no discussions came back — this fixture no longer covers that section");
+			}
+			if (spec.file.includes("snippets") && !hits(response).some((r) => (r.extra_snippets?.length ?? 0) > 0)) {
+				console.log("      warning: no extra_snippets came back — this fixture no longer covers them");
+			}
 		} catch (error) {
 			failures++;
 			console.log(`FAIL  capture ${spec.file}\n      ${messageOf(error)}`);
