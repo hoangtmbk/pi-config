@@ -297,6 +297,12 @@ describe("safeSegment", () => {
 		assert.equal(safeSegment("///", 10, "session"), "session");
 		assert.equal(safeSegment("a/b c", 10, "session"), "a-b-c");
 	});
+
+	it("refuses a dots-only segment, which would resolve to a parent directory", () => {
+		assert.equal(safeSegment("..", 10, "session"), "session");
+		assert.equal(safeSegment(".", 10, "session"), "session");
+		assert.equal(safeSegment("v1.2", 10, "session"), "v1.2");
+	});
 });
 
 describe("sliceBytes", () => {
