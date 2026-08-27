@@ -192,10 +192,11 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 							display: true,
 							details: { run: message.run.name, agent: message.run.agent, task: message.run.task },
 						},
-						// The parent may well be idle, and a result nobody reads is a
-						// wasted run — as is a question nobody answers. Landing either
-						// while the parent is streaming is 05's job.
-						{ triggerTurn: true },
+						// Both halves of ADR-0002's Delivery policy in one call, because
+						// which one happens is pi's decision, not this file's: an idle
+						// parent is woken, and a streaming one takes it as a steer, which
+						// pi lands at a turn boundary rather than mid-tool-call.
+						{ triggerTurn: true, deliverAs: "steer" },
 					);
 
 					// A Waiting Run keeps its child: the process stays up, doing nothing but

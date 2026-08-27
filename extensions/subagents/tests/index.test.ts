@@ -72,10 +72,58 @@ interface RegisteredTool {
 	) => Promise<AgentToolResult<unknown>>;
 }
 
+/** Where pi puts a custom message once it has read the options it was given. */
+type Landing = "turn" | "steer" | "followUp" | "nextTurn" | "transcript";
+
+interface SendOptions {
+	triggerTurn?: boolean;
+	deliverAs?: "steer" | "followUp" | "nextTurn";
+}
+
 interface SentMessage {
 	content: string;
 	customType: string;
 	triggerTurn?: boolean;
+	deliverAs?: string;
+	/** Where it landed, given whether the parent was streaming when it was sent. */
+	landed: Landing;
+}
+
+/**
+ * pi's own routing rule, mirrored from `AgentSession.sendCustomMessage` (0.84.3).
+ *
+ * Which of idle-wake and streaming-steer happens is pi's decision, not this
+ * extension's — so the only thing the extension can get right is handing pi the
+ * options that make both halves of ADR-0002's Delivery policy come out right.
+ * Writing the rule down here is what lets a test see both halves.
+ */
+function landing(options: SendOptions | undefined, streaming: boolean): Landing {
+	if (options?.deliverAs === "nextTurn") return "nextTurn";
+	if (streaming && options?.triggerTurn !== false) return options?.deliverAs === "followUp" ? "followUp" : "steer";
+	return options?.triggerTurn ? "turn" : "transcript";
+}
+
+/** The parent session's own state, as far as Delivery cares: streaming, or idle. */
+interface Parent {
+	streaming: boolean;
+}
+
+/** Records everything the extension says to the parent, and how it lands. */
+function recorder(parent: Parent, tools: RegisteredTool[], sent: SentMessage[]) {
+	return {
+		registerTool(tool: unknown) {
+			tools.push(tool as RegisteredTool);
+		},
+		sendMessage(message: { customType: string; content: string }, options?: SendOptions) {
+			sent.push({
+				customType: message.customType,
+				content: message.content,
+				triggerTurn: options?.triggerTurn,
+				deliverAs: options?.deliverAs,
+				landed: landing(options, parent.streaming),
+			});
+		},
+	};
 }
 
 const started: RunChild[] = [];
@@ -94,15 +142,8 @@ function requireTool(tools: RegisteredTool[], name: string): RegisteredTool {
 function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>) {
 	const tools: RegisteredTool[] = [];
 	const sent: SentMessage[] = [];
-
-	const pi = {
-		registerTool(tool: unknown) {
-			tools.push(tool as RegisteredTool);
-		},
-		sendMessage(message: { customType: string; content: string }, options?: { triggerTurn?: boolean }) {
-			sent.push({ customType: message.customType, content: message.content, triggerTurn: options?.triggerTurn });
-		},
-	};
+	const parent: Parent = { streaming: false };
+	const pi = recorder(parent, tools, sent);
 
 	registerSubagents(pi as unknown as ExtensionAPI, {
 		roster,
@@ -113,7 +154,13 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>) {
 		},
 	});
 
-	return { subagent: requireTool(tools, "subagent"), subagentAnswer: requireTool(tools, "subagent_answer"), tools, sent };
+	return {
+		subagent: requireTool(tools, "subagent"),
+		subagentAnswer: requireTool(tools, "subagent_answer"),
+		tools,
+		sent,
+		parent,
+	};
 }
 
 const CTX = {} as ExtensionContext;
@@ -123,15 +170,8 @@ function stubbedSession() {
 	const tools: RegisteredTool[] = [];
 	const sent: SentMessage[] = [];
 	const spawned: { name: string; emit: (event: JsonAgentSessionEvent) => void; prompts: string[]; stops: number }[] = [];
-
-	const pi = {
-		registerTool(tool: unknown) {
-			tools.push(tool as RegisteredTool);
-		},
-		sendMessage(message: { customType: string; content: string }, options?: { triggerTurn?: boolean }) {
-			sent.push({ customType: message.customType, content: message.content, triggerTurn: options?.triggerTurn });
-		},
-	};
+	const parent: Parent = { streaming: false };
+	const pi = recorder(parent, tools, sent);
 
 	registerSubagents(pi as unknown as ExtensionAPI, {
 		roster: ROSTER,
@@ -149,7 +189,13 @@ function stubbedSession() {
 		},
 	});
 
-	return { subagent: requireTool(tools, "subagent"), subagentAnswer: requireTool(tools, "subagent_answer"), sent, spawned };
+	return {
+		subagent: requireTool(tools, "subagent"),
+		subagentAnswer: requireTool(tools, "subagent_answer"),
+		sent,
+		spawned,
+		parent,
+	};
 }
 
 /** Call a registered tool the way pi would, and read its text back. */
@@ -245,6 +291,60 @@ describe("subagent", () => {
 			assert.match(error.message, /worker/);
 			return true;
 		});
+	});
+});
+
+describe("Delivery", () => {
+	it("wakes an idle parent, so a result nobody asked for is not left unread", async () => {
+		const { subagent, sent, spawned, parent } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		parent.streaming = false;
+		spawned[0].emit(said("Found three call sites."));
+		spawned[0].emit(SETTLED);
+
+		assert.equal(sent[0].landed, "turn");
+	});
+
+	it("queues as a steer while the parent is streaming, so it never lands mid-tool-call", async () => {
+		const { subagent, sent, spawned, parent } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		parent.streaming = true;
+		spawned[0].emit(said("Found three call sites."));
+		spawned[0].emit(SETTLED);
+
+		assert.equal(sent[0].landed, "steer");
+		assert.equal(sent[0].deliverAs, "steer");
+	});
+
+	it("delivers both Runs when two settle in the same tick, losing neither", async () => {
+		const { subagent, sent, spawned, parent } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "one" });
+		await call(subagent, { agent: "scout", task: "two" });
+
+		parent.streaming = true;
+		spawned[0].emit(said("first result"));
+		spawned[1].emit(said("second result"));
+		spawned[0].emit(SETTLED);
+		spawned[1].emit(SETTLED);
+
+		assert.equal(sent.length, 2);
+		assert.match(sent[0].content, /Run `scout`.*first result/s);
+		assert.match(sent[1].content, /Run `scout-2`.*second result/s);
+		assert.deepEqual(sent.map((message) => message.landed), ["steer", "steer"]);
+	});
+
+	it("queues a Question as a steer too, so an answerable Run is not announced mid-tool-call", async () => {
+		const { subagent, sent, spawned, parent } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		parent.streaming = true;
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+
+		assert.equal(sent[0].customType, "subagent-question");
+		assert.equal(sent[0].landed, "steer");
 	});
 });
 
