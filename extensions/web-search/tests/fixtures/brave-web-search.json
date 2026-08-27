@@ -1,0 +1,28 @@
+{
+  "query": { "original": "go generics" },
+  "type": "search",
+  "web": {
+    "type": "search",
+    "results": [
+      {
+        "title": "An Introduction To Generics - The Go Programming Language",
+        "url": "https://go.dev/blog/intro-generics",
+        "description": "This post is an introduction to <strong>generics</strong> in <strong>Go</strong>: type parameters on functions and types.",
+        "page_age": "2022-03-22T00:00:00",
+        "meta_url": { "scheme": "https", "netloc": "go.dev", "hostname": "go.dev", "path": "› blog  › intro-generics" }
+      },
+      {
+        "title": "Type Parameters Proposal",
+        "url": "https://go.googlesource.com/proposal/+/refs/heads/master/design/43651-type-parameters.md",
+        "description": "The design doc behind Go&#39;s type parameters, including constraints and inference.",
+        "meta_url": { "scheme": "https", "netloc": "go.googlesource.com", "hostname": "go.googlesource.com", "path": "› proposal" }
+      },
+      {
+        "title": "Tutorial: Getting started with generics",
+        "url": "https://go.dev/doc/tutorial/generics",
+        "description": "In this tutorial, you&#39;ll declare two simple non-generic functions, then\n            carry the same logic over to a single generic function.",
+        "meta_url": { "scheme": "https", "netloc": "go.dev", "hostname": "go.dev", "path": "› doc  › tutorial  › generics" }
+      }
+    ]
+  }
+}

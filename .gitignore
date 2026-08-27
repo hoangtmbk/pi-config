@@ -8,3 +8,10 @@ auth.json
 models-store.json
 sessions/
 trust.json
+
+# API keys for extensions — this repo is public
+.env
+**/.env
+
+# scratch working state (local ticket tracker, etc.)
+.scratch/
