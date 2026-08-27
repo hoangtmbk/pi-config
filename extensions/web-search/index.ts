@@ -9,7 +9,7 @@
 
 import { DEFAULT_MAX_BYTES, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { search } from "./brave.ts";
+import { DEFAULT_COUNT, MAX_COUNT, MIN_COUNT, normalizeCount, normalizeFreshness, search } from "./brave.ts";
 import { MAX_EXCERPTS, formatResults, usableResults } from "./format.ts";
 import { resolveApiKey } from "./key.ts";
 
@@ -18,6 +18,25 @@ const WebSearchParams = Type.Object({
 		description:
 			'Search terms. Brave\'s operators work inside the query: site:example.com, -excluded, "exact phrase", filetype:pdf.',
 	}),
+	// `Type.Integer` rather than a number: half a result does not exist, and the
+	// bounds are declared so the model reads them off the schema.
+	count: Type.Optional(
+		Type.Integer({
+			minimum: MIN_COUNT,
+			maximum: MAX_COUNT,
+			description: `How many results to return, ${MIN_COUNT}–${MAX_COUNT}. Defaults to ${DEFAULT_COUNT}.`,
+		}),
+	),
+	// A plain string rather than an enum: the date range cannot be spelled as
+	// one, and the shape is validated in code, which can say what went wrong.
+	freshness: Type.Optional(
+		Type.String({
+			description:
+				"Only return results from the last day (pd), week (pw), month (pm) or year (py), " +
+				"or from an explicit range YYYY-MM-DDtoYYYY-MM-DD (for example 2026-01-01to2026-03-31). " +
+				"Set this only when recency matters.",
+		}),
+	),
 });
 
 /** Metadata only — never the rendered markdown, which is already in `content`. */
@@ -38,11 +57,17 @@ export default function (pi: ExtensionAPI) {
 		parameters: WebSearchParams,
 
 		async execute(_toolCallId, params, signal) {
+			// Checked before the key is looked up: a bad count or recency value is
+			// the model's to fix, and saying so costs neither a keychain prompt nor
+			// a request. The normalised freshness is what the header will report.
+			const count = normalizeCount(params.count);
+			const freshness = normalizeFreshness(params.freshness);
+
 			// Resolved per call rather than at load time, so a session without a
 			// key still starts — and reports the problem only if a search is run.
 			const startedAt = Date.now();
 			const key = resolveApiKey();
-			const response = await search(params.query, key, signal);
+			const response = await search(params.query, key, { count, freshness }, signal);
 
 			const details: WebSearchDetails = {
 				query: params.query,
@@ -52,7 +77,7 @@ export default function (pi: ExtensionAPI) {
 			// The budget is pi's tool output limit, applied whole result by whole
 			// result — a wide search must not flood the context window, and half an
 			// entry is a URL the model cannot fetch.
-			const text = formatResults(params.query, response, { maxBytes: DEFAULT_MAX_BYTES });
+			const text = formatResults(params.query, response, { maxBytes: DEFAULT_MAX_BYTES, freshness });
 
 			return { content: [{ type: "text", text }], details };
 		},

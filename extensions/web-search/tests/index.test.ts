@@ -33,7 +33,7 @@ interface RegisteredTool {
 	parameters: { properties: Record<string, { type: string }>; required?: string[] };
 	execute: (
 		toolCallId: string,
-		params: { query: string },
+		params: { query: string; count?: number; freshness?: string },
 		signal: AbortSignal | undefined,
 		onUpdate: undefined,
 		ctx: ExtensionContext,
@@ -160,5 +160,94 @@ describe("the web-search extension", () => {
 			pi: { extensions: string[] };
 		};
 		assert.ok(manifest.pi.extensions.includes("./extensions/web-search/index.ts"), manifest.pi.extensions.join(", "));
+	});
+});
+
+describe("the count and freshness parameters", () => {
+	it("offers a bounded count and a freshness, both optional", () => {
+		const { parameters } = registeredTools()[0] as unknown as RegisteredTool;
+
+		assert.equal(parameters.properties.count?.type, "integer");
+		assert.equal(parameters.properties.freshness?.type, "string");
+		assert.deepEqual(parameters.required, ["query"]);
+	});
+
+	it("declares the range a count may take, so the model does not have to guess", () => {
+		const { parameters } = registeredTools()[0] as unknown as RegisteredTool;
+		const count = parameters.properties.count as { minimum?: number; maximum?: number } | undefined;
+
+		assert.equal(count?.minimum, 1);
+		assert.equal(count?.maximum, 20);
+	});
+
+	it("names every accepted recency form in the freshness description", () => {
+		const { parameters } = registeredTools()[0] as unknown as RegisteredTool;
+		const freshness = parameters.properties.freshness as { description?: string } | undefined;
+
+		for (const form of ["pd", "pw", "pm", "py", "YYYY-MM-DDtoYYYY-MM-DD"]) {
+			assert.ok(freshness?.description?.includes(form), `${form} missing from: ${freshness?.description}`);
+		}
+	});
+
+	it("sends both to Brave and names the filter in the header", async () => {
+		const tool = registeredTools()[0] as unknown as RegisteredTool;
+		const found = { web: { results: [{ title: "T", url: "https://a.test/" }] } };
+		const { fetch, calls } = fakeFetch(() => jsonResponse(found));
+
+		const result = await withEnvKey("test-key", () =>
+			withFetch(fetch, () =>
+				tool.execute("call-1", { query: "rust", count: 3, freshness: "PW" }, undefined, undefined, CTX),
+			),
+		);
+
+		const url = new URL(calls[0]?.url ?? "");
+		assert.equal(url.searchParams.get("count"), "3");
+		assert.equal(url.searchParams.get("freshness"), "pw");
+
+		const content = result.content[0];
+		const text = content?.type === "text" ? content.text : "";
+		assert.match(text, /^search: "rust" — 1 result \(Brave · freshness=pw\)$/m);
+	});
+
+	it("searches for ten results with no recency filter when neither is given", async () => {
+		const tool = registeredTools()[0] as unknown as RegisteredTool;
+		const { fetch, calls } = fakeFetch(() => jsonResponse({ web: { results: [] } }));
+
+		await withEnvKey("test-key", () =>
+			withFetch(fetch, () => tool.execute("call-1", { query: "rust" }, undefined, undefined, CTX)),
+		);
+
+		const url = new URL(calls[0]?.url ?? "");
+		assert.equal(url.searchParams.get("count"), "10");
+		assert.equal(url.searchParams.get("freshness"), null);
+	});
+
+	it("rejects a malformed freshness rather than spending a search on it", async () => {
+		const tool = registeredTools()[0] as unknown as RegisteredTool;
+		const { fetch, calls } = fakeFetch(() => jsonResponse({}));
+
+		const error = await withEnvKey("test-key", () =>
+			withFetch(fetch, async () =>
+				rejection(tool.execute("call-1", { query: "rust", freshness: "last tuesday" }, undefined, undefined, CTX)),
+			),
+		);
+
+		assert.match(error.message, /pd.*pw.*pm.*py/);
+		assert.match(error.message, /YYYY-MM-DDtoYYYY-MM-DD/);
+		assert.equal(calls.length, 0);
+	});
+
+	it("rejects a count outside the supported range, naming the bounds", async () => {
+		const tool = registeredTools()[0] as unknown as RegisteredTool;
+		const { fetch, calls } = fakeFetch(() => jsonResponse({}));
+
+		const error = await withEnvKey("test-key", () =>
+			withFetch(fetch, async () =>
+				rejection(tool.execute("call-1", { query: "rust", count: 50 }, undefined, undefined, CTX)),
+			),
+		);
+
+		assert.match(error.message, /\b1\b.*\b20\b/);
+		assert.equal(calls.length, 0);
 	});
 });
