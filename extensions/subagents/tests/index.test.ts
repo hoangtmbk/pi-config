@@ -246,6 +246,12 @@ describe("subagent registration", () => {
 		assert.match(subagent.description, /Edits code and runs commands/);
 	});
 
+	it("points at the join, so waiting is not mistaken for polling", () => {
+		const { subagent } = fakeSession();
+
+		assert.match(subagent.description, /subagent_wait/);
+	});
+
 	it("says so plainly when no agents were discovered", () => {
 		const { subagent } = fakeSession({ agents: [], problems: [] });
 
@@ -634,6 +640,18 @@ describe("subagent_wait", () => {
 		spawned[0].emit(SETTLED);
 
 		assert.match(await rejoined, /Three call sites\./);
+	});
+
+	it("says a Run named twice once, so one join collects one result per Run", async () => {
+		const { subagent, subagentWait, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		const joined = call(subagentWait, { names: ["scout", "scout"] });
+		spawned[0].emit(said("Found three call sites."));
+		spawned[0].emit(SETTLED);
+		const collected = await joined;
+
+		assert.equal(collected.match(/Found three call sites\./g)?.length, 1);
 	});
 
 	it("collects a real child's result over the RPC stream", async () => {

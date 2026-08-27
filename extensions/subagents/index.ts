@@ -116,6 +116,7 @@ export interface SubagentsOptions {
 function describeRoster(roster: Roster): string {
 	const lines = [
 		"Delegate a task to a subagent and keep working. Returns the run's name immediately — the run works in its own process, and its result is delivered into this conversation when it finishes, so do not poll for it.",
+		"If you have nothing to do until it comes back, wait for it with subagent_wait rather than polling.",
 		"A run starts from an empty context: it sees only the task you write, never this conversation.",
 	];
 
@@ -275,7 +276,9 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 		parameters: SubagentWaitParams,
 
 		async execute(_toolCallId, params) {
-			const named = (params.names ?? []).map((name) => name.trim()).filter(Boolean);
+			// Deduped, because a name given twice is one Run, and collecting it twice
+			// would report the same result twice inside a single join.
+			const named = [...new Set((params.names ?? []).map((name) => name.trim()).filter(Boolean))];
 			// Checked here rather than in the Supervisor, because this is the side
 			// that can say which names would have worked.
 			for (const name of named) if (!supervisor.get(name)) throw unknownRun(name, supervisor.list());
