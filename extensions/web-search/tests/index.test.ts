@@ -119,6 +119,29 @@ describe("the web-search extension", () => {
 		assert.deepEqual(result.details, { query: "go generics", resultCount: 3 });
 	});
 
+	it("renders discussion threads under their own heading, numbered on from the web list", async () => {
+		const tool = registeredTools()[0] as unknown as RegisteredTool;
+		const response = JSON.parse(readFileSync(join(FIXTURE_DIR, "brave-web-discussions.json"), "utf8")) as unknown;
+		const { fetch, calls } = fakeFetch(() => jsonResponse(response));
+
+		const result = await withEnvKey("test-key", () =>
+			withFetch(fetch, () =>
+				tool.execute("call-1", { query: "rust async fn in traits" }, undefined, undefined, CTX),
+			),
+		);
+
+		// Discussions were asked for in the same single search.
+		assert.equal(calls.length, 1);
+		assert.equal(new URL(calls[0]?.url ?? "").searchParams.get("result_filter"), "web,discussions");
+
+		const content = result.content[0];
+		const text = content?.type === "text" ? content.text : "";
+		assert.match(text, /^search: "rust async fn in traits" — 2 web, 2 discussions \(Brave\)$/m);
+		assert.match(text, /^## Discussions$/m);
+		assert.match(text, /^3\. Why is async in traits still painful/m);
+		assert.deepEqual(result.details, { query: "rust async fn in traits", resultCount: 4 });
+	});
+
 	it("keeps a wide search inside pi's tool output limit, whole results only", async () => {
 		const tool = registeredTools()[0] as unknown as RegisteredTool;
 		// Far more text than one tool result may carry, so the budget has to fire.

@@ -70,9 +70,25 @@ export interface BraveResult {
 	extra_snippets?: string[];
 }
 
+/**
+ * The blocks a search asks Brave for.
+ *
+ * Discussions earn the second slot because web results systematically under-rank
+ * them for debugging questions. Of the rest, news is reachable through
+ * `freshness`, videos say nothing to a text agent, and an infobox is a Wikipedia
+ * summary the model usually already has.
+ */
+const RESULT_FILTER = "web,discussions";
+
 /** The slice of Brave's response this tool reads. */
 export interface BraveResponse {
 	web?: { results?: BraveResult[] };
+	/**
+	 * Forum and Q&A threads, in their own block rather than mixed into `web`.
+	 * Brave hangs thread metadata off a `data` object on each result; the fields
+	 * this tool renders sit alongside it, exactly as they do on a web result.
+	 */
+	discussions?: { results?: BraveResult[] };
 }
 
 export interface SearchDeps {
@@ -165,7 +181,7 @@ export function buildSearchUrl(query: string, params: SearchParams = {}): string
 	const url = new URL(ENDPOINT);
 	url.searchParams.set("q", query);
 	url.searchParams.set("count", String(count));
-	url.searchParams.set("result_filter", "web");
+	url.searchParams.set("result_filter", RESULT_FILTER);
 	// The alternative excerpts a result is triaged on — every one that prevents a
 	// wrong `web_fetch` saves 50 KB of context.
 	url.searchParams.set("extra_snippets", "true");

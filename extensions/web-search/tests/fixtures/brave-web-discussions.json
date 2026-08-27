@@ -1,0 +1,61 @@
+{
+  "query": { "original": "rust async fn in traits" },
+  "type": "search",
+  "web": {
+    "type": "search",
+    "results": [
+      {
+        "title": "Async fn and return-position impl Trait in traits",
+        "url": "https://blog.rust-lang.org/2023/12/21/async-fn-rpit-in-traits.html",
+        "description": "Rust 1.75 stabilizes <strong>async fn</strong> and return-position impl Trait in <strong>traits</strong>.",
+        "meta_url": { "scheme": "https", "netloc": "blog.rust-lang.org", "hostname": "blog.rust-lang.org", "path": "› 2023  › 12  › 21" },
+        "extra_snippets": ["<strong>dyn Trait</strong> is still unsupported; dynamic dispatch needs a crate such as async-trait."]
+      },
+      {
+        "title": "async-trait",
+        "url": "https://crates.io/crates/async-trait",
+        "description": "Type erasure for <strong>async trait</strong> methods.",
+        "meta_url": { "scheme": "https", "netloc": "crates.io", "hostname": "crates.io", "path": "› crates  › async-trait" }
+      }
+    ]
+  },
+  "discussions": {
+    "type": "search",
+    "mutated_by_goggles": false,
+    "results": [
+      {
+        "type": "search_result",
+        "subtype": "discussion",
+        "title": "Why is async in traits still painful?",
+        "url": "https://old.reddit.com/r/rust/comments/18abcde/why_is_async_in_traits_still_painful/",
+        "description": "The stabilized form covers static dispatch only, so anything object-safe still reaches for a crate.",
+        "meta_url": { "scheme": "https", "netloc": "old.reddit.com", "hostname": "old.reddit.com", "path": "› r  › rust" },
+        "data": {
+          "forum_name": "r/rust",
+          "num_answers": 42,
+          "score": "128 points",
+          "title": "Why is async in traits still painful?",
+          "question": "I upgraded to 1.75 expecting dyn support and did not get it. What am I missing?",
+          "top_comment": "Nothing — RPITIT gives you static dispatch. Object safety is a separate, unsolved problem."
+        },
+        "extra_snippets": ["Send bounds are the other half: the returned future is not guaranteed Send."]
+      },
+      {
+        "type": "search_result",
+        "subtype": "discussion",
+        "title": "async fn in trait: what changed in 1.75",
+        "url": "https://users.rust-lang.org/t/async-fn-in-trait-what-changed-in-1-75/104321",
+        "description": "A walk through the desugaring, and why the associated type cannot be named yet.",
+        "meta_url": { "scheme": "https", "netloc": "users.rust-lang.org", "hostname": "users.rust-lang.org", "path": "› t" },
+        "data": {
+          "forum_name": "The Rust Programming Language Forum",
+          "num_answers": 7,
+          "score": null,
+          "title": "async fn in trait: what changed in 1.75",
+          "question": "Can someone spell out the desugaring?",
+          "top_comment": "It produces an anonymous associated type, which is why you cannot write the bound."
+        }
+      }
+    ]
+  }
+}

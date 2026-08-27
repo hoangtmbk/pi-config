@@ -9,6 +9,11 @@
  * ready to hand to `web_fetch`. The excerpts are why a search is cheaper than a
  * fetch — each one that rules a page out saves reading 50 KB of it.
  *
+ * Discussion threads follow the web results under their own heading, sharing
+ * one numbering sequence with them: a heading so the model can tell a forum
+ * thread from an article, one sequence so referring to either works the same
+ * way.
+ *
  * Every field of a result is optional. Brave omits what a page has none of, so
  * a missing title, description or excerpt degrades the entry rather than
  * failing the search; only a missing URL removes it, because there would be
@@ -169,21 +174,84 @@ function formatResult(result: BraveResult, index: number): string {
 }
 
 /**
- * The results worth showing, in Brave's order.
+ * The two kinds of hit a search returns, in the order they render.
  *
- * A result with no URL cannot be fetched, so it is not worth a number — and
- * dropping it here rather than in the renderer keeps the count in the header,
- * the numbering, and anything the caller reports about the search in agreement.
+ * Both are ranked lists of pages, so both render as one, but a forum thread is
+ * read differently from an article — the answer is in the replies, and its
+ * authority is a stranger's. The heading is what lets the model tell them
+ * apart; the numbering, which runs across both, is what lets it refer to any of
+ * them the same way.
  */
-export function usableResults(response: BraveResponse): BraveResult[] {
-	return (response.web?.results ?? []).filter((result) => Boolean(result.url));
+interface Section {
+	/**
+	 * Rendered above the section's first entry. The web list leads and needs
+	 * none: a heading over the top of the list would say what the header already
+	 * said.
+	 */
+	heading?: string;
+	/** How the header names this kind, given how many of it were returned. */
+	label: (total: number) => string;
+	results: BraveResult[];
 }
 
-/** How many results there are, and — when the budget dropped some — how many are shown. */
-function countPhrase(shown: number, total: number): string {
-	if (total === 0) return "no results";
-	const noun = `result${total === 1 ? "" : "s"}`;
-	return shown >= total ? `${total} ${noun}` : `showing ${shown} of ${total} ${noun}`;
+/** A result with no URL cannot be fetched, so it is not worth a number. */
+function fetchable(results: BraveResult[] = []): BraveResult[] {
+	return results.filter((result) => Boolean(result.url));
+}
+
+/**
+ * The sections worth rendering, in Brave's order, empty ones dropped.
+ *
+ * Dropping them here rather than in the renderer is what keeps a search with no
+ * discussions from growing an empty heading, and keeps the header, the
+ * numbering and anything the caller reports about the search in agreement.
+ */
+function sectionsOf(response: BraveResponse): Section[] {
+	const sections: Section[] = [
+		{ label: () => "web", results: fetchable(response.web?.results) },
+		{
+			heading: "## Discussions",
+			label: (total) => `discussion${total === 1 ? "" : "s"}`,
+			results: fetchable(response.discussions?.results),
+		},
+	];
+	return sections.filter((section) => section.results.length > 0);
+}
+
+/**
+ * The results worth showing, across both sections, in the order they render.
+ *
+ * The caller counts them to report the size of the search, so this is the same
+ * list the numbering runs over — one hit, one number, one count.
+ */
+export function usableResults(response: BraveResponse): BraveResult[] {
+	return sectionsOf(response).flatMap((section) => section.results);
+}
+
+/**
+ * How many hits there are of each kind, and — when the budget dropped some —
+ * how many of each are shown.
+ *
+ * The kinds are named only when there is more than the web list to name: with
+ * discussions in play, "10 web, 3 discussions" says which part of the list is
+ * which, and without them a search reads as the plain "10 results" it always
+ * has. `showing` is forced when the widest the phrase could ever get is being
+ * measured rather than rendered.
+ */
+function countPhrase(sections: Section[], shown: number[], forceShowing = false): string {
+	if (sections.length === 0) return "no results";
+
+	// A heading means a kind other than the leading web list is in play.
+	const named = sections.some((section) => section.heading !== undefined);
+	const complete = !forceShowing && sections.every((section, index) => shown[index] === section.results.length);
+
+	const parts = sections.map((section, index) => {
+		const total = section.results.length;
+		const noun = named ? section.label(total) : `result${total === 1 ? "" : "s"}`;
+		return complete ? `${total} ${noun}` : `${shown[index]} of ${total} ${noun}`;
+	});
+
+	return `${complete ? "" : "showing "}${parts.join(", ")}`;
 }
 
 /**
@@ -224,6 +292,36 @@ export interface FormatOptions {
 	freshness?: string;
 }
 
+/** One entry as it renders, and which section it belongs to. */
+interface Chunk {
+	text: string;
+	section: number;
+}
+
+/**
+ * Every entry, numbered continuously across the sections, each one carrying its
+ * own heading when it opens a section.
+ *
+ * The heading travels with the entry below it rather than standing on its own,
+ * so a budget that stops before that entry cannot leave a heading promising
+ * results that were dropped.
+ */
+function chunksOf(sections: Section[]): Chunk[] {
+	const chunks: Chunk[] = [];
+	let number = 1;
+
+	for (const [index, section] of sections.entries()) {
+		for (const [position, result] of section.results.entries()) {
+			const entry = formatResult(result, number);
+			number += 1;
+			const opensSection = position === 0 && section.heading !== undefined;
+			chunks.push({ text: opensSection ? `${section.heading}${SEPARATOR}${entry}` : entry, section: index });
+		}
+	}
+
+	return chunks;
+}
+
 /**
  * The full tool output for one search.
  *
@@ -235,30 +333,33 @@ export interface FormatOptions {
  * query, so there is nothing to rescue.
  */
 export function formatResults(query: string, response: BraveResponse, options: FormatOptions = {}): string {
-	const results = usableResults(response);
+	const sections = sectionsOf(response);
 	const maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY;
 	const { freshness } = options;
 
-	if (results.length === 0) return header(query, countPhrase(0, 0), freshness);
+	const totals = sections.map((section) => section.results.length);
+	if (sections.length === 0) return header(query, countPhrase(sections, totals), freshness);
 
-	const entries = results.map((result, index) => formatResult(result, index + 1));
-	const fullHeader = header(query, countPhrase(entries.length, entries.length), freshness);
-	const whole = `${fullHeader}${RULE}${entries.join(SEPARATOR)}`;
+	const chunks = chunksOf(sections);
+	const fullHeader = header(query, countPhrase(sections, totals), freshness);
+	const whole = `${fullHeader}${RULE}${chunks.map((chunk) => chunk.text).join(SEPARATOR)}`;
 	if (bytes(whole) <= maxBytes) return whole;
 
-	// Dropping any result lengthens the header, so the room it will need is
-	// reserved before the entries are measured. At most `total - 1` are shown,
-	// which is the widest that phrase can get.
-	let used = bytes(header(query, countPhrase(entries.length - 1, entries.length), freshness)) + bytes(RULE);
-	const shown: string[] = [];
-	for (const entry of entries) {
-		const cost = bytes(entry) + (shown.length === 0 ? 0 : bytes(SEPARATOR));
+	// Dropping any hit lengthens the header, so the room it will need is reserved
+	// before the entries are measured. The `showing x of y` form at full counts is
+	// the widest that phrase can get, whatever survives below.
+	let used = bytes(header(query, countPhrase(sections, totals, true), freshness)) + bytes(RULE);
+	const shown = sections.map(() => 0);
+	const kept: string[] = [];
+	for (const chunk of chunks) {
+		const cost = bytes(chunk.text) + (kept.length === 0 ? 0 : bytes(SEPARATOR));
 		if (used + cost > maxBytes) break;
 		used += cost;
-		shown.push(entry);
+		kept.push(chunk.text);
+		shown[chunk.section] += 1;
 	}
 
-	const head = header(query, countPhrase(shown.length, entries.length), freshness);
+	const head = header(query, countPhrase(sections, shown), freshness);
 	// A rule over an empty list would promise results that are not there.
-	return shown.length === 0 ? head : `${head}${RULE}${shown.join(SEPARATOR)}`;
+	return kept.length === 0 ? head : `${head}${RULE}${kept.join(SEPARATOR)}`;
 }

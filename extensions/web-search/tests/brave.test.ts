@@ -17,11 +17,15 @@ describe("buildSearchUrl", () => {
 		assert.match(buildSearchUrl("hello"), /^https:\/\/api\.search\.brave\.com\/res\/v1\/web\/search\?/);
 	});
 
-	it("carries the query, a result count, and the web filter", () => {
+	it("carries the query and a result count", () => {
 		const url = new URL(buildSearchUrl("rust async fn in traits"));
 		assert.equal(url.searchParams.get("q"), "rust async fn in traits");
 		assert.equal(url.searchParams.get("count"), "10");
-		assert.equal(url.searchParams.get("result_filter"), "web");
+	});
+
+	it("asks for discussion threads alongside the web results, and nothing else", () => {
+		const url = new URL(buildSearchUrl("rust async fn in traits"));
+		assert.equal(url.searchParams.get("result_filter"), "web,discussions");
 	});
 
 	it("asks for the extra snippets, the excerpts a result is triaged on", () => {
