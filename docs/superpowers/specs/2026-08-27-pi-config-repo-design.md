@@ -10,7 +10,7 @@ credentials, caches or session transcripts under version control.
 
 ## Decision
 
-A **pi package repo** (`hoangtmbk/pi-config`, private), consumed via `pi install`, rather than
+A **pi package repo** (`hoangtmbk/pi-config`, public — it holds no credentials or machine state), consumed via `pi install`, rather than
 git-tracking `~/.pi/agent` directly. Rationale: `~/.pi/agent` also holds `auth.json` (OAuth
 tokens), `sessions/`, `models-store.json`, `trust.json` and pi-managed `git/`/`npm/` clones; a
 dotfiles-style repo there is one `git add -A` away from leaking a token, and the existing
