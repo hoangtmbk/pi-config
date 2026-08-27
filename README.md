@@ -73,11 +73,21 @@ since the files were cleaned when that run ended. The model should re-fetch the 
 | Type | Handling |
 |---|---|
 | `text/html`, `application/xhtml+xml` | Readability extraction → markdown, with a whole-page fallback |
-| `application/json`, `*+json` | Parsed and pretty-printed; raw passthrough if malformed |
+| `application/json`, `*+json` | Rendered as markdown when the payload is one we know (npm, PyPI, StackExchange); otherwise pretty-printed, and passed through raw if malformed |
+| `application/pdf` | Text layer extracted, one marker per page; a scan with no text layer throws |
 | `text/*`, YAML, XML, source files | Passed through unchanged |
 | Anything else | Throws, naming the type and size — never dumps binary into context |
 
 When a server sends no `Content-Type`, the body is sniffed for HTML.
+
+## URL rewrites
+
+Some pages have a machine-readable twin, and fetching that instead costs a fraction of the tokens:
+a GitHub blob becomes the raw file, an npm or PyPI project page becomes its registry document, a
+Wikipedia article becomes Parsoid HTML, an arXiv abstract becomes the HTML rendering, and a
+StackExchange question becomes the API document — plus one extra request for its top answers, merged
+into the same payload. Every rewrite is a guess, so a non-2xx answer falls back to the original URL,
+and either way the swap is reported in the `note:` line of the header.
 
 ## What the cleanup does
 
@@ -111,7 +121,7 @@ Each rule was added because it was observed wasting tokens on a real page:
 
 ## Not included, on purpose
 
-JavaScript rendering, caching, robots.txt, search, multi-URL fetching, PDF, and auth/cookies. There
+JavaScript rendering, caching, robots.txt, search, multi-URL fetching, and auth/cookies. There
 is also no SSRF blocking — fetching `localhost:3000` docs is a thing you want from a local dev tool.
 
 ## Testing

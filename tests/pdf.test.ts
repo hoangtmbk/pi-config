@@ -1,51 +1,13 @@
 /**
- * PDF text extraction, against PDFs built here byte by byte.
+ * PDF text extraction, against PDFs built byte by byte by `makePdf` (helpers.ts).
  *
- * A fixture file would be opaque (and a network fetch is out of the question),
- * so the test writes the smallest document PDF.js will accept: catalog, page
- * tree, one Helvetica font, and a text-showing content stream per page, with a
- * cross-reference table whose offsets are computed from the serialised output.
+ * A fixture file would be opaque, and a network fetch is out of the question.
  */
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { pdfToText } from "../pdf.ts";
-
-/** A one-line PDF per page, each drawn with `Tj` so it lands in the text layer. */
-function makePdf(pageTexts: string[], title?: string): Uint8Array {
-	// Object ids: 1 catalog, 2 page tree, 3 font, then page/content pairs.
-	const pageIds = pageTexts.map((_, index) => 4 + index * 2);
-	const objects = [
-		"<< /Type /Catalog /Pages 2 0 R >>",
-		`<< /Type /Pages /Kids [${pageIds.map((id) => `${id} 0 R`).join(" ")}] /Count ${pageTexts.length} >>`,
-		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-	];
-	for (const [index, text] of pageTexts.entries()) {
-		const stream = `BT /F1 24 Tf 100 700 Td (${text}) Tj ET`;
-		objects.push(
-			"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] " +
-				`/Resources << /Font << /F1 3 0 R >> >> /Contents ${pageIds[index]! + 1} 0 R >>`,
-			`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
-		);
-	}
-
-	if (title !== undefined) objects.push(`<< /Title (${title}) >>`);
-	const infoId = title === undefined ? undefined : objects.length;
-
-	// ASCII only, so string length is the byte offset each xref entry needs.
-	let pdf = "%PDF-1.4\n";
-	const offsets = objects.map((object, index) => {
-		const offset = pdf.length;
-		pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
-		return offset;
-	});
-	const startxref = pdf.length;
-	pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
-	for (const offset of offsets) pdf += `${String(offset).padStart(10, "0")} 00000 n \n`;
-	const info = infoId === undefined ? "" : ` /Info ${infoId} 0 R`;
-	pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R${info} >>\nstartxref\n${startxref}\n%%EOF\n`;
-	return new TextEncoder().encode(pdf);
-}
+import { makePdf } from "./helpers.ts";
 
 const PAGE_ONE = "Hello PDF, this is page one.";
 const PAGE_TWO = "And this is page two.";

@@ -10,7 +10,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { describe, it } from "node:test";
 import { extract } from "../extract.ts";
-import { type FetchedPage, fetchPage, WebFetchError } from "../fetch.ts";
+import { type FetchedPage, fetchPage, resolveRequestUrl, WebFetchError } from "../fetch.ts";
 
 type Handler = (req: http.IncomingMessage, res: http.ServerResponse) => void;
 
@@ -114,7 +114,7 @@ describe("request headers", () => {
 		);
 
 		assert.equal(page.contentType, "text/markdown");
-		const extracted = extract(page, false);
+		const extracted = await extract(page, false);
 		assert.equal(extracted.mode, "text");
 		assert.equal(extracted.markdown, "# Title\n\nBody text.");
 	});
@@ -396,6 +396,7 @@ describe("tracking parameters", () => {
 	function htmlPage(body: string): FetchedPage {
 		return {
 			url: "https://example.test/",
+			requestedUrl: "https://example.test/",
 			status: 200,
 			contentType: "text/html",
 			charset: "utf-8",
@@ -405,9 +406,9 @@ describe("tracking parameters", () => {
 		};
 	}
 
-	it("strips analytics parameters but keeps meaningful ones", () => {
+	it("strips analytics parameters but keeps meaningful ones", async () => {
 		const link = "https://example.com/a?utm_source=x&fbclid=y&ref_src=z&ref=keep&source=keep&si=keep&id=7";
-		const { markdown } = extract(htmlPage(`<html><body><p><a href="${link}">link</a></p></body></html>`), true);
+		const { markdown } = await extract(htmlPage(`<html><body><p><a href="${link}">link</a></p></body></html>`), true);
 
 		assert.ok(!markdown.includes("utm_source"), markdown);
 		assert.ok(!markdown.includes("fbclid"), markdown);
@@ -416,5 +417,173 @@ describe("tracking parameters", () => {
 		assert.match(markdown, /source=keep/);
 		assert.match(markdown, /si=keep/);
 		assert.match(markdown, /id=7/);
+	});
+});
+
+describe("URL rewrites", () => {
+	it("resolves a github blob URL to the raw file, keeping the original as the fallback", () => {
+		const resolved = resolveRequestUrl("https://github.com/mozilla/readability/blob/main/README.md");
+
+		assert.equal(resolved.url, "https://raw.githubusercontent.com/mozilla/readability/main/README.md");
+		assert.equal(resolved.rewrite?.note, "github blob → raw");
+		assert.equal(resolved.rewrite?.fallback?.toString(), "https://github.com/mozilla/readability/blob/main/README.md");
+	});
+
+	it("leaves an ordinary URL alone", () => {
+		const resolved = resolveRequestUrl("https://example.test/page");
+		assert.equal(resolved.url, "https://example.test/page");
+		assert.equal(resolved.rewrite, undefined);
+	});
+
+	it("fetches the rewritten URL and says so", async () => {
+		const paths: string[] = [];
+		const page = await withServer(
+			(req, res) => {
+				paths.push(req.url ?? "");
+				text(200, "text/plain", "raw file")(req, res);
+			},
+			(base) =>
+				fetchPage(`http://${base}/asked-for`, undefined, {
+					rewrite: () => ({ url: new URL(`http://${base}/rewritten`), note: "test → rewritten" }),
+				}),
+		);
+
+		assert.deepEqual(paths, ["/rewritten"]);
+		assert.equal(page.body, "raw file");
+		assert.equal(page.requestedUrl, `http://${page.url.split("/")[2]}/asked-for`);
+		assert.equal(page.note, "test → rewritten");
+	});
+
+	it("falls back to the original when the rewritten URL answers non-2xx", async () => {
+		const paths: string[] = [];
+		const page = await withServer(
+			(req, res) => {
+				paths.push(req.url ?? "");
+				if (req.url === "/original") {
+					text(200, "text/html", "<p>the page itself</p>")(req, res);
+					return;
+				}
+				text(404, "text/plain", "no such raw file")(req, res);
+			},
+			(base) =>
+				fetchPage(`http://${base}/original`, undefined, {
+					rewrite: () => ({
+						url: new URL(`http://${base}/rewritten`),
+						note: "test → rewritten",
+						fallback: new URL(`http://${base}/original`),
+					}),
+				}),
+		);
+
+		assert.deepEqual(paths, ["/rewritten", "/original"]);
+		assert.equal(page.body, "<p>the page itself</p>");
+		assert.match(page.url, /\/original$/);
+		assert.equal(page.note, "test → rewritten failed (404); fetched original");
+	});
+
+	it("keeps the rewrite's failure to itself when there is no fallback", async () => {
+		const error = await withServer(text(404, "text/plain", "gone"), (base) =>
+			rejection(
+				fetchPage(`http://${base}/asked-for`, undefined, {
+					rewrite: () => ({ url: new URL(`http://${base}/rewritten`), note: "test → rewritten" }),
+				}),
+			),
+		);
+
+		assert.match(error.message, /HTTP 404/);
+		assert.match(error.message, /\/rewritten/);
+	});
+});
+
+describe("StackExchange answers", () => {
+	const QUESTION = {
+		items: [{ question_id: 1, title: "How do I do the thing?", score: 4, body: "<p>Asking.</p>" }],
+	};
+	const ANSWERS = { items: [{ answer_id: 2, score: 9, is_accepted: true, body: "<p>Like this.</p>" }] };
+
+	/** Serve the question document and, one path deeper, its answers. */
+	const serve: Handler = (req, res) => {
+		const path = (req.url ?? "").split("?")[0];
+		if (path === "/questions/1/answers") {
+			text(200, "application/json", JSON.stringify(ANSWERS))(req, res);
+			return;
+		}
+		text(200, "application/json", JSON.stringify(QUESTION))(req, res);
+	};
+
+	/** Fetch through a rewrite that points at the local question document. */
+	function fetchQuestion(base: string): Promise<FetchedPage> {
+		return fetchPage(`http://${base}/q/1`, undefined, {
+			rewrite: () => ({
+				url: new URL(`http://${base}/questions/1?site=test&filter=withbody`),
+				note: "stackoverflow → StackExchange API",
+				fallback: new URL(`http://${base}/q/1`),
+			}),
+		});
+	}
+
+	it("merges the answers into the question document", async () => {
+		const queries: string[] = [];
+		const page = await withServer(
+			(req, res) => {
+				queries.push(req.url ?? "");
+				serve(req, res);
+			},
+			fetchQuestion,
+		);
+
+		assert.deepEqual(queries, [
+			"/questions/1?site=test&filter=withbody",
+			"/questions/1/answers?site=test&filter=withbody&order=desc&sort=votes&pagesize=10",
+		]);
+
+		const merged = JSON.parse(page.body) as { items: unknown[]; answers: { answer_id: number }[] };
+		assert.equal(merged.items.length, 1, "the question survives the merge");
+		assert.deepEqual(merged.answers, ANSWERS.items);
+		assert.equal(page.bytes, Buffer.byteLength(page.body), "the byte count follows the merged body");
+	});
+
+	it("hands extract one JSON document holding both", async () => {
+		// The renderer keys on the real API host, which a loopback server is not,
+		// so this asserts the merge survives as far as extract — the rendering of
+		// an api.stackexchange.com payload is covered in the extract unit tests.
+		const page = await withServer(serve, fetchQuestion);
+		const extracted = await extract(page, false);
+
+		assert.equal(extracted.mode, "json");
+		assert.match(extracted.markdown, /How do I do the thing\?/);
+		assert.match(extracted.markdown, /Like this\./);
+	});
+
+	it("returns the question alone when the answers request fails", async () => {
+		const page = await withServer((req, res) => {
+			if ((req.url ?? "").startsWith("/questions/1/answers")) {
+				text(500, "text/plain", "boom")(req, res);
+				return;
+			}
+			serve(req, res);
+		}, fetchQuestion);
+
+		const merged = JSON.parse(page.body) as { items: unknown[]; answers?: unknown };
+		assert.equal(merged.items.length, 1);
+		assert.equal(merged.answers, undefined);
+	});
+
+	it("asks for no answers when the rewrite was abandoned for its fallback", async () => {
+		const paths: string[] = [];
+		const page = await withServer(
+			(req, res) => {
+				paths.push((req.url ?? "").split("?")[0] as string);
+				if ((req.url ?? "").startsWith("/questions/1")) {
+					text(404, "text/plain", "throttled")(req, res);
+					return;
+				}
+				text(200, "text/html", "<p>the question page</p>")(req, res);
+			},
+			fetchQuestion,
+		);
+
+		assert.deepEqual(paths, ["/questions/1", "/q/1"]);
+		assert.equal(page.body, "<p>the question page</p>");
 	});
 });

@@ -6,7 +6,13 @@
  * content-type gate so binaries are never downloaded into the context window,
  * and wiring pi's cancellation signal through to the socket so Esc actually
  * aborts an in-flight request.
+ *
+ * It also owns the *where*: `rewrite.ts` decides that a human-facing page has a
+ * machine-readable twin, and this layer fetches it — falling back to the
+ * original when the guess misses, so a rewrite can never lose a page.
  */
+
+import { type Rewrite, rewriteUrl } from "./rewrite.ts";
 
 /** Many sites 403 a bare Node fetch. Present as a normal browser. */
 const USER_AGENT =
@@ -73,6 +79,10 @@ function isLocalHost(host: string): boolean {
 export interface FetchedPage {
 	/** URL after redirects — used as the base for resolving relative links. */
 	url: string;
+	/** What the caller asked for, normalized and before any rewrite. */
+	requestedUrl: string;
+	/** Set when the URL fetched was not the URL asked for, so the swap is never silent. */
+	note?: string;
 	status: number;
 	/** Lowercased content type, parameters stripped. Empty string if absent. */
 	contentType: string;
@@ -91,6 +101,11 @@ export interface FetchOptions {
 	allowPdf?: boolean;
 	/** Deadline for the whole request including the body read. Defaults to 30s. */
 	timeoutMs?: number;
+	/**
+	 * The rewrite table to consult. Defaults to the real one; a test injects its
+	 * own so the fallback and answer-merging paths can run against a local server.
+	 */
+	rewrite?: (url: URL) => Rewrite | undefined;
 }
 
 export class WebFetchError extends Error {}
@@ -310,9 +325,79 @@ function summarizeErrorBody(body: string): string {
 		.slice(0, 300);
 }
 
+/**
+ * Where a request should actually go: the machine-readable twin when a rule
+ * knows of one, the URL itself otherwise. Exported so the rewrite decision can
+ * be tested without a round trip.
+ */
+export function resolveRequestUrl(
+	normalized: string,
+	rewrite: (url: URL) => Rewrite | undefined = rewriteUrl,
+): { url: string; rewrite: Rewrite | undefined } {
+	let applied: Rewrite | undefined;
+	try {
+		applied = rewrite(new URL(normalized));
+	} catch {
+		// A rule that throws must not cost us the page.
+		applied = undefined;
+	}
+	return { url: (applied?.url ?? normalized).toString(), rewrite: applied };
+}
+
+/** The API document for a single question — the one rewrite that needs a second request. */
+const QUESTION_PATH_PATTERN = /\/questions\/\d+$/;
+
+/** Answers per question. The API allows 100; ten is what a reader will read. */
+const MAX_ANSWERS = 10;
+
+/**
+ * Splice a question's answers into the question document.
+ *
+ * The questions endpoint returns the question alone, and the answers are the
+ * reason anyone opened the page. They arrive as a second document, merged into
+ * the first under `answers` so `extract` still sees a single JSON payload.
+ * Every failure here is survivable: the question by itself is still the page.
+ */
+async function attachAnswers(
+	questionUrl: URL,
+	page: FetchedPage,
+	get: (url: string) => Promise<Response>,
+): Promise<void> {
+	const site = questionUrl.searchParams.get("site");
+	if (site === null) return;
+
+	const url = new URL(questionUrl);
+	url.pathname = `${url.pathname}/answers`;
+	url.search = new URLSearchParams({
+		site,
+		filter: "withbody",
+		order: "desc",
+		sort: "votes",
+		pagesize: String(MAX_ANSWERS),
+	}).toString();
+
+	try {
+		const response = await get(url.toString());
+		if (!response.ok) {
+			await response.body?.cancel().catch(() => {});
+			return;
+		}
+		const { bytes } = await readBoundedBody(response, MAX_BODY_BYTES);
+		const { charset } = parseContentType(response.headers.get("content-type"));
+		const items: unknown = JSON.parse(decodeBody(bytes, charset)).items;
+		const question: unknown = JSON.parse(page.body);
+		if (!Array.isArray(items) || typeof question !== "object" || question === null) return;
+
+		page.body = JSON.stringify({ ...question, answers: items });
+		page.bytes = Buffer.byteLength(page.body);
+	} catch {
+		// Rate limit, malformed JSON, dead connection — proceed with the question.
+	}
+}
+
 export async function fetchPage(rawUrl: string, signal?: AbortSignal, options: FetchOptions = {}): Promise<FetchedPage> {
-	const url = normalizeUrl(rawUrl);
-	const shown = shortUrl(url);
+	const requestedUrl = normalizeUrl(rawUrl);
+	const resolved = resolveRequestUrl(requestedUrl, options.rewrite);
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
 	// Combine pi's cancellation with our own timeout so either can abort.
@@ -320,7 +405,8 @@ export async function fetchPage(rawUrl: string, signal?: AbortSignal, options: F
 	const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
 
 	/** Map a transport/abort failure — from the request or from the body read — onto a readable error. */
-	const fail = (error: unknown, phase: "reach" | "read"): WebFetchError => {
+	const fail = (error: unknown, phase: "reach" | "read", failed: string): WebFetchError => {
+		const shown = shortUrl(failed);
 		if (signal?.aborted) return new WebFetchError(`Cancelled: ${shown}`);
 		if (timeout.aborted) return new WebFetchError(`Timed out after ${timeoutMs / 1000}s: ${shown}`);
 		const reason = describeFailure(error);
@@ -329,7 +415,7 @@ export async function fetchPage(rawUrl: string, signal?: AbortSignal, options: F
 		);
 	};
 
-	const send = async (userAgent: string): Promise<Response> => {
+	const send = async (url: string, userAgent: string): Promise<Response> => {
 		try {
 			return await fetch(url, {
 				redirect: "follow",
@@ -344,19 +430,36 @@ export async function fetchPage(rawUrl: string, signal?: AbortSignal, options: F
 				},
 			});
 		} catch (error) {
-			throw fail(error, "reach");
+			throw fail(error, "reach", url);
 		}
 	};
 
-	let response = await send(USER_AGENT);
+	/** One URL, including the bot-wall retry. */
+	const attempt = async (target: string): Promise<Response> => {
+		const first = await send(target, USER_AGENT);
+		// Bot walls key on the browser UA arriving without client hints. An honest
+		// crawler UA gets through often enough to be worth exactly one retry.
+		if (!RETRY_STATUSES.has(first.status)) return first;
+		await first.body?.cancel().catch(() => {});
+		return await send(target, PLAIN_USER_AGENT);
+	};
 
-	// Bot walls key on the browser UA arriving without client hints. An honest
-	// crawler UA gets through often enough to be worth exactly one retry.
-	if (RETRY_STATUSES.has(response.status)) {
+	let url = resolved.url;
+	let note = resolved.rewrite?.note;
+	let response = await attempt(url);
+
+	// A rewrite is a guess about where the content lives: an API can rate-limit,
+	// a raw-file address can be wrong. When the guess misses, the page the user
+	// actually asked for is still there.
+	const fallback = resolved.rewrite?.fallback;
+	if (!response.ok && fallback) {
 		await response.body?.cancel().catch(() => {});
-		response = await send(PLAIN_USER_AGENT);
+		note = `${resolved.rewrite?.note} failed (${response.status}); fetched original`;
+		url = fallback.toString();
+		response = await attempt(url);
 	}
 
+	const shown = shortUrl(url);
 	const { type, charset } = parseContentType(response.headers.get("content-type"));
 
 	if (!response.ok) {
@@ -383,7 +486,7 @@ export async function fetchPage(rawUrl: string, signal?: AbortSignal, options: F
 	try {
 		read = await readBoundedBody(response, MAX_BODY_BYTES);
 	} catch (error) {
-		throw fail(error, "read");
+		throw fail(error, "read", url);
 	}
 
 	if (response.status === 204 || read.bytes.length === 0) {
@@ -397,6 +500,7 @@ export async function fetchPage(rawUrl: string, signal?: AbortSignal, options: F
 
 	const page: FetchedPage = {
 		url: response.url || url,
+		requestedUrl,
 		status: response.status,
 		contentType: type,
 		charset,
@@ -404,6 +508,14 @@ export async function fetchPage(rawUrl: string, signal?: AbortSignal, options: F
 		bytes: read.bytes.length,
 		truncatedAtBytes: read.truncated,
 	};
+	if (note !== undefined) page.note = note;
 	if (kind === "pdf") page.bytesBody = read.bytes;
+
+	// A StackExchange question document is only half the page; the answers are a
+	// second request. Skipped when the rewrite was abandoned for its fallback.
+	const rewritten = resolved.rewrite !== undefined && url === resolved.url ? new URL(url) : undefined;
+	if (rewritten && type.includes("json") && QUESTION_PATH_PATTERN.test(rewritten.pathname)) {
+		await attachAnswers(rewritten, page, (target) => send(target, USER_AGENT));
+	}
 	return page;
 }

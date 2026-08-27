@@ -10,12 +10,13 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { extract, type Extracted } from "../extract.ts";
 import type { FetchedPage } from "../fetch.ts";
-import { headings } from "./helpers.ts";
+import { headings, makePdf } from "./helpers.ts";
 
 /** The full extraction result for an inline page body. */
-function extractOf(body: string, raw = false): Extracted {
+async function extractOf(body: string, raw = false): Promise<Extracted> {
 	const page: FetchedPage = {
 		url: "https://example.test/page",
+		requestedUrl: "https://example.test/page",
 		status: 200,
 		contentType: "text/html",
 		charset: "utf-8",
@@ -23,12 +24,12 @@ function extractOf(body: string, raw = false): Extracted {
 		bytes: Buffer.byteLength(body),
 		truncatedAtBytes: false,
 	};
-	return extract(page, raw);
+	return await extract(page, raw);
 }
 
 /** Article-mode markdown for an inline page body. */
-function markdownOf(body: string): string {
-	return extractOf(body).markdown;
+async function markdownOf(body: string): Promise<string> {
+	return (await extractOf(body)).markdown;
 }
 
 /** The `|`-delimited lines of the markdown — the GFM table, if one was emitted. */
@@ -48,8 +49,8 @@ const FILLER =
 	"lifetime of the process, so a change to any of them needs a restart before it " +
 	"takes effect anywhere in the cluster. The defaults are safe for production.</p>";
 
-describe("code-block chrome removal must not touch prose", () => {
-	const markdown = markdownOf(`<!doctype html>
+describe("code-block chrome removal must not touch prose", async () => {
+	const markdown = await markdownOf(`<!doctype html>
 <html><head><title>Chrome removal</title></head><body>
 <h1>Chrome removal</h1>
 ${FILLER}
@@ -63,33 +64,33 @@ ${FILLER}
 <div class="language-namespace"><p>Keep this namespace note too</p></div>
 </body></html>`);
 
-	it("keeps a body-copy block sitting next to a code block", () => {
+	it("keeps a body-copy block sitting next to a code block", async () => {
 		assert.ok(markdown.includes("Keep me"), `body-copy prose deleted; got:\n${markdown}`);
 	});
 
-	it("keeps a class that merely starts with a label token", () => {
+	it("keeps a class that merely starts with a label token", async () => {
 		assert.ok(
 			markdown.includes("Keep this namespace note too"),
 			`language-namespace prose deleted; got:\n${markdown}`,
 		);
 	});
 
-	it("drops the copy control and the language label around the code", () => {
+	it("drops the copy control and the language label around the code", async () => {
 		assert.equal(markdown.includes("Copy"), false, `copy control leaked; got:\n${markdown}`);
 		const stray = markdown.split("\n").filter((line) => line.trim() === "js");
 		assert.deepEqual(stray, [], `language label leaked as a stray line; got:\n${markdown}`);
 	});
 
-	it("still fences the code with its language", () => {
+	it("still fences the code with its language", async () => {
 		assert.ok(markdown.includes("```js\nconst x = 1;\n```"), `code block mangled; got:\n${markdown}`);
 	});
 });
 
-describe("the article's own top heading survives Readability", () => {
+describe("the article's own top heading survives Readability", async () => {
 	// Readability deletes the first h1/h2 whose text similarity to the page title
 	// exceeds 0.75. A title that is the heading plus a few more words scores 1.0,
 	// so the heading goes even though the two are not the same string.
-	const markdown = markdownOf(`<!doctype html>
+	const markdown = await markdownOf(`<!doctype html>
 <html><head><title>Configuring TLS for the gateway</title></head><body>
 <header><p>Example Docs</p></header>
 <main>
@@ -99,13 +100,13 @@ ${FILLER}
 </main>
 </body></html>`);
 
-	it("keeps the h1 that differs from the page title", () => {
+	it("keeps the h1 that differs from the page title", async () => {
 		assert.ok(/^#+ Configuring TLS$/m.test(markdown), `h1 deleted; got:\n${markdown}`);
 	});
 });
 
-describe("a heading in page chrome is not restored", () => {
-	const markdown = markdownOf(`<!doctype html>
+describe("a heading in page chrome is not restored", async () => {
+	const markdown = await markdownOf(`<!doctype html>
 <html><head><title>Example Docs — the documentation site</title></head><body>
 <header><h1>Example Docs</h1></header>
 <main>
@@ -114,16 +115,16 @@ ${FILLER}
 </main>
 </body></html>`);
 
-	it("leaves the site name out of the article", () => {
+	it("leaves the site name out of the article", async () => {
 		assert.equal(markdown.includes("Example Docs"), false, `chrome heading restored; got:\n${markdown}`);
 	});
 });
 
-describe("tables — layout is unwrapped, data becomes GFM", () => {
-	it("unwraps a table nested inside another table into its cell", () => {
+describe("tables — layout is unwrapped, data becomes GFM", async () => {
+	it("unwraps a table nested inside another table into its cell", async () => {
 		// The outer table is data-shaped and stays one; the inner one is a layout
 		// grid whatever its shape, and a GFM cell could not hold a table anyway.
-		const markdown = markdownOf(
+		const markdown = await markdownOf(
 			pageWithTable(`<table><tr><td>
 				<table><tr><td>inner a</td><td>inner b</td></tr><tr><td>inner c</td><td>inner d</td></tr></table>
 			</td><td>outer right</td></tr><tr><td>row two</td><td>cell</td></tr></table>`),
@@ -135,14 +136,14 @@ describe("tables — layout is unwrapped, data becomes GFM", () => {
 		]);
 	});
 
-	it("unwraps a single-row table", () => {
-		const markdown = markdownOf(pageWithTable("<table><tr><td>left</td><td>right</td></tr></table>"));
+	it("unwraps a single-row table", async () => {
+		const markdown = await markdownOf(pageWithTable("<table><tr><td>left</td><td>right</td></tr></table>"));
 		assert.ok(markdown.includes("left"), `cell lost; got:\n${markdown}`);
 		assert.deepEqual(tableRows(markdown), [], `single-row table rendered as GFM; got:\n${markdown}`);
 	});
 
-	it("unwraps a single-column table", () => {
-		const markdown = markdownOf(
+	it("unwraps a single-column table", async () => {
+		const markdown = await markdownOf(
 			pageWithTable("<table><tr><td>one</td></tr><tr><td>two</td></tr><tr><td>three</td></tr></table>"),
 		);
 		for (const cell of ["one", "two", "three"]) {
@@ -151,26 +152,26 @@ describe("tables — layout is unwrapped, data becomes GFM", () => {
 		assert.deepEqual(tableRows(markdown), [], `single-column table rendered as GFM; got:\n${markdown}`);
 	});
 
-	it("renders a td-only data table, its first row as the header", () => {
+	it("renders a td-only data table, its first row as the header", async () => {
 		// GFM has no way to render a table with no header row, and the first row
 		// of a td-only table is what a browser shows on top: it is the header.
-		const markdown = markdownOf(
+		const markdown = await markdownOf(
 			pageWithTable("<table><tr><td>Name</td><td>Port</td></tr><tr><td>http</td><td>80</td></tr></table>"),
 		);
 		assert.deepEqual(tableRows(markdown), ["| Name | Port |", "| --- | --- |", "| http | 80 |"]);
 	});
 
-	it("uses a th row as the header row", () => {
-		const markdown = markdownOf(
+	it("uses a th row as the header row", async () => {
+		const markdown = await markdownOf(
 			pageWithTable("<table><tr><th>Name</th><th>Port</th></tr><tr><td>http</td><td>80</td></tr></table>"),
 		);
 		assert.deepEqual(tableRows(markdown), ["| Name | Port |", "| --- | --- |", "| http | 80 |"]);
 	});
 
-	it("emits an empty header row when the th cells label the rows", () => {
+	it("emits an empty header row when the th cells label the rows", async () => {
 		// `<th>` below the first row means the table labels its rows, so no row of
 		// it is a header — and stealing the first one would hide that row's data.
-		const markdown = markdownOf(
+		const markdown = await markdownOf(
 			pageWithTable("<table><tr><th>Name</th><td>Ada</td></tr><tr><th>Born</th><td>1815</td></tr></table>"),
 		);
 		assert.deepEqual(tableRows(markdown), [
@@ -181,8 +182,8 @@ describe("tables — layout is unwrapped, data becomes GFM", () => {
 		]);
 	});
 
-	it("puts the caption on a bold line above the table", () => {
-		const markdown = markdownOf(
+	it("puts the caption on a bold line above the table", async () => {
+		const markdown = await markdownOf(
 			pageWithTable(
 				"<table><caption>Well-known ports</caption><tr><th>Name</th><th>Port</th></tr>" +
 					"<tr><td>http</td><td>80</td></tr></table>",
@@ -192,8 +193,8 @@ describe("tables — layout is unwrapped, data becomes GFM", () => {
 		assert.deepEqual(tableRows(markdown), ["| Name | Port |", "| --- | --- |", "| http | 80 |"]);
 	});
 
-	it("pads a colspan with the empty cells it covers", () => {
-		const markdown = markdownOf(
+	it("pads a colspan with the empty cells it covers", async () => {
+		const markdown = await markdownOf(
 			pageWithTable(
 				"<table><tr><th>Name</th><th>Port</th><th>Notes</th></tr>" +
 					"<tr><td colspan=\"3\">none of the above</td></tr>" +
@@ -208,8 +209,8 @@ describe("tables — layout is unwrapped, data becomes GFM", () => {
 		]);
 	});
 
-	it("keeps a link inside a cell", () => {
-		const markdown = markdownOf(
+	it("keeps a link inside a cell", async () => {
+		const markdown = await markdownOf(
 			pageWithTable(
 				'<table><tr><th>Name</th><th>Spec</th></tr>' +
 					'<tr><td>http</td><td><a href="/rfc/9110">RFC 9110</a></td></tr></table>',
@@ -222,8 +223,8 @@ describe("tables — layout is unwrapped, data becomes GFM", () => {
 	});
 });
 
-describe("heading text loses its permalink debris but keeps its own punctuation", () => {
-	const markdown = markdownOf(`<!doctype html>
+describe("heading text loses its permalink debris but keeps its own punctuation", async () => {
+	const markdown = await markdownOf(`<!doctype html>
 <html><head><title>Debris</title></head><body>
 <h1>Debris</h1>
 ${FILLER}
@@ -256,7 +257,7 @@ ${FILLER}
 		["Editable heading[edit]", "Editable heading"],
 		["Sphinx heading\u00b6", "Sphinx heading"],
 	] as const) {
-		it(`renders ${JSON.stringify(source)} as ${JSON.stringify(expected)}`, () => {
+		it(`renders ${JSON.stringify(source)} as ${JSON.stringify(expected)}`, async () => {
 			assert.ok(
 				headings(markdown).some((heading) => heading.text === expected),
 				`headings: ${JSON.stringify(headings(markdown))}`,
@@ -264,23 +265,23 @@ ${FILLER}
 		});
 	}
 
-	it("invents no heading that lost its text", () => {
+	it("invents no heading that lost its text", async () => {
 		const empty = headings(markdown).filter((heading) => heading.text === "");
 		assert.deepEqual(empty, []);
 	});
 });
 
-describe("kept ratio", () => {
-	it("is 1 when the whole page is converted", () => {
-		const extracted = extractOf(
+describe("kept ratio", async () => {
+	it("is 1 when the whole page is converted", async () => {
+		const extracted = await extractOf(
 			"<!doctype html><html><head><title>Short</title></head><body><p>Too short for Readability.</p></body></html>",
 		);
 		assert.equal(extracted.mode, "full-page");
 		assert.equal(extracted.keptRatio, 1);
 	});
 
-	it("reports the share Readability kept of an article page", () => {
-		const extracted = extractOf(`<!doctype html>
+	it("reports the share Readability kept of an article page", async () => {
+		const extracted = await extractOf(`<!doctype html>
 <html><head><title>Ratios</title></head><body>
 <nav><a href="/a">One</a> <a href="/b">Two</a> <a href="/c">Three</a></nav>
 <main><h1>Ratios</h1>${FILLER}${FILLER}</main>
@@ -289,11 +290,11 @@ describe("kept ratio", () => {
 		assert.ok(extracted.keptRatio > 0.4 && extracted.keptRatio <= 1, `keptRatio: ${extracted.keptRatio}`);
 	});
 
-	it("falls back to the full page when Readability keeps under 40% of an unmarked page", () => {
+	it("falls back to the full page when Readability keeps under 40% of an unmarked page", async () => {
 		// No `<main>`, and the bulk of the text is in a region Readability throws
 		// away — exactly the shape that used to return a sidebar as the article.
 		const aside = Array.from({ length: 40 }, (_unused, index) => `<li>Related story ${index} about the topic</li>`).join("");
-		const extracted = extractOf(`<!doctype html>
+		const extracted = await extractOf(`<!doctype html>
 <html><head><title>Sidebar wins</title></head><body>
 <div class="article"><h1>Sidebar wins</h1>${FILLER}</div>
 <div class="sidebar"><ul>${aside}</ul></div>
@@ -303,7 +304,7 @@ describe("kept ratio", () => {
 	});
 });
 
-describe("raw mode converts the whole body", () => {
+describe("raw mode converts the whole body", async () => {
 	// An index page: the navigation *is* the content, which is the case `raw`
 	// exists for. The automatic fallback is allowed to drop it; `raw` is not.
 	const INDEX_PAGE = `<!doctype html>
@@ -314,8 +315,8 @@ describe("raw mode converts the whole body", () => {
 <footer><p>Footer contact line.</p></footer>
 </body></html>`;
 
-	it("keeps the nav links and the footer", () => {
-		const extracted = extractOf(INDEX_PAGE, true);
+	it("keeps the nav links and the footer", async () => {
+		const extracted = await extractOf(INDEX_PAGE, true);
 		assert.equal(extracted.mode, "full-page");
 		assert.ok(
 			extracted.markdown.includes("[Alpha page](https://example.test/pages/alpha)"),
@@ -326,8 +327,8 @@ describe("raw mode converts the whole body", () => {
 		assert.equal(extracted.keptRatio, 1);
 	});
 
-	it("still cleans what is markup rather than content", () => {
-		const extracted = extractOf(
+	it("still cleans what is markup rather than content", async () => {
+		const extracted = await extractOf(
 			`<!doctype html><html><head><title>Raw</title></head><body>
 <script>var tracking = 1;</script><h1>Raw</h1><pre class="language-js">const x = 1;</pre>
 <a href="/docs?utm_source=news">Docs</a></body></html>`,
@@ -341,8 +342,8 @@ describe("raw mode converts the whole body", () => {
 		);
 	});
 
-	it("is the only path that keeps chrome — the automatic fallback drops it", () => {
-		const extracted = extractOf(INDEX_PAGE);
+	it("is the only path that keeps chrome — the automatic fallback drops it", async () => {
+		const extracted = await extractOf(INDEX_PAGE);
 		assert.equal(extracted.mode, "full-page");
 		assert.ok(extracted.markdown.includes("Two pages are listed."), `content lost; got:\n${extracted.markdown}`);
 		assert.equal(extracted.markdown.includes("Alpha page"), false, `nav kept; got:\n${extracted.markdown}`);
@@ -350,13 +351,135 @@ describe("raw mode converts the whole body", () => {
 	});
 });
 
-describe("a body-less fragment converts whole", () => {
-	const markdown = markdownOf("<h2>Fragment</h2><p>first</p><p>second</p><pre>fragment code</pre>");
+describe("a body-less fragment converts whole", async () => {
+	const markdown = await markdownOf("<h2>Fragment</h2><p>first</p><p>second</p><pre>fragment code</pre>");
 
-	it("keeps every top-level element", () => {
+	it("keeps every top-level element", async () => {
 		assert.ok(markdown.includes("## Fragment"), `heading lost; got: ${JSON.stringify(markdown)}`);
 		assert.ok(markdown.includes("first"), `first paragraph lost; got: ${JSON.stringify(markdown)}`);
 		assert.ok(markdown.includes("second"), `second paragraph lost; got: ${JSON.stringify(markdown)}`);
 		assert.ok(markdown.includes("```\nfragment code\n```"), `code lost; got: ${JSON.stringify(markdown)}`);
+	});
+});
+
+/** A `FetchedPage` for a payload that is not HTML. */
+function pageOf(url: string, contentType: string, body: string, bytesBody?: Uint8Array): FetchedPage {
+	return {
+		url,
+		requestedUrl: url,
+		status: 200,
+		contentType,
+		charset: "utf-8",
+		body,
+		bytes: bytesBody?.byteLength ?? Buffer.byteLength(body),
+		truncatedAtBytes: false,
+		...(bytesBody ? { bytesBody } : {}),
+	};
+}
+
+describe("JSON from a host with a renderer is rendered, not dumped", async () => {
+	const packument = {
+		name: "turndown",
+		"dist-tags": { latest: "7.2.0" },
+		description: "A library that converts HTML to Markdown",
+		license: "MIT",
+		versions: { "7.1.1": { version: "7.1.1" }, "7.2.0": { version: "7.2.0" } },
+		time: { "7.1.1": "2022-06-11T00:00:00.000Z", "7.2.0": "2024-11-05T00:00:00.000Z" },
+		readme: "# Turndown\n\nConverts HTML into markdown.",
+	};
+	const extracted = await extract(
+		pageOf("https://registry.npmjs.org/turndown", "application/json", JSON.stringify(packument)),
+		false,
+	);
+
+	it("keeps the mode json and titles the page from the rendered heading", () => {
+		assert.equal(extracted.mode, "json");
+		assert.equal(extracted.title, "turndown 7.2.0");
+	});
+
+	it("renders the fields a reader wants", () => {
+		assert.match(extracted.markdown, /^# turndown 7\.2\.0/);
+		assert.match(extracted.markdown, /A library that converts HTML to Markdown/);
+		assert.match(extracted.markdown, /- 7\.2\.0 — 2024-11-05/);
+		assert.match(extracted.markdown, /Converts HTML into markdown\./);
+	});
+
+	it("leaves the raw JSON out entirely", () => {
+		assert.ok(!extracted.markdown.includes('"dist-tags"'), extracted.markdown);
+		assert.ok(!extracted.markdown.includes("{"), extracted.markdown);
+	});
+});
+
+describe("a StackExchange payload's HTML bodies go through the page pipeline", async () => {
+	const question = {
+		items: [{ title: "How do I read a file?", score: 3, answer_count: 1, body: "<p>I have a <em>file</em>.</p>" }],
+		answers: [
+			{
+				score: 12,
+				is_accepted: true,
+				body: '<p>Like this:</p><pre class="lang-js"><code>const x = fs.readFileSync("f");</code></pre>',
+			},
+		],
+	};
+	const extracted = await extract(
+		pageOf("https://api.stackexchange.com/2.3/questions/1", "application/json", JSON.stringify(question)),
+		false,
+	);
+
+	it("converts the answer body to markdown, fenced with its language", () => {
+		assert.equal(extracted.mode, "json");
+		assert.equal(extracted.title, "How do I read a file?");
+		assert.match(extracted.markdown, /## Answer \(score 12, accepted\)/);
+		assert.match(extracted.markdown, /```js\nconst x = fs\.readFileSync\("f"\);\n```/);
+	});
+
+	it("does not escape the code it converted", () => {
+		assert.ok(!extracted.markdown.includes('\\"'), extracted.markdown);
+	});
+});
+
+describe("JSON no renderer knows still pretty-prints", async () => {
+	const extracted = await extract(
+		pageOf("https://example.test/data.json", "application/json", '{"b":[1,2],"a":{"deep":true}}'),
+		false,
+	);
+
+	it("keeps the document, indented", () => {
+		assert.equal(extracted.mode, "json");
+		assert.equal(extracted.title, undefined);
+		assert.equal(extracted.markdown, '{\n  "b": [\n    1,\n    2\n  ],\n  "a": {\n    "deep": true\n  }\n}');
+	});
+});
+
+describe("PDF bytes become text", async () => {
+	const bytes = makePdf(["Hello PDF, this is page one.", "And this is page two."], "The Paper");
+	const extracted = await extract(pageOf("https://example.test/paper.pdf", "application/pdf", "", bytes), false);
+
+	it("reports the pdf mode and the document's own title", () => {
+		assert.equal(extracted.mode, "pdf");
+		assert.equal(extracted.title, "The Paper");
+		assert.equal(extracted.keptRatio, 1);
+	});
+
+	it("returns every page, separated by a page marker", () => {
+		assert.match(extracted.markdown, /Hello PDF, this is page one\./);
+		assert.match(extracted.markdown, /<!-- page 2 -->/);
+		assert.match(extracted.markdown, /And this is page two\./);
+		// Nothing was dropped, so nothing is announced.
+		assert.ok(!extracted.markdown.startsWith("pages:"), extracted.markdown);
+	});
+
+	it("reports a PDF with no text layer as a fetch error", async () => {
+		const blank = makePdf(["hi"]);
+		await assert.rejects(extract(pageOf("https://example.test/scan.pdf", "application/pdf", "", blank), false), {
+			name: "Error",
+			message: /Could not read the PDF at https:\/\/example\.test\/scan\.pdf: .*no extractable text/,
+		});
+	});
+
+	it("refuses a PDF response that carried no bytes", async () => {
+		await assert.rejects(extract(pageOf("https://example.test/empty.pdf", "application/pdf", ""), false), {
+			message: /No PDF data at https:\/\/example\.test\/empty\.pdf/,
+		});
 	});
 });

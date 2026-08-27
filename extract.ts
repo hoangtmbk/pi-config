@@ -16,6 +16,7 @@ import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import TurndownService from "turndown";
 import { WebFetchError, type FetchedPage } from "./fetch.ts";
+import { renderKnownJson } from "./renderers.ts";
 
 export interface Extracted {
 	title: string | undefined;
@@ -23,7 +24,7 @@ export interface Extracted {
 	publishedTime: string | undefined;
 	markdown: string;
 	/** How the content was obtained — surfaced so the model can judge quality. */
-	mode: "article" | "full-page" | "json" | "text";
+	mode: "article" | "full-page" | "json" | "text" | "pdf";
 	/**
 	 * Share of the page's text that survived extraction, 0–1. A low value on an
 	 * `article` result is the model's warning that Readability was aggressive;
@@ -689,17 +690,39 @@ function adoptStrayNodes(document: Document): void {
 	if (!body.parentNode) document.appendChild(body);
 }
 
-function extractHtml(page: FetchedPage, raw: boolean): Extracted {
-	const { document } = parseHTML(page.body);
-
+/**
+ * The cleanup every path shares: everything that is markup rather than content
+ * goes, and what is left is normalised. Nothing here chooses what to keep — that
+ * is Readability's job, or `raw`'s refusal to choose — so a fragment out of a
+ * JSON field can run the same passes a whole page does.
+ */
+function cleanDocument(document: Document, baseUrl: string): void {
 	adoptStrayNodes(document);
 	stripNonContent(document);
 	cleanHeadings(document);
 	hoistCodeAsides(document);
 	flattenPreBlocks(document);
-	absolutizeLinks(document, page.url);
+	absolutizeLinks(document, baseUrl);
 	cleanLinks(document);
 	unwrapLayoutTables(document);
+}
+
+/**
+ * An HTML fragment as markdown. API payloads carry prose as HTML — a
+ * StackExchange answer body, an npm README — and it deserves the same treatment
+ * as a page: fenced code with its language, no image URLs, absolute links.
+ */
+function fragmentToMarkdown(html: string, baseUrl: string): string {
+	const { document } = parseHTML(html);
+	cleanDocument(document, baseUrl);
+	const body = (document.querySelector("body") ?? document.documentElement) as Element | undefined;
+	return createTurndown().turndown(body?.innerHTML || html).trim();
+}
+
+function extractHtml(page: FetchedPage, raw: boolean): Extracted {
+	const { document } = parseHTML(page.body);
+
+	cleanDocument(document, page.url);
 
 	const documentTitle =
 		document.querySelector("title")?.textContent?.trim() ||
@@ -773,9 +796,37 @@ function extractHtml(page: FetchedPage, raw: boolean): Extracted {
 	};
 }
 
+/** The document title a rendered payload gave itself, i.e. its first heading. */
+function leadHeading(markdown: string): string | undefined {
+	return /^# (.+)$/m.exec(markdown)?.[1]?.trim() || undefined;
+}
+
 function extractJson(page: FetchedPage): Extracted {
 	try {
 		const parsed = JSON.parse(page.body);
+
+		// A packument or an answer dump is mostly punctuation by weight. When the
+		// payload is one we know, render the few fields a reader wants instead.
+		const finalUrl = ((): URL | undefined => {
+			try {
+				return new URL(page.url);
+			} catch {
+				return undefined;
+			}
+		})();
+		const rendered =
+			finalUrl && renderKnownJson(finalUrl, parsed, (html) => fragmentToMarkdown(html, page.url));
+		if (rendered !== undefined) {
+			return {
+				title: leadHeading(rendered),
+				byline: undefined,
+				publishedTime: undefined,
+				markdown: rendered,
+				mode: "json",
+				keptRatio: 1,
+			};
+		}
+
 		return {
 			title: undefined,
 			byline: undefined,
@@ -797,8 +848,44 @@ function extractJson(page: FetchedPage): Extracted {
 	}
 }
 
-export function extract(page: FetchedPage, raw: boolean): Extracted {
+/**
+ * PDF text, with the page count stated when the document was longer than we read.
+ *
+ * `unpdf` packages the whole of PDF.js — about two megabytes — so it is imported
+ * here rather than at module scope: every non-PDF fetch would otherwise pay for
+ * loading it.
+ */
+async function extractPdf(page: FetchedPage): Promise<Extracted> {
+	const bytes = page.bytesBody;
+	if (bytes === undefined || bytes.length === 0) {
+		throw new WebFetchError(`No PDF data at ${page.url} — the response carried no bytes.`);
+	}
+
+	const { pdfToText } = await import("./pdf.ts");
+	const pdf = await pdfToText(bytes).catch((error: unknown) => {
+		throw new WebFetchError(
+			`Could not read the PDF at ${page.url}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	});
+
+	// Every page after the first is announced by a marker, so they count the
+	// pages actually rendered without pdf.ts having to report it.
+	const shown = (pdf.text.match(/<!-- page \d+ -->/g)?.length ?? 0) + 1;
+	return {
+		title: pdf.title,
+		byline: undefined,
+		publishedTime: undefined,
+		markdown: pdf.truncatedPages ? `pages: ${pdf.pages} (showing first ${shown})\n\n${pdf.text}` : pdf.text,
+		mode: "pdf",
+		keptRatio: 1,
+	};
+}
+
+export async function extract(page: FetchedPage, raw: boolean): Promise<Extracted> {
 	const type = page.contentType;
+
+	// Bytes rather than a body means the fetch layer let a PDF through.
+	if (page.bytesBody !== undefined || type === "application/pdf") return await extractPdf(page);
 
 	if (type === "text/html" || type === "application/xhtml+xml") {
 		return extractHtml(page, raw);
@@ -834,6 +921,6 @@ export function extract(page: FetchedPage, raw: boolean): Extracted {
 	// Refuse binary rather than dumping it into the context window.
 	throw new WebFetchError(
 		`Cannot extract text from "${type}" (${page.bytes} bytes) at ${page.url}. ` +
-			`web_fetch handles HTML, JSON, and plain text.`,
+			`web_fetch handles HTML, JSON, PDF, and plain text.`,
 	);
 }

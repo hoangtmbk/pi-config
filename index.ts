@@ -86,7 +86,7 @@ async function saveFullPage(ctx: ExtensionContext, url: string, markdown: string
 
 /** Compact provenance block. Every line here is information the model cannot infer. */
 function buildHeader(
-	page: { url: string; status: number; contentType: string },
+	page: { url: string; status: number; contentType: string; note?: string },
 	extracted: Extracted,
 	truncation: TruncationResult,
 	fullOutputPath: string | undefined,
@@ -95,6 +95,8 @@ function buildHeader(
 
 	if (extracted.title) lines.push(`# ${extracted.title}`);
 	lines.push(`source: ${page.url} (${page.status} · ${page.contentType || "unknown type"})`);
+	// The URL fetched was not the URL asked for — say which, and why.
+	if (page.note) lines.push(`note: ${page.note}`);
 	if (extracted.byline) lines.push(`author: ${extracted.byline}`);
 	if (extracted.publishedTime) lines.push(`published: ${extracted.publishedTime}`);
 
@@ -136,7 +138,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Web Fetch",
 		description:
 			"Fetch a URL and return its main content as clean markdown. Strips navigation, ads, scripts, and image URLs. " +
-			"Handles HTML, JSON, and plain text. " +
+			"Handles HTML, JSON, PDF, and plain text. " +
 			`Output is truncated at ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; ` +
 			"when truncated, the complete page is saved to a temp file whose path is reported, so it can be read or grepped in full.",
 		promptSnippet: "Fetch a URL and read its main content as markdown",
@@ -148,8 +150,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: WebFetchParams,
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const page = await fetchPage(params.url, signal);
-			const extracted = extract(page, params.raw === true);
+			const page = await fetchPage(params.url, signal, { allowPdf: true });
+			const extracted = await extract(page, params.raw === true);
 
 			if (!extracted.markdown.trim()) {
 				throw new Error(

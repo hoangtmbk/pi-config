@@ -71,6 +71,40 @@ const cases: Case[] = [
 					: undefined,
 	},
 	{
+		name: "github blob → raw file (rewrite)",
+		url: "https://github.com/mozilla/readability/blob/main/README.md",
+		check: (r) =>
+			r.mode !== "text"
+				? `expected text mode from the raw file, got ${r.mode}`
+				: !/Readability/i.test(r.markdown)
+					? "expected the README body"
+					: /<div|<span/i.test(r.markdown)
+						? "got the GitHub page rather than the raw file"
+						: undefined,
+	},
+	{
+		name: "npm package → registry document (rewrite + renderer)",
+		url: "https://www.npmjs.com/package/turndown",
+		check: (r) =>
+			r.mode !== "json"
+				? `expected json mode, got ${r.mode}`
+				: !/^# turndown/m.test(r.markdown)
+					? "expected the rendered package heading"
+					: r.markdown.includes('"dist-tags"')
+						? "raw packument leaked into the output"
+						: undefined,
+	},
+	{
+		name: "PDF text (arXiv)",
+		url: "https://arxiv.org/pdf/1706.03762",
+		check: (r) =>
+			r.mode !== "pdf"
+				? `expected pdf mode, got ${r.mode}`
+				: !/attention/i.test(r.markdown)
+					? "expected the paper's text"
+					: undefined,
+	},
+	{
 		name: "plain text",
 		url: "https://www.rfc-editor.org/rfc/rfc7231.txt",
 		check: (r) =>
@@ -89,7 +123,7 @@ const errorCases: ErrorCase[] = [
 	{ name: "unresolvable host", url: "https://this-host-does-not-exist-xyz123.invalid/", expect: /Could not reach/ },
 	{ name: "bad protocol", url: "ftp://example.com/file.txt", expect: /Unsupported protocol/ },
 	{ name: "not a URL", url: "!!! not a url !!!", expect: /Not a valid URL|Could not reach/ },
-	{ name: "binary content", url: "https://httpbin.org/image/png", expect: /Cannot extract text/ },
+	{ name: "binary content", url: "https://httpbin.org/image/png", expect: /Refusing binary content/ },
 ];
 
 let failures = 0;
@@ -97,8 +131,8 @@ let failures = 0;
 console.log("--- content cases ---");
 for (const testCase of cases) {
 	try {
-		const page = await fetchPage(testCase.url);
-		const extracted = extract(page, testCase.raw === true);
+		const page = await fetchPage(testCase.url, undefined, { allowPdf: true });
+		const extracted = await extract(page, testCase.raw === true);
 		const problem = testCase.check({
 			markdown: extracted.markdown,
 			title: extracted.title,
@@ -125,7 +159,7 @@ console.log("\n--- error cases ---");
 for (const testCase of errorCases) {
 	try {
 		const page = await fetchPage(testCase.url);
-		extract(page, false);
+		await extract(page, false);
 		failures++;
 		console.log(`FAIL  ${testCase.name}\n      expected a throw, got success`);
 	} catch (error) {
