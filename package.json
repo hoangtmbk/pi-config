@@ -19,7 +19,8 @@
   "scripts": {
     "test": "tsx --test extensions/*/tests/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "live:web-fetch": "tsx extensions/web-fetch/test.ts"
+    "live:web-fetch": "tsx extensions/web-fetch/test.ts",
+    "live:web-search": "tsx extensions/web-search/test.ts"
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
