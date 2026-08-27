@@ -31,6 +31,7 @@ interface RegisteredTool {
 	label: string;
 	description: string;
 	promptSnippet?: string;
+	promptGuidelines?: string[];
 	parameters: { properties: Record<string, { type: string }>; required?: string[] };
 	execute: (
 		toolCallId: string,
@@ -198,7 +199,10 @@ describe("the web-search extension", () => {
 		// and the markdown's own list is nowhere in the metadata.
 		const content = result.content[0];
 		const text = content?.type === "text" ? content.text : "";
-		assert.ok(!text.includes(String(result.details?.elapsedMs)), text.split("\n")[0]);
+		// Checked as "the markdown states no duration" rather than as "the markdown
+		// does not contain this exact number": a fast search elapses in one digit,
+		// and one digit appears in any prose that counts anything.
+		assert.doesNotMatch(text, /\b\d+(\.\d+)?\s*(ms|s)\b/, text.split("\n")[0]);
 		assert.ok(!JSON.stringify(result.details).includes("An Introduction To Generics"));
 	});
 
@@ -214,6 +218,35 @@ describe("the web-search extension", () => {
 
 		assert.match(error.message, /BRAVE_API_KEY/);
 		assert.equal(calls.length, 0);
+	});
+
+	it("tells the model to search for URLs and then fetch them, treating snippets as triage", () => {
+		const tool = registeredTools()[0] as unknown as RegisteredTool;
+		const guidance = [tool.description, ...(tool.promptGuidelines ?? [])].join("\n");
+
+		assert.ok(tool.promptGuidelines?.length, "a tool with no promptGuidelines steers nothing");
+		assert.match(guidance, /web_fetch/);
+		assert.match(guidance, /triage/i);
+		// The failure mode this guards: answering out of the snippet list without
+		// ever opening the page it came from.
+		assert.match(guidance, /\bread\b/i);
+	});
+
+	it("tells the model to reach for operators rather than a second search", () => {
+		const tool = registeredTools()[0] as unknown as RegisteredTool;
+		const guidance = (tool.promptGuidelines ?? []).join("\n");
+
+		assert.match(guidance, /operator/i);
+		assert.match(guidance, /site:/);
+		assert.match(guidance, /one search|single search|several searches|instead of running/i);
+	});
+
+	it("tells the model to filter by recency only when recency matters", () => {
+		const tool = registeredTools()[0] as unknown as RegisteredTool;
+		const guidance = (tool.promptGuidelines ?? []).join("\n");
+
+		assert.match(guidance, /freshness/);
+		assert.match(guidance, /only when|unless/i);
 	});
 
 	it("is listed in the package manifest, so a fresh session loads it", () => {
@@ -239,6 +272,19 @@ describe("the count and freshness parameters", () => {
 
 		assert.equal(count?.minimum, 1);
 		assert.equal(count?.maximum, 20);
+	});
+
+	it("says what a count actually bounds, since discussions are appended to it", () => {
+		const { parameters } = registeredTools()[0] as unknown as RegisteredTool;
+		const description = (parameters.properties.count as { description?: string } | undefined)?.description ?? "";
+
+		// The old wording — "how many results to return" — promised a total the
+		// tool does not deliver: `count` is sent to Brave's web block, and the
+		// discussions block is returned alongside it.
+		assert.doesNotMatch(description, /results to return/i);
+		assert.match(description, /web results/i);
+		assert.match(description, /discussion/i);
+		assert.match(description, /more/i);
 	});
 
 	it("names every accepted recency form in the freshness description", () => {

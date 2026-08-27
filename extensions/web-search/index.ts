@@ -33,7 +33,13 @@ const WebSearchParams = Type.Object({
 		Type.Integer({
 			minimum: MIN_COUNT,
 			maximum: MAX_COUNT,
-			description: `How many results to return, ${MIN_COUNT}–${MAX_COUNT}. Defaults to ${DEFAULT_COUNT}.`,
+			// Not "how many results to return": the count is sent to Brave's web
+			// block alone, and the discussions block is appended to whatever it
+			// yields — so a count of 10 can come back as more than ten hits.
+			description:
+				`How many web results to ask for, ${MIN_COUNT}–${MAX_COUNT}. Defaults to ${DEFAULT_COUNT}. ` +
+				"It bounds the web list only; matching discussion threads are listed after it, so a search can " +
+				"return more hits than this.",
 		}),
 	),
 	// A plain string rather than an enum: the date range cannot be spelled as
@@ -82,6 +88,16 @@ export default function (pi: ExtensionAPI) {
 			"Results are for triage — pick the promising URLs and read them with web_fetch. " +
 			"Requires a Brave Search API key in BRAVE_API_KEY or in a .env beside the extension.",
 		promptSnippet: "Search the web and get ranked results with snippets",
+		// What the model is told about *when* to reach for this, in the system
+		// prompt rather than in the tool description — these are habits, not
+		// parameters. Each one is a failure this tool would otherwise invite:
+		// answering out of the snippet list, running three searches where one
+		// query would do, and narrowing a search that had no reason to be narrow.
+		promptGuidelines: [
+			"web_search finds URLs; web_fetch reads them. Treat titles and snippets as triage — they say which page is worth opening, not what the page says. Fetch before answering, and never cite a page from its snippet alone.",
+			'Put operators in one query instead of running several searches: site:example.com to pin a source, "exact phrase" for a literal string, -term to exclude, filetype:pdf for documents. If the top results miss, rephrase the query rather than searching again with the same words.',
+			"Set freshness only when recency actually matters (a release, an outage, a this-year question). On an evergreen topic it hides the best pages, which are usually the older ones.",
+		],
 		parameters: WebSearchParams,
 		// pi runs tools in parallel by default, and two concurrent searches on a
 		// plan that allows one request per second is a guaranteed 429.
