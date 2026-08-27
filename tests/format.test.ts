@@ -95,18 +95,27 @@ describe("buildHeader", () => {
 	});
 
 	it("reports the kept ratio of an article that lost most of the page", () => {
-		const lines = header({ mode: "article", keptRatio: 0.62 });
+		const lines = header({ mode: "article", keptRatio: 0.42 });
 
 		assert.ok(
-			lines.includes("extracted: 62% of page text (article) — use raw=true if something is missing"),
+			lines.includes("extracted: 42% of page text (article) — use raw=true if something is missing"),
 			lines.join("\n"),
 		);
 	});
 
 	it("names full-page mode in the same line, since raw is still the fix", () => {
-		const lines = header({ mode: "full-page", keptRatio: 0.71 });
+		const lines = header({ mode: "full-page", keptRatio: 0.38 });
 
-		assert.ok(lines.includes("extracted: 71% of page text (full-page) — use raw=true if something is missing"));
+		assert.ok(lines.includes("extracted: 38% of page text (full-page) — use raw=true if something is missing"));
+	});
+
+	it("stays quiet about the half a documentation page that is always sidebar", () => {
+		// A docs page keeping ~60-75% of its text is the normal case, not a
+		// warning: firing there made "use raw=true" advice on nearly every fetch.
+		for (const keptRatio of [0.62, 0.71, 0.89]) {
+			const lines = header({ mode: "article", keptRatio });
+			assert.ok(!lines.some((line) => line.startsWith("extracted:")), String(keptRatio));
+		}
 	});
 
 	it("says nothing about extraction for raw results, which keep everything", () => {

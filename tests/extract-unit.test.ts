@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { extract, type Extracted } from "../extract.ts";
-import { type FetchedPage, WebFetchError } from "../fetch.ts";
+import { classifyPage, type FetchedPage, WebFetchError } from "../fetch.ts";
 import { headings, makePdf } from "./helpers.ts";
 
 /** The error a promise rejects with, so the assertion can be about the error itself. */
@@ -29,6 +29,7 @@ async function extractOf(body: string, raw = false): Promise<Extracted> {
 		requestedUrl: "https://example.test/page",
 		status: 200,
 		contentType: "text/html",
+		kind: "html",
 		charset: "utf-8",
 		body,
 		bytes: Buffer.byteLength(body),
@@ -379,6 +380,7 @@ function pageOf(url: string, contentType: string, body: string, bytesBody?: Uint
 		requestedUrl: url,
 		status: 200,
 		contentType,
+		kind: classifyPage(contentType, body),
 		charset: "utf-8",
 		body,
 		bytes: bytesBody?.byteLength ?? Buffer.byteLength(body),
@@ -556,5 +558,145 @@ describe("a renderer that fails costs only the rendering", async () => {
 		assert.equal(extracted.mode, "json");
 		assert.equal(extracted.title, "Half a question");
 		assert.ok(!extracted.markdown.includes("[object Object]"), extracted.markdown);
+	});
+});
+
+describe("every body the fetch layer accepted is extractable", async () => {
+	// `fetchPage` refuses binaries by header before the download and by sniffing
+	// the first kilobyte after it, so whatever reaches `extract()` is text. A
+	// second, narrower content-type list here used to fetch these, decode them,
+	// and then throw `Cannot extract text from …`.
+	for (const type of ["application/octet-stream", "application/ecmascript", "application/x-ndjson", ""]) {
+		it(`extracts a text body declared ${JSON.stringify(type) || "with no type"} as text`, async () => {
+			const body = 'export const answer = 42;\n{"line":1}\n';
+			const extracted = await extract(pageOf("https://example.test/raw/file", type, body), false);
+
+			assert.equal(extracted.mode, "text");
+			assert.equal(extracted.markdown, body.trim());
+		});
+	}
+
+	it("still treats an octet-stream page that is HTML as HTML", async () => {
+		const body = `<!doctype html><html><head><title>Shrug</title></head><body><h1>Shrug</h1>${FILLER}</body></html>`;
+		const extracted = await extract(pageOf("https://example.test/page", "application/octet-stream", body), false);
+
+		assert.ok(extracted.markdown.includes("# Shrug"), `not parsed as HTML; got:\n${extracted.markdown}`);
+	});
+
+	it("does not sniff a body the server declared as plain text", async () => {
+		const body = "<p>This is a snippet of HTML, quoted verbatim in a .txt file.</p>";
+		const extracted = await extract(pageOf("https://example.test/notes.txt", "text/plain", body), false);
+
+		assert.equal(extracted.mode, "text");
+		assert.equal(extracted.markdown, body);
+	});
+});
+
+describe("a form is a container, not a control", async () => {
+	// Classic ASP.NET WebForms: the whole page body lives inside one `<form>`.
+	const extracted = await extractOf(`<!doctype html>
+<html><head><title>WebForms</title></head><body>
+<form method="post" action="/Default.aspx" id="aspnetForm">
+<h1>Release notes</h1>
+${FILLER}
+<label>Search</label><input type="text" name="q"><select name="v"><option>3.1</option></select>
+<textarea name="notes">draft</textarea><button type="submit">Go</button>
+</form>
+</body></html>`);
+
+	it("keeps the prose the form wrapped", async () => {
+		assert.ok(extracted.markdown.includes("Transport security settings"), `body lost; got:\n${extracted.markdown}`);
+		assert.ok(/^#+ Release notes$/m.test(extracted.markdown), `heading lost; got:\n${extracted.markdown}`);
+	});
+
+	it("drops the interactive controls", async () => {
+		for (const control of ["Go", "draft", "3.1"]) {
+			assert.equal(extracted.markdown.includes(control), false, `${control} leaked; got:\n${extracted.markdown}`);
+		}
+	});
+});
+
+describe("the kept ratio counts what the DOM cleanup removed", async () => {
+	it("falls below 1 when cleanup deleted text, not just when Readability did", async () => {
+		// Measured before the cleanup, so a deletion is visible; scripts are not,
+		// since their bodies are not text anyone reads.
+		const extracted = await extractOf(`<!doctype html>
+<html><head><title>Cleanup</title></head><body>
+<script>var noise = "${"x".repeat(400)}";</script>
+<p>${"Kept prose. ".repeat(20)}</p>
+<nav class="skip-to-content"><a href="#main">Skip to content</a></nav>
+<div class="copy-button">${"Discarded control text. ".repeat(5)}</div>
+</body></html>`);
+
+		// 240 characters of prose against 120 of deleted control text and a 15
+		// character jump link: ~0.64. Were the 400 characters of script counted in
+		// the denominator too, it would be ~0.31.
+		assert.ok(extracted.keptRatio < 0.9, `cleanup losses invisible: keptRatio ${extracted.keptRatio}`);
+		assert.ok(extracted.keptRatio > 0.5, `script text counted against the page: ${extracted.keptRatio}`);
+	});
+});
+
+describe("anchor-classed links in prose keep their text", async () => {
+	const markdown = await markdownOf(`<!doctype html>
+<html><head><title>Anchors</title></head><body>
+<h1>Anchors</h1>
+${FILLER}
+<p>See <a class="anchor" href="/x">the linked docs</a> for more, plus
+<a class="headerlink" href="/y">important text</a>.</p>
+<p class="skip-top">Prose in a class that merely starts with skip-to.</p>
+<p class="skip-toggle">More prose in a lookalike class.</p>
+<nav class="js-skip-to-content"><a href="#main">Skip to content</a></nav>
+</body></html>`);
+
+	it("keeps the label of a prose anchor", async () => {
+		assert.ok(markdown.includes("the linked docs"), `anchor label deleted; got:\n${markdown}`);
+		assert.ok(markdown.includes("important text"), `headerlink label deleted; got:\n${markdown}`);
+	});
+
+	it("keeps prose whose class merely starts with a jump-link token", async () => {
+		assert.ok(markdown.includes("merely starts with skip-to"), `skip-top prose deleted; got:\n${markdown}`);
+		assert.ok(markdown.includes("lookalike class"), `skip-toggle prose deleted; got:\n${markdown}`);
+	});
+
+	it("still drops the jump link itself", async () => {
+		assert.equal(markdown.includes("Skip to content"), false, `jump link kept; got:\n${markdown}`);
+	});
+});
+
+describe("code chrome is matched by whole class token", async () => {
+	const markdown = await markdownOf(`<!doctype html>
+<html><head><title>Tokens</title></head><body>
+<h1>Tokens</h1>
+${FILLER}
+<div class="clipboard-api-example"><p>Reading from the clipboard requires permission.</p></div>
+<div class="copy-link-guide"><p>How to copy a link to a section.</p></div>
+<div class="language-label-explainer"><p>What the language label above a block means.</p></div>
+<div class="wrapper">
+  <span class="language-name">js</span>
+  <clipboard-copy class="ClipboardButton js-clipboard-copy">Copy code</clipboard-copy>
+  <button class="copybtn">Copy this</button>
+  <pre class="language-js"><code>const x = 1;</code></pre>
+</div>
+</body></html>`);
+
+	for (const kept of [
+		"Reading from the clipboard requires permission.",
+		"How to copy a link to a section.",
+		"What the language label above a block means.",
+	]) {
+		it(`keeps ${JSON.stringify(kept.slice(0, 24))}…`, async () => {
+			assert.ok(markdown.includes(kept), `prose deleted; got:\n${markdown}`);
+		});
+	}
+
+	it("still removes the controls the tokens name exactly", async () => {
+		assert.equal(markdown.includes("Copy code"), false, `js-clipboard-copy kept; got:\n${markdown}`);
+		assert.equal(markdown.includes("Copy this"), false, `copybtn kept; got:\n${markdown}`);
+		const stray = markdown.split("\n").filter((line) => line.trim() === "js");
+		assert.deepEqual(stray, [], `language-name label kept; got:\n${markdown}`);
+	});
+
+	it("keeps the code the controls sat beside", async () => {
+		assert.ok(markdown.includes("```js\nconst x = 1;\n```"), `code lost; got:\n${markdown}`);
 	});
 });

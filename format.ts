@@ -9,8 +9,17 @@
 import type { TruncationResult } from "@earendil-works/pi-coding-agent";
 import type { Extracted } from "./extract.ts";
 
-/** Below this share of the page's text, extraction is worth flagging. */
-const KEPT_RATIO_FLOOR = 0.9;
+/**
+ * Below this share of the page's text, extraction is worth flagging.
+ *
+ * Measured across the fixture suite, a documentation page keeps roughly half its
+ * text by design — the other half is the sidebar, the version picker and the
+ * footer, none of which the reader asked for. At a 0.9 floor the line fired on
+ * 11 of 14 fixtures, so "use raw=true if something is missing" became advice on
+ * nearly every fetch and invited a second, redundant request. 0.6 fires on the
+ * pages where the number means something.
+ */
+const KEPT_RATIO_FLOOR = 0.6;
 
 /**
  * Last path segments that mean the fetch landed on a gate rather than on the
@@ -129,13 +138,19 @@ function lastSegment(url: string): string {
 	return segment.replace(/\.[^.]*$/, "");
 }
 
-/** Filesystem-safe slice of arbitrary text, or `fallback` if nothing survives. */
+/**
+ * Filesystem-safe slice of arbitrary text, or `fallback` if nothing survives.
+ *
+ * A segment of only dots is refused as well as an empty one: `..` would resolve
+ * the scratch directory to its parent, which `index.ts` later removes whole.
+ */
 export function safeSegment(value: string, max: number, fallback: string): string {
 	return (
 		value
 			.replace(/[^a-zA-Z0-9._-]+/g, "-")
 			.replace(/^-+|-+$/g, "")
-			.slice(0, max) || fallback
+			.slice(0, max)
+			.replace(/^\.+$/, "") || fallback
 	);
 }
 

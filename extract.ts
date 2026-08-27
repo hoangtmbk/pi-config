@@ -1,11 +1,11 @@
 /**
  * Content extraction for web_fetch.
  *
- * Routes by content type, and for HTML runs Readability to drop nav/ads/
- * sidebars before converting to markdown. The cleanup exists because each rule
- * was observed wasting real tokens on real pages: tracking query params, image
- * URLs the model can never use, and the empty `[](#anchor)` links GitHub emits
- * next to every heading.
+ * Routes on the kind `fetch.ts` decided the body was, and for HTML runs
+ * Readability to drop nav/ads/sidebars before converting to markdown. The
+ * cleanup exists because each rule was observed wasting real tokens on real
+ * pages: tracking query params, image URLs the model can never use, and the
+ * empty `[](#anchor)` links GitHub emits next to every heading.
  *
  * All of that cleanup happens on the DOM, never on the markdown. A regex over
  * the finished markdown cannot tell prose from the inside of a code fence, and
@@ -35,10 +35,6 @@ export interface Extracted {
 
 /** Readability output shorter than this means it almost certainly ate the page. */
 const MIN_ARTICLE_CHARS = 200;
-
-/** Content types that are text but not HTML — passed through untouched. */
-const TEXT_TYPE_PATTERN =
-	/^text\/|^application\/(x-)?(yaml|toml|x-sh|javascript|typescript|xml)$|\+xml$/;
 
 const TRACKING_PARAM_PATTERN = /^(utm_[a-z_]+|fbclid|gclid|mc_[a-z]+|ref_src|_hs[a-z]+|igshid)$/i;
 
@@ -434,17 +430,44 @@ function cleanLinks(document: Document): void {
 }
 
 /**
- * Class tokens that only ever name a control beside a code block: copy buttons,
+ * Class names that only ever name a control beside a code block: copy buttons,
  * language labels, block titles.
  *
- * Every alternative has to be a whole class token, and every alternative has to
- * be unmistakably a control. A bare `copy` was tried and is wrong: `copy`,
- * `body-copy` and `hero-copy` are how CMS and marketing templates name body
- * text, and this sweep runs over the whole document, so matching them deletes
- * prose outright.
+ * The pattern is anchored, and it is tested against one whitespace-separated
+ * class *token* at a time. Both halves matter. A bare `copy` was tried and is
+ * wrong — `copy`, `body-copy` and `hero-copy` are how CMS and marketing
+ * templates name body text — and letting a token merely *start* with a control
+ * word is wrong for the same reason one step later: `clipboard-api-example`,
+ * `copy-link-guide` and `language-label-explainer` are prose sections on exactly
+ * the documentation pages this tool is pointed at, and this sweep deletes what
+ * it matches. The optional `js-` is GitHub's behaviour prefix (`js-clipboard-copy`),
+ * which names a control and nothing else.
  */
 const CODE_CHROME_CLASS_PATTERN =
-	/(?:^|[\s_-])(?:copy[-_]?(?:button|btn|icon|code|link)|copy[-_]to[-_]clipboard|clipboard|lang(?:uage)?[-_](?:label|name)|code[-_]?block[-_]?title)(?:[\s_-]|$)/i;
+	/^(?:js[-_])?(?:copy[-_]?(?:button|btn|icon|code|link)|copy[-_]to[-_]clipboard|clipboard[-_]?(?:copy|button|btn|icon)?|lang(?:uage)?[-_](?:label|name)|code[-_]?block[-_]?title)$/i;
+
+/** The whitespace-separated class tokens of an element. */
+function classTokens(element: Element): string[] {
+	return (element.getAttribute("class") ?? "").split(/\s+/).filter(Boolean);
+}
+
+/** True when any whole class token matches. */
+function hasClassToken(element: Element, pattern: RegExp): boolean {
+	return classTokens(element).some((token) => pattern.test(token));
+}
+
+/**
+ * Elements that carry no text and never will: scripts, styles and inert
+ * templates. Split out from the rest of the cleanup because the kept-ratio
+ * denominator is measured between the two — script bodies would swamp it, but
+ * everything below this line removes text a reader might have wanted, so those
+ * losses have to stay visible in the ratio.
+ */
+function stripInvisible(document: Document): void {
+	for (const element of Array.from(document.querySelectorAll("script, style, noscript, template"))) {
+		element.remove();
+	}
+}
 
 /**
  * Remove everything that is markup rather than content.
@@ -454,14 +477,26 @@ const CODE_CHROME_CLASS_PATTERN =
  * stray `js` or `bash` line above the code.
  */
 function stripNonContent(document: Document): void {
+	stripInvisible(document);
+
 	for (const element of Array.from(
-		document.querySelectorAll("script, style, noscript, svg, canvas, iframe, template, form, button"),
+		document.querySelectorAll("svg, canvas, iframe, input, select, textarea, button"),
 	)) {
 		element.remove();
 	}
 
+	// A `<form>` is a container, not a control. Classic ASP.NET WebForms wraps the
+	// *entire* page body in one `<form runat="server">`, and search, docs and wiki
+	// pages routinely put prose inside one — deleting the subtree took the page
+	// with it and left the caller reading "may require JavaScript". The controls
+	// above are gone already, so unwrapping keeps only what a reader would see.
+	for (const form of Array.from(document.querySelectorAll("form"))) {
+		while (form.firstChild) form.parentNode?.insertBefore(form.firstChild, form);
+		form.remove();
+	}
+
 	for (const element of Array.from(document.querySelectorAll("[class]"))) {
-		if (!CODE_CHROME_CLASS_PATTERN.test(element.getAttribute("class") ?? "")) continue;
+		if (!hasClassToken(element, CODE_CHROME_CLASS_PATTERN)) continue;
 		// A wrapper holding the code block is content; only the controls go.
 		if (element.querySelector("pre")) continue;
 		element.remove();
@@ -469,13 +504,37 @@ function stripNonContent(document: Document): void {
 }
 
 /**
- * Controls documentation generators hang off a heading: Wikipedia's `[edit]`
- * link, Sphinx's `¶` permalink, GitHub's anchor icon.
+ * Wikipedia's `[edit]` control. It is a section control wherever it appears —
+ * and where it appears is *beside* the `<h2>`, inside the `div.mw-heading`
+ * wrapper, not inside the heading — so this one is document-wide by necessity.
  */
-const HEADING_CONTROL_SELECTOR = ".mw-editsection, a.headerlink, a.anchor";
+const EDIT_SECTION_SELECTOR = ".mw-editsection";
 
-/** Keyboard-only jump links, which are markup for screen readers and noise here. */
-const SKIP_LINK_SELECTOR = '.mw-jump-link, [class*="skip-to"]';
+/**
+ * Permalink anchors documentation generators hang off a heading: Sphinx's `¶`,
+ * GitHub's anchor icon, mkdocs' `headerlink`.
+ *
+ * Matched by class, which is why the removal below is conditional. `anchor` and
+ * `headerlink` are ordinary English words: an `<a class="anchor">the linked
+ * docs</a>` in prose is a link with a label, and deleting it took the label
+ * with it.
+ */
+const HEADING_ANCHOR_SELECTOR = "a.headerlink, a.anchor";
+
+/** A permalink anchor's whole label: nothing, or a glyph standing in for "link". */
+const ANCHOR_LABEL_PATTERN = /^[#\u00b6\u00a7\u{1f517}\u200b\ufeff\s]*$/u;
+
+/** Wikipedia's jump-to-content link, by class. */
+const JUMP_LINK_SELECTOR = ".mw-jump-link";
+
+/**
+ * Keyboard-only jump links, which are markup for screen readers and noise here.
+ *
+ * A whole class token, and the `to` has to end there: `skip-to-content` and
+ * `js-skip-to-content` are jump links, `skip-top`, `skip-toggle` and
+ * `skip-total` are not, and this removes the element's whole subtree.
+ */
+const SKIP_LINK_CLASS_PATTERN = /^(?:js[-_])?skip[-_]to(?:[-_]|$)/i;
 
 const HEADING_SELECTOR = "h1, h2, h3, h4, h5, h6";
 
@@ -519,10 +578,27 @@ function textNodesOf(root: Element): Text[] {
  * leaves the div with no links at all, and the heading survives.
  */
 function cleanHeadings(document: Document): void {
-	for (const control of Array.from(
-		document.querySelectorAll(`${HEADING_CONTROL_SELECTOR}, ${SKIP_LINK_SELECTOR}`),
-	)) {
+	for (const control of Array.from(document.querySelectorAll(`${EDIT_SECTION_SELECTOR}, ${JUMP_LINK_SELECTOR}`))) {
 		control.remove();
+	}
+
+	for (const element of Array.from(document.querySelectorAll("[class]"))) {
+		if (hasClassToken(element, SKIP_LINK_CLASS_PATTERN)) element.remove();
+	}
+
+	for (const anchor of Array.from(document.querySelectorAll(HEADING_ANCHOR_SELECTOR))) {
+		const label = anchor.textContent ?? "";
+		// A glyph, or nothing at all, is a permalink: it goes, subtree and all.
+		if (ANCHOR_LABEL_PATTERN.test(label)) {
+			anchor.remove();
+			continue;
+		}
+		// Inside a heading the anchor's text is usually the heading's own words
+		// (mkdocs wraps them), so it is only debris when the heading says something
+		// else too. Everywhere else it is an ordinary link with an ordinary label,
+		// and `cleanLinks` already deals with the empty and href-less cases.
+		const heading = anchor.closest?.(HEADING_SELECTOR) as Element | null;
+		if (heading && (heading.textContent ?? "").replace(label, "").trim() !== "") anchor.remove();
 	}
 
 	for (const heading of Array.from(document.querySelectorAll(HEADING_SELECTOR))) {
@@ -680,12 +756,14 @@ function readabilityInput(document: Document, region: Element | undefined): Docu
  * document element yields only the first of the fragment's elements.
  */
 function adoptStrayNodes(document: Document): void {
+	// Idempotent: the body this created on an earlier pass is a document child
+	// too, and adopting it into itself is an error rather than a no-op.
+	const body = document.querySelector("body") ?? document.createElement("body");
 	const strays = Array.from(document.childNodes).filter(
-		(node) => node.nodeType === 1 && (node as Element).nodeName !== "HTML",
+		(node) => node.nodeType === 1 && (node as Element).nodeName !== "HTML" && node !== body,
 	);
 	if (strays.length === 0) return;
 
-	const body = document.querySelector("body") ?? document.createElement("body");
 	for (const stray of strays) body.appendChild(stray);
 	if (!body.parentNode) document.appendChild(body);
 }
@@ -722,6 +800,16 @@ function fragmentToMarkdown(html: string, baseUrl: string): string {
 function extractHtml(page: FetchedPage, raw: boolean): Extracted {
 	const { document } = parseHTML(page.body);
 
+	// The kept-ratio denominator is taken here, before any cleanup that can drop
+	// text a reader wanted: unwrapped forms, chrome-classed blocks, deleted
+	// asides. Measured after cleanup, those losses were invisible — a page whose
+	// whole body sat in a `<form>` reported `extracted: 100%` while returning
+	// nothing. Scripts and styles are already gone, since their bodies are not
+	// text anyone reads and would swamp the figure.
+	adoptStrayNodes(document);
+	stripInvisible(document);
+	const pageChars = textLength((document.querySelector("body") ?? document.documentElement)?.textContent);
+
 	cleanDocument(document, page.url);
 
 	const documentTitle =
@@ -735,8 +823,7 @@ function extractHtml(page: FetchedPage, raw: boolean): Extracted {
 	// `documentElement` covers a document with no `<body>`; the cast is because a
 	// degenerate page can leave even that undefined, whatever the DOM types say.
 	const body = (document.querySelector("body") ?? document.documentElement) as Element | undefined;
-	const pageChars = textLength(body?.textContent);
-	const region = mainContentRegion(document, pageChars);
+	const region = mainContentRegion(document, textLength(body?.textContent));
 
 	if (!raw) {
 		// Readability mutates whatever it is given, so it never gets the original.
@@ -907,46 +994,27 @@ async function extractPdf(page: FetchedPage): Promise<Extracted> {
 	};
 }
 
+/**
+ * Route a fetched body to its extractor.
+ *
+ * There is no content-type test here: `fetchPage` already refused everything
+ * binary — by header before the download, by sniffing the first kilobyte after
+ * it — and recorded what survived in `page.kind`. A second, narrower pattern
+ * living here is what used to make `application/octet-stream` with a plain-text
+ * body get fetched, decoded and then thrown away.
+ */
 export async function extract(page: FetchedPage, raw: boolean): Promise<Extracted> {
-	const type = page.contentType;
-
 	// Bytes rather than a body means the fetch layer let a PDF through.
-	if (page.bytesBody !== undefined || type === "application/pdf") return await extractPdf(page);
+	if (page.bytesBody !== undefined || page.kind === "pdf") return await extractPdf(page);
+	if (page.kind === "html") return extractHtml(page, raw);
+	if (page.kind === "json") return extractJson(page);
 
-	if (type === "text/html" || type === "application/xhtml+xml") {
-		return extractHtml(page, raw);
-	}
-	if (type === "application/json" || type.endsWith("+json") || type === "text/json") {
-		return extractJson(page);
-	}
-	if (TEXT_TYPE_PATTERN.test(type)) {
-		return {
-			title: undefined,
-			byline: undefined,
-			publishedTime: undefined,
-			markdown: page.body.trim(),
-			mode: "text",
-			keptRatio: 1,
-		};
-	}
-
-	// No declared type: sniff, since plenty of servers omit the header.
-	if (!type) {
-		const looksHtml = /<\s*(!doctype\s+html|html|head|body|div|p)\b/i.test(page.body.slice(0, 2000));
-		if (looksHtml) return extractHtml(page, raw);
-		return {
-			title: undefined,
-			byline: undefined,
-			publishedTime: undefined,
-			markdown: page.body.trim(),
-			mode: "text",
-			keptRatio: 1,
-		};
-	}
-
-	// Refuse binary rather than dumping it into the context window.
-	throw new WebFetchError(
-		`Cannot extract text from "${type}" (${page.bytes} bytes) at ${page.url}. ` +
-			`web_fetch handles HTML, JSON, PDF, and plain text.`,
-	);
+	return {
+		title: undefined,
+		byline: undefined,
+		publishedTime: undefined,
+		markdown: page.body.trim(),
+		mode: "text",
+		keptRatio: 1,
+	};
 }

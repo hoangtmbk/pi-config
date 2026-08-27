@@ -67,6 +67,43 @@ const PDF_EXTENSION_PATTERN = /\.pdf$/i;
 const TEXT_TYPE_PATTERN =
 	/^text\/|\+xml$|\+json$|^application\/(json|xml|xhtml\+xml|javascript|ecmascript|x-yaml|yaml|toml)$/;
 
+/** Enough of a body to tell markup from prose. */
+const HTML_SNIFF_BYTES = 2000;
+
+const HTML_SNIFF_PATTERN = /<\s*(!doctype\s+html|html|head|body|div|p)\b/i;
+
+/**
+ * Which extractor a fetched body belongs to.
+ *
+ * This is the *only* place that decision is made. It used to be made twice —
+ * once here to decide what was worth downloading, once in `extract()` against a
+ * narrower pattern — and the two disagreed: `application/octet-stream` with a
+ * text body, `application/ecmascript` and `application/x-ndjson` were all
+ * fetched, decoded, and then refused. Anything that survives the binary gate
+ * below is text as far as this module is concerned, so `extract()` only has to
+ * route on the answer it is given.
+ */
+export type PageKind = "html" | "json" | "pdf" | "text";
+
+/**
+ * The kind of a body the fetch layer accepted.
+ *
+ * Sniffing is limited to types that declared nothing usable (no header at all,
+ * `application/octet-stream`, a vendor type nobody has heard of). A server that
+ * said `text/plain` meant it, even if the body happens to contain a tag.
+ */
+export function classifyPage(contentType: string, body: string): PageKind {
+	if (contentType === "application/pdf") return "pdf";
+	if (contentType === "text/html" || contentType === "application/xhtml+xml") return "html";
+	if (contentType === "application/json" || contentType === "text/json" || contentType.endsWith("+json")) {
+		return "json";
+	}
+	if (!TEXT_TYPE_PATTERN.test(contentType) && HTML_SNIFF_PATTERN.test(body.slice(0, HTML_SNIFF_BYTES))) {
+		return "html";
+	}
+	return "text";
+}
+
 /** Hosts that are almost never reachable over https, so `https://` would just fail. */
 function isLocalHost(host: string): boolean {
 	return (
@@ -89,6 +126,8 @@ export interface FetchedPage {
 	status: number;
 	/** Lowercased content type, parameters stripped. Empty string if absent. */
 	contentType: string;
+	/** Which extractor this body belongs to. Decided here and nowhere else. */
+	kind: PageKind;
 	/** Charset from the Content-Type header, if the server declared one. */
 	charset: string | undefined;
 	body: string;
@@ -509,13 +548,17 @@ export async function fetchPage(rawUrl: string, signal?: AbortSignal, options: F
 		throw binaryError(type, url, response.headers.get("content-length"), "the body is not text");
 	}
 
+	const body = kind === "pdf" ? "" : decodeBody(read.bytes, charset);
 	const page: FetchedPage = {
 		url: response.url || url,
 		requestedUrl,
 		status: response.status,
 		contentType: type,
+		// A `.pdf` behind `application/octet-stream` is still a PDF, so the gate's
+		// verdict wins over the header here.
+		kind: kind === "pdf" ? "pdf" : classifyPage(type, body),
 		charset,
-		body: kind === "pdf" ? "" : decodeBody(read.bytes, charset),
+		body,
 		bytes: read.bytes.length,
 		truncatedAtBytes: read.truncated,
 	};

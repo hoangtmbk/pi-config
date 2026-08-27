@@ -34,6 +34,7 @@ export function loadFixture(name: string): FetchedPage {
 		requestedUrl: url,
 		status: 200,
 		contentType: "text/html",
+		kind: "html",
 		charset: "utf-8",
 		body: buffer.toString("utf8"),
 		bytes: buffer.byteLength,

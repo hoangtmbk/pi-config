@@ -323,6 +323,21 @@ describe("content-type gate", () => {
 		assert.equal(page.body, payload);
 	});
 
+	it("records the extractor kind once, for extract() to route on", async () => {
+		const cases: [string, string, string][] = [
+			["text/html", "<html><body><p>hi</p></body></html>", "html"],
+			["application/json", '{"a":1}', "json"],
+			["text/plain", "<p>quoted markup in a .txt</p>", "text"],
+			["application/x-ndjson", '{"line":1}\n', "text"],
+			["application/octet-stream", "id,name\n1,ada\n", "text"],
+			["application/octet-stream", "<!doctype html><html><body><p>hi</p></body></html>", "html"],
+		];
+		for (const [type, payload, kind] of cases) {
+			const page = await withServer(text(200, type, payload), (base) => fetchPage(`http://${base}/data.csv`));
+			assert.equal(page.kind, kind, `${type} → ${page.kind}`);
+		}
+	});
+
 	it("accepts text-ish types without sniffing", async () => {
 		for (const type of ["text/x-rst", "application/json", "application/atom+xml", "application/toml"]) {
 			const page = await withServer(text(200, type, "value = 1\n"), (base) => fetchPage(`http://${base}/`));
@@ -417,6 +432,7 @@ describe("tracking parameters", () => {
 			requestedUrl: "https://example.test/",
 			status: 200,
 			contentType: "text/html",
+			kind: "html",
 			charset: "utf-8",
 			body,
 			bytes: body.length,
