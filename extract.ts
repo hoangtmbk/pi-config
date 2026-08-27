@@ -27,9 +27,9 @@ const MIN_ARTICLE_CHARS = 200;
 
 /** Content types that are text but not HTML — passed through untouched. */
 const TEXT_TYPE_PATTERN =
-	/^text\/(plain|markdown|csv|tab-separated-values|x-|css|yaml)|^application\/(x-)?(yaml|toml|x-sh|javascript|typescript|xml)$|\+xml$/;
+	/^text\/|^application\/(x-)?(yaml|toml|x-sh|javascript|typescript|xml)$|\+xml$/;
 
-const TRACKING_PARAM_PATTERN = /^(utm_[a-z_]+|fbclid|gclid|mc_[a-z]+|ref|ref_src|source|_hs[a-z]+|igshid|si)$/i;
+const TRACKING_PARAM_PATTERN = /^(utm_[a-z_]+|fbclid|gclid|mc_[a-z]+|ref_src|_hs[a-z]+|igshid)$/i;
 
 function configureBase(turndown: TurndownService): TurndownService {
 	// Image URLs are pure cost: the model cannot fetch them and they are often

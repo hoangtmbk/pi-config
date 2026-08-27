@@ -35,6 +35,7 @@ export function loadFixture(name: string): FetchedPage {
 		charset: "utf-8",
 		body: buffer.toString("utf8"),
 		bytes: buffer.byteLength,
+		truncatedAtBytes: false,
 	};
 }
 
