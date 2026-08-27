@@ -80,6 +80,14 @@ export type ParentMessage = Delivery | Question;
 
 export class Supervisor {
 	private readonly byName = new Map<string, RunRecord>();
+	/**
+	 * The mailbox: the joins waiting to collect settled Runs' messages.
+	 *
+	 * A message a join is waiting for is collected here rather than delivered on
+	 * its own, which is the whole of the no-double-delivery rule — a joined
+	 * message re-enters the conversation once, as that join's own result.
+	 */
+	private readonly joins = new Set<PendingJoin>();
 
 	/**
 	 * Take on a new Run: reserve a name for it and record it as running.
@@ -149,12 +157,71 @@ export class Supervisor {
 			record.lastAssistant = undefined;
 			record.run.state = "waiting";
 			record.run.question = asked.question;
-			return { kind: "question", run: record.run, text: questionMessageText(record.run) };
+			return messageFor(record.run);
 		}
 
 		record.run.state = "done";
 		record.run.result = record.lastAssistant && assistantText(record.lastAssistant);
-		return { kind: "delivery", run: record.run, text: deliveryText(record.run) };
+		return messageFor(record.run);
+	}
+
+	/**
+	 * Wait for every named Run to stop being in flight, then collect what each has
+	 * to say — a Delivery for one that finished, its Question for one that is
+	 * Waiting.
+	 *
+	 * Waiting counts as stopping, deliberately: only the parent can answer a
+	 * Question, and a parent inside this call cannot, so a Waiting Run has to end
+	 * the join rather than the two features deadlocking each other. It can be
+	 * answered and joined again.
+	 *
+	 * Every name must be one this Supervisor registered; callers check that first,
+	 * because they are the ones who can say what the valid names were.
+	 */
+	join(names: string[]): Promise<ParentMessage[]> {
+		if (names.every((name) => !this.isInFlight(name))) return Promise.resolve(this.collect(names));
+		return new Promise((resolve) => {
+			this.joins.add({ names, resolve });
+		});
+	}
+
+	/**
+	 * Post a settled Run's message, and say where it went: to a join that named
+	 * that Run, or to the conversation.
+	 *
+	 * A joined message re-enters the conversation as that join's own result, so
+	 * the caller must not auto-deliver it as well — that is the whole of the
+	 * no-double-delivery rule. Called right after `observe`, on the message it
+	 * returned, because only the Supervisor knows what is being joined.
+	 */
+	post(message: ParentMessage): "join" | "conversation" {
+		let joined = false;
+		for (const pending of this.joins) {
+			if (!pending.names.includes(message.run.name)) continue;
+			joined = true;
+			// Settling may have been the last thing this join was waiting for. The
+			// messages are collected now, while the Runs still say what they said.
+			if (pending.names.every((name) => !this.isInFlight(name))) {
+				this.joins.delete(pending);
+				pending.resolve(this.collect(pending.names));
+			}
+		}
+		return joined ? "join" : "conversation";
+	}
+
+	/** Whether a Run is still working, and so still worth a join's while. */
+	private isInFlight(name: string): boolean {
+		return this.byName.get(name)?.run.state === "running";
+	}
+
+	/** What each named Run has to say, right now. */
+	private collect(names: string[]): ParentMessage[] {
+		const messages: ParentMessage[] = [];
+		for (const name of names) {
+			const record = this.byName.get(name);
+			if (record) messages.push(messageFor(record.run));
+		}
+		return messages;
 	}
 
 	/**
@@ -170,6 +237,12 @@ export class Supervisor {
 		while (this.byName.has(`${base}-${suffix}`)) suffix++;
 		return `${base}-${suffix}`;
 	}
+}
+
+/** One `subagent_wait` in flight: the Runs it named, and how to answer it. */
+interface PendingJoin {
+	names: string[];
+	resolve: (messages: ParentMessage[]) => void;
 }
 
 interface RunRecord {
@@ -218,6 +291,18 @@ function assistantText(message: AssistantMessage): string | undefined {
 function questionText(result: unknown): string | undefined {
 	const asked = (result as { details?: { question?: unknown } } | undefined)?.details?.question;
 	return typeof asked === "string" && asked.trim() ? asked.trim() : undefined;
+}
+
+/**
+ * What a Run that has stopped being in flight has to say.
+ *
+ * The message is derived from the Run rather than stored when it settles, so a
+ * join collects exactly what an auto-delivery would have said — one shape of
+ * words for both halves of the Delivery policy.
+ */
+function messageFor(run: Run): ParentMessage {
+	if (run.state === "waiting") return { kind: "question", run, text: questionMessageText(run) };
+	return { kind: "delivery", run, text: deliveryText(run) };
 }
 
 /**

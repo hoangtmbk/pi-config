@@ -113,6 +113,121 @@ describe("Supervisor lifecycle", () => {
 	});
 });
 
+/**
+ * Feed a sequence the way the extension does — observe, then post whatever the
+ * Run announces — and collect where each message was routed.
+ */
+function announce(supervisor: Supervisor, name: string, events: JsonAgentSessionEvent[]): string[] {
+	const routes: string[] = [];
+	for (const event of events) {
+		const message = supervisor.observe(name, event);
+		if (message) routes.push(supervisor.post(message));
+	}
+	return routes;
+}
+
+/** A join in flight, so a test can ask whether it has answered yet. */
+function watch(joined: Promise<ParentMessage[]>): { collected?: ParentMessage[] } {
+	const state: { collected?: ParentMessage[] } = {};
+	joined.then((messages) => {
+		state.collected = messages;
+	});
+	return state;
+}
+
+describe("Supervisor joins", () => {
+	it("collects a Run that has already finished, without waiting for anything", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		feed(supervisor, run.name, [said("Found three call sites."), SETTLED]);
+
+		const collected = await supervisor.join([run.name]);
+
+		assert.equal(collected.length, 1);
+		assert.equal(collected[0].kind, "delivery");
+		assert.match(collected[0].text, /Found three call sites\./);
+	});
+
+	it("waits for a Run that is still in flight, and takes its Delivery when it settles", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+
+		const joined = supervisor.join([run.name]);
+		const routes = announce(supervisor, run.name, [said("Found three call sites."), SETTLED]);
+		const collected = await joined;
+
+		assert.deepEqual(routes, ["join"], "a joined message is not also delivered on its own");
+		assert.equal(collected.length, 1);
+		assert.match(collected[0].text, /Found three call sites\./);
+	});
+
+	it("returns once the last of the Runs it named has stopped, with all of them", async () => {
+		const supervisor = new Supervisor();
+		const first = supervisor.register("scout", "one");
+		const second = supervisor.register("worker", "two");
+		const join = watch(supervisor.join([first.name, second.name]));
+
+		announce(supervisor, first.name, [said("first result"), SETTLED]);
+		await Promise.resolve();
+		const halfway = join.collected;
+		assert.equal(halfway, undefined, "one Run of two has stopped, so the join is not finished");
+
+		announce(supervisor, second.name, [said("second result"), SETTLED]);
+		await Promise.resolve();
+
+		assert.deepEqual(join.collected?.map((message) => message.run.name), ["scout", "worker"]);
+		assert.match(join.collected?.[0].text ?? "", /first result/);
+		assert.match(join.collected?.[1].text ?? "", /second result/);
+	});
+
+	it("collects both Runs when two settle in the same tick", async () => {
+		const supervisor = new Supervisor();
+		const first = supervisor.register("scout", "one");
+		const second = supervisor.register("scout", "two");
+
+		const joined = supervisor.join([first.name, second.name]);
+		supervisor.observe(first.name, said("first result"));
+		supervisor.observe(second.name, said("second result"));
+		const firstRoute = supervisor.post(supervisor.observe(first.name, SETTLED) as ParentMessage);
+		const secondRoute = supervisor.post(supervisor.observe(second.name, SETTLED) as ParentMessage);
+		const collected = await joined;
+
+		assert.deepEqual([firstRoute, secondRoute], ["join", "join"]);
+		assert.deepEqual(collected.map((message) => message.run.result), ["first result", "second result"]);
+	});
+
+	it("ends on a Waiting Run rather than deadlocking, and can be joined again once it is answered", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+
+		const joined = supervisor.join([run.name]);
+		announce(supervisor, run.name, [asked("Which auth module do you mean?"), SETTLED]);
+		const waiting = await joined;
+
+		assert.equal(waiting[0].kind, "question");
+		assert.match(waiting[0].text, /Which auth module do you mean\?/);
+
+		// The answer starts the Run's next turn, which is what takes it out of
+		// Waiting; a join placed before that would collect the spent Question again.
+		supervisor.observe(run.name, AGENT_START);
+		const rejoined = supervisor.join([run.name]);
+		announce(supervisor, run.name, [said("Three call sites."), SETTLED]);
+
+		assert.equal((await rejoined)[0].kind, "delivery");
+	});
+
+	it("leaves a Run no join named to deliver on its own", () => {
+		const supervisor = new Supervisor();
+		const joined = supervisor.register("scout", "one");
+		const other = supervisor.register("scout", "two");
+		supervisor.join([joined.name]);
+
+		const routes = announce(supervisor, other.name, [said("second result"), SETTLED]);
+
+		assert.deepEqual(routes, ["conversation"]);
+	});
+});
+
 describe("Supervisor questions", () => {
 	it("moves a Run to Waiting when its settling turn asked a Question, delivering nothing", () => {
 		const supervisor = new Supervisor();
