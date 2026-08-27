@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildSearchUrl, search, WebSearchError } from "../brave.ts";
+import { buildSearchUrl, RETRY_DELAY_MS, search, WebSearchError } from "../brave.ts";
 import { fakeFetch, jsonResponse as json, rejection, stalledFetch, thrown } from "./helpers.ts";
 
 const okBody = { web: { results: [{ title: "A", url: "https://a.test/", description: "d" }] } };
@@ -385,8 +385,8 @@ describe("a rate-limited search", () => {
 		assert.equal(calls.length, 2);
 		assert.equal(response.web?.results?.[0]?.url, "https://a.test/");
 		// Long enough to clear the free plan's one-request-per-second ceiling.
-		assert.equal(slept.length, 1);
-		assert.ok((slept[0] ?? 0) >= 1000, `waited ${slept[0]}ms`);
+		assert.deepEqual(slept, [RETRY_DELAY_MS]);
+		assert.ok(RETRY_DELAY_MS > 1000, `${RETRY_DELAY_MS}ms does not clear a one-second window`);
 	});
 
 	it("waits before retrying rather than hammering the endpoint", async () => {
