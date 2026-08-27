@@ -10,11 +10,11 @@
  *
  *  - `FAKE_RPC_ARGV_OUT` — a path to write the arguments it was spawned with, as
  *    a JSON array, so a test can assert on them.
- *  - `FAKE_RPC_EVENTS` — a JSON array of events to emit on every prompt, in
- *    place of the default settle-with-one-answer sequence.
- *  - `FAKE_RPC_TURNS` — a JSON array of those arrays, one per prompt in order:
- *    what a Run that asks a question on one turn and answers on the next looks
- *    like from outside. Prompts past the end fall back to the default sequence.
+ *  - `FAKE_RPC_TURNS` — a JSON array of event arrays, one per prompt in order,
+ *    in place of the default settle-with-one-answer sequence. One entry scripts
+ *    a Run that settles on its first turn; several script a Run that asks a
+ *    question and carries on with the answer. Prompts past the end fall back to
+ *    the default.
  *  - `FAKE_RPC_ENV_OUT` — a path to write its own `PI_*` environment to, as a
  *    JSON object, so a test can assert on what the child was told.
  *
@@ -32,7 +32,6 @@ if (envOut) {
 	writeFileSync(envOut, JSON.stringify(Object.fromEntries(piEnv)), "utf-8");
 }
 
-const scripted: unknown[] | undefined = process.env.FAKE_RPC_EVENTS ? JSON.parse(process.env.FAKE_RPC_EVENTS) : undefined;
 const turns: unknown[][] | undefined = process.env.FAKE_RPC_TURNS ? JSON.parse(process.env.FAKE_RPC_TURNS) : undefined;
 
 /** How many prompts have arrived, which is what picks this turn's script. */
@@ -67,7 +66,7 @@ function handle(line: string): void {
 
 	if (command.type !== "prompt") return;
 	const turn = turns?.[promptCount++];
-	for (const event of turn ?? scripted ?? defaultEvents(command.message ?? "")) emit(event);
+	for (const event of turn ?? defaultEvents(command.message ?? "")) emit(event);
 }
 
 let buffer = "";

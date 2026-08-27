@@ -151,16 +151,12 @@ function stubbedSession() {
 	return { subagent: requireTool(tools, "subagent"), subagentAnswer: requireTool(tools, "subagent_answer"), sent, spawned };
 }
 
-async function run(tool: RegisteredTool, params: SubagentParams): Promise<string> {
+/** Call a registered tool the way pi would, and read its text back. */
+async function call(tool: RegisteredTool, params: SubagentParams | SubagentAnswerParams): Promise<string> {
 	const result = await tool.execute("call-1", params, undefined, undefined, CTX);
 	return result.content
 		.map((part) => (part.type === "text" ? part.text : ""))
 		.join("");
-}
-
-async function answer(tool: RegisteredTool, params: SubagentAnswerParams): Promise<string> {
-	const result = await tool.execute("call-1", params, undefined, undefined, CTX);
-	return result.content.map((part) => (part.type === "text" ? part.text : "")).join("");
 }
 
 /** Wait until `sent` has an `index`th message, or give up loudly. */
@@ -213,7 +209,7 @@ describe("subagent", () => {
 	it("returns a Run's name immediately, without waiting for its result", async () => {
 		const { subagent, sent } = fakeSession();
 
-		const result = await run(subagent, { agent: "scout", task: "look around" });
+		const result = await call(subagent, { agent: "scout", task: "look around" });
 
 		assert.match(result, /scout/);
 		assert.deepEqual(sent, [], "the parent turn continues; nothing has been delivered yet");
@@ -222,8 +218,8 @@ describe("subagent", () => {
 	it("auto-suffixes the second Run of the same agent", async () => {
 		const { subagent } = fakeSession();
 
-		await run(subagent, { agent: "scout", task: "one" });
-		const second = await run(subagent, { agent: "scout", task: "two" });
+		await call(subagent, { agent: "scout", task: "one" });
+		const second = await call(subagent, { agent: "scout", task: "two" });
 
 		assert.match(second, /scout-2/);
 	});
@@ -231,7 +227,7 @@ describe("subagent", () => {
 	it("delivers the child's last assistant message into the parent conversation, waking it", async () => {
 		const { subagent, sent } = fakeSession();
 
-		await run(subagent, { agent: "scout", task: "count the call sites" });
+		await call(subagent, { agent: "scout", task: "count the call sites" });
 		const delivered = await messageAt(sent);
 
 		assert.match(delivered.content, /Run `scout`/);
@@ -242,7 +238,7 @@ describe("subagent", () => {
 	it("rejects an unknown agent with the names that would have worked", async () => {
 		const { subagent } = fakeSession();
 
-		await assert.rejects(run(subagent, { agent: "nobody", task: "anything" }), (error: Error) => {
+		await assert.rejects(call(subagent, { agent: "nobody", task: "anything" }), (error: Error) => {
 			assert.match(error.message, /nobody/);
 			assert.match(error.message, /scout/);
 			assert.match(error.message, /worker/);
@@ -299,7 +295,7 @@ describe("ask_question", () => {
 describe("a Run that asks", () => {
 	it("delivers the Question into the parent conversation, attributed to the Run", async () => {
 		const { subagent, sent, spawned } = stubbedSession();
-		await run(subagent, { agent: "scout", task: "look around" });
+		await call(subagent, { agent: "scout", task: "look around" });
 
 		spawned[0].emit(asked("Which auth module do you mean?"));
 		spawned[0].emit(SETTLED);
@@ -313,7 +309,7 @@ describe("a Run that asks", () => {
 
 	it("leaves its child alive while it waits, and stops it only once it is done", async () => {
 		const { subagent, spawned } = stubbedSession();
-		await run(subagent, { agent: "scout", task: "look around" });
+		await call(subagent, { agent: "scout", task: "look around" });
 
 		spawned[0].emit(asked("Which auth module do you mean?"));
 		spawned[0].emit(SETTLED);
@@ -326,9 +322,9 @@ describe("a Run that asks", () => {
 
 	it("carries a real child's Question all the way through the RPC stream", async () => {
 		const events = [AGENT_START, asked("Which auth module do you mean?"), AGENT_END, SETTLED];
-		const { subagent, sent } = fakeSession(ROSTER, { FAKE_RPC_EVENTS: JSON.stringify(events) });
+		const { subagent, sent } = fakeSession(ROSTER, { FAKE_RPC_TURNS: JSON.stringify([events]) });
 
-		await run(subagent, { agent: "scout", task: "look around" });
+		await call(subagent, { agent: "scout", task: "look around" });
 		const question = await messageAt(sent);
 
 		assert.equal(question.customType, "subagent-question");
@@ -339,11 +335,11 @@ describe("a Run that asks", () => {
 describe("subagent_answer", () => {
 	it("resumes a Waiting Run by sending the answer to its child as a fresh prompt", async () => {
 		const { subagent, subagentAnswer, spawned } = stubbedSession();
-		await run(subagent, { agent: "scout", task: "look around" });
+		await call(subagent, { agent: "scout", task: "look around" });
 		spawned[0].emit(asked("Which auth module do you mean?"));
 		spawned[0].emit(SETTLED);
 
-		const acknowledged = await answer(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
+		const acknowledged = await call(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
 
 		assert.deepEqual(spawned[0].prompts, ["The one in src/auth.ts."]);
 		assert.match(acknowledged, /scout/);
@@ -355,10 +351,10 @@ describe("subagent_answer", () => {
 			[AGENT_START, said("Three call sites in src/auth.ts."), AGENT_END, SETTLED],
 		];
 		const { subagent, subagentAnswer, sent } = fakeSession(ROSTER, { FAKE_RPC_TURNS: JSON.stringify(turns) });
-		await run(subagent, { agent: "scout", task: "count the call sites" });
+		await call(subagent, { agent: "scout", task: "count the call sites" });
 
 		const question = await messageAt(sent);
-		await answer(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
+		await call(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
 		const delivered = await messageAt(sent, 1);
 
 		assert.equal(question.customType, "subagent-question");
@@ -374,12 +370,12 @@ describe("subagent_answer", () => {
 			[AGENT_START, said("Three call sites, tests included."), AGENT_END, SETTLED],
 		];
 		const { subagent, subagentAnswer, sent } = fakeSession(ROSTER, { FAKE_RPC_TURNS: JSON.stringify(turns) });
-		await run(subagent, { agent: "scout", task: "count the call sites" });
+		await call(subagent, { agent: "scout", task: "count the call sites" });
 
 		await messageAt(sent);
-		await answer(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
+		await call(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
 		const second = await messageAt(sent, 1);
-		await answer(subagentAnswer, { name: "scout", answer: "Yes, include the tests." });
+		await call(subagentAnswer, { name: "scout", answer: "Yes, include the tests." });
 		const delivered = await messageAt(sent, 2);
 
 		assert.deepEqual(sent.map((message) => message.customType), [
@@ -393,10 +389,10 @@ describe("subagent_answer", () => {
 
 	it("refuses a Run that has already finished, saying which state it is in", async () => {
 		const { subagent, subagentAnswer, spawned } = stubbedSession();
-		await run(subagent, { agent: "scout", task: "look around" });
+		await call(subagent, { agent: "scout", task: "look around" });
 		spawned[0].emit(SETTLED);
 
-		await assert.rejects(answer(subagentAnswer, { name: "scout", answer: "too late" }), (error: Error) => {
+		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "too late" }), (error: Error) => {
 			assert.match(error.message, /scout/);
 			assert.match(error.message, /done/);
 			return true;
@@ -406,9 +402,9 @@ describe("subagent_answer", () => {
 
 	it("refuses a Run that is still working, saying which state it is in", async () => {
 		const { subagent, subagentAnswer, spawned } = stubbedSession();
-		await run(subagent, { agent: "scout", task: "look around" });
+		await call(subagent, { agent: "scout", task: "look around" });
 
-		await assert.rejects(answer(subagentAnswer, { name: "scout", answer: "unasked for" }), (error: Error) => {
+		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "unasked for" }), (error: Error) => {
 			assert.match(error.message, /running/);
 			return true;
 		});
@@ -417,11 +413,11 @@ describe("subagent_answer", () => {
 
 	it("rejects an unknown name with the Runs that would have worked", async () => {
 		const { subagent, subagentAnswer, spawned } = stubbedSession();
-		await run(subagent, { agent: "scout", task: "look around" });
+		await call(subagent, { agent: "scout", task: "look around" });
 		spawned[0].emit(asked("Which auth module do you mean?"));
 		spawned[0].emit(SETTLED);
 
-		await assert.rejects(answer(subagentAnswer, { name: "nobody", answer: "hello" }), (error: Error) => {
+		await assert.rejects(call(subagentAnswer, { name: "nobody", answer: "hello" }), (error: Error) => {
 			assert.match(error.message, /nobody/);
 			assert.match(error.message, /scout/);
 			assert.match(error.message, /waiting/);
@@ -432,7 +428,7 @@ describe("subagent_answer", () => {
 	it("says so plainly when nothing has been started to answer", async () => {
 		const { subagentAnswer } = stubbedSession();
 
-		await assert.rejects(answer(subagentAnswer, { name: "scout", answer: "hello" }), (error: Error) => {
+		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "hello" }), (error: Error) => {
 			assert.match(error.message, /no runs/i);
 			return true;
 		});
@@ -440,11 +436,11 @@ describe("subagent_answer", () => {
 
 	it("refuses an empty answer, leaving the Run waiting rather than resuming it on nothing", async () => {
 		const { subagent, subagentAnswer, spawned } = stubbedSession();
-		await run(subagent, { agent: "scout", task: "look around" });
+		await call(subagent, { agent: "scout", task: "look around" });
 		spawned[0].emit(asked("Which auth module do you mean?"));
 		spawned[0].emit(SETTLED);
 
-		await assert.rejects(answer(subagentAnswer, { name: "scout", answer: "   " }));
+		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "   " }));
 		assert.deepEqual(spawned[0].prompts, []);
 	});
 });

@@ -15,7 +15,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type Agent, discoverAgents, type Roster } from "./agents.ts";
 import { type RunChild, RUN_NAME_ENV, type SpawnOptions, spawnRun } from "./child.ts";
-import { ASK_QUESTION_TOOL, type QuestionDetails, Supervisor } from "./supervisor.ts";
+import { ASK_QUESTION_TOOL, type QuestionDetails, type Run, Supervisor } from "./supervisor.ts";
 
 const SubagentParams = Type.Object({
 	agent: Type.String({ description: "Which agent to run — one of the names listed in this tool's description." }),
@@ -60,11 +60,9 @@ interface SubagentDetails {
  * caller mistyped and one it addressed too late: listing bare names would make a
  * Run that has already delivered look like a Run still waiting to be answered.
  */
-function unanswerableRun(name: string, supervisor: Supervisor): Error {
-	const run = supervisor.get(name);
+function unanswerableRun(name: string, run: Run | undefined, runs: Run[]): Error {
 	if (run) return new Error(`Run \`${name}\` is ${run.state}, not waiting for an answer. Only a waiting run can be answered.`);
 
-	const runs = supervisor.list();
 	const known = runs.map((candidate) => `\`${candidate.name}\` (${candidate.state})`).join(", ");
 	return new Error(`Unknown run \`${name}\`. ${known ? `Runs in this session: ${known}.` : "No runs have been started in this session."}`);
 }
@@ -244,7 +242,7 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 		async execute(_toolCallId, params) {
 			const name = params.name.trim();
 			const run = supervisor.get(name);
-			if (!run || run.state !== "waiting") throw unanswerableRun(name, supervisor);
+			if (!run || run.state !== "waiting") throw unanswerableRun(name, run, supervisor.list());
 
 			const answer = params.answer.trim();
 			// An answer saying nothing would start a turn anyway and let the Run
