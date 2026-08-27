@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildSearchUrl, RETRY_DELAY_MS, search, WebSearchError } from "../brave.ts";
+import { buildSearchUrl, describeFreshness, RETRY_DELAY_MS, search, WebSearchError } from "../brave.ts";
 import { fakeFetch, jsonResponse as json, rejection, stalledFetch, thrown } from "./helpers.ts";
 
 const okBody = { web: { results: [{ title: "A", url: "https://a.test/", description: "d" }] } };
@@ -544,5 +544,34 @@ describe("two searches in one turn", () => {
 			calls.map((call) => new URL(call.url).searchParams.get("q")),
 			["first", "second"],
 		);
+	});
+});
+
+describe("describeFreshness", () => {
+	it("says what each window code means", () => {
+		assert.equal(describeFreshness("pd"), "the past day");
+		assert.equal(describeFreshness("pw"), "the past week");
+		assert.equal(describeFreshness("pm"), "the past month");
+		assert.equal(describeFreshness("py"), "the past year");
+	});
+
+	it("spells a date range out rather than repeating Brave's wire form", () => {
+		assert.equal(describeFreshness("2026-01-01to2026-03-31"), "2026-01-01 to 2026-03-31");
+	});
+
+	it("reads the same casing and spacing a search accepts", () => {
+		assert.equal(describeFreshness(" PW "), "the past week");
+	});
+
+	it("has nothing to say about a search that was not narrowed", () => {
+		assert.equal(describeFreshness(undefined), undefined);
+		assert.equal(describeFreshness("  "), undefined);
+	});
+
+	it("names an unusable value as it was written rather than throwing", () => {
+		// A renderer runs before the search does; the search is what rejects this,
+		// with the vocabulary attached.
+		assert.equal(describeFreshness("last tuesday"), "last tuesday");
+		assert.equal(describeFreshness("2026-02-30to2026-03-31"), "2026-02-30 to 2026-03-31");
 	});
 });
