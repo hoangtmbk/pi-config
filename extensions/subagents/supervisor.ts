@@ -48,7 +48,7 @@ export interface Run {
 	result?: string;
 	/**
 	 * What the Run asked, while it is Waiting. Absent otherwise, and absent when
-	 * a Run parked without saying what it wanted to know.
+	 * a Run started Waiting without saying what it wanted to know.
 	 */
 	question?: string;
 }
@@ -105,14 +105,14 @@ export class Supervisor {
 
 	/**
 	 * Feed one event from a Run's child. Returns a Question on the event that
-	 * parks the Run, a Delivery on the event that finishes it, and nothing on
-	 * every other event.
+	 * moves the Run to Waiting, a Delivery on the event that finishes it, and
+	 * nothing on every other event.
 	 *
 	 * The done-signal is `agent_settled`, **not** `agent_end`: `agent_end` can be
 	 * followed by an automatic retry or a compaction, so a Run that ended on it
 	 * would deliver a half-finished answer and then keep working. A settling turn
-	 * that ran `ask_question` parks the Run instead of finishing it — see
-	 * `ASK_QUESTION_TOOL`.
+	 * that ran `ask_question` moves the Run to Waiting instead of finishing it —
+	 * see `ASK_QUESTION_TOOL`.
 	 */
 	observe(name: string, event: JsonAgentSessionEvent): ParentMessage | undefined {
 		const record = this.byName.get(name);
@@ -178,8 +178,9 @@ interface RunRecord {
 	lastAssistant?: AssistantMessage;
 	/**
 	 * The Question this turn ran `ask_question` with, if it did. Present means the
-	 * turn parks the Run rather than finishing it; the `question` inside can still
-	 * be absent, for a child that asked without saying what it wanted to know.
+	 * turn moves the Run to Waiting rather than finishing it; the `question`
+	 * inside can still be absent, for a child that asked without saying what it
+	 * wanted to know.
 	 */
 	asked?: { question?: string };
 }
@@ -211,20 +212,12 @@ function assistantText(message: AssistantMessage): string | undefined {
 /**
  * What the child passed to `ask_question`, read back out of its tool result.
  *
- * `details` is where `ask_question` puts it; the result text is a fallback, so a
- * Question is still legible if that ever stops being true.
+ * `unknown` rather than `QuestionDetails`, because this is the far side of a
+ * process boundary: the shape is what the child sent, not what this file hopes.
  */
 function questionText(result: unknown): string | undefined {
-	const toolResult = result as { details?: { question?: unknown }; content?: { type?: string; text?: string }[] } | undefined;
-	const asked = toolResult?.details?.question;
-	if (typeof asked === "string" && asked.trim()) return asked.trim();
-
-	const text = (toolResult?.content ?? [])
-		.filter((part) => part.type === "text")
-		.map((part) => part.text ?? "")
-		.join("")
-		.trim();
-	return text || undefined;
+	const asked = (result as { details?: { question?: unknown } } | undefined)?.details?.question;
+	return typeof asked === "string" && asked.trim() ? asked.trim() : undefined;
 }
 
 /**

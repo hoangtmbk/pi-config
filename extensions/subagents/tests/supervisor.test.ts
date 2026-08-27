@@ -9,42 +9,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import { ASK_QUESTION_TOOL, type ParentMessage, type QuestionDetails, Supervisor } from "../supervisor.ts";
-
-/** An assistant `message_end`, the event a result is read from. */
-function said(text: string): JsonAgentSessionEvent {
-	return {
-		type: "message_end",
-		message: { role: "assistant", content: [{ type: "text", text }], api: "anthropic", provider: "", model: "", usage: {} },
-	} as unknown as JsonAgentSessionEvent;
-}
-
-/** A completed `ask_question` execution — the event a Question is read from. */
-function asked(question: string): JsonAgentSessionEvent {
-	const details: QuestionDetails = { question };
-	return {
-		type: "tool_execution_end",
-		toolCallId: "call-ask",
-		toolName: ASK_QUESTION_TOOL,
-		result: { content: [{ type: "text", text: "Sent." }], details },
-		isError: false,
-	} as unknown as JsonAgentSessionEvent;
-}
-
-/** Any other tool running in the child, which must not park anything. */
-function ran(toolName: string): JsonAgentSessionEvent {
-	return {
-		type: "tool_execution_end",
-		toolCallId: `call-${toolName}`,
-		toolName,
-		result: { content: [{ type: "text", text: "ok" }] },
-		isError: false,
-	} as unknown as JsonAgentSessionEvent;
-}
-
-const AGENT_START = { type: "agent_start" } as unknown as JsonAgentSessionEvent;
-const AGENT_END = { type: "agent_end", messages: [], willRetry: false } as unknown as JsonAgentSessionEvent;
-const SETTLED = { type: "agent_settled" } as JsonAgentSessionEvent;
+import { ASK_QUESTION_TOOL, type ParentMessage, Supervisor } from "../supervisor.ts";
+import { AGENT_END, AGENT_START, asked, failed, ran, RETRYING, said, SETTLED } from "./child-events.ts";
 
 /** Feed a whole sequence to one Run and collect whatever it asks the parent to say. */
 function feed(supervisor: Supervisor, name: string, events: JsonAgentSessionEvent[]): ParentMessage[] {
@@ -95,7 +61,7 @@ describe("Supervisor lifecycle", () => {
 
 		const deliveries = feed(supervisor, run.name, [
 			said("half an answer"),
-			{ type: "agent_end", messages: [], willRetry: true } as unknown as JsonAgentSessionEvent,
+			RETRYING,
 			said("the real answer"),
 			AGENT_END,
 			SETTLED,
@@ -234,13 +200,7 @@ describe("Supervisor questions", () => {
 	it("finishes a Run whose ask_question failed, because no Question ever reached the parent", () => {
 		const supervisor = new Supervisor();
 		const run = supervisor.register("scout", "look around");
-		const failedAsk = {
-			type: "tool_execution_end",
-			toolCallId: "call-ask",
-			toolName: ASK_QUESTION_TOOL,
-			result: { content: [{ type: "text", text: "A question cannot be empty." }] },
-			isError: true,
-		} as unknown as JsonAgentSessionEvent;
+		const failedAsk = failed(ASK_QUESTION_TOOL, "A question cannot be empty.");
 
 		const announced = feed(supervisor, run.name, [failedAsk, said("Guessed instead."), AGENT_END, SETTLED]);
 
@@ -262,7 +222,7 @@ describe("Supervisor questions", () => {
 		assert.match(announced[0].text, /without producing a result/);
 	});
 
-	it("says so plainly when a Run parks without saying what it wanted to know", () => {
+	it("says so plainly when a Run starts Waiting without saying what it wanted to know", () => {
 		const supervisor = new Supervisor();
 		const run = supervisor.register("scout", "look around");
 		const silentAsk = {

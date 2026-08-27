@@ -18,6 +18,7 @@ import type { RunChild } from "../child.ts";
 import { spawnRun } from "../child.ts";
 import { registerSubagents } from "../index.ts";
 import { ASK_QUESTION_TOOL, type QuestionDetails } from "../supervisor.ts";
+import { AGENT_END, AGENT_START, asked, SETTLED } from "./child-events.ts";
 
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CHILD = join(TESTS_DIR, "fake-rpc-child.ts");
@@ -140,20 +141,6 @@ function stubbedSession() {
 	assert.ok(subagent, "expected a subagent tool");
 	return { subagent, sent, spawned };
 }
-
-/** A completed `ask_question` execution, as the parent sees it in the child's stream. */
-function asked(question: string): JsonAgentSessionEvent {
-	const details: QuestionDetails = { question };
-	return {
-		type: "tool_execution_end",
-		toolCallId: "call-ask",
-		toolName: ASK_QUESTION_TOOL,
-		result: { content: [{ type: "text", text: "Sent." }], details },
-		isError: false,
-	} as unknown as JsonAgentSessionEvent;
-}
-
-const SETTLED = { type: "agent_settled" } as JsonAgentSessionEvent;
 
 async function run(tool: RegisteredTool, params: SubagentParams): Promise<string> {
 	const result = await tool.execute("call-1", params, undefined, undefined, CTX);
@@ -316,24 +303,13 @@ describe("a Run that asks", () => {
 		spawned[0].emit(SETTLED);
 		assert.equal(spawned[0].stops, 0, "a Waiting Run's child is neither killed nor reaped");
 
-		spawned[0].emit({ type: "agent_start" } as unknown as JsonAgentSessionEvent);
+		spawned[0].emit(AGENT_START);
 		spawned[0].emit(SETTLED);
 		assert.equal(spawned[0].stops, 1);
 	});
 
 	it("carries a real child's Question all the way through the RPC stream", async () => {
-		const events = [
-			{ type: "agent_start" },
-			{
-				type: "tool_execution_end",
-				toolCallId: "call-ask",
-				toolName: ASK_QUESTION_TOOL,
-				result: { content: [{ type: "text", text: "Sent." }], details: { question: "Which auth module do you mean?" } },
-				isError: false,
-			},
-			{ type: "agent_end", messages: [], willRetry: false },
-			{ type: "agent_settled" },
-		];
+		const events = [AGENT_START, asked("Which auth module do you mean?"), AGENT_END, SETTLED];
 		const { subagent, sent } = fakeSession(ROSTER, { FAKE_RPC_EVENTS: JSON.stringify(events) });
 
 		await run(subagent, { agent: "scout", task: "look around" });

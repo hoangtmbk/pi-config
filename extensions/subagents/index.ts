@@ -108,7 +108,7 @@ function registerAskQuestion(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params) {
 			const question = params.question.trim();
 			// A Question nobody can read would still stop the Run, so refuse it here
-			// and let the turn carry on: a failed ask never reaches the parent.
+			// and let the turn carry on: a failed execution never reaches the parent.
 			if (!question) throw new Error("A question cannot be empty. Say what you need to know.");
 
 			const details: QuestionDetails = { question };
@@ -176,8 +176,8 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 						{ triggerTurn: true },
 					);
 
-					// A Waiting Run is alive and idle by design: its child holds the whole
-					// context the answer will land in, so nothing here is killed or reaped.
+					// A Waiting Run keeps its child: the process stays up, doing nothing but
+					// holding the context an answer lands in. Nothing is killed or reaped.
 					if (message.kind === "question") return;
 
 					// A done Run has nothing left to say, and an idle pi child is a
