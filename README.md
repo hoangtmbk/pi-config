@@ -104,7 +104,10 @@ Each rule was added because it was observed wasting tokens on a real page:
 - Non-2xx throws with the server's own error text included — pi marks the result `isError`.
 - If Readability returns nothing usable (under 200 chars), it falls back to whole-page conversion
   automatically. This is why `raw` is rarely needed.
-- Charset from the `Content-Type` header is honoured, falling back to UTF-8.
+- Charset comes from the `Content-Type` header, and when the header declares none, from the
+  document's own `<meta charset>` (or `<meta http-equiv="Content-Type">`). Legacy Shift_JIS and
+  GB2312 pages therefore decode as text instead of replacement characters. Unknown labels fall
+  back to UTF-8.
 
 ## Not included, on purpose
 

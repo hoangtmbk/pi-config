@@ -1,13 +1,12 @@
 /**
  * Charset decoding (defect 1.9).
  *
- * Kept in its own file because `decodeBody` does not exist yet: the import
- * throws, and node:test would otherwise take the fidelity suite down with it.
+ * `decodeBody` is the one piece of `fetch.ts` that is pure enough to test
+ * without a server: bytes in, text out.
  */
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-// @ts-expect-error — `decodeBody` is the export defect 1.9 must add; remove this line once it exists.
 import { decodeBody } from "../fetch.ts";
 import { fixtureBytes } from "./helpers.ts";
 

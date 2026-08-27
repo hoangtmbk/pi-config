@@ -216,12 +216,44 @@ async function readBoundedBody(response: Response, limit: number): Promise<{ byt
 	return { bytes, truncated: !complete };
 }
 
-/** Decode with the server's charset, falling back to utf-8 for ones Node does not know. */
-function decodeCharset(bytes: Uint8Array, charset: string | undefined): string {
+/**
+ * `<meta charset=x>` and `<meta http-equiv="Content-Type" content="...; charset=x">`.
+ * One pattern covers both: the label is whatever follows the last `charset=` in
+ * the tag, quoted or not.
+ */
+const META_CHARSET_PATTERN = /<meta\b[^>]*?\bcharset\s*=\s*["']?\s*([\w:.+-]+)/i;
+
+/** How much of the body to search for a `<meta charset>`, per the HTML spec's own prescan. */
+const CHARSET_SNIFF_BYTES = 2048;
+
+/** The charset the document declares about itself, if any. */
+function sniffCharset(buffer: Uint8Array): string | undefined {
+	// latin1 because the prescan must not fail on bytes that are not yet known to
+	// be valid in any encoding — every byte maps to a character, and the ASCII
+	// markup we are looking for survives unchanged.
+	const prefix = Buffer.from(
+		buffer.buffer,
+		buffer.byteOffset,
+		Math.min(buffer.byteLength, CHARSET_SNIFF_BYTES),
+	).toString("latin1");
+	return META_CHARSET_PATTERN.exec(prefix)?.[1]?.toLowerCase();
+}
+
+/**
+ * Decode a body as text.
+ *
+ * The `Content-Type` header wins when it declares a charset; otherwise the
+ * document's own `<meta charset>` decides. Plenty of legacy pages — Shift_JIS
+ * and GB2312 docs especially — declare their encoding only in the markup, and
+ * decoding those as utf-8 turns the whole page into replacement characters.
+ */
+export function decodeBody(buffer: Uint8Array, headerCharset: string | undefined): string {
+	const label = headerCharset || sniffCharset(buffer) || "utf-8";
 	try {
-		return new TextDecoder(charset || "utf-8").decode(bytes);
+		return new TextDecoder(label, { fatal: false }).decode(buffer);
 	} catch {
-		return new TextDecoder("utf-8").decode(bytes);
+		// A label Node does not know. utf-8 is the web's default and the best guess left.
+		return new TextDecoder("utf-8").decode(buffer);
 	}
 }
 
@@ -333,7 +365,7 @@ export async function fetchPage(rawUrl: string, signal?: AbortSignal, options: F
 			bytes: new Uint8Array(0),
 			truncated: false,
 		}));
-		const detail = summarizeErrorBody(decodeCharset(read.bytes, charset));
+		const detail = summarizeErrorBody(decodeBody(read.bytes, charset));
 		throw new WebFetchError(
 			`HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""} for ${shown}` +
 				(detail ? ` — ${detail}` : ""),
@@ -368,7 +400,7 @@ export async function fetchPage(rawUrl: string, signal?: AbortSignal, options: F
 		status: response.status,
 		contentType: type,
 		charset,
-		body: kind === "pdf" ? "" : decodeCharset(read.bytes, charset),
+		body: kind === "pdf" ? "" : decodeBody(read.bytes, charset),
 		bytes: read.bytes.length,
 		truncatedAtBytes: read.truncated,
 	};

@@ -84,6 +84,12 @@ describe("python-asyncio — Sphinx pre blocks (defects 1.2, 1.3)", () => {
 		assert.ok(fences(markdown).length >= 1, `fences: ${fences(markdown).length}`);
 	});
 
+	it("keeps the first code example, the one in the Sphinx sidebar", () => {
+		// The page's first `<pre>` sits in `<aside class="sidebar">`, which
+		// Readability deletes outright unless the aside is unwrapped first.
+		assertFenceHasLines(markdown, ["import asyncio", "asyncio.run(main())"]);
+	});
+
 	it("keeps the REPL session verbatim", () => {
 		// Text of the fixture's `highlight-pycon` <pre>.
 		assert.ok(markdown.includes(">>> import asyncio"), "REPL prompt missing or escaped");

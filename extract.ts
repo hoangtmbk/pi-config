@@ -24,6 +24,12 @@ export interface Extracted {
 	markdown: string;
 	/** How the content was obtained — surfaced so the model can judge quality. */
 	mode: "article" | "full-page" | "json" | "text";
+	/**
+	 * Share of the page's text that survived extraction, 0–1. A low value on an
+	 * `article` result is the model's warning that Readability was aggressive;
+	 * 1 means nothing was dropped.
+	 */
+	keptRatio: number;
 }
 
 /** Readability output shorter than this means it almost certainly ate the page. */
@@ -239,9 +245,28 @@ const TURNDOWN_OPTIONS = {
 	emDelimiter: "*",
 } as const;
 
-/** Direct children of a table, skipping any nested table's own rows and cells. */
+/** Descendants belonging to a table, skipping any nested table's own rows and cells. */
 function ownDescendants(table: Element, selector: string): Element[] {
 	return Array.from(table.querySelectorAll(selector)).filter((element) => element.closest("table") === table);
+}
+
+/** The cells belonging to a row, skipping any nested table's cells. */
+function ownCells(row: Element): Element[] {
+	return Array.from(row.querySelectorAll("th, td")).filter((cell) => cell.closest("tr") === row);
+}
+
+/** Widest `colspan` honoured — past this a page is padding, not spanning. */
+const MAX_COLSPAN = 32;
+
+/** A row's cells, each spanning cell followed by the empty columns it covers. */
+function expandCells(row: Element, render: (cell: Element) => string): string[] {
+	const cells: string[] = [];
+	for (const cell of ownCells(row)) {
+		cells.push(render(cell));
+		const span = Number.parseInt(cell.getAttribute("colspan") ?? "", 10);
+		for (let covered = 1; covered < Math.min(span || 1, MAX_COLSPAN); covered++) cells.push("");
+	}
+	return cells;
 }
 
 function createTurndown(): TurndownService {
@@ -261,30 +286,43 @@ function createTurndown(): TurndownService {
 			const rows = ownDescendants(table, "tr");
 			if (rows.length === 0) return "";
 
-			const toCells = (row: Element) =>
-				Array.from(row.querySelectorAll("th, td"))
-					.filter((cell) => cell.closest("tr") === row)
-					.map((cell) =>
-						cellConverter
-							.turndown(cell.innerHTML ?? "")
-							.replace(/\|/g, "\\|")
-							.replace(/\s*\n+\s*/g, " ")
-							.trim(),
-					);
+			// A cell's markup, flattened onto one line: a newline inside a GFM cell
+			// ends the row, and an unescaped pipe adds a column that is not there.
+			const render = (cell: Element) =>
+				cellConverter
+					.turndown(cell.innerHTML ?? "")
+					.replace(/\|/g, "\\|")
+					.replace(/\s*\n+\s*/g, " ")
+					.trim();
 
-			const grid = rows.map(toCells).filter((cells) => cells.length > 0);
+			const grid = rows
+				.map((row) => ({
+					cells: expandCells(row, render),
+					labels: ownCells(row).some((cell) => cell.nodeName === "TH"),
+				}))
+				.filter((row) => row.cells.length > 0);
 			if (grid.length === 0) return "";
 
-			const width = Math.max(...grid.map((cells) => cells.length));
-			const pad = (cells: string[]) => [...cells, ...Array(width - cells.length).fill("")];
+			// The first row is the column header unless `<th>` shows up further
+			// down — that means the table labels its *rows*, so no row is a header
+			// row and GFM needs an empty one to render any of the data at all.
+			const header = grid.slice(1).some((row) => row.labels) ? undefined : grid[0];
+			const body = header ? grid.slice(1) : grid;
 
-			const [header, ...body] = grid;
+			const width = Math.max(...grid.map((row) => row.cells.length));
+			const line = (cells: string[]) =>
+				`| ${[...cells, ...Array(width - cells.length).fill("")].join(" | ")} |`;
+
+			const caption = ownDescendants(table, "caption")[0];
 			const lines = [
-				`| ${pad(header).join(" | ")} |`,
-				`| ${Array(width).fill("---").join(" | ")} |`,
-				...body.map((cells) => `| ${pad(cells).join(" | ")} |`),
+				header ? line(header.cells) : `|${" |".repeat(width)}`,
+				line(Array(width).fill("---")),
+				...body.map((row) => line(row.cells)),
 			];
-			return `\n\n${lines.join("\n")}\n\n`;
+			// The caption names the table; a bold line above it is the closest
+			// markdown has, and GFM has nowhere to put it inside the table.
+			const title = caption ? render(caption) : "";
+			return `\n\n${title ? `**${title}**\n\n` : ""}${lines.join("\n")}\n\n`;
 		},
 	});
 
@@ -292,26 +330,46 @@ function createTurndown(): TurndownService {
 }
 
 /**
+ * A table that cannot be holding tabular data.
+ *
+ * Three shapes qualify, and each is a certainty rather than a guess: a table
+ * inside another table is a layout grid, and a table with one row — or with one
+ * cell in every row — has no second dimension to tabulate.
+ *
+ * `<th>` deliberately plays no part. It was the old test, and it is wrong in
+ * both directions: plenty of real data tables mark their header row with `<td>`
+ * (they get flattened), and layout tables occasionally carry a stray `<th>`.
+ */
+function isLayoutTable(table: Element): boolean {
+	if (table.parentElement?.closest("table")) return true;
+	const rows = ownDescendants(table, "tr");
+	return rows.length <= 1 || rows.every((row) => ownCells(row).length <= 1);
+}
+
+/**
  * Replace layout tables with their cell contents.
  *
  * Sites like Hacker News build their entire page from nested tables. Rendering
  * those as markdown tables costs more characters than the source HTML and
- * flattens the content inside them. A table with no `<th>` is treated as
- * layout; genuine data tables essentially always mark their headers.
+ * flattens the content inside them.
  *
  * Unwrapping innermost-first (tables with no nested table) keeps cell contents
- * in document order.
+ * in document order, and re-testing after each pass lets an outer table be
+ * judged on the rows it has left. Every pass removes at least one table, so the
+ * loop ends.
  */
 function unwrapLayoutTables(document: Document): void {
-	for (let pass = 0; pass < 100; pass++) {
-		const layoutTables = Array.from(document.querySelectorAll("table")).filter(
-			(table) => !table.querySelector("th") && !table.querySelector("table"),
-		);
+	for (;;) {
+		const layoutTables = Array.from(document.querySelectorAll("table"))
+			.filter((table) => !table.querySelector("table"))
+			.filter(isLayoutTable);
 		if (layoutTables.length === 0) return;
 
 		for (const table of layoutTables) {
 			const holder = document.createElement("div");
-			for (const cell of ownDescendants(table, "td")) {
+			// The caption comes along: it is the only text a one-row table has that
+			// is not in a cell, and dropping it would lose it outright.
+			for (const cell of ownDescendants(table, "caption, td, th")) {
 				const wrapper = document.createElement("div");
 				while (cell.firstChild) wrapper.appendChild(cell.firstChild);
 				holder.appendChild(wrapper);
@@ -409,8 +467,102 @@ function stripNonContent(document: Document): void {
 	}
 }
 
+/**
+ * Controls documentation generators hang off a heading: Wikipedia's `[edit]`
+ * link, Sphinx's `¶` permalink, GitHub's anchor icon.
+ */
+const HEADING_CONTROL_SELECTOR = ".mw-editsection, a.headerlink, a.anchor";
+
+/** Keyboard-only jump links, which are markup for screen readers and noise here. */
+const SKIP_LINK_SELECTOR = '.mw-jump-link, [class*="skip-to"]';
+
+const HEADING_SELECTOR = "h1, h2, h3, h4, h5, h6";
+
+/** Permalink glyphs and zero-width padding left at the end of a heading's text. */
+const HEADING_SUFFIX_PATTERN = /[\s#¶\u200b\ufeff]+$/;
+const ZERO_WIDTH_PATTERN = /[\u200b\ufeff]/g;
+
+/** Every text node under an element, in document order. */
+function textNodesOf(root: Element): Text[] {
+	const found: Text[] = [];
+	const walk = (parent: Node) => {
+		for (const child of Array.from(parent.childNodes)) {
+			if (child.nodeType === 3) found.push(child as Text);
+			else if (child.nodeType === 1) walk(child);
+		}
+	};
+	walk(root);
+	return found;
+}
+
+/**
+ * Strip the anchor debris documentation sites attach to their headings.
+ *
+ * This is worth more than the characters it saves. Wikipedia wraps every section
+ * heading as `<div class="mw-heading"><h2>History</h2><span class="mw-editsection">[edit]</span></div>`,
+ * and Readability's `_cleanConditionally` deletes that div — 13 characters of
+ * text at link density 0.31 trips both its "suspiciously short" and its "low
+ * weight and a little linky" rules — taking the `<h2>` inside it with it. That
+ * is why ten of the eleven section headings never reached the markdown: not the
+ * `<div>` wrapper, but the `[edit]` link sharing it. Removing the control first
+ * leaves the div with no links at all, and the heading survives.
+ */
+function cleanHeadings(document: Document): void {
+	for (const control of Array.from(
+		document.querySelectorAll(`${HEADING_CONTROL_SELECTOR}, ${SKIP_LINK_SELECTOR}`),
+	)) {
+		control.remove();
+	}
+
+	for (const heading of Array.from(document.querySelectorAll(HEADING_SELECTOR))) {
+		// A heading anchor hidden from assistive tech is decoration by definition.
+		for (const decoration of Array.from(heading.querySelectorAll('a[aria-hidden="true"]'))) {
+			decoration.remove();
+		}
+
+		const texts = textNodesOf(heading);
+		for (const text of texts) text.nodeValue = (text.nodeValue ?? "").replace(ZERO_WIDTH_PATTERN, "");
+
+		const last = texts.filter((text) => (text.nodeValue ?? "").trim() !== "").pop();
+		if (!last) continue;
+		// A heading that *is* a `#` keeps it — there would be nothing left otherwise.
+		if ((heading.textContent ?? "").replace(HEADING_SUFFIX_PATTERN, "").trim() === "") continue;
+		last.nodeValue = (last.nodeValue ?? "").replace(HEADING_SUFFIX_PATTERN, "");
+	}
+}
+
+/**
+ * Hoist the contents of any `<aside>` that holds a code block.
+ *
+ * Readability deletes every `<aside>` outright — `_prepArticle` ends with
+ * `_clean(articleContent, "aside")`, no scoring involved — and drops anything
+ * classed `sidebar` before it even starts scoring. Sphinx puts worked examples
+ * in `<aside class="sidebar">`, which on docs.python.org's asyncio page is the
+ * *first* code example on the page, so both rules fired and the example was
+ * gone. An aside holding a `<pre>` is a worked example rather than navigation:
+ * unwrapping it puts the code in the flow, where neither rule can reach it.
+ */
+function hoistCodeAsides(document: Document): void {
+	for (const aside of Array.from(document.querySelectorAll("aside"))) {
+		if (!aside.querySelector("pre")) continue;
+		while (aside.firstChild) aside.parentNode?.insertBefore(aside.firstChild, aside);
+		aside.remove();
+	}
+}
+
 /** Regions whose heading names the site, not the article. */
 const CHROME_REGIONS = "header, nav, footer, aside";
+
+/**
+ * Drop site chrome, for the full-page path only.
+ *
+ * On the article path Readability has already scored these out, and running
+ * this there would be a net loss: an `<aside>` holds a documentation sidebar
+ * with worked examples at least as often as it holds navigation.
+ */
+function stripChromeRegions(root: Element): void {
+	for (const region of Array.from(root.querySelectorAll(CHROME_REGIONS))) region.remove();
+}
 
 /** Text of a heading, whitespace-normalised, for comparing one against another. */
 function headingText(html: string): string {
@@ -430,10 +582,14 @@ function headingText(html: string): string {
  * heading is unrecoverable afterwards, so we re-insert it whenever no heading of
  * that text survived. Headings inside page chrome are skipped: those name the
  * site, and Readability dropped them for the right reason.
+ *
+ * `root` is the region the article was extracted from, so that "the first
+ * heading" means the first heading of the content and not of some sidebar that
+ * happens to come earlier in the document.
  */
-function restoreLeadHeading(content: string, document: Document): string {
+function restoreLeadHeading(content: string, root: ParentNode): string {
 	const outsideChrome = (selector: string) =>
-		Array.from(document.querySelectorAll(selector)).find(
+		Array.from(root.querySelectorAll(selector)).find(
 			(heading) => !heading.closest(CHROME_REGIONS) && (heading.textContent?.trim() ?? "") !== "",
 		);
 	const lead = outsideChrome("h1") ?? outsideChrome("h2");
@@ -446,10 +602,85 @@ function restoreLeadHeading(content: string, document: Document): string {
 	return survives ? content : `<h1>${lead.innerHTML}</h1>${content}`;
 }
 
+/** Elements a page uses to mark where its own content is. */
+const MAIN_CONTENT_SELECTOR = "main, article, [role=main]";
+
+/** Below this share of the page's text, a `<main>` is a shell, not the content. */
+const MIN_MAIN_RATIO = 0.4;
+
+/** Below this share kept, Readability picked something other than the article. */
+const MIN_KEPT_RATIO = 0.4;
+
+/** Length of a piece of text with runs of whitespace counted as one character. */
+function textLength(text: string | null | undefined): number {
+	return (text ?? "").replace(/\s+/g, " ").trim().length;
+}
+
+/**
+ * The element holding the page's own content, when the page marks one convincingly.
+ *
+ * The largest match wins rather than the first: docs sites nest the real
+ * `<article>` inside a `<main>` scroll container that holds nothing itself (the
+ * Claude docs do exactly this), and news sites nest teaser `<article>`s inside
+ * the real `<main>`. A region under 40% of the page's text is not the content —
+ * it is a shell whose content arrives by script — and trusting it would throw
+ * the rest of the page away.
+ */
+function mainContentRegion(document: Document, pageChars: number): Element | undefined {
+	if (pageChars === 0) return undefined;
+
+	let best: Element | undefined;
+	let bestChars = 0;
+	for (const candidate of Array.from(document.querySelectorAll(MAIN_CONTENT_SELECTOR))) {
+		const chars = textLength(candidate.textContent);
+		if (chars <= bestChars) continue;
+		best = candidate;
+		bestChars = chars;
+	}
+
+	return bestChars / pageChars >= MIN_MAIN_RATIO ? best : undefined;
+}
+
+/**
+ * The document Readability parses.
+ *
+ * When the page marks its own content region, Readability sees only that.
+ * Its scoring is per-element, so a large enough navigation tree can outscore
+ * the article — the Claude docs sidebar beat the page it belongs to. The head
+ * comes along so the title and metadata Readability reads are still there.
+ */
+function readabilityInput(document: Document, region: Element | undefined): Document {
+	if (!region) return document.cloneNode(true) as Document;
+	const head = document.querySelector("head")?.innerHTML ?? "";
+	return parseHTML(`<html><head>${head}</head><body>${region.outerHTML}</body></html>`).document;
+}
+
+/**
+ * Give the document a `<body>` holding everything, when the source had none.
+ *
+ * linkedom does no tree fixup, so a bare fragment (`<h1>…</h1><p>…</p>`) parses
+ * into a document whose *first element* is the document element and whose body
+ * is empty: converting the body then yields nothing at all, and converting the
+ * document element yields only the first of the fragment's elements.
+ */
+function adoptStrayNodes(document: Document): void {
+	const strays = Array.from(document.childNodes).filter(
+		(node) => node.nodeType === 1 && (node as Element).nodeName !== "HTML",
+	);
+	if (strays.length === 0) return;
+
+	const body = document.querySelector("body") ?? document.createElement("body");
+	for (const stray of strays) body.appendChild(stray);
+	if (!body.parentNode) document.appendChild(body);
+}
+
 function extractHtml(page: FetchedPage, raw: boolean): Extracted {
 	const { document } = parseHTML(page.body);
 
+	adoptStrayNodes(document);
 	stripNonContent(document);
+	cleanHeadings(document);
+	hoistCodeAsides(document);
 	flattenPreBlocks(document);
 	absolutizeLinks(document, page.url);
 	cleanLinks(document);
@@ -463,12 +694,17 @@ function extractHtml(page: FetchedPage, raw: boolean): Extracted {
 		document.querySelector(selector)?.getAttribute("content")?.trim() || undefined;
 
 	const turndown = createTurndown();
+	// `documentElement` covers a document with no `<body>`; the cast is because a
+	// degenerate page can leave even that undefined, whatever the DOM types say.
+	const body = (document.querySelector("body") ?? document.documentElement) as Element | undefined;
+	const pageChars = textLength(body?.textContent);
+	const region = mainContentRegion(document, pageChars);
 
 	if (!raw) {
-		// Readability mutates the document, so hand it a clone.
+		// Readability mutates whatever it is given, so it never gets the original.
 		const article = (() => {
 			try {
-				return new Readability(document.cloneNode(true) as Document, {
+				return new Readability(readabilityInput(document, region), {
 					charThreshold: 100,
 					keepClasses: true,
 				}).parse();
@@ -478,12 +714,16 @@ function extractHtml(page: FetchedPage, raw: boolean): Extracted {
 		})();
 
 		const articleMarkdown = article?.content
-			? turndown.turndown(restoreLeadHeading(article.content, document)).trim()
+			? turndown.turndown(restoreLeadHeading(article.content, region ?? document)).trim()
 			: "";
+		const keptRatio = pageChars ? Math.min(1, textLength(article?.textContent) / pageChars) : 1;
 
-		// Fall back when Readability returns nothing usable. This is the main
-		// robustness guarantee: listing pages and app shells still produce output.
-		if (articleMarkdown.length >= MIN_ARTICLE_CHARS) {
+		// Two ways to reject the article. Too short means Readability returned
+		// nothing usable; too little of the page kept means it picked the wrong
+		// element entirely — but only when the page never told us where its
+		// content was, since if it did, Readability only ever saw the content.
+		const trustworthy = region !== undefined || keptRatio >= MIN_KEPT_RATIO;
+		if (articleMarkdown.length >= MIN_ARTICLE_CHARS && trustworthy) {
 			return {
 				title: article?.title?.trim() || documentTitle,
 				byline: article?.byline?.trim() || metaContent('meta[name="author"]'),
@@ -492,12 +732,17 @@ function extractHtml(page: FetchedPage, raw: boolean): Extracted {
 					metaContent('meta[property="article:published_time"]'),
 				markdown: articleMarkdown,
 				mode: "article",
+				keptRatio,
 			};
 		}
 	}
 
-	const body = document.querySelector("body") ?? document.documentElement;
-	const markdown = turndown.turndown((body as Element)?.innerHTML ?? page.body).trim();
+	// Convert the page itself. This is the robustness guarantee: listing pages,
+	// app shells and anything Readability mishandled still produce output. The
+	// page's own content region is preferred when it marked one.
+	const source = region ?? body;
+	if (source) stripChromeRegions(source);
+	const markdown = turndown.turndown(source?.innerHTML || page.body).trim();
 
 	return {
 		title: documentTitle,
@@ -505,6 +750,7 @@ function extractHtml(page: FetchedPage, raw: boolean): Extracted {
 		publishedTime: metaContent('meta[property="article:published_time"]'),
 		markdown,
 		mode: "full-page",
+		keptRatio: pageChars ? Math.min(1, textLength(source?.textContent) / pageChars) : 1,
 	};
 }
 
@@ -517,6 +763,7 @@ function extractJson(page: FetchedPage): Extracted {
 			publishedTime: undefined,
 			markdown: JSON.stringify(parsed, null, 2),
 			mode: "json",
+			keptRatio: 1,
 		};
 	} catch {
 		// Malformed or streaming JSON (NDJSON, JSON Lines) — pass it through.
@@ -526,6 +773,7 @@ function extractJson(page: FetchedPage): Extracted {
 			publishedTime: undefined,
 			markdown: page.body.trim(),
 			mode: "text",
+			keptRatio: 1,
 		};
 	}
 }
@@ -546,6 +794,7 @@ export function extract(page: FetchedPage, raw: boolean): Extracted {
 			publishedTime: undefined,
 			markdown: page.body.trim(),
 			mode: "text",
+			keptRatio: 1,
 		};
 	}
 
@@ -559,6 +808,7 @@ export function extract(page: FetchedPage, raw: boolean): Extracted {
 			publishedTime: undefined,
 			markdown: page.body.trim(),
 			mode: "text",
+			keptRatio: 1,
 		};
 	}
 
