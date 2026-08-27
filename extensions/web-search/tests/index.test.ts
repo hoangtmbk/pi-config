@@ -198,7 +198,7 @@ describe("the web-search extension", () => {
 		// and the markdown's own list is nowhere in the metadata.
 		const content = result.content[0];
 		const text = content?.type === "text" ? content.text : "";
-		assert.ok(!/elapsed|\bms\b/i.test(text), text.split("\n")[0]);
+		assert.ok(!text.includes(String(result.details?.elapsedMs)), text.split("\n")[0]);
 		assert.ok(!JSON.stringify(result.details).includes("An Introduction To Generics"));
 	});
 

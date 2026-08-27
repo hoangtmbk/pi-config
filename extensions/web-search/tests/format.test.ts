@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { BraveResponse, BraveResult } from "../brave.ts";
-import { type FormatOptions, countPhrase, formatResults, hitLines } from "../format.ts";
+import { type FormatOptions, countPhrase, expandedLines, formatResults } from "../format.ts";
 
 const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
@@ -732,11 +732,11 @@ describe("countPhrase", () => {
 	});
 });
 
-describe("hitLines", () => {
-	it("reads the numbered titles back out of the rendered list", () => {
-		const text = markdown("rust async fn in traits", fixture("brave-web-discussions"));
+describe("expandedLines", () => {
+	it("reads the numbered titles back out of the list it just wrote", () => {
+		const rendered = formatResults("rust async fn in traits", fixture("brave-web-discussions"));
 
-		assert.deepEqual(hitLines(text), [
+		assert.deepEqual(expandedLines(rendered.text, rendered.counts), [
 			"1. Async fn and return-position impl Trait in traits — blog.rust-lang.org",
 			"2. async-trait — crates.io",
 			"3. Why is async in traits still painful? — old.reddit.com",
@@ -744,27 +744,39 @@ describe("hitLines", () => {
 		]);
 	});
 
-	it("leaves the URLs and excerpts to the model, and shows the reader the titles", () => {
-		const text = markdown("go generics", fixture("brave-web-search"));
+	it("leaves the URLs, excerpts and headings to the model", () => {
+		const rendered = formatResults("go generics", fixture("brave-web-search"));
+		const lines = expandedLines(rendered.text, rendered.counts);
 
 		assert.ok(
-			hitLines(text).every((line) => /^\d+\. /.test(line)),
-			hitLines(text).join("\n"),
+			lines.every((line) => /^\d+\. /.test(line)),
+			lines.join("\n"),
 		);
 	});
 
 	it("stops at the limit it is given", () => {
-		const text = markdown("go generics", fixture("brave-web-search"));
+		const rendered = formatResults("go generics", fixture("brave-web-search"));
 
-		assert.equal(hitLines(text, 2).length, 2);
+		assert.equal(expandedLines(rendered.text, rendered.counts, 2).length, 2);
 	});
 
-	it("falls back to the prose of a search that matched nothing", () => {
-		const text = markdown("quorble frimbus", { web: { results: [] } });
+	it("shows the prose of a search that matched nothing, since there is no list", () => {
+		const rendered = formatResults("quorble frimbus", { web: { results: [] } });
 
-		assert.deepEqual(hitLines(text), [
+		assert.deepEqual(expandedLines(rendered.text, rendered.counts), [
 			'search: "quorble frimbus" — no results (Brave)',
 			'No results for "quorble frimbus". Try broader or fewer terms, or drop narrowing operators such as site:, filetype: or an exact phrase in quotes.',
 		]);
+	});
+
+	it("shows nothing when the budget left room for no entries, rather than the header twice", () => {
+		const padding = "alpha ".repeat(200).trim();
+		const rendered = formatResults("x", response({ title: "A", url: "https://a.test/", description: padding }), {
+			maxBytes: 200,
+		});
+
+		// The header said "showing 0 of 1"; repeating it under itself would also
+		// repeat an untrusted-data warning with nothing left to warn about.
+		assert.deepEqual(expandedLines(rendered.text, rendered.counts), []);
 	});
 });

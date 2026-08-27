@@ -19,7 +19,7 @@ import {
 	normalizeFreshness,
 	search,
 } from "./brave.ts";
-import { type KindCount, MAX_EXCERPTS, countPhrase, formatResults, hitLines } from "./format.ts";
+import { type KindCount, MAX_EXCERPTS, countPhrase, expandedLines, formatResults } from "./format.ts";
 import { resolveApiKey } from "./key.ts";
 
 const WebSearchParams = Type.Object({
@@ -132,34 +132,39 @@ export default function (pi: ExtensionAPI) {
 			text += theme.fg("accent", args.query ?? "");
 			// The one filter that changes which results exist: a list read without
 			// knowing it was narrowed is a list read wrong.
-			const window = describeFreshness(args.freshness);
-			if (window) text += theme.fg("dim", ` · ${window}`);
+			const narrowedTo = describeFreshness(args.freshness);
+			if (narrowedTo) text += theme.fg("dim", ` · ${narrowedTo}`);
 			return new Text(text, 0, 0);
 		},
 
 		renderResult(result, { expanded, isPartial }, theme, _context) {
-			if (isPartial) return new Text(theme.fg("warning", "Searching…"), 0, 0);
+			if (isPartial) return new Text(theme.fg("warning", "Searching..."), 0, 0);
 
 			const details = result.details as WebSearchDetails | undefined;
-			// No metadata means a failed search or a result from before this renderer
-			// existed; the raw output is still the truth about what happened.
-			if (!details) {
-				const content = result.content[0];
-				return new Text(content?.type === "text" ? content.text : "", 0, 0);
-			}
+			const content = result.content[0];
+			const output = content?.type === "text" ? content.text : "";
+
+			// Tested on the counts rather than on `details` itself: a search that
+			// threw is given an empty details object, not none at all, so anything
+			// looser than this would read `counts` off `{}`. A failed search, and a
+			// result older than this renderer, both fall through to their own text,
+			// which is still the truth about what happened.
+			if (!Array.isArray(details?.counts)) return new Text(output, 0, 0);
 
 			const dropped = details.total - details.shown;
-			let text = theme.fg("success", countPhrase(details.counts));
+			// A search that matched nothing is an ordinary answer, not a success
+			// worth colouring as one — the markdown treats it the same way.
+			let text = theme.fg(details.total === 0 ? "muted" : "success", countPhrase(details.counts));
 			text += theme.fg("muted", ` · ${formatElapsed(details.elapsedMs)}`);
 			// The count phrase already says "showing 8 of 200"; this says why.
 			if (dropped > 0) text += theme.fg("warning", ` · ${dropped} dropped to fit the budget`);
 
 			if (expanded) {
-				const content = result.content[0];
-				const hits = hitLines(content?.type === "text" ? content.text : "");
+				const hits = expandedLines(output, details.counts);
 				for (const hit of hits) text += `\n${theme.fg("dim", hit)}`;
-				// Counted against the hits, not the search: what is missing from the
-				// screen is what the cap cut, and the budget already spoke for itself.
+				// Counted against what is on screen, not against the search: what is
+				// missing here is what the cap cut, and the budget already spoke for
+				// the rest.
 				const rest = details.shown - hits.length;
 				if (rest > 0) text += `\n${theme.fg("muted", `… and ${rest} more`)}`;
 			}

@@ -450,23 +450,34 @@ export function formatResults(query: string, response: BraveResponse, options: F
  * cap high enough for every search — is a twenty-four line block in the middle
  * of a conversation, which is the thing custom rendering exists to prevent.
  */
-export const MAX_RENDERED_HITS = 10;
+const MAX_RENDERED_HITS = 10;
 
 /**
- * The hit list, read back out of the rendered markdown.
+ * The first line of an entry, as `formatResult` writes it: the number a hit is
+ * referred to by, and nothing indented under it.
  *
- * A renderer needs the hits and the model needs the whole entries, and those are
+ * Paired with `formatResult` by hand, so the round trip through
+ * `formatResults` is asserted in the suite rather than trusted.
+ */
+const TITLE_LINE = /^\d+\. /;
+
+/**
+ * What an expanded search shows: its titles, read back out of the markdown.
+ *
+ * A reader needs the hits and the model needs the whole entries, and those are
  * the same information: putting the list in the tool's metadata as well would
  * ship every title twice, once for each reader. So the text stays the single
  * copy and this reads the titles off it — which lives here because this module
  * is the one that decided what a title line looks like.
  *
- * A search that matched nothing has no numbered lines at all, and its prose is
- * what a reader expanding it wants to see, so that is what comes back instead.
+ * `counts` rather than the absence of titles decides what an empty list means.
+ * A search that matched nothing has prose worth reading in place of a list; one
+ * whose every entry was dropped by the budget has a header that already said so,
+ * and showing it again under itself — untrusted-data warning and all, over
+ * nothing — would repeat the header and lie about what follows it.
  */
-export function hitLines(text: string, limit = MAX_RENDERED_HITS): string[] {
+export function expandedLines(text: string, counts: KindCount[], limit = MAX_RENDERED_HITS): string[] {
 	const lines = text.split("\n");
-	const hits = lines.filter((line) => /^\d+\. /.test(line));
-	const shown = hits.length > 0 ? hits : lines.filter((line) => line.trim() !== "");
-	return shown.slice(0, limit);
+	if (counts.length === 0) return lines.filter((line) => line.trim() !== "").slice(0, limit);
+	return lines.filter((line) => TITLE_LINE.test(line)).slice(0, limit);
 }
