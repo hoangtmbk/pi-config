@@ -22,10 +22,20 @@ export function fakeFetch(respond: (call: Call) => Response): { fetch: typeof gl
 	return { fetch, calls };
 }
 
-/** A `fetch` that never answers, and rejects when the request is aborted. */
+/**
+ * A `fetch` that never answers, and rejects when the request is aborted.
+ *
+ * An already-aborted signal rejects at once, exactly as the platform `fetch`
+ * does — a request that is never made cannot wait for an abort event that has
+ * already fired.
+ */
 export function stalledFetch(): typeof globalThis.fetch {
 	return (async (_input: RequestInfo | URL, init: RequestInit = {}) =>
 		new Promise<Response>((_resolve, reject) => {
+			if (init.signal?.aborted) {
+				reject(new Error("aborted"));
+				return;
+			}
 			init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
 		})) as typeof globalThis.fetch;
 }

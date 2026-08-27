@@ -18,6 +18,7 @@ import {
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import register from "../index.ts";
+import { clearResolvedKey } from "../key.ts";
 import { fakeFetch, jsonResponse, rejection } from "./helpers.ts";
 
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -60,9 +61,13 @@ async function withEnvKey<T>(key: string | undefined, body: () => Promise<T>): P
 	const saved = process.env.BRAVE_API_KEY;
 	if (key === undefined) delete process.env.BRAVE_API_KEY;
 	else process.env.BRAVE_API_KEY = key;
+	// The resolved key is cached for the life of the process, so each test starts
+	// from an unresolved one rather than inheriting the last test's.
+	clearResolvedKey();
 	try {
 		return await body();
 	} finally {
+		clearResolvedKey();
 		if (saved === undefined) delete process.env.BRAVE_API_KEY;
 		else process.env.BRAVE_API_KEY = saved;
 	}
@@ -272,5 +277,41 @@ describe("the count and freshness parameters", () => {
 
 		assert.match(error.message, /\b1\b.*\b20\b/);
 		assert.equal(calls.length, 0);
+	});
+});
+
+describe("a search that goes wrong, and one that simply finds nothing", () => {
+	it("runs one search at a time, so the plan's rate limit cannot be tripped", () => {
+		const tool = registeredTools()[0] as unknown as { executionMode?: string };
+		assert.equal(tool.executionMode, "sequential");
+	});
+
+	it("returns an ordinary result when there are no matches, not an error", async () => {
+		const tool = registeredTools()[0] as unknown as RegisteredTool;
+		const { fetch } = fakeFetch(() => jsonResponse({ web: { results: [] } }));
+
+		const result = await withEnvKey("test-key", () =>
+			withFetch(fetch, () => tool.execute("call-1", { query: "quorble frimbus" }, undefined, undefined, CTX)),
+		);
+
+		const content = result.content[0];
+		const text = content?.type === "text" ? content.text : "";
+		assert.match(text, /^No results for "quorble frimbus"\./m);
+		assert.deepEqual(result.details, { query: "quorble frimbus", resultCount: 0 });
+	});
+
+	it("tells the model what to do about a rejected key", async () => {
+		const tool = registeredTools()[0] as unknown as RegisteredTool;
+		const { fetch } = fakeFetch(() => new Response("Subscription token invalid", { status: 401 }));
+
+		const error = await withEnvKey("stale-key", () =>
+			withFetch(fetch, async () =>
+				rejection(tool.execute("call-1", { query: "go generics" }, undefined, undefined, CTX)),
+			),
+		);
+
+		assert.match(error.message, /BRAVE_API_KEY/);
+		assert.match(error.message, /Subscription token invalid/);
+		assert.ok(!error.message.includes("stale-key"), error.message);
 	});
 });

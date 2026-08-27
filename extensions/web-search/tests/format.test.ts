@@ -143,6 +143,31 @@ describe("formatResults", () => {
 	it("treats a response with no web block as no results", () => {
 		assert.match(formatResults("x", {}), /no results/);
 	});
+
+	it("answers a search that found nothing with a nudge, not a failure", () => {
+		const text = formatResults("quorble frimbus", { web: { results: [] } });
+
+		assert.match(text, /^No results for "quorble frimbus"\./m);
+		assert.match(text, /broader|fewer/i);
+		// The untrusted-data warning guards results; with none, it guards nothing.
+		assert.ok(!text.includes("untrusted"), text);
+	});
+
+	it("suggests dropping the operators a query may have over-narrowed itself with", () => {
+		const text = formatResults('site:example.com "exact phrase"', { web: { results: [] } });
+		assert.match(text, /site:/);
+	});
+
+	it("names the freshness window as something to widen when one is set", () => {
+		const text = formatResults("x", { web: { results: [] } }, { freshness: "pd" });
+		assert.match(text, /freshness/i);
+		assert.match(text, /widen|remov/i);
+	});
+
+	it("does not mention freshness when the search was not narrowed by one", () => {
+		const text = formatResults("x", { web: { results: [] } });
+		assert.ok(!/freshness/i.test(text), text);
+	});
 });
 
 describe("extra snippets", () => {

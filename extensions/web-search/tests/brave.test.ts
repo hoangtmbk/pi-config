@@ -85,7 +85,7 @@ describe("search", () => {
 	});
 
 	it("flattens a multi-line error body onto one line", async () => {
-		const { fetch } = fakeFetch(() => new Response('{\n  "error": "quota exceeded"\n}', { status: 429 }));
+		const { fetch } = fakeFetch(() => new Response('{\n  "error": "quota exceeded"\n}', { status: 402 }));
 		const error = await rejection(search("hello", "k", {}, undefined, { fetch }));
 
 		assert.ok(!error.message.includes("\n"), error.message);
@@ -292,5 +292,200 @@ describe("search with count and freshness", () => {
 		assert.ok(error instanceof WebSearchError);
 		assert.match(error.message, /\b1\b.*\b20\b/);
 		assert.equal(calls.length, 0);
+	});
+});
+
+describe("what a failed search tells the model to do", () => {
+	/** A fetch answering one non-2xx, with a sleep that never actually waits. */
+	function failing(status: number, body: string | null, statusText?: string) {
+		const { fetch, calls } = fakeFetch(() => new Response(body, { status, statusText }));
+		return {
+			calls,
+			error: () => rejection(search("hello", "k", {}, undefined, { fetch, sleep: async () => {} })),
+		};
+	}
+
+	it("says the key was rejected, and where to fix it, on a 401", async () => {
+		const error = await failing(401, "Subscription token invalid").error();
+
+		assert.match(error.message, /key/i);
+		assert.match(error.message, /BRAVE_API_KEY/);
+		assert.match(error.message, /Subscription token invalid/);
+	});
+
+	it("says the key was rejected on a 403 too", async () => {
+		const error = await failing(403, "Forbidden").error();
+		assert.match(error.message, /key/i);
+		assert.match(error.message, /BRAVE_API_KEY/);
+	});
+
+	it("says the credit is spent, quoting Brave's own words, on a 402", async () => {
+		const error = await failing(402, '{"error":"plan quota exhausted for this month"}').error();
+
+		assert.match(error.message, /plan quota exhausted for this month/);
+		assert.match(error.message, /credit|quota|plan/i);
+		assert.match(error.message, /api-dashboard\.search\.brave\.com/);
+	});
+
+	it("quotes the parameter Brave objected to on a 422", async () => {
+		const error = await failing(422, '{"error":{"detail":"count must be <= 20"}}').error();
+
+		assert.match(error.message, /count must be <= 20/);
+		assert.match(error.message, /parameter/i);
+	});
+
+	it("says a server error is Brave's end, not the query's, on a 5xx", async () => {
+		const error = await failing(503, "upstream unavailable", "Service Unavailable").error();
+
+		assert.match(error.message, /503/);
+		assert.match(error.message, /Brave/);
+		assert.match(error.message, /again/i);
+	});
+
+	it("still names the status when a failure has no body at all", async () => {
+		const error = await failing(418, null, "I'm a teapot").error();
+		assert.match(error.message, /418/);
+	});
+
+	it("says the network never reached Brave when the request itself fails", async () => {
+		const fetch = (async () => {
+			throw new TypeError("fetch failed: getaddrinfo ENOTFOUND api.search.brave.com");
+		}) as typeof globalThis.fetch;
+		const error = await rejection(search("hello", "k", {}, undefined, { fetch }));
+
+		assert.match(error.message, /ENOTFOUND/);
+		assert.match(error.message, /connection|network|reach/i);
+	});
+
+	it("never puts the key in a message, whatever went wrong", async () => {
+		const { fetch } = fakeFetch(() => new Response("nope", { status: 401 }));
+		const error = await rejection(search("hello", "super-secret-key", {}, undefined, { fetch }));
+		assert.ok(!error.message.includes("super-secret-key"), error.message);
+	});
+});
+
+describe("a rate-limited search", () => {
+	const limited = () => new Response('{"error":"rate limit exceeded"}', { status: 429 });
+
+	it("is retried once, and succeeds if the second attempt does", async () => {
+		let attempts = 0;
+		const { fetch, calls } = fakeFetch(() => {
+			attempts += 1;
+			return attempts === 1 ? limited() : json(okBody);
+		});
+		const slept: number[] = [];
+
+		const response = await search("hello", "k", {}, undefined, {
+			fetch,
+			sleep: async (ms) => {
+				slept.push(ms);
+			},
+		});
+
+		assert.equal(calls.length, 2);
+		assert.equal(response.web?.results?.[0]?.url, "https://a.test/");
+		// Long enough to clear the free plan's one-request-per-second ceiling.
+		assert.equal(slept.length, 1);
+		assert.ok((slept[0] ?? 0) >= 1000, `waited ${slept[0]}ms`);
+	});
+
+	it("waits before retrying rather than hammering the endpoint", async () => {
+		const order: string[] = [];
+		const { fetch } = fakeFetch(() => {
+			order.push("request");
+			return limited();
+		});
+
+		await rejection(
+			search("hello", "k", {}, undefined, {
+				fetch,
+				sleep: async () => {
+					order.push("wait");
+				},
+			}),
+		);
+
+		assert.deepEqual(order, ["request", "wait", "request"]);
+	});
+
+	it("gives up after the second attempt, explaining the limit", async () => {
+		const { fetch, calls } = fakeFetch(() => limited());
+		const error = await rejection(search("hello", "k", {}, undefined, { fetch, sleep: async () => {} }));
+
+		assert.equal(calls.length, 2);
+		assert.ok(error instanceof WebSearchError);
+		assert.match(error.message, /429|rate/i);
+		assert.match(error.message, /rate limit exceeded/);
+		assert.match(error.message, /second/i);
+	});
+
+	it("does not retry a failure that a second attempt cannot fix", async () => {
+		const { fetch, calls } = fakeFetch(() => new Response("Subscription token invalid", { status: 401 }));
+		await rejection(search("hello", "k", {}, undefined, { fetch, sleep: async () => {} }));
+		assert.equal(calls.length, 1);
+	});
+
+	it("abandons the retry when pi cancels the search while it waits", async () => {
+		const controller = new AbortController();
+		const { fetch, calls } = fakeFetch(() => limited());
+		const error = await rejection(
+			search("hello", "k", {}, controller.signal, {
+				fetch,
+				sleep: async () => {
+					controller.abort();
+				},
+			}),
+		);
+
+		assert.equal(calls.length, 1);
+		assert.match(error.message, /^Cancelled: hello$/);
+	});
+});
+
+describe("two searches in one turn", () => {
+	/** A fetch that hangs until it is released, so overlap is observable. */
+	function gatedFetch() {
+		const started: string[] = [];
+		const gates: (() => void)[] = [];
+		const fetch = (async (input: RequestInfo | URL) => {
+			started.push(new URL(String(input)).searchParams.get("q") ?? "");
+			await new Promise<void>((resolve) => gates.push(resolve));
+			return json(okBody);
+		}) as typeof globalThis.fetch;
+		return { fetch, started, release: () => gates.shift()?.() };
+	}
+
+	/** Let every queued microtask and timer callback run. */
+	const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+	it("run one after another, so the plan's one-per-second ceiling is not tripped", async () => {
+		const gate = gatedFetch();
+
+		const first = search("first", "k", {}, undefined, { fetch: gate.fetch });
+		const second = search("second", "k", {}, undefined, { fetch: gate.fetch });
+		await settle();
+
+		// The second search has not touched the network while the first is open.
+		assert.deepEqual(gate.started, ["first"]);
+
+		gate.release();
+		await first;
+		await settle();
+		assert.deepEqual(gate.started, ["first", "second"]);
+
+		gate.release();
+		await second;
+	});
+
+	it("lets the next search through even when the one before it failed", async () => {
+		const gate = gatedFetch();
+		const failed = rejection(search("   ", "k", {}, undefined, { fetch: gate.fetch }));
+		const next = search("after", "k", {}, undefined, { fetch: gate.fetch });
+		await failed;
+		await settle();
+
+		assert.deepEqual(gate.started, ["after"]);
+		gate.release();
+		await next;
 	});
 });

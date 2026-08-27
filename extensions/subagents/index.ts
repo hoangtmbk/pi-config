@@ -256,7 +256,8 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 
 			// The Run leaves waiting when its child starts the turn this prompt
 			// begins, which the Supervisor hears as `agent_start`. Nothing here
-			// touches the lifecycle.
+			// touches the lifecycle — so two answers sent before that event both
+			// land, and the child takes them as two turns.
 			await child.prompt(answer);
 
 			const details: SubagentDetails = { run: run.name, agent: run.agent, task: run.task };

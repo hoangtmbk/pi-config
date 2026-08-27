@@ -55,6 +55,11 @@ export default function (pi: ExtensionAPI) {
 			"Requires a Brave Search API key in BRAVE_API_KEY or in a .env beside the extension.",
 		promptSnippet: "Search the web and get ranked results with snippets",
 		parameters: WebSearchParams,
+		// pi runs tools in parallel by default, and two concurrent searches on a
+		// plan that allows one request per second is a guaranteed 429. Serialising
+		// costs a few hundred milliseconds on the rare double search and removes a
+		// whole class of flaky failure.
+		executionMode: "sequential",
 
 		async execute(_toolCallId, params, signal) {
 			// Checked before the key is looked up: a bad count or recency value is
