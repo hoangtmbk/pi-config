@@ -338,6 +338,24 @@ describe("raw mode converts the whole body", async () => {
 		assert.equal(extracted.keptRatio, 1);
 	});
 
+	it("reports a kept ratio of 1, since nothing was chosen away", async () => {
+		// Every cleanup rule fires on this page. `raw` still converted the whole
+		// body, so the header must not tell the caller to try `raw=true`.
+		const extracted = await extractOf(
+			`<!doctype html><html><head><title>Chrome</title></head><body>
+<a class="mw-jump-link" href="#main">Jump to content</a>
+<nav class="skip-to-content"><a href="#main">Skip to content</a></nav>
+<div class="mw-heading"><h2>Section</h2><span class="mw-editsection">[edit]</span></div>
+<div class="copy-button">Copy</div>
+<form><p>Prose inside a form.</p><input name="q"><button>Go</button></form>
+${FILLER}</body></html>`,
+			true,
+		);
+
+		assert.equal(extracted.keptRatio, 1, `raw reported ${extracted.keptRatio}`);
+		assert.ok(extracted.markdown.includes("Prose inside a form."), `form prose lost; got:\n${extracted.markdown}`);
+	});
+
 	it("still cleans what is markup rather than content", async () => {
 		const extracted = await extractOf(
 			`<!doctype html><html><head><title>Raw</title></head><body>
@@ -581,6 +599,31 @@ describe("every body the fetch layer accepted is extractable", async () => {
 		const extracted = await extract(pageOf("https://example.test/page", "application/octet-stream", body), false);
 
 		assert.ok(extracted.markdown.includes("# Shrug"), `not parsed as HTML; got:\n${extracted.markdown}`);
+	});
+
+	it("passes a declared source file through verbatim, tags and all", async () => {
+		// A `.ts` file comparing two variables, and a JSONL dump quoting markup.
+		// Sniffing these would hand a source file to Readability, which returns a
+		// fraction of it. Only "" and `application/octet-stream` are sniffed.
+		for (const [type, body] of [
+			["application/typescript", "const a = 1 < p; // <div>"],
+			["application/x-javascript", "const el = <div className='x' />;"],
+			["application/x-sh", "cat <<EOF\n<p>generated</p>\nEOF"],
+			["application/x-toml", 'title = "<div> in a string"'],
+			["application/x-ndjson", '{"html":"<div>one</div>"}\n{"html":"<p>two</p>"}'],
+		] as const) {
+			const extracted = await extract(pageOf("https://example.test/file", type, body), false);
+			assert.equal(extracted.mode, "text", type);
+			assert.equal(extracted.markdown, body, type);
+		}
+	});
+
+	it("still sniffs the two ways a server declares nothing", async () => {
+		const markup = "<html><body><h1>Sniffed</h1><p>Body.</p></body></html>";
+		for (const type of ["", "application/octet-stream"]) {
+			const extracted = await extract(pageOf("https://example.test/thing", type, markup), false);
+			assert.ok(extracted.markdown.includes("# Sniffed"), `${type}: ${extracted.markdown}`);
+		}
 	});
 
 	it("does not sniff a body the server declared as plain text", async () => {

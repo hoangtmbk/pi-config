@@ -63,9 +63,16 @@ const BINARY_EXTENSION_PATTERN =
 /** A path that names a PDF, for the servers that declare `application/octet-stream`. */
 const PDF_EXTENSION_PATTERN = /\.pdf$/i;
 
-/** Types we are happy to decode as text even when the body looks unusual. */
+/**
+ * Types we are happy to decode as text even when the body looks unusual.
+ *
+ * The source-file types are named explicitly rather than left to the sniff:
+ * a `.ts` file saying `a < p`, a JSX sample, an HTML heredoc in a shell script
+ * are all text a server *declared*, and passing them through verbatim is the
+ * whole point of accepting them.
+ */
 const TEXT_TYPE_PATTERN =
-	/^text\/|\+xml$|\+json$|^application\/(json|xml|xhtml\+xml|javascript|ecmascript|x-yaml|yaml|toml)$/;
+	/^text\/|\+xml$|\+json$|^application\/(json|x-ndjson|xml|xhtml\+xml|(x-)?javascript|ecmascript|(x-)?typescript|x-sh|(x-)?yaml|(x-)?toml)$/;
 
 /** Enough of a body to tell markup from prose. */
 const HTML_SNIFF_BYTES = 2000;
@@ -88,9 +95,11 @@ export type PageKind = "html" | "json" | "pdf" | "text";
 /**
  * The kind of a body the fetch layer accepted.
  *
- * Sniffing is limited to types that declared nothing usable (no header at all,
- * `application/octet-stream`, a vendor type nobody has heard of). A server that
- * said `text/plain` meant it, even if the body happens to contain a tag.
+ * Sniffing is limited to the two ways a server declares nothing at all: no
+ * header, or the `application/octet-stream` shrug. Every other type is taken at
+ * its word — `text/plain`, `application/typescript` and `application/x-ndjson`
+ * bodies contain `<div` and `<p ` for reasons of their own, and running one of
+ * those through Readability would return a fraction of the file.
  */
 export function classifyPage(contentType: string, body: string): PageKind {
 	if (contentType === "application/pdf") return "pdf";
@@ -98,9 +107,8 @@ export function classifyPage(contentType: string, body: string): PageKind {
 	if (contentType === "application/json" || contentType === "text/json" || contentType.endsWith("+json")) {
 		return "json";
 	}
-	if (!TEXT_TYPE_PATTERN.test(contentType) && HTML_SNIFF_PATTERN.test(body.slice(0, HTML_SNIFF_BYTES))) {
-		return "html";
-	}
+	const undeclared = contentType === "" || contentType === "application/octet-stream";
+	if (undeclared && HTML_SNIFF_PATTERN.test(body.slice(0, HTML_SNIFF_BYTES))) return "html";
 	return "text";
 }
 

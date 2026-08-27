@@ -879,7 +879,9 @@ function extractHtml(page: FetchedPage, raw: boolean): Extracted {
 		publishedTime: metaContent('meta[property="article:published_time"]'),
 		markdown,
 		mode: "full-page",
-		keptRatio: pageChars ? Math.min(1, textLength(source?.textContent) / pageChars) : 1,
+		// `raw` converted the whole body by definition, so nothing was chosen away
+		// and there is nothing to warn about — least of all "use raw=true".
+		keptRatio: raw || !pageChars ? 1 : Math.min(1, textLength(source?.textContent) / pageChars),
 	};
 }
 
