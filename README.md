@@ -8,6 +8,7 @@ every machine, in one repo that pi can install and update itself.
 | Path | What |
 |---|---|
 | `extensions/web-fetch/` | `web_fetch` tool — fetches a URL and returns clean, context-lean markdown. See its [README](extensions/web-fetch/README.md). |
+| `extensions/web-search/` | `web_search` tool — turns a query into ranked Brave results with snippets to triage. Needs a Brave API key. See its [README](extensions/web-search/README.md). |
 | `skills/` | Skills (`<name>/SKILL.md`). Auto-discovered; empty for now. |
 | `prompts/` | Prompt templates (`*.md`). Auto-discovered; empty for now. |
 | `themes/` | Themes (`*.json`). Auto-discovered; empty for now. |
@@ -25,7 +26,9 @@ pi install git:github.com/hoangtmbk/pi-config
 ```
 
 That clones to `~/.pi/agent/git/github.com/hoangtmbk/pi-config`, installs dependencies, and
-registers the package in `~/.pi/agent/settings.json`. Start `pi` and `web_fetch` is available.
+registers the package in `~/.pi/agent/settings.json`. Start `pi` and `web_fetch` is available;
+`web_search` needs a Brave API key on top — see
+[its README](extensions/web-search/README.md#the-api-key).
 
 Pull updates later with:
 
@@ -51,6 +54,7 @@ shows what is registered.
 npm test                 # offline suites for every extension
 npm run typecheck        # tsc against pi's real .d.ts (pi-coding-agent is a devDependency for this)
 npm run live:web-fetch   # web-fetch's manual runner against real URLs
+npm run live:web-search  # web-search's manual runner against real queries (needs a Brave API key)
 ```
 
 ### Adding things
