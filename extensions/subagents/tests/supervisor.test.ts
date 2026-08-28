@@ -365,3 +365,19 @@ describe("Supervisor questions", () => {
 		assert.match(announced[0].text, /did not say what it wanted to know/);
 	});
 });
+
+describe("Supervisor failures", () => {
+	it("delivers a failed result carrying the exit code and the last stderr", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		feed(supervisor, run.name, [AGENT_START]);
+
+		const delivery = supervisor.fail(run.name, { kind: "exit", exitCode: 3, stderr: "pi: out of tokens" });
+
+		assert.equal(delivery?.kind, "delivery");
+		assert.equal(delivery?.run.state, "failed");
+		assert.match(delivery?.text ?? "", /Run `scout` \(agent `scout`\) failed/);
+		assert.match(delivery?.text ?? "", /code 3/);
+		assert.match(delivery?.text ?? "", /pi: out of tokens/);
+	});
+});

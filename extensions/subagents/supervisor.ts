@@ -13,10 +13,30 @@ import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 /**
  * Where a Run is in its lifecycle.
  *
- * `failed` arrives with the ticket that introduces it; today a Run runs, may
- * wait on an unanswered Question, and finishes.
+ * A Run runs, may wait on an unanswered Question, and then either finishes or
+ * fails. `done` and `failed` are both final and both deliver: the difference is
+ * whether the Run has a result to hand over or a reason it has none.
  */
-export type RunState = "running" | "waiting" | "done";
+export type RunState = "running" | "waiting" | "done" | "failed";
+
+/**
+ * Why a Run stopped without finishing.
+ *
+ * Deliberately the two causes that exist, rather than one message string: a
+ * child that never started and a child that died are different things for the
+ * parent to decide about, and only the second has an exit code to report.
+ */
+export type RunFailure =
+	| { kind: "spawn"; message: string }
+	| {
+			kind: "exit";
+			/** The child's exit code, when it exited on its own. */
+			exitCode?: number;
+			/** The signal that killed the child, when one did. */
+			signal?: string;
+			/** The tail of what the child wrote to stderr — usually the whole of why. */
+			stderr?: string;
+	  };
 
 /**
  * The child-only tool a Run escalates with, and the whole of what tells a
@@ -51,6 +71,8 @@ export interface Run {
 	 * a Run started Waiting without saying what it wanted to know.
 	 */
 	question?: string;
+	/** Why the Run stopped, once it has failed. Absent otherwise. */
+	failure?: RunFailure;
 }
 
 /** A settled Run's result, ready to re-enter the parent conversation. */
@@ -115,10 +137,12 @@ export class Supervisor {
 	 * Every Run that has not finished — what a join with no names waits on.
 	 *
 	 * A Waiting Run counts as active: it is alive, and a join that passed over it
-	 * would say nothing at all about a session whose only Run needs an answer.
+	 * would say nothing at all about a session whose only Run needs an answer. A
+	 * failed one does not: it is as finished as a done one, and a join that kept
+	 * waiting on it would wait forever.
 	 */
 	active(): Run[] {
-		return this.list().filter((run) => run.state !== "done");
+		return this.list().filter((run) => !hasStopped(run.state));
 	}
 
 	/**
@@ -134,7 +158,7 @@ export class Supervisor {
 	 */
 	observe(name: string, event: JsonAgentSessionEvent): ParentMessage | undefined {
 		const record = this.byName.get(name);
-		if (!record || record.run.state === "done") return undefined;
+		if (!record || hasStopped(record.run.state)) return undefined;
 
 		if (event.type === "agent_start") {
 			// A Waiting Run whose child has started another turn has been answered,
@@ -173,6 +197,32 @@ export class Supervisor {
 		record.run.state = "done";
 		record.run.result = record.lastAssistant && assistantText(record.lastAssistant);
 		return messageFor(record.run);
+	}
+
+	/**
+	 * Report that a Run stopped without finishing, and hand back the failed
+	 * Delivery to route. Returns nothing for a Run that had already stopped, or
+	 * one this Supervisor never registered.
+	 *
+	 * A failure is a Delivery like any other, deliberately: a Run that dies is
+	 * reported down the same path as one that succeeds, because the parent has
+	 * the same decision to make either way — what to do with what came back.
+	 *
+	 * A Run that has already delivered is left alone. Its child exiting
+	 * afterwards is how a finished Run ends, not a failure to report.
+	 */
+	fail(name: string, failure: RunFailure): Delivery | undefined {
+		const record = this.byName.get(name);
+		if (!record || hasStopped(record.run.state)) return undefined;
+
+		// A Question its child can no longer be asked about is spent, and a partial
+		// message is not a result: a failed Run reports why it stopped, nothing else.
+		record.asked = undefined;
+		record.lastAssistant = undefined;
+		record.run.question = undefined;
+		record.run.state = "failed";
+		record.run.failure = failure;
+		return deliveryFor(record.run);
 	}
 
 	/**
@@ -312,7 +362,16 @@ function questionText(result: unknown): string | undefined {
  */
 function messageFor(run: Run): ParentMessage {
 	if (run.state === "waiting") return { kind: "question", run, text: questionMessageText(run) };
+	return deliveryFor(run);
+}
+
+function deliveryFor(run: Run): Delivery {
 	return { kind: "delivery", run, text: deliveryText(run) };
+}
+
+/** Whether a Run has stopped for good, whichever way it stopped. */
+function hasStopped(state: RunState): boolean {
+	return state === "done" || state === "failed";
 }
 
 /**
@@ -333,6 +392,31 @@ function questionMessageText(run: Run): string {
  * for, so this only says which Run is speaking and gets out of the way.
  */
 function deliveryText(run: Run): string {
+	if (run.state === "failed") return failureText(run);
 	const header = `Run \`${run.name}\` (agent \`${run.agent}\`) is done.`;
 	return run.result ? `${header}\n\n${run.result}` : `${header}\n\nIt finished without producing a result.`;
+}
+
+/**
+ * The failed Delivery body.
+ *
+ * It hands over the child's own last words and then stops: whether to run the
+ * task again or route around it is the parent agent's judgement, and nothing
+ * here knows enough to make it. There is no retry and no timeout — the stderr
+ * is the evidence the parent decides on.
+ */
+function failureText(run: Run): string {
+	const header = `Run \`${run.name}\` (agent \`${run.agent}\`) failed: ${failureCause(run.failure)}. It produced no result.`;
+	const guidance = "Decide whether to run the task again, run it differently, or carry on without it.";
+	const stderr = run.failure?.kind === "exit" ? run.failure.stderr : undefined;
+	return stderr ? `${header}\n\n${guidance}\n\nIts last stderr:\n\n${stderr}` : `${header}\n\n${guidance}`;
+}
+
+/** What stopped a Run, in the few words a Delivery header has room for. */
+function failureCause(failure: RunFailure | undefined): string {
+	if (!failure) return "it stopped without saying why";
+	if (failure.kind === "spawn") return `it could not be started: ${failure.message}`;
+	if (failure.signal) return `its child was killed by ${failure.signal}`;
+	if (failure.exitCode !== undefined) return `its child exited with code ${failure.exitCode}`;
+	return "its child stopped without saying why";
 }
