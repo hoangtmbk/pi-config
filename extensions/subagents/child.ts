@@ -150,6 +150,18 @@ function processOf(client: RpcClient): ChildProcess | undefined {
 }
 
 /**
+ * Whether the child is already gone.
+ *
+ * Asking spares a dead child `RpcClient.stop`'s whole SIGTERM grace period,
+ * which it waits out in full on a process that can no longer answer — a second
+ * per Run, on exactly the failure paths that are already going badly.
+ */
+function hasExited(client: RpcClient): boolean {
+	const child = processOf(client);
+	return !child || child.exitCode !== null || child.signalCode !== null;
+}
+
+/**
  * Start a Run: spawn its child, subscribe to it, and hand it the task.
  *
  * Resolves once the child is up and the task is sent — not when the Run
@@ -174,20 +186,16 @@ export async function spawnRun(options: SpawnOptions): Promise<RunChild> {
 	client.onEvent(options.onEvent);
 
 	let stopped = false;
-	let exited = false;
 	const stop = async () => {
 		if (stopped) return;
 		stopped = true;
-		// A child that has already died needs no killing, and `RpcClient.stop` waits
-		// out its whole SIGTERM grace period on one that cannot answer.
-		if (!exited) await client.stop();
+		if (!hasExited(client)) await client.stop();
 		await rm(promptDir, { recursive: true, force: true });
 	};
 
 	try {
 		await client.start();
 		processOf(client)?.once("exit", (code, signal) => {
-			exited = true;
 			if (stopped) return;
 			options.onExit?.({
 				exitCode: code ?? undefined,

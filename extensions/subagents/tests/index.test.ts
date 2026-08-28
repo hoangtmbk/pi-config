@@ -143,7 +143,7 @@ function requireTool(tools: RegisteredTool[], name: string): RegisteredTool {
 }
 
 /** A parent session that records what the extension does to it. */
-function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>) {
+function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>, cliPath: string = FAKE_CHILD) {
 	const tools: RegisteredTool[] = [];
 	const sent: SentMessage[] = [];
 	const parent: Parent = { streaming: false };
@@ -152,7 +152,7 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>) {
 	registerSubagents(pi as unknown as ExtensionAPI, {
 		roster,
 		async spawn(options) {
-			const child = await spawnRun({ ...options, cliPath: FAKE_CHILD, env });
+			const child = await spawnRun({ ...options, cliPath, env });
 			started.push(child);
 			return child;
 		},
@@ -171,7 +171,7 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>) {
 const CTX = {} as ExtensionContext;
 
 /** A parent session whose Runs are stubs: no process, and events pushed by hand. */
-function stubbedSession() {
+function stubbedSession(refuseSpawn?: Error) {
 	const tools: RegisteredTool[] = [];
 	const sent: SentMessage[] = [];
 	const spawned: {
@@ -188,6 +188,7 @@ function stubbedSession() {
 	registerSubagents(pi as unknown as ExtensionAPI, {
 		roster: ROSTER,
 		async spawn(options) {
+			if (refuseSpawn) throw refuseSpawn;
 			const child = {
 				name: options.name,
 				emit: options.onEvent,
@@ -447,6 +448,50 @@ describe("a Run that dies", () => {
 		assert.match(delivered.content, /Run `scout`.*failed/s);
 		assert.match(delivered.content, /code 3/);
 		assert.match(delivered.content, /out of tokens/);
+	});
+});
+
+describe("a Run that cannot start", () => {
+	it("comes back as a failed result rather than a thrown tool error, so the Run is not lost", async () => {
+		const { subagent, sent } = stubbedSession(new Error("pi: unknown tool `telepathy`"));
+
+		const result = await call(subagent, { agent: "scout", task: "look around" });
+
+		assert.match(result, /Run `scout` \(agent `scout`\) failed/);
+		assert.match(result, /could not be started/);
+		assert.match(result, /unknown tool `telepathy`/);
+		assert.deepEqual(sent, [], "the failure is this tool call's own result, so it is not also delivered");
+	});
+
+	it("leaves the Run listed and out of the active set, so nothing waits on it forever", async () => {
+		const { subagent, subagentWait, subagentAnswer } = stubbedSession(new Error("pi: unknown tool `telepathy`"));
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		assert.match(await call(subagentWait, {}), /nothing to wait for/);
+		assert.match(await call(subagentWait, { names: ["scout"] }), /failed/);
+		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "hello" }), (error: Error) => {
+			assert.match(error.message, /failed/);
+			return true;
+		});
+	});
+
+	it("keeps taking work after a Run that could not start", async () => {
+		const { subagent } = stubbedSession(new Error("boom"));
+
+		await call(subagent, { agent: "scout", task: "one" });
+		const second = await call(subagent, { agent: "scout", task: "two" });
+
+		assert.match(second, /scout-2/, "a Run that failed to start still owns its name");
+	});
+
+	it("reports a pi that is not there as a failed Run, over the real spawn path", async () => {
+		const { subagent, sent } = fakeSession(ROSTER, undefined, join(TESTS_DIR, "no-such-pi.ts"));
+
+		const result = await call(subagent, { agent: "scout", task: "look around" });
+
+		assert.match(result, /failed/);
+		assert.match(result, /could not be started/);
+		assert.deepEqual(sent, []);
 	});
 });
 

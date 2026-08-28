@@ -86,6 +86,11 @@ function unanswerableRun(name: string, run: Run | undefined, runs: Run[]): Error
 	return unknownRun(name, runs);
 }
 
+/** What went wrong, from something thrown across a process boundary. */
+function describeError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 export interface SubagentsOptions {
 	/** Defaults to discovery. Injected by tests, and by nothing else. */
 	roster?: Roster;
@@ -237,27 +242,42 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 				finished?.stop().catch(() => {});
 			}
 
+			const details: SubagentDetails = { run: run.name, agent: agent.name, task: params.task };
+
 			// Awaited because spawning is the part that can fail in the caller's
 			// face; the Run itself is not waited on — that is the whole point.
-			const child = await spawn({
-				agent,
-				name: run.name,
-				task: params.task,
-				model: params.model,
-				onEvent(event) {
-					const message = supervisor.observe(run.name, event);
-					if (message) announce(message);
-				},
-				onExit(exit) {
-					// A child that outlives its Run's Delivery is a Run ending rather than
-					// a Run failing, and the Supervisor says which by returning nothing.
-					const message = supervisor.fail(run.name, { kind: "exit", ...exit });
-					if (message) announce(message);
-				},
-			});
+			let child: RunChild;
+			try {
+				child = await spawn({
+					agent,
+					name: run.name,
+					task: params.task,
+					model: params.model,
+					onEvent(event) {
+						const message = supervisor.observe(run.name, event);
+						if (message) announce(message);
+					},
+					onExit(exit) {
+						// A child that outlives its Run's Delivery is a Run ending rather than
+						// a Run failing, and the Supervisor says which by returning nothing.
+						const message = supervisor.fail(run.name, { kind: "exit", ...exit });
+						if (message) announce(message);
+					},
+				});
+			} catch (error) {
+				// A Run that never started is still a Run. Throwing here would lose it
+				// mid-registration: its name would address something the session could
+				// neither wait for nor account for. Failing it instead leaves it listed,
+				// out of the active set, and reported in the same words a Run that died
+				// later would be.
+				const failure = supervisor.fail(run.name, { kind: "spawn", message: describeError(error) });
+				// Said here rather than delivered, because this tool call is already
+				// returning into the conversation the Delivery would have landed in —
+				// the same no-double-delivery rule the join follows.
+				return { content: [{ type: "text", text: failure?.text ?? describeError(error) }], details };
+			}
 			children.set(run.name, child);
 
-			const details: SubagentDetails = { run: run.name, agent: agent.name, task: params.task };
 			return {
 				content: [
 					{
