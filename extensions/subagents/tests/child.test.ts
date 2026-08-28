@@ -15,7 +15,7 @@ import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { Agent } from "../agents.ts";
-import { type RunChild, RUN_NAME_ENV, runPreamble, spawnRun } from "../child.ts";
+import { type ChildExit, type RunChild, RUN_NAME_ENV, runPreamble, spawnRun } from "../child.ts";
 import { ASK_QUESTION_TOOL } from "../supervisor.ts";
 
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -45,6 +45,10 @@ async function spawnFake(
 	const settledOnce = new Promise<void>((resolve) => {
 		settled = resolve;
 	});
+	let died: (exit: ChildExit) => void = () => {};
+	const exited = new Promise<ChildExit>((resolve) => {
+		died = resolve;
+	});
 
 	const child = await spawnRun({
 		agent: options.agent ?? SCOUT,
@@ -57,10 +61,11 @@ async function spawnFake(
 			events.push(event);
 			if (event.type === "agent_settled") settled();
 		},
+		onExit: died,
 	});
 	started.push(child);
 
-	return { child, events, settledOnce };
+	return { child, events, exited, settledOnce };
 }
 
 /** The arguments the fake child records for itself when it starts. */
@@ -131,6 +136,38 @@ describe("spawnRun", () => {
 		const prompt = readFileSync(promptPath, "utf-8");
 		assert.ok(prompt.startsWith(runPreamble("scout-2")), `expected the preamble to open the prompt, got:\n${prompt}`);
 		assert.ok(prompt.includes(SCOUT.systemPrompt), `expected the Agent body in the prompt, got:\n${prompt}`);
+	});
+
+	it("reports a child that dies mid-turn, with its exit code and its last stderr", async () => {
+		const { exited } = await spawnFake({
+			env: {
+				FAKE_RPC_TURNS: JSON.stringify([[{ type: "agent_start" }]]),
+				FAKE_RPC_EXIT_AFTER: "1",
+				FAKE_RPC_EXIT_CODE: "3",
+				FAKE_RPC_STDERR: "pi: out of tokens",
+			},
+		});
+
+		const exit = await exited;
+
+		assert.equal(exit.exitCode, 3);
+		assert.match(exit.stderr ?? "", /out of tokens/);
+	});
+
+	it("says nothing about a child it was asked to stop, because a deliberate stop is not a failure", async () => {
+		const exits: ChildExit[] = [];
+		const child = await spawnRun({
+			agent: SCOUT,
+			name: "scout",
+			task: "look around",
+			cliPath: FAKE_CHILD,
+			onEvent() {},
+			onExit: (exit) => exits.push(exit),
+		});
+
+		await child.stop();
+
+		assert.deepEqual(exits, []);
 	});
 
 	it("hands the child its task and streams the events back", async () => {

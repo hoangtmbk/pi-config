@@ -11,6 +11,7 @@
  * writing down an event sequence.
  */
 
+import type { ChildProcess } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -32,6 +33,24 @@ const EXTENSION_PATH = join(dirname(fileURLToPath(import.meta.url)), "index.ts")
  * turn.
  */
 export const RUN_NAME_ENV = "PI_SUBAGENT_RUN";
+
+/**
+ * How much of the child's stderr a failure carries.
+ *
+ * The tail rather than the head: a child that dies says why last, and the
+ * parent agent reads this in its own context window.
+ */
+const STDERR_TAIL = 2000;
+
+/** How a Run's child stopped, for a Run that stopped before it could finish. */
+export interface ChildExit {
+	/** The code it exited with, when it exited on its own. */
+	exitCode?: number;
+	/** The signal that killed it, when something did. */
+	signal?: string;
+	/** The tail of what it wrote to stderr — usually the whole of why. */
+	stderr?: string;
+}
 
 /** A Run's child process, seen from the parent. */
 export interface RunChild {
@@ -62,6 +81,14 @@ export interface SpawnOptions {
 	cliPath?: string;
 	/** Extra environment for the child. */
 	env?: Record<string, string>;
+	/**
+	 * The child exited before it was asked to. Called at most once, and never for
+	 * a child `stop` took down — a deliberate stop is not a failure.
+	 *
+	 * This is the only way a Run can stop without settling, so a Run whose caller
+	 * ignores it is a Run that can be waited on forever.
+	 */
+	onExit?: (exit: ChildExit) => void;
 }
 
 /**
@@ -110,6 +137,19 @@ function defaultCliPath(): string {
 }
 
 /**
+ * The process `RpcClient` started, reached for past its own interface.
+ *
+ * `RpcClient` watches its child's exit closely — it collects the stderr and
+ * rejects everything in flight — but offers no way to be told about it, and an
+ * exit nobody hears is exactly the lost Run this file exists to report. Narrow
+ * and defensive on purpose: a pi release that renames the field costs a Run its
+ * failed result rather than crashing the parent session.
+ */
+function processOf(client: RpcClient): ChildProcess | undefined {
+	return (client as unknown as { process?: ChildProcess | null }).process ?? undefined;
+}
+
+/**
  * Start a Run: spawn its child, subscribe to it, and hand it the task.
  *
  * Resolves once the child is up and the task is sent — not when the Run
@@ -134,15 +174,27 @@ export async function spawnRun(options: SpawnOptions): Promise<RunChild> {
 	client.onEvent(options.onEvent);
 
 	let stopped = false;
+	let exited = false;
 	const stop = async () => {
 		if (stopped) return;
 		stopped = true;
-		await client.stop();
+		// A child that has already died needs no killing, and `RpcClient.stop` waits
+		// out its whole SIGTERM grace period on one that cannot answer.
+		if (!exited) await client.stop();
 		await rm(promptDir, { recursive: true, force: true });
 	};
 
 	try {
 		await client.start();
+		processOf(client)?.once("exit", (code, signal) => {
+			exited = true;
+			if (stopped) return;
+			options.onExit?.({
+				exitCode: code ?? undefined,
+				signal: signal ?? undefined,
+				stderr: client.getStderr().trim().slice(-STDERR_TAIL) || undefined,
+			});
+		});
 		await client.prompt(options.task);
 	} catch (error) {
 		await stop();

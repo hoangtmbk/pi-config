@@ -17,6 +17,11 @@
  *    the default.
  *  - `FAKE_RPC_ENV_OUT` — a path to write its own `PI_*` environment to, as a
  *    JSON object, so a test can assert on what the child was told.
+ *  - `FAKE_RPC_STDERR` — a line to write to stderr on startup, to stand in for
+ *    whatever a real child would have complained about before dying.
+ *  - `FAKE_RPC_EXIT_CODE` and `FAKE_RPC_EXIT_AFTER` — die with that code once
+ *    that many prompts have been served (default 0: die before the parent's
+ *    first prompt, which is what a child that cannot start looks like).
  *
  * Not a `.test.ts` file, so `npm test` never runs it directly.
  */
@@ -32,7 +37,27 @@ if (envOut) {
 	writeFileSync(envOut, JSON.stringify(Object.fromEntries(piEnv)), "utf-8");
 }
 
+const stderrLine = process.env.FAKE_RPC_STDERR;
+if (stderrLine) process.stderr.write(`${stderrLine}\n`);
+
 const turns: unknown[][] | undefined = process.env.FAKE_RPC_TURNS ? JSON.parse(process.env.FAKE_RPC_TURNS) : undefined;
+
+const exitCode = process.env.FAKE_RPC_EXIT_CODE ? Number(process.env.FAKE_RPC_EXIT_CODE) : undefined;
+const exitAfter = Number(process.env.FAKE_RPC_EXIT_AFTER ?? 0);
+
+/**
+ * Die, once everything already written has reached the parent.
+ *
+ * `process.exit` would truncate the turn's events on their way down the pipe,
+ * so this drops the one handle holding the loop open and lets the exit code
+ * carry the process out on its own.
+ */
+function die(code: number): void {
+	process.exitCode = code;
+	process.stdin.destroy();
+}
+
+if (exitCode !== undefined && exitAfter === 0) die(exitCode);
 
 /** How many prompts have arrived, which is what picks this turn's script. */
 let promptCount = 0;
@@ -67,6 +92,7 @@ function handle(line: string): void {
 	if (command.type !== "prompt") return;
 	const turn = turns?.[promptCount++];
 	for (const event of turn ?? defaultEvents(command.message ?? "")) emit(event);
+	if (exitCode !== undefined && promptCount >= exitAfter) die(exitCode);
 }
 
 let buffer = "";
