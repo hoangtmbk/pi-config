@@ -40,7 +40,7 @@ export const RUN_NAME_ENV = "PI_SUBAGENT_RUN";
  * The tail rather than the head: a child that dies says why last, and the
  * parent agent reads this in its own context window.
  */
-const STDERR_TAIL = 2000;
+const STDERR_TAIL_CHARS = 2000;
 
 /** How a Run's child stopped, for a Run that stopped before it could finish. */
 export interface ChildExit {
@@ -141,24 +141,32 @@ function defaultCliPath(): string {
  *
  * `RpcClient` watches its child's exit closely — it collects the stderr and
  * rejects everything in flight — but offers no way to be told about it, and an
- * exit nobody hears is exactly the lost Run this file exists to report. Narrow
- * and defensive on purpose: a pi release that renames the field costs a Run its
- * failed result rather than crashing the parent session.
+ * exit nobody hears is exactly the lost Run this file exists to report.
+ *
+ * The one thing this cannot do is fail quietly. A pi release that renames the
+ * field leaves this returning nothing, and then no Run is ever failed for a
+ * dead child — it is waited on forever instead. Everything reading this treats
+ * "no process to look at" as "assume it is still running", so at least nothing
+ * is skipped on the strength of a field that has moved.
  */
 function processOf(client: RpcClient): ChildProcess | undefined {
 	return (client as unknown as { process?: ChildProcess | null }).process ?? undefined;
 }
 
 /**
- * Whether the child is already gone.
+ * Whether the child is known to be gone already.
  *
  * Asking spares a dead child `RpcClient.stop`'s whole SIGTERM grace period,
  * which it waits out in full on a process that can no longer answer — a second
  * per Run, on exactly the failure paths that are already going badly.
+ *
+ * A child this cannot see counts as alive, deliberately. Guessing the other way
+ * would skip the SIGTERM that ADR-0001 turns on: an orphaned pi child burns
+ * tokens invisibly, and a wasted grace period is the cheaper mistake.
  */
 function hasExited(client: RpcClient): boolean {
 	const child = processOf(client);
-	return !child || child.exitCode !== null || child.signalCode !== null;
+	return Boolean(child) && (child?.exitCode !== null || child?.signalCode !== null);
 }
 
 /**
@@ -193,16 +201,27 @@ export async function spawnRun(options: SpawnOptions): Promise<RunChild> {
 		await rm(promptDir, { recursive: true, force: true });
 	};
 
+	// At most once, and never for a child `stop` took down: a Run is failed by
+	// its child dying, and being told twice would deliver twice.
+	let reported = false;
+	const reportExit = (code: number | null, signal: string | null) => {
+		if (stopped || reported) return;
+		reported = true;
+		options.onExit?.({
+			exitCode: code ?? undefined,
+			signal: signal ?? undefined,
+			stderr: client.getStderr().trim().slice(-STDERR_TAIL_CHARS) || undefined,
+		});
+	};
+
 	try {
 		await client.start();
-		processOf(client)?.once("exit", (code, signal) => {
-			if (stopped) return;
-			options.onExit?.({
-				exitCode: code ?? undefined,
-				signal: signal ?? undefined,
-				stderr: client.getStderr().trim().slice(-STDERR_TAIL) || undefined,
-			});
-		});
+		const child = processOf(client);
+		child?.once("exit", reportExit);
+		// A child killed on the way up has already emitted its exit by now, and
+		// nothing would ever hear it: `RpcClient.start` only refuses an exit *code*,
+		// so a signalled child gets this far alive as far as it is concerned.
+		if (hasExited(client)) reportExit(child?.exitCode ?? null, child?.signalCode ?? null);
 		await client.prompt(options.task);
 	} catch (error) {
 		await stop();
