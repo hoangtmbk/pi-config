@@ -417,6 +417,9 @@ function failureCause(failure: RunFailure | undefined): string {
 	if (!failure) return "it stopped without saying why";
 	if (failure.kind === "spawn") return `it could not be started: ${failure.message}`;
 	if (failure.signal) return `its child was killed by ${failure.signal}`;
+	// A clean exit still failed the Run — the child stopped without settling — but
+	// blaming "code 0" reads like a fault where there was none. Say what happened.
+	if (failure.exitCode === 0) return "its child exited before the run finished";
 	if (failure.exitCode !== undefined) return `its child exited with code ${failure.exitCode}`;
 	return "its child stopped without saying why";
 }

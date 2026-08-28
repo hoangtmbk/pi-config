@@ -367,6 +367,16 @@ describe("Supervisor questions", () => {
 });
 
 describe("Supervisor failures", () => {
+	it("says a child that exited cleanly but early stopped early, not that code 0 went wrong", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+
+		const delivery = supervisor.fail(run.name, { kind: "exit", exitCode: 0 });
+
+		assert.match(delivery?.text ?? "", /exited before the run finished/i);
+		assert.doesNotMatch(delivery?.text ?? "", /code 0/);
+	});
+
 	it("delivers a failed result carrying the exit code and the last stderr", () => {
 		const supervisor = new Supervisor();
 		const run = supervisor.register("scout", "look around");
