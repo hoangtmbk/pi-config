@@ -16,10 +16,22 @@ import { type Agent, type AgentProblem, BUNDLED_AGENTS_DIR, discoverAgents } fro
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 const NO_SUCH_DIR = join(FIXTURES, "does-not-exist");
+/** A checkout carrying its own `.pi/agents/`, with somewhere to work from below it. */
+const PROJECT_TREE = join(FIXTURES, "project-tree");
+const DEEP_IN_PROJECT = join(PROJECT_TREE, "nested", "deep");
+/**
+ * A working directory with no project scope anywhere above it.
+ *
+ * A temporary directory rather than a path inside this repo: discovery walks up
+ * to the root, so a cwd under the repo would find whatever `.pi/agents/` the
+ * machine happens to carry above it and the user-scope tests would read the
+ * developer's own checkout.
+ */
+const NO_PROJECT = mkdtempSync(join(tmpdir(), "pi-subagents-cwd-"));
 
 /** A roster from `dir` alone: the bundled set is pointed somewhere empty. */
 function fromUserDir(dir: string) {
-	return discoverAgents({ userAgentsDir: dir, bundledAgentsDir: NO_SUCH_DIR });
+	return discoverAgents({ userAgentsDir: dir, bundledAgentsDir: NO_SUCH_DIR, cwd: NO_PROJECT });
 }
 
 function byName(agents: Agent[], name: string): Agent {
@@ -71,8 +83,10 @@ describe("discoverAgents", () => {
 	});
 
 	it("treats a missing directory as an empty one, not a failure", () => {
-		assert.deepEqual(discoverAgents({ userAgentsDir: NO_SUCH_DIR, bundledAgentsDir: NO_SUCH_DIR }), {
+		assert.deepEqual(discoverAgents({ userAgentsDir: NO_SUCH_DIR, bundledAgentsDir: NO_SUCH_DIR, cwd: NO_PROJECT }), {
 			agents: [],
+			projectAgents: [],
+			projectAgentsDir: undefined,
 			problems: [],
 		});
 	});
@@ -126,7 +140,7 @@ describe("discoverAgents", () => {
 
 	describe("precedence between two agents of the same name", () => {
 		it("lets a user agent replace a bundled one of the same name", () => {
-			const { agents, problems } = discoverAgents({ userAgentsDir: join(FIXTURES, "user-override") });
+			const { agents, problems } = discoverAgents({ userAgentsDir: join(FIXTURES, "user-override"), cwd: NO_PROJECT });
 
 			const scout = byName(agents, "scout");
 			assert.equal(scout.source, "user");
@@ -178,7 +192,7 @@ describe("discoverAgents", () => {
 
 	describe("the bundled roster", () => {
 		it("ships scout and worker, and they parse cleanly", () => {
-			const { agents, problems } = discoverAgents({ userAgentsDir: NO_SUCH_DIR });
+			const { agents, problems } = discoverAgents({ userAgentsDir: NO_SUCH_DIR, cwd: NO_PROJECT });
 
 			assert.deepEqual(problems, []);
 			assert.deepEqual(
@@ -195,18 +209,81 @@ describe("discoverAgents", () => {
 		});
 
 		it("gives scout a read-only allowlist — no bash, no edit, no write", () => {
-			const { agents } = discoverAgents({ userAgentsDir: NO_SUCH_DIR });
+			const { agents } = discoverAgents({ userAgentsDir: NO_SUCH_DIR, cwd: NO_PROJECT });
 
 			assert.deepEqual(byName(agents, "scout").tools, ["read", "grep", "find", "ls"]);
 		});
 
 		it("pins no model on either, so a run inherits the parent session's", () => {
-			const { agents } = discoverAgents({ userAgentsDir: NO_SUCH_DIR });
+			const { agents } = discoverAgents({ userAgentsDir: NO_SUCH_DIR, cwd: NO_PROJECT });
 
 			assert.deepEqual(
 				agents.map((a) => a.model),
 				[undefined, undefined],
 			);
+		});
+	});
+
+	describe("the project scope", () => {
+		/** A roster discovered from `cwd`, with the user and bundled scopes pointed somewhere empty. */
+		function fromCwd(cwd: string) {
+			return discoverAgents({ userAgentsDir: NO_SUCH_DIR, bundledAgentsDir: NO_SUCH_DIR, cwd });
+		}
+
+		it("walks up from the working directory for a project agent directory", () => {
+			const { projectAgents, projectAgentsDir } = fromCwd(DEEP_IN_PROJECT);
+
+			assert.equal(projectAgentsDir, join(PROJECT_TREE, ".pi", "agents"));
+			const prospector = byName(projectAgents, "prospector");
+			assert.equal(prospector.source, "project");
+			assert.equal(prospector.description, "A project's own agent, defined by the repository it lives in");
+		});
+
+		it("keeps what it finds out of the roster, so a checkout is never silently runnable", () => {
+			const { agents, projectAgents } = fromCwd(DEEP_IN_PROJECT);
+
+			assert.deepEqual(agents, [], "the default scope is the user's and the bundled set, and nothing else");
+			assert.ok(projectAgents.length > 0, "the project agents are discovered, just held apart");
+		});
+
+		it("finds no project scope above a directory that has none", () => {
+			const { projectAgents, projectAgentsDir } = fromCwd(NO_PROJECT);
+
+			assert.deepEqual(projectAgents, []);
+			assert.equal(projectAgentsDir, undefined);
+		});
+
+		it("holds a project agent to the same strict allowlist — no tools, no agent", () => {
+			const { projectAgents, problems } = fromCwd(DEEP_IN_PROJECT);
+
+			assert.equal(
+				projectAgents.find((a) => a.name === "toolless"),
+				undefined,
+			);
+			assert.match(problemFor(problems, "no-tools.md").reason, /tools/);
+		});
+
+		describe("a project agent and a user agent sharing a name", () => {
+			it("keeps the user's and drops the project's, saying which file lost", () => {
+				const { agents, projectAgents, problems } = discoverAgents({
+					userAgentsDir: join(FIXTURES, "user-agents"),
+					bundledAgentsDir: NO_SUCH_DIR,
+					cwd: DEEP_IN_PROJECT,
+				});
+
+				assert.equal(byName(agents, "alpha").source, "user");
+				assert.equal(
+					projectAgents.find((a) => a.name === "alpha"),
+					undefined,
+					"a repo cannot put itself behind a name the user already trusts",
+				);
+				// The project scope keeps everything it does not collide on.
+				assert.deepEqual(
+					projectAgents.map((a) => a.name),
+					["prospector"],
+				);
+				assert.match(problemFor(problems, join("project-tree", ".pi", "agents", "alpha.md")).reason, /alpha/);
+			});
 		});
 	});
 });

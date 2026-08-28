@@ -13,7 +13,7 @@
  * that knows a process exists.
  */
 
-import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type Agent, discoverAgents, type Roster } from "./agents.ts";
 import { type RunChild, RUN_NAME_ENV, type SpawnOptions, spawnRun } from "./child.ts";
@@ -169,19 +169,72 @@ function describeRoster(roster: Roster): string {
 		`Fan out as wide as the work needs: at most ${RUN_SLOTS} runs work at once and the rest queue, starting in the order you asked for them as slots free.`,
 	];
 
-	if (roster.agents.length === 0) {
+	if (roster.agents.length === 0 && roster.projectAgents.length === 0) {
 		lines.push("There are no agents installed, so this tool cannot run anything until one is added.");
-	} else {
+	}
+
+	if (roster.agents.length > 0) {
 		lines.push("Available agents:");
 		for (const agent of roster.agents) lines.push(`- ${agent.name}: ${agent.description}`);
+	}
+
+	// Listed apart from the roster and said to be gated, because they are: these
+	// are definitions the checkout wrote, and running one asks the user first.
+	if (roster.projectAgents.length > 0) {
+		lines.push(
+			`Agents defined by this project rather than by the user, in ${roster.projectAgentsDir}. Running one asks the user to confirm first, so name one only when the task genuinely calls for it:`,
+		);
+		for (const agent of roster.projectAgents) lines.push(`- ${agent.name}: ${agent.description}`);
 	}
 
 	return lines.join("\n");
 }
 
 function unknownAgent(name: string, roster: Roster): Error {
-	const known = roster.agents.map((agent) => `\`${agent.name}\``).join(", ") || "none";
+	const known = [...roster.agents, ...roster.projectAgents].map((agent) => `\`${agent.name}\``).join(", ") || "none";
 	return new Error(`Unknown agent \`${name}\`. Available agents: ${known}.`);
+}
+
+/**
+ * The trust confirmation a project Agent runs behind.
+ *
+ * A project Agent file is repo-controlled prompt injection with a tool allowlist
+ * attached: a checkout that could spawn one on its own would be a checkout that
+ * can steer this session by existing. So the user is asked, by name and by file,
+ * before the Run is so much as registered — which is what makes a refusal a
+ * thrown error rather than a failed Run: there is no Run yet, nothing to wait
+ * for and nothing to account for, and the tool call that asked is still there to
+ * say so in.
+ *
+ * Two things are not asked. A project pi already trusts is a decision the user
+ * has taken once, deliberately, and asking again would train them to say yes. A
+ * session with nowhere to put a dialog cannot ask at all, and a question nobody
+ * can answer is not grounds for running anyway: it refuses instead.
+ */
+async function approveProjectAgent(agent: Agent, ctx: ExtensionContext): Promise<void> {
+	if (ctx.isProjectTrusted()) return;
+
+	if (!ctx.hasUI) {
+		throw new Error(
+			`Agent \`${agent.name}\` is defined by this project (${agent.filePath}), which is not trusted, and this session has nowhere to ask for confirmation. Use one of your own agents, or trust this project in an interactive session first.`,
+		);
+	}
+
+	const approved = await ctx.ui.confirm(
+		`Run project agent \`${agent.name}\`?`,
+		[
+			`\`${agent.name}\` is defined by this project, not by you:`,
+			`  ${agent.filePath}`,
+			"",
+			`It would run with these tools: ${agent.tools.join(", ")}`,
+			"",
+			"A project agent file is written by the repository it lives in. Only approve it for a checkout you trust.",
+		].join("\n"),
+	);
+
+	if (!approved) {
+		throw new Error(`Running project agent \`${agent.name}\` was declined, so nothing was started. Every other agent is unaffected.`);
+	}
 }
 
 /**
@@ -233,6 +286,11 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 		return;
 	}
 
+	// Discovered here, at registration, because the tool's description carries the
+	// roster and pi wants that description before a session exists to ask for a
+	// working directory. The walk for a project scope therefore starts at the
+	// process's own cwd — which is the directory pi was started in, and so the
+	// checkout the session is about.
 	const roster = options.roster ?? discoverAgents();
 	const spawn = options.spawn ?? spawnRun;
 	/**
@@ -532,9 +590,19 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 		promptSnippet: "Delegate a task to a subagent that works in its own process",
 		parameters: SubagentParams,
 
-		async execute(_toolCallId, params) {
-			const agent: Agent | undefined = roster.agents.find((candidate) => candidate.name === params.agent);
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			// The roster first, so a project Agent can never be what a familiar name
+			// resolves to — discovery drops a project file that claims a name the user
+			// or bundled scopes already use, and this is the same rule seen from the
+			// other end.
+			const agent: Agent | undefined =
+				roster.agents.find((candidate) => candidate.name === params.agent) ??
+				roster.projectAgents.find((candidate) => candidate.name === params.agent);
 			if (!agent) throw unknownAgent(params.agent, roster);
+
+			// Before the Run is registered, so a session that says no is a session
+			// nothing happened in.
+			if (agent.source === "project") await approveProjectAgent(agent, ctx);
 
 			const run = supervisor.register(agent.name, params.task, params.name);
 			const details: SubagentDetails = { run: run.name, agent: agent.name, task: params.task };

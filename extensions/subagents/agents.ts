@@ -14,19 +14,22 @@
  *  - **Every rejection is reported.** pi's example `continue`s past a bad file;
  *    a file that looks like an Agent and is silently absent from the roster is
  *    worse than a loud one. One bad file still never takes down its neighbours.
- *  - **Project scope is absent.** A project-local agent file is repo-controlled
- *    prompt injection; it carries a trust decision, and lands behind a trust
- *    confirmation in ticket 10. Discovery here is the user scope plus the set
- *    bundled with this extension.
+ *  - **The project scope is held apart from the roster.** An Agent file the
+ *    checkout carries is repo-controlled prompt injection with an allowlist, so
+ *    a checkout must never be able to steer a session by existing. The nearest
+ *    `.pi/agents/` above the working directory is discovered, and everything it
+ *    holds comes back as `projectAgents` — never merged into `agents`, which is
+ *    the whole of what keeps the default scope user-only. Running one is gated
+ *    on a trust confirmation, which is the caller's job rather than this file's.
  */
 
-import { type Dirent, readdirSync, readFileSync } from "node:fs";
+import { type Dirent, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 /** Where an Agent came from. */
-export type AgentSource = "bundled" | "user";
+export type AgentSource = "bundled" | "user" | "project";
 
 export interface Agent {
 	name: string;
@@ -48,8 +51,17 @@ export interface AgentProblem {
 }
 
 export interface Roster {
-	/** Runnable Agents, sorted by name. */
+	/** Runnable Agents, sorted by name: the bundled set plus the user's own. */
 	agents: Agent[];
+	/**
+	 * The project scope, sorted by name and deliberately not in `agents`.
+	 *
+	 * These are defined by the checkout rather than by the user, so nothing may
+	 * run one without a trust confirmation first.
+	 */
+	projectAgents: Agent[];
+	/** Where the project Agents were found, when a directory was found at all. */
+	projectAgentsDir?: string;
 	/** Files rejected on the way, in the order they were read. */
 	problems: AgentProblem[];
 }
@@ -59,10 +71,15 @@ export interface DiscoveryOptions {
 	userAgentsDir?: string;
 	/** Defaults to the set shipped beside this file. */
 	bundledAgentsDir?: string;
+	/** Where the walk up for a project Agent directory starts. Defaults to the process's own. */
+	cwd?: string;
 }
 
 /** The Agents shipped with this extension. */
 export const BUNDLED_AGENTS_DIR = join(dirname(fileURLToPath(import.meta.url)), "agents");
+
+/** What a checkout keeps its own Agents in, relative to a directory in it. */
+const PROJECT_AGENTS_DIR = join(CONFIG_DIR_NAME, "agents");
 
 type ParseResult = { ok: true; agent: Agent } | { ok: false; reason: string };
 
@@ -155,8 +172,14 @@ function byFilename(a: Dirent, b: Dirent): number {
 	return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
 }
 
+/** What one directory held: the Agents that parsed, and the files that did not. */
+interface Scan {
+	agents: Agent[];
+	problems: AgentProblem[];
+}
+
 /** Every Agent in one directory, plus the files that failed. */
-function loadAgentsFromDir(dir: string, source: AgentSource): Roster {
+function loadAgentsFromDir(dir: string, source: AgentSource): Scan {
 	const agents: Agent[] = [];
 	const problems: AgentProblem[] = [];
 
@@ -209,12 +232,46 @@ function loadAgentsFromDir(dir: string, source: AgentSource): Roster {
 	return { agents, problems };
 }
 
+function byAgentName(a: Agent, b: Agent): number {
+	return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+}
+
 /**
- * The Agents available to a session.
+ * The nearest `.pi/agents/` at or above `from`, if a checkout carries one.
+ *
+ * Nearest rather than every one on the way up: an inner project's Agents are the
+ * ones its working directory means, and merging an outer checkout's in would
+ * make what a session can run depend on where the tree happens to sit.
+ */
+function findProjectAgentsDir(from: string): string | undefined {
+	let dir = from;
+	for (;;) {
+		const candidate = join(dir, PROJECT_AGENTS_DIR);
+		try {
+			if (statSync(candidate).isDirectory()) return candidate;
+		} catch {
+			// Nothing there, which is the normal case for almost every directory.
+		}
+
+		const parent = dirname(dir);
+		if (parent === dir) return undefined;
+		dir = parent;
+	}
+}
+
+/**
+ * The Agents available to a session, and the ones a checkout would like it to
+ * have.
  *
  * Bundled first, then the user scope, so a user file named `scout` replaces the
  * bundled `scout` outright: the bundled set is a default, and overriding it must
  * not mean editing this repo.
+ *
+ * The project scope does not take part in that: it comes back separately, and a
+ * project Agent claiming a name the user or bundled scopes already use is
+ * dropped and reported. The precedence runs one way only — a repo cannot quietly
+ * replace an Agent the user trusts, because the thing that would then be running
+ * behind a familiar name is a file the repo wrote.
  */
 export function discoverAgents(options: DiscoveryOptions = {}): Roster {
 	const bundled = loadAgentsFromDir(options.bundledAgentsDir ?? BUNDLED_AGENTS_DIR, "bundled");
@@ -223,8 +280,27 @@ export function discoverAgents(options: DiscoveryOptions = {}): Roster {
 	const byName = new Map<string, Agent>();
 	for (const agent of [...bundled.agents, ...user.agents]) byName.set(agent.name, agent);
 
+	const projectAgentsDir = findProjectAgentsDir(options.cwd ?? process.cwd());
+	const project: Scan = projectAgentsDir ? loadAgentsFromDir(projectAgentsDir, "project") : { agents: [], problems: [] };
+
+	const projectAgents: Agent[] = [];
+	const shadowed: AgentProblem[] = [];
+	for (const agent of project.agents) {
+		const taken = byName.get(agent.name);
+		if (taken) {
+			shadowed.push({
+				filePath: agent.filePath,
+				reason: `claims the name \`${agent.name}\`, already taken by the ${taken.source} agent ${basename(taken.filePath)}; a project agent never replaces one of those`,
+			});
+			continue;
+		}
+		projectAgents.push(agent);
+	}
+
 	return {
-		agents: [...byName.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
-		problems: [...bundled.problems, ...user.problems],
+		agents: [...byName.values()].sort(byAgentName),
+		projectAgents: projectAgents.sort(byAgentName),
+		projectAgentsDir,
+		problems: [...bundled.problems, ...user.problems, ...project.problems, ...shadowed],
 	};
 }

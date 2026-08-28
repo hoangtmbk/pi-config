@@ -41,7 +41,15 @@ function agent(name: string, description: string, extra: Partial<Agent> = {}): A
 
 const ROSTER: Roster = {
 	agents: [agent("scout", "Read-only recon"), agent("worker", "Edits code and runs commands")],
+	projectAgents: [],
 	problems: [],
+};
+
+/** The same session, in a checkout that carries an Agent of its own. */
+const PROJECT_ROSTER: Roster = {
+	...ROSTER,
+	projectAgents: [agent("prospector", "This repository's own agent", { source: "project", filePath: "/repo/.pi/agents/prospector.md" })],
+	projectAgentsDir: "/repo/.pi/agents",
 };
 
 interface SubagentParams {
@@ -238,13 +246,35 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>, cliP
 const CTX = {} as ExtensionContext;
 
 /**
+ * A tool call's context, as far as the trust confirmation cares: whether pi
+ * already trusts this project, whether there is anybody to ask, and what they
+ * say when asked.
+ */
+function trusting(options: { trusted?: boolean; hasUI?: boolean; approve?: boolean } = {}) {
+	const confirmations: { title: string; message: string }[] = [];
+	const ctx = {
+		cwd: "/repo",
+		hasUI: options.hasUI ?? true,
+		isProjectTrusted: () => options.trusted ?? false,
+		ui: {
+			async confirm(title: string, message: string) {
+				confirmations.push({ title, message });
+				return options.approve ?? false;
+			},
+		},
+	} as unknown as ExtensionContext;
+
+	return { ctx, confirmations };
+}
+
+/**
  * A parent session whose Runs are stubs: no process, and events pushed by hand.
  *
  * `refuseSpawnAfter` is how many spawns succeed before `refuseSpawn` starts
  * being thrown, so a test can fail the one spawn that happens without a
  * `subagent` call in flight to report it — a Run admitted from the queue.
  */
-function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error, refuseSpawnAfter = 0) {
+function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error, refuseSpawnAfter = 0, roster: Roster = ROSTER) {
 	const tools: RegisteredTool[] = [];
 	const sent: SentMessage[] = [];
 	const spawned: {
@@ -263,7 +293,7 @@ function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error, refuseSpawnAf
 	const pi = recorder(parent, tools, sent, handlers);
 
 	registerSubagents(pi as unknown as ExtensionAPI, {
-		roster: ROSTER,
+		roster,
 		async spawn(options) {
 			if (refuseSpawn && spawned.length >= refuseSpawnAfter) throw refuseSpawn;
 			const child = {
@@ -344,8 +374,9 @@ async function call(
 	tool: RegisteredTool,
 	params: SubagentParams | SubagentAnswerParams | SubagentWaitParams,
 	signal?: AbortSignal,
+	ctx: ExtensionContext = CTX,
 ): Promise<string> {
-	const result = await tool.execute("call-1", params, signal, undefined, CTX);
+	const result = await tool.execute("call-1", params, signal, undefined, ctx);
 	return result.content
 		.map((part) => (part.type === "text" ? part.text : ""))
 		.join("");
@@ -406,7 +437,7 @@ describe("subagent registration", () => {
 	});
 
 	it("says so plainly when no agents were discovered", () => {
-		const { subagent } = fakeSession({ agents: [], problems: [] });
+		const { subagent } = fakeSession({ agents: [], projectAgents: [], problems: [] });
 
 		assert.match(subagent.description, /no agents/i);
 	});
@@ -459,6 +490,120 @@ describe("subagent", () => {
 			assert.match(error.message, /scout/);
 			assert.match(error.message, /worker/);
 			return true;
+		});
+	});
+});
+
+/**
+ * The project scope: Agents the checkout defines rather than the user.
+ *
+ * A project Agent file is repo-controlled prompt injection with a tool allowlist
+ * attached, so nothing here may run one on the strength of it existing. The
+ * roster it is listed apart from, and the trust confirmation, are the whole of
+ * what stands between a checkout and a session it can steer.
+ */
+describe("a project agent", () => {
+	/** A parent session working in a checkout that carries an Agent of its own. */
+	function projectSession() {
+		return stubbedSession(undefined, undefined, 0, PROJECT_ROSTER);
+	}
+
+	it("is listed apart from the roster, as something that asks before it runs", () => {
+		const { subagent } = fakeSession(PROJECT_ROSTER);
+
+		assert.match(subagent.description, /prospector: This repository's own agent/);
+		assert.match(subagent.description, /confirm/i, "the model is told the run is gated, not simply available");
+		assert.match(subagent.description, /\/repo\/\.pi\/agents/, "and where the definitions come from");
+	});
+
+	it("asks before spawning a Run in a project pi does not trust", async () => {
+		const { subagent, spawned } = projectSession();
+		const { ctx, confirmations } = trusting({ trusted: false, approve: true });
+
+		await call(subagent, { agent: "prospector", task: "survey the repo" }, undefined, ctx);
+
+		assert.equal(confirmations.length, 1);
+		assert.match(confirmations[0].title, /prospector/);
+		assert.match(confirmations[0].message, /\/repo\/\.pi\/agents\/prospector\.md/, "the confirmation names the file being trusted");
+		assert.match(confirmations[0].message, /read/, "and the tools it would run with");
+		assert.deepEqual(
+			spawned.map((child) => child.agent),
+			["prospector"],
+			"an approved run spawns like any other",
+		);
+	});
+
+	it("asks nothing for a user or bundled agent, however untrusted the project", async () => {
+		const { subagent, spawned } = projectSession();
+		const { ctx, confirmations } = trusting({ trusted: false, approve: false });
+
+		await call(subagent, { agent: "scout", task: "look around" }, undefined, ctx);
+
+		assert.deepEqual(confirmations, [], "the user's own agents are not the checkout's to define");
+		assert.equal(spawned.length, 1);
+	});
+
+	it("asks nothing in a project pi already trusts", async () => {
+		const { subagent, spawned } = projectSession();
+		const { ctx, confirmations } = trusting({ trusted: true });
+
+		await call(subagent, { agent: "prospector", task: "survey the repo" }, undefined, ctx);
+
+		assert.deepEqual(confirmations, [], "the trust decision has already been taken, once, by the user");
+		assert.equal(spawned.length, 1);
+	});
+
+	it("refuses when there is nobody to ask, rather than running unconfirmed", async () => {
+		const { subagent, spawned } = projectSession();
+		const { ctx, confirmations } = trusting({ trusted: false, hasUI: false });
+
+		await assert.rejects(call(subagent, { agent: "prospector", task: "survey the repo" }, undefined, ctx), (error: Error) => {
+			assert.match(error.message, /prospector/);
+			assert.match(error.message, /trust/i);
+			return true;
+		});
+		assert.deepEqual(confirmations, []);
+		assert.deepEqual(spawned, [], "a headless session is not a session that says yes");
+	});
+
+	describe("declining", () => {
+		it("starts nothing and leaves no Run behind", async () => {
+			const { subagent, subagentWait, spawned, sent } = projectSession();
+			const { ctx } = trusting({ trusted: false, approve: false });
+
+			await assert.rejects(call(subagent, { agent: "prospector", task: "survey the repo" }, undefined, ctx), (error: Error) => {
+				assert.match(error.message, /prospector/);
+				return true;
+			});
+
+			assert.deepEqual(spawned, []);
+			assert.deepEqual(sent, [], "nothing was started, so nothing is delivered");
+			assert.match(await call(subagentWait, {}), /nothing to wait for/i, "and no Run is left for a join to hang on");
+		});
+
+		it("leaves the rest of the roster fully usable", async () => {
+			const { subagent, spawned, sent } = projectSession();
+			const { ctx } = trusting({ trusted: false, approve: false });
+			await assert.rejects(call(subagent, { agent: "prospector", task: "survey the repo" }, undefined, ctx));
+
+			const started = await call(subagent, { agent: "scout", task: "look around" }, undefined, ctx);
+
+			assert.match(started, /Started run `scout`/);
+			spawned[0].emit(said("Found three call sites."));
+			spawned[0].emit(SETTLED);
+			assert.match(sent[0].content, /Found three call sites\./);
+		});
+
+		it("asks again next time, so declining once is not a decision about every run", async () => {
+			const { subagent } = projectSession();
+			const declining = trusting({ trusted: false, approve: false });
+			await assert.rejects(call(subagent, { agent: "prospector", task: "survey the repo" }, undefined, declining.ctx));
+
+			const approving = trusting({ trusted: false, approve: true });
+			await call(subagent, { agent: "prospector", task: "survey the repo" }, undefined, approving.ctx);
+
+			assert.equal(declining.confirmations.length, 1);
+			assert.equal(approving.confirmations.length, 1);
 		});
 	});
 });

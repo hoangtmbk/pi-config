@@ -16,8 +16,15 @@ _Avoid_: subagent (when you mean the definition), agent type, role
 **Roster**:
 The set of Agents a session can run: the definitions bundled with the extension plus the user's
 own, with a user definition replacing a bundled one of the same name. What the `subagent` tool's
-description is built from.
+description is built from. Agents the checkout defines are held apart from it — see Project scope.
 _Avoid_: registry, catalog, agent list
+
+**Project scope**:
+The Agents a checkout defines, in the nearest `.pi/agents/` at or above the working directory.
+Never in the Roster: one is runnable only behind a trust confirmation, and one claiming a Roster
+name is dropped rather than replacing it, because a repo-controlled file must not be what a
+familiar name resolves to.
+_Avoid_: local agents, repo agents, workspace scope
 
 **Run**:
 One execution of an agent: a single child pi process carrying out one delegated task, with its
