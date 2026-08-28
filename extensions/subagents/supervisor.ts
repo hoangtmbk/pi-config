@@ -107,11 +107,11 @@ export type ParentMessage = Delivery | Question;
 export class Supervisor {
 	private readonly byName = new Map<string, RunRecord>();
 	/**
-	 * The mailbox: the joins waiting to collect settled Runs' messages.
+	 * The `subagent_wait` calls in flight, each with the Runs it named.
 	 *
-	 * A message a join is waiting for is collected here rather than delivered on
-	 * its own, which is the whole of the no-double-delivery rule — a joined
-	 * message re-enters the conversation once, as that join's own result.
+	 * A message a join is waiting for is collected by that join rather than
+	 * delivered on its own — half of the no-double-delivery rule. The other half
+	 * is the mailbox: see `RunRecord.said`.
 	 */
 	private readonly joins = new Set<PendingJoin>();
 
@@ -123,7 +123,7 @@ export class Supervisor {
 	 */
 	register(agent: string, task: string, requestedName?: string): Run {
 		const name = this.reserveName(requestedName?.trim() || agent);
-		const record: RunRecord = { run: { name, agent, task, state: "running" } };
+		const record: RunRecord = { run: { name, agent, task, state: "running" }, said: false };
 		this.byName.set(name, record);
 		return record.run;
 	}
@@ -164,14 +164,6 @@ export class Supervisor {
 		const record = this.byName.get(name);
 		if (!record || hasStopped(record.run.state)) return undefined;
 
-		if (event.type === "agent_start") {
-			// A Waiting Run whose child has started another turn has been answered,
-			// so its Question is spent. Sending that answer is another ticket's job.
-			record.run.state = "running";
-			record.run.question = undefined;
-			return undefined;
-		}
-
 		if (event.type === "message_end") {
 			if (isResultBearing(event.message)) record.lastAssistant = event.message;
 			return undefined;
@@ -195,12 +187,47 @@ export class Supervisor {
 			record.lastAssistant = undefined;
 			record.run.state = "waiting";
 			record.run.question = asked.question;
-			return messageFor(record.run);
+		} else {
+			record.run.state = "done";
+			record.run.result = record.lastAssistant && assistantText(record.lastAssistant);
 		}
 
-		record.run.state = "done";
-		record.run.result = record.lastAssistant && assistantText(record.lastAssistant);
+		// Either way the Run now has something it has not said yet.
+		record.said = false;
 		return messageFor(record.run);
+	}
+
+	/**
+	 * Report that a Waiting Run has been answered, and is working again.
+	 *
+	 * The parent answering is what takes a Run out of Waiting — not its child
+	 * getting round to starting a turn. Only the first of those is a moment the
+	 * parent can sequence against, and a join placed after an answer has to wait
+	 * for the resumed Run rather than collect the Question it just answered.
+	 *
+	 * Does nothing to a Run that is not Waiting: callers check that first,
+	 * because they are the ones who can say what state it is in instead.
+	 */
+	answered(name: string): void {
+		const record = this.byName.get(name);
+		if (record?.run.state !== "waiting") return;
+		record.run.state = "running";
+		record.run.question = undefined;
+	}
+
+	/**
+	 * Put an answered Run back to Waiting on the Question it was answered about,
+	 * for an answer that never reached its child.
+	 *
+	 * The inverse of `answered`, and not optional: a Run left running on a turn
+	 * that never started is one every join waits on forever, and a Question the
+	 * parent can no longer be told about is one it can never answer again.
+	 */
+	unanswered(name: string, question?: string): void {
+		const record = this.byName.get(name);
+		if (record?.run.state !== "running") return;
+		record.run.state = "waiting";
+		record.run.question = question;
 	}
 
 	/**
@@ -226,6 +253,7 @@ export class Supervisor {
 		record.run.question = undefined;
 		record.run.state = "failed";
 		record.run.failure = failure;
+		record.said = false;
 		return deliveryFor(record.run);
 	}
 
@@ -254,9 +282,9 @@ export class Supervisor {
 	 * that Run, or to the conversation.
 	 *
 	 * A joined message re-enters the conversation as that join's own result, so
-	 * the caller must not auto-deliver it as well — that is the whole of the
-	 * no-double-delivery rule. Called right after `observe`, on the message it
-	 * returned, because only the Supervisor knows what is being joined.
+	 * the caller must not auto-deliver it as well. Called right after `observe`,
+	 * on the message it returned, because only the Supervisor knows what is being
+	 * joined.
 	 */
 	post(message: ParentMessage): "join" | "conversation" {
 		let joined = false;
@@ -270,7 +298,24 @@ export class Supervisor {
 				pending.resolve(this.collect(pending.names));
 			}
 		}
-		return joined ? "join" : "conversation";
+		if (joined) return "join";
+		// Only a Delivery is marked. A Question is still outstanding however often
+		// it is said, and nothing that repeats it says it a second time.
+		if (message.kind === "delivery") this.markSaid(message.run.name);
+		return "conversation";
+	}
+
+	/**
+	 * Mark a Run's Delivery as already re-entered into the parent conversation.
+	 *
+	 * Called for a Delivery this Supervisor routed there itself, and by the
+	 * spawn-failure path, which returns its Delivery as the `subagent` call's own
+	 * result — already the conversation a Delivery would have landed in. Either
+	 * way it keeps a later join from repeating what the parent already holds.
+	 */
+	markSaid(name: string): void {
+		const record = this.byName.get(name);
+		if (record) record.said = true;
 	}
 
 	/** Whether a Run is still working, and so still worth a join's while. */
@@ -278,12 +323,30 @@ export class Supervisor {
 		return this.byName.get(name)?.run.state === "running";
 	}
 
-	/** What each named Run has to say, right now. */
+	/**
+	 * What each named Run has to say, right now — emptying its mailbox as it goes.
+	 *
+	 * A Run whose Delivery has already been said comes back saying so rather than
+	 * saying its result twice: the half of the no-double-delivery rule that a
+	 * pending join cannot cover on its own. It is a mark rather than a destructive
+	 * drain, so a Run still has its result to hand for anything that asks.
+	 *
+	 * A Waiting Run is the exception, and comes back with its Question however
+	 * often it is asked for: the Question is still outstanding, and a join that
+	 * said a Run was Waiting without saying what on would leave the parent nothing
+	 * to act on.
+	 */
 	private collect(names: string[]): ParentMessage[] {
 		const messages: ParentMessage[] = [];
 		for (const name of names) {
 			const record = this.byName.get(name);
-			if (record) messages.push(messageFor(record.run));
+			if (!record) continue;
+			if (!hasStopped(record.run.state)) {
+				messages.push(messageFor(record.run));
+				continue;
+			}
+			messages.push(record.said ? alreadySaid(record.run) : messageFor(record.run));
+			record.said = true;
 		}
 		return messages;
 	}
@@ -311,6 +374,20 @@ interface PendingJoin {
 
 interface RunRecord {
 	run: Run;
+	/**
+	 * The mailbox, as one bit: whether this Run's Delivery has already re-entered
+	 * the parent conversation.
+	 *
+	 * Cleared every time the Run gets something new to say, and set by whoever
+	 * says it — an auto-delivery, a join collecting it, or a caller that said it
+	 * inline. A join that finds it set reports the Run without repeating its
+	 * result, which is the half of the no-double-delivery rule a pending join
+	 * cannot cover on its own.
+	 *
+	 * A Delivery only. A Question is outstanding until it is answered, so saying
+	 * it again is not saying it twice.
+	 */
+	said: boolean;
 	/** The newest assistant message seen, which becomes the result on settling. */
 	lastAssistant?: AssistantMessage;
 	/**
@@ -373,6 +450,23 @@ function deliveryFor(run: Run): Delivery {
 	return { kind: "delivery", run, text: deliveryText(run) };
 }
 
+/**
+ * A Delivery that has already landed, said again without saying it twice.
+ *
+ * Says where the Run got to and stops, rather than repeating a result the parent
+ * is already holding: a join that names a Run whose Delivery has landed is
+ * asking for something it already has, and the useful reply is to say so.
+ */
+function alreadySaid(run: Run): Delivery {
+	const what = run.state === "failed" ? "failed. Why it failed" : "is done. Its result";
+	return { kind: "delivery", run, text: `${runHeader(run)} ${what} was already delivered into this conversation, and is not repeated here.` };
+}
+
+/** How every message names the Run that is speaking. */
+function runHeader(run: Run): string {
+	return `Run \`${run.name}\` (agent \`${run.agent}\`)`;
+}
+
 /** Whether a Run has stopped for good, whichever way it stopped. */
 function hasStopped(state: RunState): boolean {
 	return state === "done" || state === "failed";
@@ -385,7 +479,7 @@ function hasStopped(state: RunState): boolean {
  * and the Run's name is what addresses it.
  */
 function questionMessageText(run: Run): string {
-	const header = `Run \`${run.name}\` (agent \`${run.agent}\`) has a question and is waiting for an answer.`;
+	const header = `${runHeader(run)} has a question and is waiting for an answer.`;
 	return run.question ? `${header}\n\n${run.question}` : `${header}\n\nIt did not say what it wanted to know.`;
 }
 
@@ -397,7 +491,7 @@ function questionMessageText(run: Run): string {
  */
 function deliveryText(run: Run): string {
 	if (run.state === "failed") return failureText(run);
-	const header = `Run \`${run.name}\` (agent \`${run.agent}\`) is done.`;
+	const header = `${runHeader(run)} is done.`;
 	return run.result ? `${header}\n\n${run.result}` : `${header}\n\nIt finished without producing a result.`;
 }
 
@@ -410,7 +504,7 @@ function deliveryText(run: Run): string {
  * is the evidence the parent decides on.
  */
 function failureText(run: Run): string {
-	const header = `Run \`${run.name}\` (agent \`${run.agent}\`) failed: ${failureCause(run.failure)}. It produced no result.`;
+	const header = `${runHeader(run)} failed: ${failureCause(run.failure)}. It produced no result.`;
 	const guidance = "Decide whether to run the task again, run it differently, or carry on without it.";
 	const stderr = run.failure?.kind === "exit" ? run.failure.stderr : undefined;
 	return stderr ? `${header}\n\n${guidance}\n\nIts last stderr:\n\n${stderr}` : `${header}\n\n${guidance}`;

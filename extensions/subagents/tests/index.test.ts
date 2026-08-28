@@ -171,7 +171,7 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>, cliP
 const CTX = {} as ExtensionContext;
 
 /** A parent session whose Runs are stubs: no process, and events pushed by hand. */
-function stubbedSession(refuseSpawn?: Error) {
+function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error) {
 	const tools: RegisteredTool[] = [];
 	const sent: SentMessage[] = [];
 	const spawned: {
@@ -199,6 +199,7 @@ function stubbedSession(refuseSpawn?: Error) {
 			spawned.push(child);
 			return {
 				prompt: async (message: string) => {
+					if (refusePrompt) throw refusePrompt;
 					child.prompts.push(message);
 				},
 				stop: async () => {
@@ -224,6 +225,20 @@ async function call(tool: RegisteredTool, params: SubagentParams | SubagentAnswe
 	return result.content
 		.map((part) => (part.type === "text" ? part.text : ""))
 		.join("");
+}
+
+/** A tool call in flight, so a test can ask whether it has come back yet. */
+function watch(pending: Promise<string>): { text?: string } {
+	const state: { text?: string } = {};
+	pending.then((text) => {
+		state.text = text;
+	});
+	return state;
+}
+
+/** Let everything already queued run, so a join that could have resolved has. */
+function flush(): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 /** Wait until `sent` has an `index`th message, or give up loudly. */
@@ -468,7 +483,7 @@ describe("a Run that cannot start", () => {
 		await call(subagent, { agent: "scout", task: "look around" });
 
 		assert.match(await call(subagentWait, {}), /nothing to wait for/);
-		assert.match(await call(subagentWait, { names: ["scout"] }), /failed/);
+		assert.match(await call(subagentWait, { names: ["scout"] }), /Run `scout`.*failed/s);
 		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "hello" }), (error: Error) => {
 			assert.match(error.message, /failed/);
 			return true;
@@ -556,13 +571,14 @@ describe("a Run that asks", () => {
 	});
 
 	it("leaves its child alive while it waits, and stops it only once it is done", async () => {
-		const { subagent, spawned } = stubbedSession();
+		const { subagent, subagentAnswer, spawned } = stubbedSession();
 		await call(subagent, { agent: "scout", task: "look around" });
 
 		spawned[0].emit(asked("Which auth module do you mean?"));
 		spawned[0].emit(SETTLED);
 		assert.equal(spawned[0].stops, 0, "a Waiting Run's child is neither killed nor reaped");
 
+		await call(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
 		spawned[0].emit(AGENT_START);
 		spawned[0].emit(SETTLED);
 		assert.equal(spawned[0].stops, 1);
@@ -633,6 +649,38 @@ describe("subagent_answer", () => {
 		]);
 		assert.match(second.content, /Should I include the tests\?/);
 		assert.match(delivered.content, /Three call sites, tests included\./);
+	});
+
+	it("refuses a second answer to a Run the first one already resumed", async () => {
+		const { subagent, subagentAnswer, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+
+		await call(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
+
+		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "and the tests too" }), (error: Error) => {
+			assert.match(error.message, /running/);
+			return true;
+		});
+		assert.deepEqual(spawned[0].prompts, ["The one in src/auth.ts."], "one answer, one turn");
+	});
+
+	it("leaves the Run waiting on its Question when the answer cannot be sent, rather than stranding it", async () => {
+		const { subagent, subagentWait, subagentAnswer, spawned } = stubbedSession(undefined, new Error("rpc: stream closed"));
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+
+		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." }), /stream closed/);
+
+		// Still Waiting, so a join comes back with the Question rather than hanging
+		// on a Run whose resumed turn never started.
+		const collected = await call(subagentWait, {});
+		assert.match(collected, /Which auth module do you mean\?/);
+		// And still answerable: the second attempt gets as far as the send again,
+		// rather than being refused for being in the wrong state.
+		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." }), /stream closed/);
 	});
 
 	it("refuses a Run that has already finished, saying which state it is in", async () => {
@@ -708,7 +756,7 @@ describe("subagent_wait", () => {
 		assert.deepEqual(sent, [], "a joined result re-enters the conversation once, as the join's own result");
 	});
 
-	it("returns a Run that finished before the join was placed, straight from the mailbox", async () => {
+	it("returns a Run that finished before the join was placed, without waiting for anything", async () => {
 		const { subagent, subagentWait, spawned } = stubbedSession();
 		await call(subagent, { agent: "scout", task: "look around" });
 		spawned[0].emit(said("Found three call sites."));
@@ -716,7 +764,8 @@ describe("subagent_wait", () => {
 
 		const collected = await call(subagentWait, { names: ["scout"] });
 
-		assert.match(collected, /Found three call sites\./);
+		assert.match(collected, /Run `scout`/);
+		assert.match(collected, /is done/);
 	});
 
 	it("rejects an unknown name with the Runs that would have worked, waiting for nothing", async () => {
@@ -776,13 +825,19 @@ describe("subagent_wait", () => {
 
 		assert.match(await joined, /Which auth module do you mean\?/);
 
+		// No hand-fed `agent_start`: answering is what takes the Run out of Waiting,
+		// so a join placed straight after has something to sequence against.
 		await call(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
+		const rejoined = watch(call(subagentWait, { names: ["scout"] }));
+		await flush();
+		assert.equal(rejoined.text, undefined, "the answered Run is working again, so the join waits for it");
+
 		spawned[0].emit(AGENT_START);
-		const rejoined = call(subagentWait, { names: ["scout"] });
 		spawned[0].emit(said("Three call sites."));
 		spawned[0].emit(SETTLED);
+		await flush();
 
-		assert.match(await rejoined, /Three call sites\./);
+		assert.match(rejoined.text ?? "", /Three call sites\./);
 	});
 
 	it("says a Run named twice once, so one join collects one result per Run", async () => {
@@ -833,5 +888,92 @@ describe("subagent_wait", () => {
 
 		assert.match(collected, /Run `scout`/);
 		assert.match(collected, /Result for: count the call sites/);
+	});
+});
+
+describe("no double delivery", () => {
+	it("does not repeat a result that already reached the conversation on its own", async () => {
+		const { subagent, subagentWait, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(said("Found three call sites."));
+		spawned[0].emit(SETTLED);
+		assert.equal(sent.length, 1, "no join was pending, so it was delivered on its own");
+
+		const collected = await call(subagentWait, { names: ["scout"] });
+
+		assert.match(collected, /already delivered/);
+		assert.doesNotMatch(collected, /Found three call sites\./);
+		assert.equal(sent.length, 1, "and the join said nothing more into the conversation");
+	});
+
+	it("hands a result to the first join that collects it and to no second one", async () => {
+		const { subagent, subagentWait, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		const joined = call(subagentWait, { names: ["scout"] });
+		spawned[0].emit(said("Found three call sites."));
+		spawned[0].emit(SETTLED);
+		assert.match(await joined, /Found three call sites\./);
+
+		const again = await call(subagentWait, { names: ["scout"] });
+
+		assert.match(again, /already delivered/);
+		assert.doesNotMatch(again, /Found three call sites\./);
+		assert.deepEqual(sent, [], "the result re-entered the conversation once, as the first join's result");
+	});
+
+	it("waits for the Run still in flight without repeating the one that already came back", async () => {
+		const { subagent, subagentWait, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "one" });
+		await call(subagent, { agent: "worker", task: "two" });
+		spawned[0].emit(said("first result"));
+		spawned[0].emit(SETTLED);
+
+		const joined = call(subagentWait, { names: ["scout", "worker"] });
+		spawned[1].emit(said("second result"));
+		spawned[1].emit(SETTLED);
+		const collected = await joined;
+
+		assert.match(collected, /Run `scout`.*already delivered/s);
+		assert.doesNotMatch(collected, /first result/);
+		assert.match(collected, /second result/);
+	});
+
+	it("still repeats an outstanding Question, which is not a result the parent already holds", async () => {
+		const { subagent, subagentWait, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+		assert.equal(sent.length, 1);
+
+		const collected = await call(subagentWait, { names: ["scout"] });
+		const again = await call(subagentWait, { names: ["scout"] });
+
+		assert.match(collected, /Which auth module do you mean\?/);
+		assert.match(again, /Which auth module do you mean\?/);
+	});
+
+	it("does not repeat a failure that already reached the conversation on its own", async () => {
+		const { subagent, subagentWait, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].die({ exitCode: 3, stderr: "pi: out of tokens" });
+		assert.equal(sent.length, 1);
+
+		const collected = await call(subagentWait, { names: ["scout"] });
+
+		assert.match(collected, /Run `scout`.*failed/s);
+		assert.match(collected, /already delivered/);
+		assert.doesNotMatch(collected, /out of tokens/);
+	});
+
+	it("does not repeat a Run that could not start, whose failure was this tool call's own result", async () => {
+		const { subagent, subagentWait } = stubbedSession(new Error("pi: unknown tool `telepathy`"));
+		const started = await call(subagent, { agent: "scout", task: "look around" });
+
+		const collected = await call(subagentWait, { names: ["scout"] });
+
+		assert.match(started, /unknown tool `telepathy`/);
+		assert.match(collected, /Run `scout`.*failed/s);
+		assert.doesNotMatch(collected, /telepathy/);
 	});
 });

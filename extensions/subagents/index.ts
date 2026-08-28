@@ -272,8 +272,10 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 				// later would be.
 				const failure = supervisor.fail(run.name, { kind: "spawn", message: describeError(error) });
 				// Said here rather than delivered, because this tool call is already
-				// returning into the conversation the Delivery would have landed in —
-				// the same no-double-delivery rule the join follows.
+				// returning into the conversation the Delivery would have landed in.
+				// Marked said for the same reason: a later join naming this Run reports
+				// it without repeating a failure the parent already has.
+				supervisor.markSaid(run.name);
 				return { content: [{ type: "text", text: failure?.text ?? describeError(error) }], details };
 			}
 			children.set(run.name, child);
@@ -297,7 +299,7 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 			"Wait for runs to finish and collect their results here, rather than letting them arrive in this conversation on their own.",
 			"Waits until every run you name — or every run that has not finished, if you name none — is done or waiting on a question, then returns what each has to say.",
 			"A run that is waiting comes back with its question: answer it with subagent_answer and wait again.",
-			"A result collected here is not also delivered on its own, so nothing is said twice.",
+			"Nothing is said twice: a result collected here is not also delivered on its own, and a run whose result already arrived on its own comes back saying so rather than repeating it.",
 			"Use it when you have nothing to do until the runs come back; otherwise keep working and let their results arrive.",
 		].join(" "),
 		promptSnippet: "Wait for subagent runs to come back and collect their results",
@@ -354,11 +356,22 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 			const child = children.get(name);
 			if (!child) throw new Error(`Run \`${name}\` is waiting, but its child is gone, so the answer cannot be delivered.`);
 
-			// The Run leaves waiting when its child starts the turn this prompt
-			// begins, which the Supervisor hears as `agent_start`. Nothing here
-			// touches the lifecycle — so two answers sent before that event both
-			// land, and the child takes them as two turns.
-			await child.prompt(answer);
+			// The Run leaves Waiting here rather than when its child gets round to
+			// starting a turn: this is the moment the caller can sequence against, so
+			// a `subagent_wait` issued straight after an answer waits for the resumed
+			// Run instead of collecting the Question it just answered. It also closes
+			// the window a second answer would have been accepted in.
+			const question = run.question;
+			supervisor.answered(name);
+			try {
+				await child.prompt(answer);
+			} catch (error) {
+				// The answer never reached the child, so the Run is waiting on the same
+				// Question it was. Leaving it running would strand it: no turn was
+				// started to end it, and every join would wait on it forever.
+				supervisor.unanswered(name, question);
+				throw error;
+			}
 
 			const details: SubagentDetails = { run: run.name, agent: run.agent, task: run.task };
 			return {

@@ -217,13 +217,20 @@ describe("Supervisor joins", () => {
 		assert.equal(waiting[0].kind, "question");
 		assert.match(waiting[0].text, /Which auth module do you mean\?/);
 
-		// The answer starts the Run's next turn, which is what takes it out of
-		// Waiting; a join placed before that would collect the spent Question again.
-		supervisor.observe(run.name, AGENT_START);
-		const rejoined = supervisor.join([run.name]);
-		announce(supervisor, run.name, [said("Three call sites."), SETTLED]);
+		// Answering is what takes a Run out of Waiting, and it is the only moment
+		// the parent can sequence against — a join placed after it waits for the
+		// resumed Run rather than collecting the spent Question again.
+		supervisor.answered(run.name);
+		const rejoined = watch(supervisor.join([run.name]));
+		await Promise.resolve();
+		const halfway = rejoined.collected;
+		assert.equal(halfway, undefined, "the answered Run is working again, so the join waits for it");
 
-		assert.equal((await rejoined)[0].kind, "delivery");
+		announce(supervisor, run.name, [said("Three call sites."), SETTLED]);
+		await Promise.resolve();
+
+		assert.equal(rejoined.collected?.[0].kind, "delivery");
+		assert.match(rejoined.collected?.[0].text ?? "", /Three call sites\./);
 	});
 
 	it("leaves a Run no join named to deliver on its own", () => {
@@ -235,6 +242,100 @@ describe("Supervisor joins", () => {
 		const routes = announce(supervisor, other.name, [said("second result"), SETTLED]);
 
 		assert.deepEqual(routes, ["conversation"]);
+	});
+});
+
+describe("Supervisor no double delivery", () => {
+	it("says a Delivery that already reached the conversation was delivered, rather than saying it twice", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		const routes = announce(supervisor, run.name, [said("Found three call sites."), SETTLED]);
+
+		const collected = await supervisor.join([run.name]);
+
+		assert.deepEqual(routes, ["conversation"], "no join was pending, so it was auto-delivered");
+		assert.equal(collected.length, 1);
+		assert.match(collected[0].text, /already delivered/);
+		assert.doesNotMatch(collected[0].text, /Found three call sites\./);
+	});
+
+	it("hands a result to the first join to collect it and to no second one", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		feed(supervisor, run.name, [said("Found three call sites."), SETTLED]);
+
+		const first = await supervisor.join([run.name]);
+		const second = await supervisor.join([run.name]);
+
+		assert.match(first[0].text, /Found three call sites\./);
+		assert.match(second[0].text, /already delivered/);
+		assert.doesNotMatch(second[0].text, /Found three call sites\./);
+	});
+
+	it("does not repeat an already-delivered Run for the sake of the in-flight one beside it", async () => {
+		const supervisor = new Supervisor();
+		const finished = supervisor.register("scout", "one");
+		const working = supervisor.register("worker", "two");
+		announce(supervisor, finished.name, [said("first result"), SETTLED]);
+
+		const joined = supervisor.join([finished.name, working.name]);
+		announce(supervisor, working.name, [said("second result"), SETTLED]);
+		const collected = await joined;
+
+		assert.match(collected[0].text, /already delivered/);
+		assert.doesNotMatch(collected[0].text, /first result/);
+		assert.match(collected[1].text, /second result/);
+	});
+
+	it("counts a failed Run's Delivery as said too, because failures travel the same path", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		const failure = supervisor.fail(run.name, { kind: "exit", exitCode: 3, stderr: "pi: out of tokens" });
+		supervisor.post(failure as ParentMessage);
+
+		const collected = await supervisor.join([run.name]);
+
+		assert.equal(collected[0].kind, "delivery");
+		assert.match(collected[0].text, /already delivered/);
+		assert.doesNotMatch(collected[0].text, /out of tokens/);
+	});
+
+	it("marks a message its caller said itself, so a later join does not say it again", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		supervisor.fail(run.name, { kind: "spawn", message: "pi: unknown tool `telepathy`" });
+		supervisor.markSaid(run.name);
+
+		const collected = await supervisor.join([run.name]);
+
+		assert.match(collected[0].text, /already delivered/);
+		assert.doesNotMatch(collected[0].text, /telepathy/);
+	});
+
+	it("keeps saying an outstanding Question, which is not a result the parent already holds", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		const routes = announce(supervisor, run.name, [asked("Which auth module do you mean?"), SETTLED]);
+
+		const first = await supervisor.join([run.name]);
+		const second = await supervisor.join([run.name]);
+
+		assert.deepEqual(routes, ["conversation"]);
+		assert.match(first[0].text, /Which auth module do you mean\?/);
+		assert.match(second[0].text, /Which auth module do you mean\?/);
+	});
+
+	it("gives an answered Run a fresh thing to say, so its Delivery is not mistaken for the spent Question", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		announce(supervisor, run.name, [asked("Which auth module do you mean?"), SETTLED]);
+		supervisor.answered(run.name);
+
+		announce(supervisor, run.name, [said("Three call sites."), SETTLED]);
+		const collected = await supervisor.join([run.name]);
+
+		assert.match(collected[0].text, /already delivered/, "the Delivery went to the conversation, once");
+		assert.equal(supervisor.get(run.name)?.result, "Three call sites.");
 	});
 });
 
@@ -289,16 +390,11 @@ describe("Supervisor questions", () => {
 		const supervisor = new Supervisor();
 		const run = supervisor.register("scout", "look around");
 
-		const announced = feed(supervisor, run.name, [
-			asked("Which auth module do you mean?"),
-			SETTLED,
-			AGENT_START,
-			asked("Should I include the tests?"),
-			SETTLED,
-			AGENT_START,
-			said("Three call sites, tests included."),
-			SETTLED,
-		]);
+		const announced = feed(supervisor, run.name, [asked("Which auth module do you mean?"), SETTLED]);
+		supervisor.answered(run.name);
+		announced.push(...feed(supervisor, run.name, [AGENT_START, asked("Should I include the tests?"), SETTLED]));
+		supervisor.answered(run.name);
+		announced.push(...feed(supervisor, run.name, [AGENT_START, said("Three call sites, tests included."), AGENT_END, SETTLED]));
 
 		assert.deepEqual(
 			announced.map((message) => message.kind),
@@ -311,15 +407,39 @@ describe("Supervisor questions", () => {
 		assert.equal(supervisor.get(run.name)?.question, undefined);
 	});
 
-	it("counts a Run as running again once its child starts the turn after a Question", () => {
+	it("counts a Run as running again once it has been answered, without waiting on its child", () => {
 		const supervisor = new Supervisor();
 		const run = supervisor.register("scout", "look around");
 
 		feed(supervisor, run.name, [asked("Which auth module do you mean?"), SETTLED]);
-		supervisor.observe(run.name, AGENT_START);
+		supervisor.answered(run.name);
 
 		assert.equal(supervisor.get(run.name)?.state, "running");
 		assert.equal(supervisor.get(run.name)?.question, undefined);
+	});
+
+	it("puts an answered Run back on its Question when the answer could not be sent", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		feed(supervisor, run.name, [asked("Which auth module do you mean?"), SETTLED]);
+
+		supervisor.answered(run.name);
+		supervisor.unanswered(run.name, "Which auth module do you mean?");
+
+		assert.equal(supervisor.get(run.name)?.state, "waiting");
+		assert.equal(supervisor.get(run.name)?.question, "Which auth module do you mean?");
+	});
+
+	it("leaves a Run that is not Waiting alone when told it was answered", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		feed(supervisor, run.name, [said("Found three call sites."), SETTLED]);
+
+		supervisor.answered(run.name);
+		supervisor.answered("ghost");
+
+		assert.equal(supervisor.get(run.name)?.state, "done");
+		assert.equal(supervisor.get(run.name)?.result, "Found three call sites.");
 	});
 
 	it("finishes a Run whose ask_question failed, because no Question ever reached the parent", () => {
@@ -339,6 +459,7 @@ describe("Supervisor questions", () => {
 		const run = supervisor.register("scout", "look around");
 
 		feed(supervisor, run.name, [said("I need to know which module."), asked("Which auth module do you mean?"), SETTLED]);
+		supervisor.answered(run.name);
 		const announced = feed(supervisor, run.name, [AGENT_START, SETTLED]);
 
 		assert.equal(announced.length, 1);
