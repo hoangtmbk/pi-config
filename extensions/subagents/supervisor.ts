@@ -13,11 +13,22 @@ import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 /**
  * Where a Run is in its lifecycle.
  *
- * A Run runs, may wait on an unanswered Question, and then either finishes or
- * fails. `done` and `failed` are both final and both deliver: the difference is
- * whether the Run has a result to hand over or a reason it has none.
+ * A Run may queue for a free slot, then runs, may wait on an unanswered
+ * Question, and then either finishes or fails. `done` and `failed` are both
+ * final and both deliver: the difference is whether the Run has a result to hand
+ * over or a reason it has none.
  */
-export type RunState = "running" | "waiting" | "done" | "failed";
+export type RunState = "queued" | "running" | "waiting" | "done" | "failed";
+
+/**
+ * How many Runs may be working at once. Everything past that queues.
+ *
+ * ADR-0002's cap. Small and fixed rather than derived from the machine, because
+ * the binding constraint is the provider's rate limit and not this computer:
+ * four children hammering one API key is already where a wide fan-out starts
+ * costing more in retries than it saves in wall-clock.
+ */
+export const RUN_SLOTS = 4;
 
 /**
  * Why a Run stopped without finishing.
@@ -109,16 +120,52 @@ export interface Question {
 }
 
 /**
- * What an observed event asks the parent session to say, when it asks anything.
+ * A queued Run's answer to a join that asked about it before it had started.
+ *
+ * Only a join ever sees one, and only in the one case where waiting any longer
+ * would strand it: see `isInFlight`. Nothing settled it, so there is nothing to
+ * deliver and nothing to mark as said.
+ */
+export interface Queued {
+	kind: "queued";
+	run: Run;
+	/** The message body the parent session receives. */
+	text: string;
+}
+
+/**
+ * What a settling Run asks the parent session to say.
  *
  * A Question and a Delivery both land in the conversation the same way and
  * differ in one thing that matters upstream: a Delivery ends the Run, a Question
  * leaves its child alive and waiting to be answered.
  */
-export type ParentMessage = Delivery | Question;
+export type SettledMessage = Delivery | Question;
+
+/** Everything a join can come back holding, settled or not. */
+export type ParentMessage = SettledMessage | Queued;
+
+export interface SupervisorOptions {
+	/**
+	 * A queued Run whose slot has come free, handed over to be started.
+	 *
+	 * The Supervisor owns which Run goes next and when, and nothing else: it has
+	 * no way to spawn one. Called only for a Run that was queued — one registered
+	 * into a free slot is already the caller's to start.
+	 */
+	onAdmit?: (run: Run) => void;
+}
 
 export class Supervisor {
 	private readonly byName = new Map<string, RunRecord>();
+	private readonly onAdmit?: (run: Run) => void;
+	/**
+	 * Whether every Run is being ended, and so nothing may be admitted.
+	 *
+	 * Without it `endAll` would fail a Run, free its slot, and start a queued one
+	 * into the session that is going away — the orphan the reap exists to prevent.
+	 */
+	private ending = false;
 	/**
 	 * The `subagent_wait` calls in flight, each with the Runs it named.
 	 *
@@ -128,15 +175,23 @@ export class Supervisor {
 	 */
 	private readonly joins = new Set<PendingJoin>();
 
+	constructor(options: SupervisorOptions = {}) {
+		this.onAdmit = options.onAdmit;
+	}
+
 	/**
-	 * Take on a new Run: reserve a name for it and record it as running.
+	 * Take on a new Run: reserve a name for it and record it as running, or as
+	 * queued when every slot is taken.
 	 *
 	 * Called before anything is spawned, because the name is what the caller
-	 * needs back and what the child is told it is.
+	 * needs back and what the child is told it is. The caller starts a Run that
+	 * came back running; a queued one is handed to `onAdmit` later instead, so
+	 * that a fan-out past the cap costs the parent a wait rather than an error.
 	 */
 	register(agent: string, task: string, requestedName?: string): Run {
 		const name = this.reserveName(requestedName?.trim() || agent);
-		const record: RunRecord = { run: { name, agent, task, state: "running" }, said: false };
+		const state: RunState = this.slotsInUse() < RUN_SLOTS ? "running" : "queued";
+		const record: RunRecord = { run: { name, agent, task, state }, said: false };
 		this.byName.set(name, record);
 		return record.run;
 	}
@@ -173,7 +228,7 @@ export class Supervisor {
 	 * that ran `ask_question` moves the Run to Waiting instead of finishing it —
 	 * see `ASK_QUESTION_TOOL`.
 	 */
-	observe(name: string, event: JsonAgentSessionEvent): ParentMessage | undefined {
+	observe(name: string, event: JsonAgentSessionEvent): SettledMessage | undefined {
 		const record = this.byName.get(name);
 		if (!record || hasStopped(record.run.state)) return undefined;
 
@@ -203,11 +258,14 @@ export class Supervisor {
 		} else {
 			record.run.state = "done";
 			record.run.result = record.lastAssistant && assistantText(record.lastAssistant);
+			// The slot this Run was holding is free, so whatever has been queued
+			// longest starts now rather than when the parent next asks for anything.
+			this.admitQueued();
 		}
 
 		// Either way the Run now has something it has not said yet.
 		record.said = false;
-		return messageFor(record.run);
+		return settledFor(record.run);
 	}
 
 	/**
@@ -267,6 +325,10 @@ export class Supervisor {
 		record.run.state = "failed";
 		record.run.failure = failure;
 		record.said = false;
+		// A Run that died frees its slot exactly like one that finished. Draining
+		// on success alone would lose a slot to every crash until a session that
+		// had seen four of them could start nothing at all.
+		this.admitQueued();
 		return deliveryFor(record.run);
 	}
 
@@ -325,15 +387,28 @@ export class Supervisor {
 	 * Joins in flight are ended rather than answered, for the reason `join`
 	 * gives: the turn a join would return its Deliveries into is the turn that
 	 * just went away.
+	 *
+	 * A queued Run ends here too, and is reported in the same words as one that
+	 * was already working: it is a Run the session took on, and leaving it listed
+	 * as waiting for a slot that will never come would be a Run nothing ever
+	 * resolves.
 	 */
 	endAll(reason: string): Delivery[] {
 		for (const pending of this.joins) pending.reject(new Error(`Waiting stopped: ${reason}.`));
 		this.joins.clear();
 
 		const deliveries: Delivery[] = [];
-		for (const name of this.byName.keys()) {
-			const delivery = this.fail(name, { kind: "stopped", reason });
-			if (delivery) deliveries.push(delivery);
+		// Every slot these Runs free is freed into a session that is going away, so
+		// nothing is admitted while this runs. Restored afterwards rather than set
+		// for good: an aborted turn ends every Run and the session carries on.
+		this.ending = true;
+		try {
+			for (const name of this.byName.keys()) {
+				const delivery = this.fail(name, { kind: "stopped", reason });
+				if (delivery) deliveries.push(delivery);
+			}
+		} finally {
+			this.ending = false;
 		}
 		return deliveries;
 	}
@@ -347,7 +422,7 @@ export class Supervisor {
 	 * on the message it returned, because only the Supervisor knows what is being
 	 * joined.
 	 */
-	post(message: ParentMessage): "join" | "conversation" {
+	post(message: SettledMessage): "join" | "conversation" {
 		let joined = false;
 		for (const pending of this.joins) {
 			if (!pending.names.includes(message.run.name)) continue;
@@ -379,9 +454,53 @@ export class Supervisor {
 		if (record) record.said = true;
 	}
 
-	/** Whether a Run is still working, and so still worth a join's while. */
+	/**
+	 * Whether a Run is still working, or still expected to, and so still worth a
+	 * join's while.
+	 *
+	 * A queued Run counts while something is running: a join that passed over one
+	 * would come back before the work it named had even started. It stops counting
+	 * once every slot is held by a Waiting Run, for the reason `join` gives about
+	 * Waiting itself — nothing left can free a slot except the parent answering,
+	 * and a parent inside the join cannot. Waiting for it there is not patience,
+	 * it is a deadlock.
+	 */
 	private isInFlight(name: string): boolean {
-		return this.byName.get(name)?.run.state === "running";
+		const state = this.byName.get(name)?.run.state;
+		if (state === "running") return true;
+		return state === "queued" && this.list().some((run) => run.state === "running");
+	}
+
+	/** How many of the `RUN_SLOTS` are taken right now. */
+	private slotsInUse(): number {
+		return this.list().filter((run) => holdsSlot(run.state)).length;
+	}
+
+	/**
+	 * Start every queued Run a free slot can now take, oldest request first.
+	 *
+	 * Called wherever a Run stops, which is the only thing that frees a slot —
+	 * and from both terminal states, not just `done`, because a queue that
+	 * drained on success alone would leak a slot on every crash until the session
+	 * had none left.
+	 *
+	 * Order comes from the registry itself, which is insertion-ordered and so
+	 * already in the order the Runs were asked for; there is no second list to
+	 * keep in step with it. The admissions are handed over after the promotions,
+	 * so `onAdmit` sees a Supervisor whose slots are already accounted for.
+	 */
+	private admitQueued(): void {
+		if (this.ending) return;
+		const admitted: Run[] = [];
+		let used = this.slotsInUse();
+		for (const record of this.byName.values()) {
+			if (used >= RUN_SLOTS) break;
+			if (record.run.state !== "queued") continue;
+			record.run.state = "running";
+			used++;
+			admitted.push(record.run);
+		}
+		for (const run of admitted) this.onAdmit?.(run);
 	}
 
 	/**
@@ -505,6 +624,12 @@ function questionText(result: unknown): string | undefined {
  * words for both halves of the Delivery policy.
  */
 function messageFor(run: Run): ParentMessage {
+	if (run.state === "queued") return { kind: "queued", run, text: queuedMessageText(run) };
+	return settledFor(run);
+}
+
+/** What a Run that settled has to say — the only two things a Run says on its own. */
+function settledFor(run: Run): SettledMessage {
 	if (run.state === "waiting") return { kind: "question", run, text: questionMessageText(run) };
 	return deliveryFor(run);
 }
@@ -536,6 +661,20 @@ function hasStopped(state: RunState): boolean {
 }
 
 /**
+ * Whether a Run is holding one of the `RUN_SLOTS`.
+ *
+ * A Waiting Run holds its slot, deliberately. Its child is up and idle with the
+ * whole task in its context, and an answer resumes it that instant: releasing
+ * the slot would mean either exceeding the cap the moment it is answered, or
+ * making the parent's own answer queue behind work it started later. The cheaper
+ * of the two mistakes is a slot held by a process that is only waiting to be
+ * told something.
+ */
+function holdsSlot(state: RunState): boolean {
+	return state === "running" || state === "waiting";
+}
+
+/**
  * The message body a Question arrives in.
  *
  * Named after the Run rather than the Agent's persona: the parent answers a Run,
@@ -544,6 +683,17 @@ function hasStopped(state: RunState): boolean {
 function questionMessageText(run: Run): string {
 	const header = `${runHeader(run)} has a question and is waiting for an answer.`;
 	return run.question ? `${header}\n\n${run.question}` : `${header}\n\nIt did not say what it wanted to know.`;
+}
+
+/**
+ * The message body a still-queued Run comes back to a join in.
+ *
+ * Only ever said in the one case that produces it: every slot is held by a Run
+ * waiting for an answer, so this Run cannot start until the parent answers one.
+ * It says that, because the parent reading it is the only one who can act on it.
+ */
+function queuedMessageText(run: Run): string {
+	return `${runHeader(run)} has not started yet: every run slot is held by a run that is waiting for an answer. Answer those and it starts on its own.`;
 }
 
 /**

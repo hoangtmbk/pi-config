@@ -9,12 +9,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import { ASK_QUESTION_TOOL, type ParentMessage, Supervisor } from "../supervisor.ts";
+import { ASK_QUESTION_TOOL, type ParentMessage, type Run, RUN_SLOTS, type SettledMessage, Supervisor } from "../supervisor.ts";
 import { AGENT_END, AGENT_START, asked, failed, ran, RETRYING, said, SETTLED } from "./child-events.ts";
 
 /** Feed a whole sequence to one Run and collect whatever it asks the parent to say. */
-function feed(supervisor: Supervisor, name: string, events: JsonAgentSessionEvent[]): ParentMessage[] {
-	const announced: ParentMessage[] = [];
+function feed(supervisor: Supervisor, name: string, events: JsonAgentSessionEvent[]): SettledMessage[] {
+	const announced: SettledMessage[] = [];
 	for (const event of events) {
 		const message = supervisor.observe(name, event);
 		if (message) announced.push(message);
@@ -198,8 +198,8 @@ describe("Supervisor joins", () => {
 		const joined = supervisor.join([first.name, second.name]);
 		supervisor.observe(first.name, said("first result"));
 		supervisor.observe(second.name, said("second result"));
-		const firstRoute = supervisor.post(supervisor.observe(first.name, SETTLED) as ParentMessage);
-		const secondRoute = supervisor.post(supervisor.observe(second.name, SETTLED) as ParentMessage);
+		const firstRoute = supervisor.post(supervisor.observe(first.name, SETTLED) as SettledMessage);
+		const secondRoute = supervisor.post(supervisor.observe(second.name, SETTLED) as SettledMessage);
 		const collected = await joined;
 
 		assert.deepEqual([firstRoute, secondRoute], ["join", "join"]);
@@ -291,7 +291,7 @@ describe("Supervisor no double delivery", () => {
 		const supervisor = new Supervisor();
 		const run = supervisor.register("scout", "look around");
 		const failure = supervisor.fail(run.name, { kind: "exit", exitCode: 3, stderr: "pi: out of tokens" });
-		supervisor.post(failure as ParentMessage);
+		supervisor.post(failure as SettledMessage);
 
 		const collected = await supervisor.join([run.name]);
 
@@ -510,6 +510,117 @@ describe("Supervisor failures", () => {
 		assert.match(delivery?.text ?? "", /Run `scout` \(agent `scout`\) failed/);
 		assert.match(delivery?.text ?? "", /code 3/);
 		assert.match(delivery?.text ?? "", /pi: out of tokens/);
+	});
+});
+
+/** Ask for `count` Runs in one go, the way a wide fan-out does. */
+function fanOut(supervisor: Supervisor, count: number): Run[] {
+	return Array.from({ length: count }, (_, index) => supervisor.register("scout", `task ${index}`));
+}
+
+/** The Runs holding a slot right now: started, and not yet stopped. */
+function working(supervisor: Supervisor): string[] {
+	return supervisor
+		.list()
+		.filter((run) => run.state === "running" || run.state === "waiting")
+		.map((run) => run.name);
+}
+
+/** A Supervisor that records every Run it admits from the queue. */
+function admitting(): { supervisor: Supervisor; admitted: string[] } {
+	const admitted: string[] = [];
+	return { supervisor: new Supervisor({ onAdmit: (run) => admitted.push(run.name) }), admitted };
+}
+
+describe("Supervisor concurrency", () => {
+	it("starts Runs up to the cap and queues the rest", () => {
+		const supervisor = new Supervisor();
+
+		const states = fanOut(supervisor, RUN_SLOTS + 2).map((run) => run.state);
+
+		assert.deepEqual(states, [...Array(RUN_SLOTS).fill("running"), "queued", "queued"]);
+	});
+
+	it("never has more than the cap working at once, however wide the fan-out", () => {
+		const { supervisor } = admitting();
+		const runs = fanOut(supervisor, RUN_SLOTS * 3);
+
+		for (const run of runs) {
+			assert.ok(working(supervisor).length <= RUN_SLOTS, `${working(supervisor).length} Runs working, cap is ${RUN_SLOTS}`);
+			feed(supervisor, run.name, [said("done"), SETTLED]);
+		}
+
+		assert.deepEqual(working(supervisor), [], "every Run finished, so nothing is left holding a slot");
+	});
+
+	it("admits the Run that has been queued longest as each slot frees", () => {
+		const { supervisor, admitted } = admitting();
+		const runs = fanOut(supervisor, RUN_SLOTS + 3);
+
+		feed(supervisor, runs[0].name, [said("done"), SETTLED]);
+		feed(supervisor, runs[1].name, [said("done"), SETTLED]);
+
+		assert.deepEqual(admitted, [runs[RUN_SLOTS].name, runs[RUN_SLOTS + 1].name], "queued Runs start in the order they were asked for");
+		assert.equal(supervisor.get(runs[RUN_SLOTS + 2].name)?.state, "queued");
+	});
+
+	it("frees a slot for a Run that crashed, not only for one that finished", () => {
+		const { supervisor, admitted } = admitting();
+		const runs = fanOut(supervisor, RUN_SLOTS + 1);
+
+		supervisor.fail(runs[0].name, { kind: "exit", exitCode: 1 });
+
+		assert.deepEqual(admitted, [runs[RUN_SLOTS].name]);
+	});
+
+	it("keeps a Waiting Run's slot, because an answer resumes its child that instant", () => {
+		const { supervisor, admitted } = admitting();
+		const runs = fanOut(supervisor, RUN_SLOTS + 1);
+
+		feed(supervisor, runs[0].name, [asked("Which auth module do you mean?"), SETTLED]);
+
+		assert.deepEqual(admitted, [], "a Waiting Run is alive and still holds its slot");
+		assert.equal(working(supervisor).length, RUN_SLOTS, "the slot is still taken, so the cap is still reached");
+		assert.equal(supervisor.get(runs[RUN_SLOTS].name)?.state, "queued");
+	});
+
+	it("counts a queued Run as active, so a join waits for one that has not started", async () => {
+		const { supervisor } = admitting();
+		const runs = fanOut(supervisor, RUN_SLOTS + 1);
+		const queued = runs[RUN_SLOTS];
+
+		const join = watch(supervisor.join([queued.name]));
+		await Promise.resolve();
+
+		assert.ok(supervisor.active().includes(queued), "a Run waiting for a slot has not finished");
+		assert.equal(join.collected, undefined, "a queued Run has nothing to say yet");
+	});
+
+	it("ends a join rather than stranding it on a Run only the parent can start", async () => {
+		const { supervisor } = admitting();
+		const runs = fanOut(supervisor, RUN_SLOTS + 1);
+		const join = watch(supervisor.join(supervisor.active().map((run) => run.name)));
+
+		// Every slot goes to a Run waiting on an answer, so nothing is left to free
+		// the slot the queued Run needs — and the parent inside this join is the
+		// only one who could answer.
+		for (const run of runs.slice(0, RUN_SLOTS)) announce(supervisor, run.name, [asked("Which auth module do you mean?"), SETTLED]);
+		await Promise.resolve();
+
+		assert.equal(join.collected?.length, RUN_SLOTS + 1);
+		assert.match(join.collected?.[RUN_SLOTS].text ?? "", /has not started/);
+		assert.match(join.collected?.[RUN_SLOTS].text ?? "", /waiting for an answer/);
+	});
+
+	it("does not start a queued Run into a session that is ending", () => {
+		const { supervisor, admitted } = admitting();
+		const runs = fanOut(supervisor, RUN_SLOTS + 2);
+
+		const deliveries = supervisor.endAll("the session is shutting down");
+
+		assert.deepEqual(admitted, [], "the slots freed by ending Runs are not handed to the queue");
+		assert.deepEqual(deliveries.map((delivery) => delivery.run.name), runs.map((run) => run.name), "a queued Run is ended like any other");
+		assert.match(deliveries[RUN_SLOTS].text, /the session is shutting down/);
 	});
 });
 

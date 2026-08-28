@@ -39,6 +39,12 @@ The state of a run that has asked a question and not yet been answered. Delibera
 from done: the run has produced no result and is still alive.
 _Avoid_: parked, blocked, idle, stalled
 
+**Slot**:
+One of the four places a run may work in. A run holds a slot from the moment it starts until it
+stops, waiting on a question included; a run asked for while all four are held is queued, and
+starts when one frees. Four because the binding constraint is provider rate limits (ADR-0002).
+_Avoid_: worker, lane, permit, concurrency limit
+
 **Delivery**:
 The moment a finished or failed run's result re-enters the parent session's conversation.
 Separate from the run finishing — a run can be done for some time before its result is delivered.

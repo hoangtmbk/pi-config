@@ -17,7 +17,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type Agent, discoverAgents, type Roster } from "./agents.ts";
 import { type RunChild, RUN_NAME_ENV, type SpawnOptions, spawnRun } from "./child.ts";
-import { ASK_QUESTION_TOOL, type ParentMessage, type QuestionDetails, type Run, type RunState, Supervisor } from "./supervisor.ts";
+import { ASK_QUESTION_TOOL, type QuestionDetails, type Run, RUN_SLOTS, type RunState, type SettledMessage, Supervisor } from "./supervisor.ts";
 
 const SubagentParams = Type.Object({
 	agent: Type.String({ description: "Which agent to run — one of the names listed in this tool's description." }),
@@ -138,6 +138,7 @@ function describeRoster(roster: Roster): string {
 		"Delegate a task to a subagent and keep working. Returns the run's name immediately — the run works in its own process, and its result is delivered into this conversation when it finishes, so do not poll for it.",
 		"If you have nothing to do until it comes back, wait for it with subagent_wait rather than polling.",
 		"A run starts from an empty context: it sees only the task you write, never this conversation.",
+		`Fan out as wide as the work needs: at most ${RUN_SLOTS} runs work at once and the rest queue, starting in the order you asked for them as slots free.`,
 	];
 
 	if (roster.agents.length === 0) {
@@ -206,7 +207,6 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 
 	const roster = options.roster ?? discoverAgents();
 	const spawn = options.spawn ?? spawnRun;
-	const supervisor = new Supervisor();
 	/**
 	 * Every Run's child, from the moment it starts being spawned.
 	 *
@@ -226,7 +226,7 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 	 * the whole difference between the two: a settled Run's message wakes the
 	 * parent, and an ended Run's waits for it.
 	 */
-	function say(message: ParentMessage, options: { triggerTurn: boolean; deliverAs?: "steer" }): void {
+	function say(message: SettledMessage, options: { triggerTurn: boolean; deliverAs?: "steer" }): void {
 		const details: SubagentDetails = { run: message.run.name, agent: message.run.agent, task: message.run.task };
 		pi.sendMessage(
 			{
@@ -253,6 +253,113 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 	}
 
 	/**
+	 * Say what a settled Run has to say, and clean up after it once it has
+	 * stopped for good.
+	 *
+	 * The same path for a Delivery, a Question and a failure, deliberately: a Run
+	 * that dies is reported exactly like one that succeeds, so nothing downstream
+	 * has to know which of the two happened to handle it.
+	 */
+	function announce(message: SettledMessage): void {
+		// A `subagent_wait` that named this Run collects the message instead, and
+		// returns it as its own result. Saying it here as well would say it twice,
+		// which is the whole of the no-double-delivery rule.
+		// Both halves of ADR-0002's Delivery policy in one call, because which one
+		// happens is pi's decision, not this file's: an idle parent is woken, and a
+		// streaming one takes it as a steer, which pi lands at a turn boundary
+		// rather than mid-tool-call.
+		if (supervisor.post(message) === "conversation") say(message, { triggerTurn: true, deliverAs: "steer" });
+
+		// A Waiting Run keeps its child: the process stays up, doing nothing but
+		// holding the context an answer lands in. Nothing is killed or reaped.
+		if (message.kind === "question") return;
+
+		// A stopped Run has nothing left to say, and the child left behind is a pi
+		// process nothing will ever prompt again.
+		//
+		// The Supervisor handed this Run's slot on the moment it stopped, so for as
+		// long as this reap takes there can be one more child alive than there are
+		// slots. Deliberate: the extra one has settled and is issuing no requests,
+		// which is the only thing the cap is protecting.
+		void reap(message.run.name);
+	}
+
+	/**
+	 * Spawn a Run's child and wire it to the Supervisor.
+	 *
+	 * Rejects with whatever the spawn threw, having left the Run itself untouched:
+	 * the two callers report a Run that could not start in different places — a
+	 * `subagent` call returns it, and an admission from the queue delivers it,
+	 * because by then the call that asked for it is long gone.
+	 */
+	async function startRun(run: Run, agent: Agent, model?: string): Promise<void> {
+		// Recorded before it is awaited, not after: a Run that settles or is reaped
+		// while its child is still starting has to have something to reach the child
+		// by, and the promise is the only thing that exists yet.
+		const spawning = spawn({
+			agent,
+			name: run.name,
+			task: run.task,
+			model,
+			onStarted(child) {
+				// From here the reap has something to kill without waiting for the
+				// whole spawn — which a child that never takes its first prompt would
+				// never finish, leaving a live process nothing could reach. A Run
+				// already reaped inside that window has no entry left to replace, and
+				// its child is stopped on arrival instead.
+				if (children.has(run.name)) children.set(run.name, Promise.resolve(child));
+				else void child.stop().catch(() => {});
+			},
+			onEvent(event) {
+				const message = supervisor.observe(run.name, event);
+				if (message) announce(message);
+			},
+			onExit(exit) {
+				// A child that outlives its Run's Delivery is a Run ending rather than
+				// a Run failing, and the Supervisor says which by returning nothing.
+				const message = supervisor.fail(run.name, { kind: "exit", ...exit });
+				if (message) announce(message);
+			},
+		});
+		children.set(run.name, spawning);
+
+		try {
+			await spawning;
+		} catch (error) {
+			children.delete(run.name);
+			throw error;
+		}
+	}
+
+	/**
+	 * How to start each Run that is waiting for a slot, by name.
+	 *
+	 * The Supervisor owns the queue itself — who goes next, and when a slot frees
+	 * — and this owns the one thing it has no business knowing: what the
+	 * `subagent` call that queued the Run asked for, which is the Agent it named
+	 * and the model it overrode. That call is long gone by the time the Run runs.
+	 */
+	const starters = new Map<string, () => Promise<void>>();
+
+	const supervisor = new Supervisor({
+		onAdmit(run) {
+			const start = starters.get(run.name);
+			starters.delete(run.name);
+			// A Run admitted with nothing to start it would sit there running with no
+			// child to ever end it, and every join would wait on it forever. It
+			// cannot happen; if it does, it fails like any other Run that never
+			// started rather than quietly holding a slot.
+			const starting = start?.() ?? Promise.reject(new Error("its slot came free but nothing was left to start it with"));
+			void starting.catch((error) => {
+				// Delivered rather than returned: the `subagent` call that queued this
+				// Run answered long ago, so there is nothing left to return it into.
+				const failure = supervisor.fail(run.name, { kind: "spawn", message: describeError(error) });
+				if (failure) announce(failure);
+			});
+		},
+	});
+
+	/**
 	 * End every Run with the session that owns them — ADR-0001's reap.
 	 *
 	 * Every child is SIGTERMed whatever state its Run is in, Waiting and
@@ -270,6 +377,10 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 		// a `sendMessage` into a session already half torn down, say — can be what
 		// stops the children being killed.
 		const reaping = [...children.keys()].map(reap);
+		// A queued Run has no child to reap — it is ended by the Supervisor failing
+		// it like any other — so forgetting how to start it is the whole of what
+		// keeps one from coming up after the session that asked for it has gone.
+		starters.clear();
 		for (const delivery of supervisor.endAll(reason)) {
 			// Into the conversation, and deliberately without waking it — the one
 			// place this departs from ADR-0002's Delivery policy, which wakes an idle
@@ -322,72 +433,30 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 			if (!agent) throw unknownAgent(params.agent, roster);
 
 			const run = supervisor.register(agent.name, params.task, params.name);
-
-			/**
-			 * Say what a settled Run has to say, and clean up after it once it has
-			 * stopped for good.
-			 *
-			 * The same path for a Delivery, a Question and a failure, deliberately: a
-			 * Run that dies is reported exactly like one that succeeds, so nothing
-			 * downstream has to know which of the two happened to handle it.
-			 */
-			function announce(message: ParentMessage): void {
-				// A `subagent_wait` that named this Run collects the message instead,
-				// and returns it as its own result. Saying it here as well would say
-				// it twice, which is the whole of the no-double-delivery rule.
-				// Both halves of ADR-0002's Delivery policy in one call, because which
-				// one happens is pi's decision, not this file's: an idle parent is
-				// woken, and a streaming one takes it as a steer, which pi lands at a
-				// turn boundary rather than mid-tool-call.
-				if (supervisor.post(message) === "conversation") say(message, { triggerTurn: true, deliverAs: "steer" });
-
-				// A Waiting Run keeps its child: the process stays up, doing nothing but
-				// holding the context an answer lands in. Nothing is killed or reaped.
-				if (message.kind === "question") return;
-
-				// A stopped Run has nothing left to say, and an idle pi child is a
-				// process burning nothing but still holding a slot.
-				void reap(message.run.name);
-			}
-
 			const details: SubagentDetails = { run: run.name, agent: agent.name, task: params.task };
 
-			// Recorded before it is awaited, not after: a Run that settles or is
-			// reaped while its child is still starting has to have something to
-			// reach the child by, and the promise is the only thing that exists yet.
-			const spawning = spawn({
-				agent,
-				name: run.name,
-				task: params.task,
-				model: params.model,
-				onStarted(child) {
-					// From here the reap has something to kill without waiting for the
-					// whole spawn — which a child that never takes its first prompt would
-					// never finish, leaving a live process nothing could reach. A Run
-					// already reaped inside that window has no entry left to replace, and
-					// its child is stopped on arrival instead.
-					if (children.has(run.name)) children.set(run.name, Promise.resolve(child));
-					else void child.stop().catch(() => {});
-				},
-				onEvent(event) {
-					const message = supervisor.observe(run.name, event);
-					if (message) announce(message);
-				},
-				onExit(exit) {
-					// A child that outlives its Run's Delivery is a Run ending rather than
-					// a Run failing, and the Supervisor says which by returning nothing.
-					const message = supervisor.fail(run.name, { kind: "exit", ...exit });
-					if (message) announce(message);
-				},
-			});
-			children.set(run.name, spawning);
+			// Every slot is taken, so this Run starts when one frees. The name still
+			// comes back now: a fan-out past the cap is a wait, not a refusal, and
+			// nothing about how the parent addresses this Run depends on when its
+			// child comes up.
+			if (run.state === "queued") {
+				starters.set(run.name, () => startRun(run, agent, params.model));
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Queued run \`${run.name}\` (agent \`${agent.name}\`). At most ${RUN_SLOTS} runs work at once, so it starts as soon as a slot frees; its result will arrive in this conversation on its own.`,
+						},
+					],
+					details,
+				};
+			}
 
 			// Awaited because spawning is the part that can fail in the caller's
 			// face; the Run itself is not waited on — that is the whole point.
 			try {
-				await spawning;
+				await startRun(run, agent, params.model);
 			} catch (error) {
-				children.delete(run.name);
 				// A Run that never started is still a Run. Throwing here would lose it
 				// mid-registration: its name would address something the session could
 				// neither wait for nor account for. Failing it instead leaves it listed,

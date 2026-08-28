@@ -18,7 +18,7 @@ import type { Agent, Roster } from "../agents.ts";
 import type { ChildExit, RunChild } from "../child.ts";
 import { spawnRun } from "../child.ts";
 import { registerSubagents } from "../index.ts";
-import { ASK_QUESTION_TOOL, type QuestionDetails } from "../supervisor.ts";
+import { ASK_QUESTION_TOOL, type QuestionDetails, RUN_SLOTS } from "../supervisor.ts";
 import { AGENT_END, AGENT_START, asked, said, SETTLED } from "./child-events.ts";
 import { pidFrom, reaped } from "./processes.ts";
 
@@ -216,12 +216,21 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>, cliP
 
 const CTX = {} as ExtensionContext;
 
-/** A parent session whose Runs are stubs: no process, and events pushed by hand. */
-function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error) {
+/**
+ * A parent session whose Runs are stubs: no process, and events pushed by hand.
+ *
+ * `refuseSpawnAfter` is how many spawns succeed before `refuseSpawn` starts
+ * being thrown, so a test can fail the one spawn that happens without a
+ * `subagent` call in flight to report it — a Run admitted from the queue.
+ */
+function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error, refuseSpawnAfter = 0) {
 	const tools: RegisteredTool[] = [];
 	const sent: SentMessage[] = [];
 	const spawned: {
 		name: string;
+		agent: string;
+		task: string;
+		model?: string;
 		emit: (event: JsonAgentSessionEvent) => void;
 		/** Kill this Run's child out from under it, the way a crash would. */
 		die: (exit: ChildExit) => void;
@@ -235,9 +244,12 @@ function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error) {
 	registerSubagents(pi as unknown as ExtensionAPI, {
 		roster: ROSTER,
 		async spawn(options) {
-			if (refuseSpawn) throw refuseSpawn;
+			if (refuseSpawn && spawned.length >= refuseSpawnAfter) throw refuseSpawn;
 			const child = {
 				name: options.name,
+				agent: options.agent.name,
+				task: options.task,
+				model: options.model,
 				emit: options.onEvent,
 				die: (exit: ChildExit) => options.onExit?.(exit),
 				prompts: [] as string[],
@@ -598,6 +610,118 @@ describe("a Run that cannot start", () => {
 		assert.match(result, /failed/);
 		assert.match(result, /could not be started/);
 		assert.deepEqual(sent, []);
+	});
+});
+
+/** The name the `index`th Run of a `scout` fan-out gets, given the auto-suffixing. */
+function scout(index: number): string {
+	return index === 0 ? "scout" : `scout-${index + 1}`;
+}
+
+/** Fan out `count` Runs through the tool, and hand back what each call said. */
+async function fanOut(subagent: RegisteredTool, count: number): Promise<string[]> {
+	const results: string[] = [];
+	for (let index = 0; index < count; index++) results.push(await call(subagent, { agent: "scout", task: `task ${index}` }));
+	return results;
+}
+
+describe("subagent concurrency", () => {
+	it("queues a Run past the cap, and still hands its name back straight away", async () => {
+		const { subagent, subagentAnswer, spawned } = stubbedSession();
+
+		const results = await fanOut(subagent, RUN_SLOTS + 1);
+
+		assert.equal(spawned.length, RUN_SLOTS, "nothing past the cap has a child yet");
+		assert.match(results[RUN_SLOTS], new RegExp(`\`${scout(RUN_SLOTS)}\``), "the fan-out gets its name back either way");
+		assert.match(results[RUN_SLOTS], /queued/i);
+		assert.match(results[RUN_SLOTS], /slot/i, "and is told why it has not started");
+		// The state the Run reads as, said back to the parent that addresses it.
+		await assert.rejects(call(subagentAnswer, { name: scout(RUN_SLOTS), answer: "hello" }), (error: Error) => {
+			assert.match(error.message, /is queued/);
+			return true;
+		});
+	});
+
+	it("starts a queued Run over the real spawn path, once a slot frees", async () => {
+		// Every child asks before it answers, so the cap is reached by Runs that
+		// stay put: the fifth is queued because four slots are held, not because a
+		// subprocess happened to be slow.
+		const turns = [
+			[AGENT_START, asked("Which auth module do you mean?"), AGENT_END, SETTLED],
+			[AGENT_START, said("Three call sites in src/auth.ts."), AGENT_END, SETTLED],
+		];
+		const { subagent, subagentAnswer, sent } = fakeSession(ROSTER, { FAKE_RPC_TURNS: JSON.stringify(turns) });
+
+		const results = await fanOut(subagent, RUN_SLOTS + 1);
+		await messageAt(sent, RUN_SLOTS - 1);
+		assert.match(results[RUN_SLOTS], /queued/i, "four Waiting Runs hold the four slots");
+
+		// Answering one lets it finish, which is the only thing that frees a slot.
+		await call(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
+		await messageAt(sent, RUN_SLOTS + 1);
+
+		const queued = sent.find((message) => message.content.includes(`\`${scout(RUN_SLOTS)}\``));
+		assert.match(queued?.content ?? "", /Which auth module do you mean\?/, "the queued Run started in a child of its own");
+	});
+
+	it("starts the Run that has been queued longest when a slot frees", async () => {
+		const { subagent, spawned } = stubbedSession();
+		await fanOut(subagent, RUN_SLOTS + 2);
+
+		spawned[0].emit(said("Found three call sites."));
+		spawned[0].emit(SETTLED);
+		await flush();
+
+		assert.deepEqual(spawned.map((child) => child.name), [...Array.from({ length: RUN_SLOTS }, (_, index) => scout(index)), scout(RUN_SLOTS)]);
+	});
+
+	it("starts a queued Run on a slot freed by a crash, not only by a result", async () => {
+		const { subagent, spawned } = stubbedSession();
+		await fanOut(subagent, RUN_SLOTS + 1);
+
+		spawned[0].die({ exitCode: 3, stderr: "pi: out of tokens" });
+		await flush();
+
+		assert.equal(spawned.length, RUN_SLOTS + 1, "a slot lost to every crash would leave a session unable to start anything");
+		assert.equal(spawned[RUN_SLOTS].name, scout(RUN_SLOTS));
+	});
+
+	it("starts a queued Run on the Agent and task its own call asked for", async () => {
+		const { subagent, spawned } = stubbedSession();
+		await fanOut(subagent, RUN_SLOTS);
+		await call(subagent, { agent: "worker", task: "rewrite the parser", model: "a-bigger-model" });
+
+		spawned[0].emit(SETTLED);
+		await flush();
+
+		assert.equal(spawned[RUN_SLOTS].name, "worker");
+		assert.equal(spawned[RUN_SLOTS].task, "rewrite the parser");
+		assert.equal(spawned[RUN_SLOTS].agent, "worker");
+		assert.equal(spawned[RUN_SLOTS].model, "a-bigger-model", "the model override outlives the call that queued the Run");
+	});
+
+	it("ends a queued Run with the session, though there is no child to reap", async () => {
+		const { subagent, sent, spawned, shutdown } = stubbedSession();
+		await fanOut(subagent, RUN_SLOTS + 1);
+
+		await shutdown();
+
+		assert.equal(spawned.length, RUN_SLOTS, "a Run ended before its slot came free never starts one");
+		const ended = sent.find((message) => message.content.includes(`\`${scout(RUN_SLOTS)}\``));
+		assert.match(ended?.content ?? "", /failed/);
+		assert.match(ended?.content ?? "", /shutting down/);
+	});
+
+	it("delivers a queued Run that could not start, whose own tool call is long gone", async () => {
+		const { subagent, sent, spawned } = stubbedSession(new Error("pi: unknown tool `telepathy`"), undefined, RUN_SLOTS);
+		await fanOut(subagent, RUN_SLOTS + 1);
+
+		spawned[0].emit(SETTLED);
+		await flush();
+
+		const failed = sent.find((message) => message.content.includes(`\`${scout(RUN_SLOTS)}\``));
+		assert.match(failed?.content ?? "", /could not be started/);
+		assert.match(failed?.content ?? "", /unknown tool `telepathy`/);
 	});
 });
 
