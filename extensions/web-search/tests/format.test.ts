@@ -52,7 +52,7 @@ describe("formatResults", () => {
 
 	it("states the query and the number of results in the header", () => {
 		const text = markdown("go generics", fixture("brave-web-search"));
-		assert.match(text.split("\n")[0] ?? "", /^search: "go generics" — 3 results \(Brave\)$/);
+		assert.match(text.split("\n")[0] ?? "", /^search: "go generics" — 5 results \(Brave\)$/);
 	});
 
 	it("marks the results as untrusted data rather than instructions", () => {
@@ -68,7 +68,7 @@ describe("formatResults", () => {
 	it("numbers every result in order", () => {
 		const text = markdown("go generics", fixture("brave-web-search"));
 		const numbers = [...text.matchAll(/^(\d+)\. /gm)].map((match) => match[1]);
-		assert.deepEqual(numbers, ["1", "2", "3"]);
+		assert.deepEqual(numbers, ["1", "2", "3", "4", "5"]);
 	});
 
 	it("says one result in the singular", () => {
@@ -396,8 +396,8 @@ describe("a result with no usable excerpts", () => {
 		const text = markdown("go generics", fixture("brave-web-search"));
 
 		assert.ok(!/^ {3}– /m.test(text), text);
-		assert.match(text, /^search: "go generics" — 3 results \(Brave\)$/m);
-		assert.match(text, /^ {3}This post is an introduction to generics in Go/m);
+		assert.match(text, /^search: "go generics" — 5 results \(Brave\)$/m);
+		assert.match(text, /^ {3}In Go 1\.18 an interface may contain methods/m);
 	});
 
 	it("renders a result whose extra_snippets is present but empty", () => {
@@ -438,7 +438,7 @@ describe("the filters a search was run with", () => {
 	it("names the recency window in the header, beside the provider", () => {
 		const text = markdown("go generics", fixture("brave-web-search"), { freshness: "pm" });
 
-		assert.match(text.split("\n")[0] ?? "", /^search: "go generics" — 3 results \(Brave · freshness=pm\)$/);
+		assert.match(text.split("\n")[0] ?? "", /^search: "go generics" — 5 results \(Brave · freshness=pm\)$/);
 	});
 
 	it("names an explicit date range the same way", () => {
@@ -534,7 +534,7 @@ describe("discussions", () => {
 		const text = markdown("go generics", fixture("brave-web-search"));
 
 		assert.ok(!text.includes("## Discussions"), text);
-		assert.match(text, /^search: "go generics" — 3 results \(Brave\)$/m);
+		assert.match(text, /^search: "go generics" — 5 results \(Brave\)$/m);
 	});
 
 	it("numbers a discussions-only response from one, under its heading", () => {
@@ -675,8 +675,8 @@ describe("what a render reports about itself", () => {
 	it("counts every hit when the whole list fits", () => {
 		const rendered = formatResults("go generics", fixture("brave-web-search"));
 
-		assert.equal(rendered.shown, 3);
-		assert.equal(rendered.total, 3);
+		assert.equal(rendered.shown, 5);
+		assert.equal(rendered.total, 5);
 	});
 
 	it("counts each kind separately, naming it as the header does", () => {

@@ -57,7 +57,17 @@ function registeredTools(): Record<string, unknown>[] {
 /** Nothing in `execute` touches the context, so an empty one is honest. */
 const CTX = {} as ExtensionContext;
 
-/** Run `body` with `BRAVE_API_KEY` set (or unset), restoring it afterwards. */
+/**
+ * Run `body` with `BRAVE_API_KEY` set to `key`, restoring it afterwards.
+ *
+ * Pass `""` rather than `undefined` for the no-key cases. Unsetting the
+ * variable entirely does not mean "no key": `resolveApiKey` then falls through
+ * to the `.env` beside the extension, so on a machine where someone has put a
+ * real key there the suite would quietly search with it. An empty string is
+ * both a value the tool must reject and one `process.loadEnvFile` will not
+ * overwrite, which is what makes these cases hermetic. That the *absence* of a
+ * key anywhere is an error is `key.test.ts`'s to prove, with a `.env` it owns.
+ */
 async function withEnvKey<T>(key: string | undefined, body: () => Promise<T>): Promise<T> {
 	const saved = process.env.BRAVE_API_KEY;
 	if (key === undefined) delete process.env.BRAVE_API_KEY;
@@ -120,13 +130,13 @@ describe("the web-search extension", () => {
 
 		const content = result.content[0];
 		assert.equal(content?.type, "text");
-		assert.match(content?.type === "text" ? content.text : "", /^search: "go generics" — 3 results \(Brave\)$/m);
-		assert.match(content?.type === "text" ? content.text : "", /^1\. An Introduction To Generics/m);
+		assert.match(content?.type === "text" ? content.text : "", /^search: "go generics" — 5 results \(Brave\)$/m);
+		assert.match(content?.type === "text" ? content.text : "", /^1\. Tutorial: Getting started with generics/m);
 		// The counts describe the list that was rendered; the query is not repeated
 		// here, because a renderer reads it off the call's own arguments.
-		assert.deepEqual(result.details?.counts, [{ kind: "results", shown: 3, total: 3 }]);
-		assert.equal(result.details?.shown, 3);
-		assert.equal(result.details?.total, 3);
+		assert.deepEqual(result.details?.counts, [{ kind: "results", shown: 5, total: 5 }]);
+		assert.equal(result.details?.shown, 5);
+		assert.equal(result.details?.total, 5);
 	});
 
 	it("renders discussion threads under their own heading, numbered on from the web list", async () => {
@@ -211,7 +221,7 @@ describe("the web-search extension", () => {
 		const tool = registeredTools()[0] as unknown as RegisteredTool;
 		const { fetch, calls } = fakeFetch(() => jsonResponse({}));
 
-		const error = await withEnvKey(undefined, () =>
+		const error = await withEnvKey("", () =>
 			withFetch(fetch, async () =>
 				rejection(tool.execute("call-1", { query: "go generics" }, undefined, undefined, CTX)),
 			),

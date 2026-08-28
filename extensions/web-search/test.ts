@@ -19,11 +19,19 @@
  * (a rejected key, a timeout, and three values rejected before a request is
  * spent) without a subscription. The seven query cases need a real key.
  *
+ * A case can also come back as `note` rather than ok or FAIL. Two of the things
+ * this tool asks Brave for — `extra_snippets` and the `discussions` block — are
+ * sold rather than guaranteed, and on a plan that serves neither their absence
+ * is the expected outcome, not a regression. Those notes are replayed as a
+ * block at the end: it is the runner's answer to "what does this key buy".
+ *
  * `--capture` is how the hand-written fixtures get replaced with real ones: it
- * writes the exact JSON Brave answered, pretty-printed, to the three files the
+ * writes the exact JSON Brave answered, pretty-printed, to the files the
  * offline suite reads. Expect to re-pin the assertions that name a specific
  * title or host afterwards — the fixtures change, and the tests that quote them
- * are meant to.
+ * are meant to. A fixture that exists to carry a shape the response does not
+ * have is skipped rather than overwritten, so a capture on a thinner plan
+ * cannot quietly empty the suite.
  */
 
 import { writeFileSync } from "node:fs";
@@ -57,12 +65,24 @@ function hostOf(url = ""): string {
 	}
 }
 
+/**
+ * What a case concluded: a string is a failure, a `note` is a fact about the
+ * plan this key is on rather than something wrong with the code.
+ *
+ * The distinction has to exist because two of the things this tool asks Brave
+ * for — `extra_snippets` and the `discussions` block — are sold, not
+ * guaranteed. On a plan that does not serve them their absence is the correct
+ * outcome and the renderer is meant to degrade, so a runner that scored it as a
+ * failure would be permanently red and stop being read at all.
+ */
+type Verdict = string | { note: string } | undefined;
+
 interface Case {
 	name: string;
 	query: string;
 	params?: SearchParams;
-	/** Returns an error string when the case fails its expectations. */
-	check: (response: BraveResponse, markdown: string) => string | undefined;
+	/** An error string when the case fails, a `note` for a plan fact, nothing when it passes. */
+	check: (response: BraveResponse, markdown: string) => Verdict;
 }
 
 const cases: Case[] = [
@@ -86,7 +106,7 @@ const cases: Case[] = [
 			// renderer degrades to description-only — but it is the single fact
 			// this runner exists to establish, so say which way it went.
 			if (withSnippets.length === 0) {
-				return "no result carried extra_snippets: this plan does not serve them, and triage is description-only";
+				return { note: "no result carried extra_snippets: this plan does not serve them, and triage is description-only" };
 			}
 			const overlong = withSnippets.find((result) => (result.extra_snippets?.length ?? 0) > 5);
 			return overlong ? "a result carried more than the documented 5 extra_snippets" : undefined;
@@ -96,16 +116,24 @@ const cases: Case[] = [
 		name: "discussions block, requested alongside web",
 		query: "rust async fn in traits",
 		check: (response) => {
-			const discussions = response.discussions?.results ?? [];
-			// Not every query has forum threads; an empty block is an answer, an
-			// absent one after `result_filter=web,discussions` is worth knowing.
-			return response.discussions === undefined
-				? "no discussions block came back at all — check result_filter is still honoured"
-				: discussions.length === 0
-					? undefined
-					: discussions.some((result) => !result.url)
-						? "a discussion arrived without a url"
-						: undefined;
+			// `result_filter` is honoured whether or not the plan sells
+			// discussions, and this is how to see it: the blocks it excludes must
+			// not come back. Sent without the filter this same query returns a
+			// `videos` block, so their absence here is the filter working rather
+			// than the query having nothing else to offer.
+			const blocks = response as Record<string, unknown>;
+			const excluded = ["videos", "news", "faq", "infobox"].filter((name) => blocks[name] !== undefined);
+			if (excluded.length > 0) {
+				return `result_filter is not being honoured: ${excluded.join(", ")} came back despite web,discussions`;
+			}
+
+			// Sold, not guaranteed. An absent block on a plan that does not serve
+			// one is expected; a malformed block never is.
+			if (response.discussions === undefined) {
+				return { note: "no discussions block at all: this plan does not serve one, so every list is web-only" };
+			}
+			const discussions = response.discussions.results ?? [];
+			return discussions.some((result) => !result.url) ? "a discussion arrived without a url" : undefined;
 		},
 	},
 	{
@@ -197,12 +225,28 @@ interface CaptureSpec {
 	file: string;
 	query: string;
 	params?: SearchParams;
+	/**
+	 * The shape this fixture exists to carry. A response that lacks it is not
+	 * written: overwriting would leave the offline suite green while covering
+	 * nothing, which is worse than a hand-written stand-in that still covers it.
+	 */
+	requires?: { name: string; present: (response: BraveResponse) => boolean };
 }
 
 const captures: CaptureSpec[] = [
 	{ file: "brave-web-search.json", query: "go generics", params: { count: 5 } },
-	{ file: "brave-web-search-snippets.json", query: "rust async fn in traits", params: { count: 3 } },
-	{ file: "brave-web-discussions.json", query: "rust async fn in traits", params: { count: 5 } },
+	{
+		file: "brave-web-search-snippets.json",
+		query: "rust async fn in traits",
+		params: { count: 3 },
+		requires: { name: "extra_snippets", present: (r) => hits(r).some((h) => (h.extra_snippets?.length ?? 0) > 0) },
+	},
+	{
+		file: "brave-web-discussions.json",
+		query: "rust async fn in traits",
+		params: { count: 5 },
+		requires: { name: "discussions block", present: (r) => (r.discussions?.results?.length ?? 0) > 0 },
+	},
 ];
 
 function messageOf(error: unknown): string {
@@ -218,6 +262,8 @@ try {
 }
 
 let failures = 0;
+/** Plan facts observed along the way, replayed as a block at the end. */
+const notes: string[] = [];
 
 console.log("--- live queries ---");
 
@@ -248,9 +294,12 @@ for (const testCase of cases) {
 			`${web} web + ${discussions} discussions, ${snippets} with extra_snippets, ` +
 			`${shown}/${total} rendered, ${size}B (~${Math.round(size / 4)} tok), ${elapsed}ms`;
 
-		if (problem) {
+		if (typeof problem === "string") {
 			failures++;
 			console.log(`FAIL  ${testCase.name}\n      ${problem}\n      ${stats}`);
+		} else if (problem) {
+			notes.push(problem.note);
+			console.log(`note  ${testCase.name}\n      ${problem.note}\n      ${stats}`);
 		} else {
 			console.log(`ok    ${testCase.name}\n      ${stats}`);
 		}
@@ -288,20 +337,23 @@ if (process.argv.includes("--capture")) {
 				count: normalizeCount(spec.params?.count),
 				freshness: normalizeFreshness(spec.params?.freshness),
 			});
+
+			// Checked before the write, not warned about after it. A fixture that
+			// no longer carries its shape is a silently empty test.
+			if (spec.requires && !spec.requires.present(response)) {
+				console.log(
+					`skip  ${spec.file}\n      nothing came back carrying ${spec.requires.name}, which is the whole reason\n` +
+						"      this fixture exists — keeping the hand-written one rather than emptying the suite",
+				);
+				continue;
+			}
+
 			const path = join(FIXTURE_DIR, spec.file);
 			// Pretty-printed and newline-terminated, so a fixture diff reads as one.
 			writeFileSync(path, `${JSON.stringify(response, null, 2)}\n`, "utf8");
 			const web = response.web?.results?.length ?? 0;
 			const discussions = response.discussions?.results?.length ?? 0;
 			console.log(`wrote ${spec.file}\n      "${spec.query}" → ${web} web + ${discussions} discussions`);
-			// A fixture exists to carry a shape. Capturing a response that lacks it
-			// leaves the suite testing nothing, quietly, so say so at capture time.
-			if (spec.file.includes("discussions") && discussions === 0) {
-				console.log("      warning: no discussions came back — this fixture no longer covers that section");
-			}
-			if (spec.file.includes("snippets") && !hits(response).some((r) => (r.extra_snippets?.length ?? 0) > 0)) {
-				console.log("      warning: no extra_snippets came back — this fixture no longer covers them");
-			}
 		} catch (error) {
 			failures++;
 			console.log(`FAIL  capture ${spec.file}\n      ${messageOf(error)}`);
@@ -312,6 +364,11 @@ if (process.argv.includes("--capture")) {
 			"the assertions that quote a specific title, host or snippet are pinned to the\n" +
 			"old fixtures and are meant to be re-pinned to the new ones.",
 	);
+}
+
+if (notes.length > 0) {
+	console.log("\n--- what this key's plan serves ---");
+	for (const note of notes) console.log(`  · ${note}`);
 }
 
 console.log(failures === 0 ? "\nAll cases passed." : `\n${failures} case(s) failed.`);

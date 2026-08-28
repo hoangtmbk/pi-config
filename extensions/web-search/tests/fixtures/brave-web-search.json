@@ -1,28 +1,265 @@
 {
-  "query": { "original": "go generics" },
   "type": "search",
+  "query": {
+    "original": "go generics",
+    "show_strict_warning": false,
+    "is_navigational": false,
+    "is_news_breaking": false,
+    "spellcheck_off": false,
+    "country": "us",
+    "bad_results": false,
+    "should_fallback": false,
+    "postal_code": "",
+    "city": "",
+    "header_country": "",
+    "more_results_available": true,
+    "state": ""
+  },
+  "mixed": {
+    "type": "mixed",
+    "main": [
+      {
+        "type": "web",
+        "index": 0,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 1,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 2,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 3,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 4,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 5,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 6,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 7,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 8,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 9,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 10,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 11,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 12,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 13,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 14,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 15,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 16,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 17,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 18,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 19,
+        "all": false
+      }
+    ],
+    "top": [],
+    "side": []
+  },
   "web": {
     "type": "search",
     "results": [
       {
+        "title": "Tutorial: Getting started with generics - The Go Programming Language",
+        "url": "https://go.dev/doc/tutorial/generics",
+        "is_source_local": false,
+        "is_source_both": false,
+        "description": "Call the generic function you just declared, passing each of the maps you created. Specify type arguments – the type names in square brackets – to be clear about the types that should replace type parameters in the function you’re calling. As you’ll see in the next section, you can often omit the type arguments in the function call. Go can often infer them from your code.",
+        "profile": {
+          "name": "Go",
+          "url": "https://go.dev/doc/tutorial/generics",
+          "long_name": "go.dev",
+          "img": "https://imgs.search.brave.com/KMfL1FeoSi71TAAcxfVYbbF5s7R5B5-QxKrwHmmJKGg/rs:fit:32:32:1:0/g:ce/aHR0cDovL2Zhdmlj/b25zLnNlYXJjaC5i/cmF2ZS5jb20vaWNv/bnMvYzJmMGQ0MDEy/MGNmMDk0YWQwNWRl/MjY3NzY4MzFkOGYy/YWFiMDFlMTExNDZj/MDUzZDgyNTNjMjUy/ODFlZTY2Yy9nby5k/ZXYv"
+        },
+        "language": "en",
+        "family_friendly": true,
+        "type": "search_result",
+        "subtype": "generic",
+        "is_live": false,
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "go.dev",
+          "hostname": "go.dev",
+          "favicon": "https://imgs.search.brave.com/KMfL1FeoSi71TAAcxfVYbbF5s7R5B5-QxKrwHmmJKGg/rs:fit:32:32:1:0/g:ce/aHR0cDovL2Zhdmlj/b25zLnNlYXJjaC5i/cmF2ZS5jb20vaWNv/bnMvYzJmMGQ0MDEy/MGNmMDk0YWQwNWRl/MjY3NzY4MzFkOGYy/YWFiMDFlMTExNDZj/MDUzZDgyNTNjMjUy/ODFlZTY2Yy9nby5k/ZXYv",
+          "path": "› doc  › tutorial  › generics"
+        }
+      },
+      {
         "title": "An Introduction To Generics - The Go Programming Language",
         "url": "https://go.dev/blog/intro-generics",
-        "description": "This post is an introduction to <strong>generics</strong> in <strong>Go</strong>: type parameters on functions and types.",
+        "is_source_local": false,
+        "is_source_both": false,
+        "description": "In Go 1.18 an interface may contain methods and embedded interfaces just as before, but it may also embed non-interface types, unions, and sets of underlying types. When used as a type constraint, the type set defined by an interface specifies exactly the types that are permitted as type arguments for the respective type parameter. Within a generic function body, if the type of a operand is a type parameter P with constraint C, operations are permitted if they are permitted by all types in the type set of C (there are currently some implementation restrictions here, but ordinary code is unlikely to encounter them).",
         "page_age": "2022-03-22T00:00:00",
-        "meta_url": { "scheme": "https", "netloc": "go.dev", "hostname": "go.dev", "path": "› blog  › intro-generics" }
+        "profile": {
+          "name": "Go",
+          "url": "https://go.dev/blog/intro-generics",
+          "long_name": "go.dev",
+          "img": "https://imgs.search.brave.com/KMfL1FeoSi71TAAcxfVYbbF5s7R5B5-QxKrwHmmJKGg/rs:fit:32:32:1:0/g:ce/aHR0cDovL2Zhdmlj/b25zLnNlYXJjaC5i/cmF2ZS5jb20vaWNv/bnMvYzJmMGQ0MDEy/MGNmMDk0YWQwNWRl/MjY3NzY4MzFkOGYy/YWFiMDFlMTExNDZj/MDUzZDgyNTNjMjUy/ODFlZTY2Yy9nby5k/ZXYv"
+        },
+        "language": "en",
+        "family_friendly": true,
+        "type": "search_result",
+        "subtype": "generic",
+        "is_live": false,
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "go.dev",
+          "hostname": "go.dev",
+          "favicon": "https://imgs.search.brave.com/KMfL1FeoSi71TAAcxfVYbbF5s7R5B5-QxKrwHmmJKGg/rs:fit:32:32:1:0/g:ce/aHR0cDovL2Zhdmlj/b25zLnNlYXJjaC5i/cmF2ZS5jb20vaWNv/bnMvYzJmMGQ0MDEy/MGNmMDk0YWQwNWRl/MjY3NzY4MzFkOGYy/YWFiMDFlMTExNDZj/MDUzZDgyNTNjMjUy/ODFlZTY2Yy9nby5k/ZXYv",
+          "path": "› blog  › intro-generics"
+        },
+        "age": "March 22, 2022"
       },
       {
-        "title": "Type Parameters Proposal",
-        "url": "https://go.googlesource.com/proposal/+/refs/heads/master/design/43651-type-parameters.md",
-        "description": "The design doc behind Go&#39;s type parameters, including constraints and inference.",
-        "meta_url": { "scheme": "https", "netloc": "go.googlesource.com", "hostname": "go.googlesource.com", "path": "› proposal" }
+        "title": "Go by Example: Generics",
+        "url": "https://gobyexample.com/generics",
+        "is_source_local": false,
+        "is_source_both": false,
+        "description": "Starting with version 1.18, Go has added support for generics, also known as type parameters · As an example of a generic function, SlicesIndex takes a slice of any comparable type and an element of that type and returns the index of the first occurrence of v in s, or -1 if not present.",
+        "profile": {
+          "name": "Go by Example",
+          "url": "https://gobyexample.com/generics",
+          "long_name": "gobyexample.com",
+          "img": "https://imgs.search.brave.com/Xjhqzob7TC4fzLj6Ph9hqBqkzoDFoy0tvPf0KKDMFPs/rs:fit:32:32:1:0/g:ce/aHR0cDovL2Zhdmlj/b25zLnNlYXJjaC5i/cmF2ZS5jb20vaWNv/bnMvNTc3YTA0M2Ux/YTgzOGQ4YjY3NjUx/NTAyYTMyYWY3ZTNj/Yjk1ZDAxMzQxNDNl/NDZhODNiMGEyZjli/YmU1ZTUxYi9nb2J5/ZXhhbXBsZS5jb20v"
+        },
+        "language": "en",
+        "family_friendly": true,
+        "type": "search_result",
+        "subtype": "generic",
+        "is_live": false,
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "gobyexample.com",
+          "hostname": "gobyexample.com",
+          "favicon": "https://imgs.search.brave.com/Xjhqzob7TC4fzLj6Ph9hqBqkzoDFoy0tvPf0KKDMFPs/rs:fit:32:32:1:0/g:ce/aHR0cDovL2Zhdmlj/b25zLnNlYXJjaC5i/cmF2ZS5jb20vaWNv/bnMvNTc3YTA0M2Ux/YTgzOGQ4YjY3NjUx/NTAyYTMyYWY3ZTNj/Yjk1ZDAxMzQxNDNl/NDZhODNiMGEyZjli/YmU1ZTUxYi9nb2J5/ZXhhbXBsZS5jb20v",
+          "path": "› generics"
+        }
       },
       {
-        "title": "Tutorial: Getting started with generics",
-        "url": "https://go.dev/doc/tutorial/generics",
-        "description": "In this tutorial, you&#39;ll declare two simple non-generic functions, then\n            carry the same logic over to a single generic function.",
-        "meta_url": { "scheme": "https", "netloc": "go.dev", "hostname": "go.dev", "path": "› doc  › tutorial  › generics" }
+        "title": "Generics in Go: Your Friendly Guide to Reusable Code - DEV Community",
+        "url": "https://dev.to/shrsv/generics-in-go-your-friendly-guide-to-reusable-code-4fkc",
+        "is_source_local": false,
+        "is_source_both": false,
+        "description": "Generics let you write functions, types, and methods that work with multiple types without losing Go’s type safety.",
+        "page_age": "2026-03-07T18:51:37",
+        "profile": {
+          "name": "DEV Community",
+          "url": "https://dev.to/shrsv/generics-in-go-your-friendly-guide-to-reusable-code-4fkc",
+          "long_name": "dev.to",
+          "img": "https://imgs.search.brave.com/UUpF8I85K--vkQzrhameM7iRPRU5VCTXyWbS4sk6G2g/rs:fit:32:32:1:0/g:ce/aHR0cDovL2Zhdmlj/b25zLnNlYXJjaC5i/cmF2ZS5jb20vaWNv/bnMvNTg5MTcxNDBh/N2U4ODc4MDg0NWQ4/MzU0YWJkNDY3ZWRm/MjUxY2U1YjY5MzJm/YWRlOTI4YjAyZDI1/ZjU0MmJjNi9kZXYu/dG8v"
+        },
+        "language": "en",
+        "family_friendly": true,
+        "type": "search_result",
+        "subtype": "article",
+        "is_live": false,
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "dev.to",
+          "hostname": "dev.to",
+          "favicon": "https://imgs.search.brave.com/UUpF8I85K--vkQzrhameM7iRPRU5VCTXyWbS4sk6G2g/rs:fit:32:32:1:0/g:ce/aHR0cDovL2Zhdmlj/b25zLnNlYXJjaC5i/cmF2ZS5jb20vaWNv/bnMvNTg5MTcxNDBh/N2U4ODc4MDg0NWQ4/MzU0YWJkNDY3ZWRm/MjUxY2U1YjY5MzJm/YWRlOTI4YjAyZDI1/ZjU0MmJjNi9kZXYu/dG8v",
+          "path": "› shrsv  › generics-in-go-your-friendly-guide-to-reusable-code-4fkc"
+        },
+        "thumbnail": {
+          "src": "https://imgs.search.brave.com/PcJzd8EVXPylNKQ276XfaUtjJn1-1rnK-ewhPOJBKxQ/rs:fit:200:200:1:0/g:ce/aHR0cHM6Ly9tZWRp/YTIuZGV2LnRvL2R5/bmFtaWMvaW1hZ2Uv/d2lkdGg9MTA4MCxo/ZWlnaHQ9MTA4MCxm/aXQ9Y292ZXIsZ3Jh/dml0eT1hdXRvLGZv/cm1hdD1hdXRvL2h0/dHBzJTNBJTJGJTJG/ZGV2LXRvLXVwbG9h/ZHMuczMuYW1hem9u/YXdzLmNvbSUyRnVw/bG9hZHMlMkZhcnRp/Y2xlcyUyRjMwYnJl/a2xmY3F1b3A5amM0/NzZrLnBuZw",
+          "original": "https://media2.dev.to/dynamic/image/width=1080,height=1080,fit=cover,gravity=auto,format=auto/https%3A%2F%2Fdev-to-uploads.s3.amazonaws.com%2Fuploads%2Farticles%2F30breklfcquop9jc476k.png",
+          "logo": false
+        },
+        "age": "March 7, 2026"
+      },
+      {
+        "title": "A Tour of Go",
+        "url": "https://go.dev/tour/generics/2",
+        "is_source_local": false,
+        "is_source_both": false,
+        "description": "A Tour of Go",
+        "profile": {
+          "name": "Go",
+          "url": "https://go.dev/tour/generics/2",
+          "long_name": "go.dev",
+          "img": "https://imgs.search.brave.com/KMfL1FeoSi71TAAcxfVYbbF5s7R5B5-QxKrwHmmJKGg/rs:fit:32:32:1:0/g:ce/aHR0cDovL2Zhdmlj/b25zLnNlYXJjaC5i/cmF2ZS5jb20vaWNv/bnMvYzJmMGQ0MDEy/MGNmMDk0YWQwNWRl/MjY3NzY4MzFkOGYy/YWFiMDFlMTExNDZj/MDUzZDgyNTNjMjUy/ODFlZTY2Yy9nby5k/ZXYv"
+        },
+        "language": "en",
+        "family_friendly": true,
+        "type": "search_result",
+        "subtype": "generic",
+        "is_live": false,
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "go.dev",
+          "hostname": "go.dev",
+          "favicon": "https://imgs.search.brave.com/KMfL1FeoSi71TAAcxfVYbbF5s7R5B5-QxKrwHmmJKGg/rs:fit:32:32:1:0/g:ce/aHR0cDovL2Zhdmlj/b25zLnNlYXJjaC5i/cmF2ZS5jb20vaWNv/bnMvYzJmMGQ0MDEy/MGNmMDk0YWQwNWRl/MjY3NzY4MzFkOGYy/YWFiMDFlMTExNDZj/MDUzZDgyNTNjMjUy/ODFlZTY2Yy9nby5k/ZXYv",
+          "path": "› tour  › generics  › 2"
+        }
       }
-    ]
+    ],
+    "family_friendly": true
   }
 }
