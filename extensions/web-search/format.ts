@@ -156,14 +156,63 @@ function excerptsOf(result: BraveResult, description: string): string[] {
 	return kept;
 }
 
-/** One entry: `N. title — host`, the URL, the description, then its excerpts. */
-function formatResult(result: BraveResult, index: number): string {
+/** The steps a page's age is reported in, longest first, in milliseconds. */
+const AGE_UNITS: [limit: number, unit: string][] = [
+	[365 * 24 * 60 * 60 * 1000, "year"],
+	[30 * 24 * 60 * 60 * 1000, "month"],
+	[7 * 24 * 60 * 60 * 1000, "week"],
+	[24 * 60 * 60 * 1000, "day"],
+];
+
+/**
+ * How old a page is, in the roundest terms that still decide something.
+ *
+ * "2 years ago" is triage: with a `freshness` filter unset it is the only thing
+ * in an entry that says a tutorial predates the feature being asked about. The
+ * precision is deliberately coarse — nothing is decided by the difference
+ * between 43 and 44 days, and a rounded phrase reads at a glance where a
+ * timestamp has to be parsed.
+ *
+ * Anything under a day is "today": Brave's timestamps are frequently
+ * zone-less and dated to midnight, so an hours figure would be false precision
+ * built on a value that is already approximate. A page dated in the future is a
+ * mis-stamped page rather than news, and says nothing worth a line.
+ */
+export function relativeAge(pageAge: string | undefined, now: number = Date.now()): string | undefined {
+	// The shape is checked before parsing, rather than leaving it to `Date.parse`.
+	// That function accepts far more than ISO-8601 and quietly succeeds on things
+	// no one meant as a date — `Date.parse("0000")` is the year zero, which would
+	// render as "2028 years ago" and put a fabricated fact in front of the model.
+	// Brave sends ISO-8601, so anything not starting as a date is not a date.
+	if (!pageAge || !/^\d{4}-\d{2}-\d{2}/.test(pageAge)) return undefined;
+
+	const published = Date.parse(pageAge);
+	if (Number.isNaN(published)) return undefined;
+
+	const elapsed = now - published;
+	// A day of slack rather than zero: a zone-less midnight timestamp can read as
+	// a few hours ahead of a viewer east of the page's own clock.
+	if (elapsed < -AGE_UNITS[3][0]) return undefined;
+
+	for (const [limit, unit] of AGE_UNITS) {
+		const count = Math.floor(elapsed / limit);
+		if (count >= 1) return `${count} ${unit}${count === 1 ? "" : "s"} ago`;
+	}
+	return "today";
+}
+
+/** One entry: `N. title — host`, the URL and age, the description, then its excerpts. */
+function formatResult(result: BraveResult, index: number, now?: number): string {
 	const host = hostOf(result);
 	// An untitled result falls back to its host, and then the ` — host` suffix
 	// would only repeat it.
 	const title = plainText(result.title ?? "") || host || "untitled";
 	const suffix = host && host !== title ? ` — ${host}` : "";
-	const lines = [`${index}. ${title}${suffix}`, `   ${result.url}`];
+
+	// On the URL line rather than a line of its own: it is a fact about the page
+	// the URL names, and a list of 10 results cannot spend 10 lines saying so.
+	const age = relativeAge(result.page_age, now);
+	const lines = [`${index}. ${title}${suffix}`, `   ${result.url}${age ? ` · ${age}` : ""}`];
 
 	const description = plainText(result.description ?? "");
 	if (description) lines.push(`   ${description}`);
@@ -337,6 +386,12 @@ export interface FormatOptions {
 	 * header so the model reads the list as the narrowed one it is.
 	 */
 	freshness?: string;
+	/**
+	 * What "now" is when a page's age is worked out. A test seam: the ages in a
+	 * fixture are fixed, so an assertion about them is only stable if the instant
+	 * they are measured from is too. Defaults to the wall clock.
+	 */
+	now?: number;
 }
 
 /**
@@ -380,13 +435,13 @@ interface Chunk {
  * so a budget that stops before that entry cannot leave a heading promising
  * results that were dropped.
  */
-function chunksOf(sections: Section[]): Chunk[] {
+function chunksOf(sections: Section[], now?: number): Chunk[] {
 	const chunks: Chunk[] = [];
 	let number = 1;
 
 	for (const [index, section] of sections.entries()) {
 		for (const [position, result] of section.results.entries()) {
-			const entry = formatResult(result, number);
+			const entry = formatResult(result, number, now);
 			number += 1;
 			const opensSection = position === 0 && section.heading !== undefined;
 			chunks.push({ text: opensSection ? `${section.heading}${SEPARATOR}${entry}` : entry, section: index });
@@ -417,7 +472,7 @@ export function formatResults(query: string, response: BraveResponse, options: F
 		sections,
 		sections.map((section) => section.results.length),
 	);
-	const chunks = chunksOf(sections);
+	const chunks = chunksOf(sections, options.now);
 	const fullHeader = header(query, countPhrase(everything), freshness);
 	const whole = `${fullHeader}${RULE}${chunks.map((chunk) => chunk.text).join(SEPARATOR)}`;
 	if (bytes(whole) <= maxBytes) return formatted(whole, everything);

@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { BraveResponse, BraveResult } from "../brave.ts";
-import { type FormatOptions, countPhrase, expandedLines, formatResults } from "../format.ts";
+import { type FormatOptions, countPhrase, expandedLines, formatResults, relativeAge } from "../format.ts";
 
 const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
@@ -778,5 +778,85 @@ describe("expandedLines", () => {
 		// The header said "showing 0 of 1"; repeating it under itself would also
 		// repeat an untrusted-data warning with nothing left to warn about.
 		assert.deepEqual(expandedLines(rendered.text, rendered.counts), []);
+	});
+});
+
+describe("how old a page is", () => {
+	/** A fixed instant, so an assertion about an age is not an assertion about today. */
+	const NOW = Date.parse("2026-08-28T12:00:00Z");
+	const ago = (published: string) => relativeAge(published, NOW);
+
+	it("says nothing about a result Brave gave no date for", () => {
+		assert.equal(relativeAge(undefined, NOW), undefined);
+		assert.equal(relativeAge("", NOW), undefined);
+	});
+
+	it("says nothing rather than guessing at a date it cannot read", () => {
+		assert.equal(ago("not a date"), undefined);
+		assert.equal(ago("0000"), undefined);
+	});
+
+	it("reports the age in the roundest unit that still says something", () => {
+		assert.equal(ago("2026-08-28T09:00:00Z"), "today");
+		assert.equal(ago("2026-08-26T12:00:00Z"), "2 days ago");
+		assert.equal(ago("2026-08-14T12:00:00Z"), "2 weeks ago");
+		assert.equal(ago("2026-05-28T12:00:00Z"), "3 months ago");
+		assert.equal(ago("2022-03-22T00:00:00Z"), "4 years ago");
+	});
+
+	it("keeps the unit singular when there is one of it", () => {
+		assert.equal(ago("2026-08-27T06:00:00Z"), "1 day ago");
+		assert.equal(ago("2026-08-20T12:00:00Z"), "1 week ago");
+		assert.equal(ago("2026-07-20T12:00:00Z"), "1 month ago");
+		assert.equal(ago("2025-06-28T12:00:00Z"), "1 year ago");
+	});
+
+	it("reads a zone-less timestamp, which is the form Brave usually sends", () => {
+		assert.equal(ago("2026-08-26T00:00:00"), "2 days ago");
+	});
+
+	it("forgives a page stamped hours ahead, and drops one stamped days ahead", () => {
+		// A zone-less midnight can read as ahead of a reader east of the page's
+		// own clock. A date genuinely in the future is a mis-stamped page.
+		assert.equal(ago("2026-08-28T20:00:00Z"), "today");
+		assert.equal(ago("2027-01-01T00:00:00Z"), undefined);
+	});
+
+	it("puts the age on the URL line, so a result still costs three lines", () => {
+		const text = markdown(
+			"go generics",
+			response({
+				title: "An Introduction To Generics",
+				url: "https://go.dev/blog/intro-generics",
+				description: "Type parameters on functions and types.",
+				meta_url: { hostname: "go.dev" },
+				page_age: "2022-03-22T00:00:00",
+			}),
+			{ now: NOW },
+		);
+
+		assert.ok(
+			text.endsWith(
+				"1. An Introduction To Generics — go.dev\n" +
+					"   https://go.dev/blog/intro-generics · 4 years ago\n" +
+					"   Type parameters on functions and types.",
+			),
+			text,
+		);
+	});
+
+	it("leaves the URL line alone for a result with no date", () => {
+		const text = markdown("go generics", response({ title: "T", url: "https://a.test/" }), { now: NOW });
+
+		assert.match(text, /^ {3}https:\/\/a\.test\/$/m);
+	});
+
+	it("dates the results in a real capture that carry one, and only those", () => {
+		const text = markdown("go generics", fixture("brave-web-search"), { now: NOW });
+
+		// Two of the five results came back with a page_age; three did not, which
+		// is the ordinary shape of a Brave list rather than a gap to fill in.
+		const dated = [...text.matchAll(/^ {3}https:\S+ · (.+)$/gm)].map((match) => match[1]);
+		assert.deepEqual(dated, ["4 years ago", "5 months ago"]);
 	});
 });

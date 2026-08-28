@@ -74,6 +74,13 @@ export interface BraveResult {
 	description?: string;
 	meta_url?: { hostname?: string };
 	/**
+	 * When Brave believes the page was published, as an ISO-8601 timestamp —
+	 * usually without a zone (`2022-03-22T00:00:00`). Present for maybe half the
+	 * results in a list, since it depends on the page saying so, which is why the
+	 * renderer treats a missing one as ordinary rather than as a gap.
+	 */
+	page_age?: string;
+	/**
 	 * Alternative excerpts from the page, up to 5. Historically a paid-plan
 	 * field, so its absence is ordinary and must degrade the entry to its
 	 * description rather than fail the search.
