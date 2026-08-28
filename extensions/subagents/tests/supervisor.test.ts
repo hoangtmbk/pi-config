@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { ASK_QUESTION_TOOL, type ParentMessage, type Run, RUN_SLOTS, type SettledMessage, Supervisor } from "../supervisor.ts";
-import { AGENT_END, AGENT_START, asked, failed, ran, RETRYING, said, SETTLED } from "./child-events.ts";
+import { AGENT_END, AGENT_START, asked, failed, ran, RETRYING, said, SETTLED, started } from "./child-events.ts";
 
 /** Feed a whole sequence to one Run and collect whatever it asks the parent to say. */
 function feed(supervisor: Supervisor, name: string, events: JsonAgentSessionEvent[]): SettledMessage[] {
@@ -721,5 +721,55 @@ describe("Supervisor joins that are abandoned", () => {
 
 		await assert.rejects(supervisor.join([run.name], AbortSignal.abort()));
 		assert.match((await supervisor.join([run.name]))[0].text, /Found three call sites\./);
+	});
+});
+
+describe("Supervisor progress", () => {
+	it("takes a Run's activity from the tool its child started, with what the tool is working on", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+
+		feed(supervisor, run.name, [AGENT_START, started("read", { path: "src/auth.ts" })]);
+
+		assert.equal(supervisor.get(run.name)?.activity, "read src/auth.ts");
+	});
+
+	it("names the tool alone when its arguments name no subject worth showing", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("worker", "fix the build");
+
+		feed(supervisor, run.name, [started("bash", { command: "npm test -- --reporter dot" })]);
+
+		assert.equal(supervisor.get(run.name)?.activity, "bash");
+	});
+
+	it("keeps the last tool started, so a Run between tools still says what it was doing", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+
+		feed(supervisor, run.name, [started("grep", { pattern: "spawnRun" }), ran("grep"), started("read", { path: "child.ts" })]);
+
+		assert.equal(supervisor.get(run.name)?.activity, "read child.ts");
+	});
+
+	it("drops the activity when a Run starts Waiting, which is the whole of what it is doing", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+
+		feed(supervisor, run.name, [started("read", { path: "src/auth.ts" }), asked("Which auth module?"), SETTLED]);
+
+		assert.equal(supervisor.get(run.name)?.state, "waiting");
+		assert.equal(supervisor.get(run.name)?.activity, undefined);
+	});
+
+	it("stamps a Run with when it was asked for, so its age counts from the parent's request", () => {
+		let clock = 1000;
+		const supervisor = new Supervisor({ now: () => clock });
+
+		const first = supervisor.register("scout", "one");
+		clock = 4000;
+		const second = supervisor.register("worker", "two");
+
+		assert.deepEqual([first.askedAt, second.askedAt], [1000, 4000]);
 	});
 });

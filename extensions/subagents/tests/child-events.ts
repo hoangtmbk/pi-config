@@ -27,6 +27,11 @@ export function asked(question: string): JsonAgentSessionEvent {
 	return toolExecutionEnd(ASK_QUESTION_TOOL, { content: [{ type: "text", text: "Sent." }], details }, false);
 }
 
+/** A tool the child has just started — the event a Run's current activity is read from. */
+export function started(toolName: string, args: unknown = {}): JsonAgentSessionEvent {
+	return { type: "tool_execution_start", toolCallId: `call-${toolName}`, toolName, args } as unknown as JsonAgentSessionEvent;
+}
+
 /** Any other tool running in the child, which must leave no Run Waiting. */
 export function ran(toolName: string): JsonAgentSessionEvent {
 	return toolExecutionEnd(toolName, { content: [{ type: "text", text: "ok" }] }, false);

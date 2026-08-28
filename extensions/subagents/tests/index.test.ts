@@ -19,7 +19,8 @@ import type { ChildExit, RunChild } from "../child.ts";
 import { spawnRun } from "../child.ts";
 import { registerSubagents } from "../index.ts";
 import { ASK_QUESTION_TOOL, type QuestionDetails, RUN_SLOTS } from "../supervisor.ts";
-import { AGENT_END, AGENT_START, asked, said, SETTLED } from "./child-events.ts";
+// `started` is aliased: this file already has a `started` of its own, the children it must reap.
+import { AGENT_END, AGENT_START, asked, said, SETTLED, started as toolStarted } from "./child-events.ts";
 import { pidFrom, reaped } from "./processes.ts";
 
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -138,24 +139,44 @@ function recorder(parent: Parent, tools: RegisteredTool[], sent: SentMessage[], 
 	};
 }
 
+/** One thing the extension put above the editor, as pi was told it. */
+interface WidgetCall {
+	key: string;
+	lines: string[] | undefined;
+	placement?: string;
+}
+
 /**
  * The parent session's own lifecycle, as far as this extension sees it: a turn
- * that can be aborted, and a session that can be shut down.
+ * that can be aborted, a session that can be started and shut down, and the
+ * widget surface a started session hands over.
  *
- * Both are pi's, not the extension's, so a test drives them by firing the events
- * the extension subscribed to — the same way pi would.
+ * All of it is pi's, not the extension's, so a test drives it by firing the
+ * events the extension subscribed to — the same way pi would.
  */
 function lifecycle(handlers: Map<string, Handler[]>) {
 	const aborting = new AbortController();
-	const ctx = { signal: aborting.signal } as ExtensionContext;
+	const widgets: WidgetCall[] = [];
+	const ui = {
+		setWidget(key: string, content: string[] | undefined, options?: { placement?: string }) {
+			widgets.push({ key, lines: content, placement: options?.placement });
+		},
+	} as unknown as ExtensionContext["ui"];
+	const ctx = { signal: aborting.signal, hasUI: true, ui } as ExtensionContext;
+	// Print and JSON modes: the same session, with nowhere to put a widget.
+	const headless = { ...ctx, hasUI: false } as ExtensionContext;
 
-	async function fire(event: string, payload: Record<string, unknown>): Promise<void> {
-		for (const handler of handlers.get(event) ?? []) await handler({ type: event, ...payload }, ctx);
+	async function fire(event: string, payload: Record<string, unknown>, using = ctx): Promise<void> {
+		for (const handler of handlers.get(event) ?? []) await handler({ type: event, ...payload }, using);
 	}
 
 	return {
 		/** The turn every tool call in a test runs inside. */
 		aborting,
+		/** Everything the extension has put above the editor, oldest first. */
+		widgets,
+		/** Start the session, the way pi does before anything else happens. */
+		startSession: (hasUI = true) => fire("session_start", { reason: "startup" }, hasUI ? ctx : headless),
 		/** Start a turn and abort it, the way a parent session that is interrupted does. */
 		async abortTurn(): Promise<void> {
 			await fire("agent_start", {});
@@ -1346,5 +1367,66 @@ describe("a session that ends", () => {
 
 		assert.ok(await reaped(pid), `pid ${pid} outlived the session that was still starting it`);
 		assert.match(await starting, /Run `scout`.*did not start/s, "the Run that never started is named, not lost");
+	});
+});
+
+describe("subagents widget", () => {
+	it("shows the Runs in flight above the editor, and nothing at all when there are none", async () => {
+		const session = stubbedSession();
+		await session.startSession();
+		// Snapshotted rather than asserted in place: `deepEqual` narrows what it is
+		// given, and the rest of this test still needs `widgets` to hold widgets.
+		assert.deepEqual([...session.widgets], [], "a session with no Runs costs no widget");
+
+		await call(session.subagent, { agent: "scout", task: "look around" });
+
+		const shown = session.widgets.at(-1);
+		assert.equal(shown?.key, "subagents");
+		assert.equal(shown?.placement, "aboveEditor");
+		assert.match(shown?.lines?.[0] ?? "", /1 active/);
+		assert.match(shown?.lines?.[1] ?? "", /scout\s+running/);
+
+		session.spawned[0].emit(SETTLED);
+
+		assert.equal(session.widgets.at(-1)?.lines, undefined, "the widget goes away with the last Run");
+	});
+
+	it("says what a Run's child is doing, from the tool it started", async () => {
+		const session = stubbedSession();
+		await session.startSession();
+		await call(session.subagent, { agent: "scout", task: "look around" });
+
+		session.spawned[0].emit(toolStarted("read", { path: "src/auth.ts" }));
+
+		assert.match(session.widgets.at(-1)?.lines?.[1] ?? "", /running · read src\/auth\.ts/);
+		session.spawned[0].emit(SETTLED);
+	});
+
+	it("never puts a Question's text in the widget, which is a status surface", async () => {
+		const session = stubbedSession();
+		await session.startSession();
+		await call(session.subagent, { agent: "scout", task: "look around" });
+
+		session.spawned[0].emit(asked("Which auth module do you mean?"));
+		session.spawned[0].emit(SETTLED);
+
+		const lines = session.widgets.at(-1)?.lines ?? [];
+		assert.match(lines[1] ?? "", /scout\s+waiting/);
+		assert.ok(
+			lines.every((line) => !line.includes("auth module")),
+			`expected no question text above the editor, got ${JSON.stringify(lines)}`,
+		);
+		await session.shutdown();
+	});
+
+	it("puts no widget anywhere in a session that has no UI to put one in", async () => {
+		const session = stubbedSession();
+		await session.startSession(false);
+
+		await call(session.subagent, { agent: "scout", task: "look around" });
+		session.spawned[0].emit(toolStarted("read", { path: "src/auth.ts" }));
+		session.spawned[0].emit(SETTLED);
+
+		assert.deepEqual(session.widgets, [], "a headless session is told nothing about widgets");
 	});
 });

@@ -6,6 +6,10 @@
  * the child's event stream and hands back the Delivery when a Run settles. That
  * separation is load-bearing: it is what makes the lifecycle testable by writing
  * down an event sequence, rather than by mocking a subprocess.
+ *
+ * The one reading it does is the clock, for stamping how long a Run has been
+ * outstanding, and even that arrives through `SupervisorOptions.now` so a test
+ * can hand it a clock of its own. Nothing else here touches the world.
  */
 
 import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
@@ -90,6 +94,24 @@ export interface Run {
 	task: string;
 	state: RunState;
 	/**
+	 * When the session took this Run on, as a millisecond clock reading.
+	 *
+	 * The moment it was asked for rather than the moment its child came up: a
+	 * queued Run is outstanding work from the instant the parent asked for it,
+	 * and a clock that only started once a slot freed would report a fan-out of
+	 * eight as if half of it had not been asked for yet.
+	 */
+	askedAt: number;
+	/**
+	 * What this Run's child is doing, as of the last tool it started. Absent for
+	 * a Run that has not run a tool yet, and for one that is Waiting.
+	 *
+	 * The last tool it *started*, deliberately: a child spends its time inside
+	 * tool calls, and one that has finished a tool and not yet started another is
+	 * a moment too short to be worth a line that says nothing.
+	 */
+	activity?: string;
+	/**
 	 * The child's last assistant message, once the Run is done. Absent when the
 	 * child settled without saying anything.
 	 */
@@ -154,11 +176,20 @@ export interface SupervisorOptions {
 	 * into a free slot is already the caller's to start.
 	 */
 	onAdmit?: (run: Run) => void;
+	/**
+	 * What time it is, in milliseconds, for stamping a Run's `askedAt`.
+	 *
+	 * Injected rather than read, so that this file keeps reading nothing outside
+	 * itself and a test can say how old a Run is instead of waiting for it to get
+	 * that old. Defaults to the wall clock.
+	 */
+	now?: () => number;
 }
 
 export class Supervisor {
 	private readonly byName = new Map<string, RunRecord>();
 	private readonly onAdmit?: (run: Run) => void;
+	private readonly now: () => number;
 	/**
 	 * Whether every Run is being ended, and so nothing may be admitted.
 	 *
@@ -177,6 +208,7 @@ export class Supervisor {
 
 	constructor(options: SupervisorOptions = {}) {
 		this.onAdmit = options.onAdmit;
+		this.now = options.now ?? Date.now;
 	}
 
 	/**
@@ -191,7 +223,7 @@ export class Supervisor {
 	register(agent: string, task: string, requestedName?: string): Run {
 		const name = this.reserveName(requestedName?.trim() || agent);
 		const state: RunState = this.slotsInUse() < RUN_SLOTS ? "running" : "queued";
-		const record: RunRecord = { run: { name, agent, task, state }, said: false };
+		const record: RunRecord = { run: { name, agent, task, state, askedAt: this.now() }, said: false };
 		this.byName.set(name, record);
 		return record.run;
 	}
@@ -237,6 +269,11 @@ export class Supervisor {
 			return undefined;
 		}
 
+		if (event.type === "tool_execution_start") {
+			record.run.activity = activityOf(event.toolName, event.args);
+			return undefined;
+		}
+
 		if (event.type === "tool_execution_end") {
 			// An `ask_question` that failed never reached the parent, so the child is
 			// still working and this turn settles like any other. A second Question in
@@ -255,6 +292,10 @@ export class Supervisor {
 			record.lastAssistant = undefined;
 			record.run.state = "waiting";
 			record.run.question = asked.question;
+			// Waiting is the whole of what a Waiting Run is doing. The tool it last
+			// started was the `ask_question` that got it here, and reporting that as
+			// activity would say a Run is busy when it is stopped.
+			record.run.activity = undefined;
 		} else {
 			record.run.state = "done";
 			record.run.result = record.lastAssistant && assistantText(record.lastAssistant);
@@ -614,6 +655,34 @@ function assistantText(message: AssistantMessage): string | undefined {
 function questionText(result: unknown): string | undefined {
 	const asked = (result as { details?: { question?: unknown } } | undefined)?.details?.question;
 	return typeof asked === "string" && asked.trim() ? asked.trim() : undefined;
+}
+
+/**
+ * The argument names a tool call is read as a subject through.
+ *
+ * pi's own file tools take a `path` and its two search tools take a `pattern`,
+ * and both are short, single-valued and the thing the call is *about*. `bash`'s
+ * `command` is deliberately not among them: it is arbitrary shell, routinely
+ * longer and more line-broken than a status line can hold, and "bash" already
+ * says as much as a clipped fragment of it would.
+ */
+const ACTIVITY_SUBJECTS: readonly string[] = ["path", "pattern"];
+
+/**
+ * What a child is doing, from the tool it just started: the tool's name, and
+ * what it is working on when the call names something.
+ *
+ * `unknown` because this is the far side of a process boundary — the arguments
+ * are whatever the child's model produced for whatever tools its Agent
+ * allowlisted, so nothing here assumes a shape.
+ */
+function activityOf(toolName: string, args: unknown): string {
+	const named = (args ?? {}) as Record<string, unknown>;
+	for (const key of ACTIVITY_SUBJECTS) {
+		const subject = named[key];
+		if (typeof subject === "string" && subject.trim()) return `${toolName} ${subject.trim()}`;
+	}
+	return toolName;
 }
 
 /**

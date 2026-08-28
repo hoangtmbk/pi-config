@@ -13,11 +13,12 @@
  * that knows a process exists.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type Agent, discoverAgents, type Roster } from "./agents.ts";
 import { type RunChild, RUN_NAME_ENV, type SpawnOptions, spawnRun } from "./child.ts";
 import { ASK_QUESTION_TOOL, type QuestionDetails, type Run, RUN_SLOTS, type RunState, type SettledMessage, Supervisor } from "./supervisor.ts";
+import { renderRuns } from "./widget.ts";
 
 const SubagentParams = Type.Object({
 	agent: Type.String({ description: "Which agent to run — one of the names listed in this tool's description." }),
@@ -69,6 +70,27 @@ const AskQuestionParams = Type.Object({
  */
 const REAP_GRACE_MS = 2000;
 
+/** What the Runs block is keyed on, for pi to replace or clear it by. */
+const WIDGET_KEY = "subagents";
+
+/**
+ * Where the block goes.
+ *
+ * Above the editor is pi's own default, and it is said out loud anyway: this is
+ * a status surface that has to sit between the conversation and what is being
+ * typed, and reading it off a default would leave that unstated.
+ */
+const WIDGET_PLACEMENT = { placement: "aboveEditor" } as const;
+
+/**
+ * How often the widget is redrawn while Runs are active.
+ *
+ * The Runs themselves move it — a Run starting, settling, or its child picking
+ * up a tool all repaint it at once — so this exists for the one thing nothing
+ * announces: the elapsed readings, which are in seconds and so go stale in one.
+ */
+const WIDGET_TICK_MS = 1000;
+
 /** Metadata for the transcript — the Run's identity, not its result. */
 interface SubagentDetails {
 	run: string;
@@ -102,6 +124,12 @@ function unanswerableRun(name: string, run: Run | undefined, runs: Run[]): Error
 /** What went wrong, from whatever a failed spawn threw. */
 function describeError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+/** Whether two renderings of the widget are the same block of lines. */
+function sameLines(next: string[] | undefined, previous: string[] | undefined): boolean {
+	if (!next || !previous) return next === previous;
+	return next.length === previous.length && next.every((line, index) => line === previous[index]);
 }
 
 /**
@@ -220,6 +248,59 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 	const children = new Map<string, Promise<RunChild>>();
 
 	/**
+	 * Where the widget goes, once a session has said it has somewhere to put it.
+	 *
+	 * Undefined until `session_start`, and left undefined for a session with no
+	 * UI — a `-p` run or the JSON mode — which is the whole of what keeps this
+	 * feature from writing anything into a headless session's output.
+	 */
+	let surface: ExtensionUIContext | undefined;
+
+	/** The lines currently above the editor, so an unchanged block is not redrawn. */
+	let shown: string[] | undefined;
+
+	/** The repaint that keeps the elapsed readings moving, while anything is running. */
+	let ticking: ReturnType<typeof setInterval> | undefined;
+
+	/**
+	 * Redraw the Runs block, or take it away when there is nothing left to show.
+	 *
+	 * Called wherever a Run's state or activity can have changed, and on a timer
+	 * for the elapsed readings. Both go through here rather than through
+	 * `setWidget` directly, so the "hidden when nothing is active" rule and the
+	 * timer that costs an idle session nothing are stated once.
+	 *
+	 * Being called from many places is deliberate rather than an oversight to be
+	 * gathered into a Supervisor callback: a missed call is bounded, because the
+	 * timer is running for as long as anything is active and redraws within a
+	 * second — including the last redraw, which takes the block away and then
+	 * stops the timer. The cost of forgetting one is a second of staleness, never
+	 * a widget stuck on screen.
+	 */
+	function paint(): void {
+		if (!surface) return;
+
+		const runs = supervisor.active();
+		const lines = renderRuns(runs, Date.now());
+		// pi redraws on every call, so an unchanged block is handed over only when
+		// it has changed — which for a session with no Runs is never.
+		if (!sameLines(lines, shown)) {
+			shown = lines;
+			surface.setWidget(WIDGET_KEY, lines, WIDGET_PLACEMENT);
+		}
+
+		if (runs.length > 0 && !ticking) {
+			ticking = setInterval(paint, WIDGET_TICK_MS);
+			// A clock that redraws a widget is never a reason for a process with
+			// nothing left to do to stay up.
+			ticking.unref();
+		} else if (runs.length === 0 && ticking) {
+			clearInterval(ticking);
+			ticking = undefined;
+		}
+	}
+
+	/**
 	 * Put what a Run has to say into the parent conversation.
 	 *
 	 * `options` is the one thing that differs between the two callers, and it is
@@ -313,12 +394,18 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 			onEvent(event) {
 				const message = supervisor.observe(run.name, event);
 				if (message) announce(message);
+				// Every event, because most of what the widget shows the Supervisor
+				// reports nothing about: a child picking up a tool changes the line
+				// without settling anything. `paint` is what makes that cheap — it
+				// hands pi a block only when the block has changed.
+				paint();
 			},
 			onExit(exit) {
 				// A child that outlives its Run's Delivery is a Run ending rather than
 				// a Run failing, and the Supervisor says which by returning nothing.
 				const message = supervisor.fail(run.name, { kind: "exit", ...exit });
 				if (message) announce(message);
+				paint();
 			},
 		});
 		children.set(run.name, spawning);
@@ -355,7 +442,9 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 				// Run answered long ago, so there is nothing left to return it into.
 				const failure = supervisor.fail(run.name, { kind: "spawn", message: describeError(error) });
 				if (failure) announce(failure);
+				paint();
 			});
+			paint();
 		},
 	});
 
@@ -395,7 +484,22 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 		// yet, a spawn whose process has not come up, cannot hold the session open.
 		// That one stops itself on arrival instead.
 		await Promise.race([Promise.all(reaping), deadline(REAP_GRACE_MS)]);
+		// Nothing is active any more, so this takes the block away and stops the
+		// timer that was redrawing it.
+		paint();
 	}
+
+	// The one event that hands over a context before anything can have happened.
+	// `hasUI` is what says whether there is anywhere to put a widget: it is false
+	// in print and JSON modes, where the block would be output rather than UI.
+	pi.on("session_start", (_event, ctx) => {
+		surface = ctx.hasUI ? ctx.ui : undefined;
+		// A session that is being started again — a `/reload`, a switch — has
+		// whatever it was showing behind it, so the next block is drawn afresh
+		// rather than skipped as unchanged.
+		shown = undefined;
+		paint();
+	});
 
 	// Awaited by pi, so the children are gone before the session is.
 	pi.on("session_shutdown", () => endEveryRun("the session is shutting down"));
@@ -434,6 +538,9 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 
 			const run = supervisor.register(agent.name, params.task, params.name);
 			const details: SubagentDetails = { run: run.name, agent: agent.name, task: params.task };
+			// From here on this Run is something the parent is waiting for, whether
+			// it is queued, starting or already going, so it is on the block.
+			paint();
 
 			// Every slot is taken, so this Run starts when one frees. The name still
 			// comes back now: a fan-out past the cap is a wait, not a refusal, and
@@ -473,6 +580,7 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 				// Naming it is still worth doing: without that this returns a bare RPC
 				// error that says nothing about which Run it was about.
 				const stopped = `Run \`${run.name}\` (agent \`${agent.name}\`) did not start: ${describeError(error)}`;
+				paint();
 				return { content: [{ type: "text", text: failure?.text ?? stopped }], details };
 			}
 
@@ -572,6 +680,9 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 				supervisor.unanswered(name, question);
 				throw error;
 			}
+
+			// The Run has left Waiting, so the block says it is running again.
+			paint();
 
 			const details: SubagentDetails = { run: run.name, agent: run.agent, task: run.task };
 			return {
