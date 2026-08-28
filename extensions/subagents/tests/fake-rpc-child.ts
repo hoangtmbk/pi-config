@@ -22,6 +22,12 @@
  *  - `FAKE_RPC_EXIT_CODE` and `FAKE_RPC_EXIT_AFTER` — die with that code once
  *    that many prompts have been served (default 0: die before the parent's
  *    first prompt, which is what a child that cannot start looks like).
+ *  - `FAKE_RPC_PID_OUT` — a path to write its own pid to, so a test can ask the
+ *    operating system whether the process is really gone.
+ *  - `FAKE_RPC_IGNORE_SIGTERM` — swallow SIGTERM, standing in for a child too
+ *    wedged to take the polite way out. Only SIGKILL ends it.
+ *  - `FAKE_RPC_SILENT` — never answer a prompt, not even to acknowledge it, so
+ *    the spawn that sent it never finishes. A child that is up and unreachable.
  *
  * Not a `.test.ts` file, so `npm test` never runs it directly.
  */
@@ -30,6 +36,13 @@ import { writeFileSync } from "node:fs";
 
 const argvOut = process.env.FAKE_RPC_ARGV_OUT;
 if (argvOut) writeFileSync(argvOut, JSON.stringify(process.argv.slice(2)), "utf-8");
+
+const pidOut = process.env.FAKE_RPC_PID_OUT;
+if (pidOut) writeFileSync(pidOut, String(process.pid), "utf-8");
+
+// An empty handler is how a Node process refuses SIGTERM: it replaces the
+// default terminate-on-signal behaviour with doing nothing at all.
+if (process.env.FAKE_RPC_IGNORE_SIGTERM) process.on("SIGTERM", () => {});
 
 const envOut = process.env.FAKE_RPC_ENV_OUT;
 if (envOut) {
@@ -41,6 +54,8 @@ const stderrLine = process.env.FAKE_RPC_STDERR;
 if (stderrLine) process.stderr.write(`${stderrLine}\n`);
 
 const turns: unknown[][] | undefined = process.env.FAKE_RPC_TURNS ? JSON.parse(process.env.FAKE_RPC_TURNS) : undefined;
+
+const silent = Boolean(process.env.FAKE_RPC_SILENT);
 
 const exitCode = process.env.FAKE_RPC_EXIT_CODE ? Number(process.env.FAKE_RPC_EXIT_CODE) : undefined;
 const exitAfter = Number(process.env.FAKE_RPC_EXIT_AFTER ?? 0);
@@ -84,6 +99,11 @@ function defaultEvents(prompt: string): unknown[] {
 function handle(line: string): void {
 	if (!line.trim()) return;
 	const command = JSON.parse(line) as { id?: string; type: string; message?: string };
+
+	// A silent child leaves the prompt unacknowledged, so whoever sent it waits
+	// for good. It stays up and answering nothing, which is what a wedged pi
+	// looks like from the outside.
+	if (silent && command.type === "prompt") return;
 
 	// Every command gets a response; `RpcClient.send` waits for one before its
 	// promise resolves, prompts included.

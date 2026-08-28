@@ -40,6 +40,19 @@ export type RunFailure =
 			signal?: string;
 			/** The tail of what the child wrote to stderr — usually the whole of why. */
 			stderr?: string;
+	  }
+	| {
+			/**
+			 * The session ended the Run on purpose — an abort, or a shutdown.
+			 *
+			 * A third arm rather than an `exit` with `signal: "SIGTERM"`, because
+			 * that would read as a Run something killed out from under it. This one
+			 * says who did it, which is the difference between a fault to look into
+			 * and the parent getting what it asked for.
+			 */
+			kind: "stopped";
+			/** Why the session ended it, as the clause a Delivery says it in. */
+			reason: string;
 	  };
 
 /**
@@ -269,12 +282,60 @@ export class Supervisor {
 	 *
 	 * Every name must be one this Supervisor registered; callers check that first,
 	 * because they are the ones who can say what the valid names were.
+	 *
+	 * `signal` is the caller's turn. An aborted turn abandons the join rather
+	 * than collecting into it: collecting marks the Runs said, and a result
+	 * marked said inside a tool call nobody will read is a result the parent
+	 * never sees. Abandoned, they deliver on their own instead.
 	 */
-	join(names: string[]): Promise<ParentMessage[]> {
+	join(names: string[], signal?: AbortSignal): Promise<ParentMessage[]> {
+		if (signal?.aborted) return Promise.reject(signal.reason);
 		if (names.every((name) => !this.isInFlight(name))) return Promise.resolve(this.collect(names));
-		return new Promise((resolve) => {
-			this.joins.add({ names, resolve });
+		return new Promise((resolve, reject) => {
+			// `abandon` closes over the join and the join closes over `abandon`, so
+			// one of the two has to be filled in second.
+			let abandon = () => {};
+			const pending: PendingJoin = {
+				names,
+				resolve: (messages) => {
+					signal?.removeEventListener("abort", abandon);
+					resolve(messages);
+				},
+				reject,
+			};
+			if (signal) {
+				abandon = () => {
+					this.joins.delete(pending);
+					reject(signal.reason);
+				};
+				signal.addEventListener("abort", abandon, { once: true });
+			}
+			this.joins.add(pending);
 		});
+	}
+
+	/**
+	 * End every Run that is still going, because the session that owns them is
+	 * ending, and hand back the failed Deliveries to route.
+	 *
+	 * The other half of ADR-0001's reap: killing the children leaves the Runs
+	 * looking alive, and a Run that is listed as running but whose child is gone
+	 * is one every later join waits on forever.
+	 *
+	 * Joins in flight are ended rather than answered, for the reason `join`
+	 * gives: the turn a join would return its Deliveries into is the turn that
+	 * just went away.
+	 */
+	endAll(reason: string): Delivery[] {
+		for (const pending of this.joins) pending.reject(new Error(`Waiting stopped: ${reason}.`));
+		this.joins.clear();
+
+		const deliveries: Delivery[] = [];
+		for (const name of this.byName.keys()) {
+			const delivery = this.fail(name, { kind: "stopped", reason });
+			if (delivery) deliveries.push(delivery);
+		}
+		return deliveries;
 	}
 
 	/**
@@ -370,6 +431,8 @@ export class Supervisor {
 interface PendingJoin {
 	names: string[];
 	resolve: (messages: ParentMessage[]) => void;
+	/** How to end it without an answer, when there is no longer one to give. */
+	reject: (error: unknown) => void;
 }
 
 interface RunRecord {
@@ -514,6 +577,7 @@ function failureText(run: Run): string {
 function failureCause(failure: RunFailure | undefined): string {
 	if (!failure) return "it stopped without saying why";
 	if (failure.kind === "spawn") return `it could not be started: ${failure.message}`;
+	if (failure.kind === "stopped") return `it was stopped because ${failure.reason}`;
 	if (failure.signal) return `its child was killed by ${failure.signal}`;
 	// A clean exit still failed the Run — the child stopped without settling — but
 	// blaming "code 0" reads like a fault where there was none. Say what happened.

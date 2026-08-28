@@ -512,3 +512,103 @@ describe("Supervisor failures", () => {
 		assert.match(delivery?.text ?? "", /pi: out of tokens/);
 	});
 });
+
+describe("Supervisor endings", () => {
+	it("fails every Run still going, saying it was the session that stopped them", () => {
+		const supervisor = new Supervisor();
+		const first = supervisor.register("scout", "one");
+		const second = supervisor.register("worker", "two");
+		feed(supervisor, second.name, [asked("Which auth module do you mean?"), SETTLED]);
+
+		const deliveries = supervisor.endAll("the session is shutting down");
+
+		assert.deepEqual(deliveries.map((delivery) => delivery.run.name), [first.name, second.name]);
+		assert.deepEqual(deliveries.map((delivery) => delivery.run.state), ["failed", "failed"]);
+		assert.match(deliveries[0].text, /Run `scout` \(agent `scout`\) failed/);
+		assert.match(deliveries[0].text, /the session is shutting down/);
+		assert.doesNotMatch(deliveries[1].text, /Which auth module do you mean\?/, "a spent Question is not a result");
+	});
+
+	it("leaves a Run that already stopped alone, so a delivered result is not overwritten", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		feed(supervisor, run.name, [said("Found three call sites."), SETTLED]);
+
+		const deliveries = supervisor.endAll("the session is shutting down");
+
+		assert.deepEqual(deliveries, []);
+		assert.equal(supervisor.get(run.name)?.state, "done");
+		assert.equal(supervisor.get(run.name)?.result, "Found three call sites.");
+	});
+
+	it("ends a join in flight rather than leaving it waiting on Runs that are gone", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		const joined = supervisor.join([run.name]);
+
+		supervisor.endAll("the parent turn was aborted");
+
+		await assert.rejects(joined, (error: Error) => {
+			assert.match(error.message, /the parent turn was aborted/);
+			return true;
+		});
+	});
+
+	it("leaves the ended Runs unsaid, so their Deliveries still have somewhere to go", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		const joined = assert.rejects(supervisor.join([run.name]));
+
+		const deliveries = supervisor.endAll("the parent turn was aborted");
+
+		assert.equal(deliveries.length, 1, "the join in flight does not collect them: nobody will read its result");
+		assert.match(deliveries[0].text, /the parent turn was aborted/);
+		await joined;
+	});
+});
+
+describe("Supervisor joins that are abandoned", () => {
+	it("drops a join whose turn was aborted, rather than stranding it", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		const aborting = new AbortController();
+
+		const joined = supervisor.join([run.name], aborting.signal);
+		aborting.abort();
+
+		await assert.rejects(joined);
+	});
+
+	it("delivers to the conversation after an abandoned join, rather than into it", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		const aborting = new AbortController();
+		const joined = supervisor.join([run.name], aborting.signal);
+		aborting.abort();
+		await assert.rejects(joined);
+
+		const routes = announce(supervisor, run.name, [said("Found three call sites."), SETTLED]);
+
+		assert.deepEqual(routes, ["conversation"], "the abandoned join is no longer collecting");
+	});
+
+	it("collects normally when the turn is never aborted", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		const aborting = new AbortController();
+
+		const joined = supervisor.join([run.name], aborting.signal);
+		announce(supervisor, run.name, [said("Found three call sites."), SETTLED]);
+
+		assert.match((await joined)[0].text, /Found three call sites\./);
+	});
+
+	it("refuses a join placed on an already-aborted turn, rather than marking Runs said for nobody", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		feed(supervisor, run.name, [said("Found three call sites."), SETTLED]);
+
+		await assert.rejects(supervisor.join([run.name], AbortSignal.abort()));
+		assert.match((await supervisor.join([run.name]))[0].text, /Found three call sites\./);
+	});
+});

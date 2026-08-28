@@ -56,6 +56,19 @@ const AskQuestionParams = Type.Object({
 	}),
 });
 
+/**
+ * How long the reap waits for its children to go before letting the session
+ * finish shutting down.
+ *
+ * `RunChild.stop` is already bounded — a SIGTERM, then a SIGKILL for anything
+ * still standing after the grace period — so this covers the one part of the
+ * reap that is not: a child still being spawned, whose first prompt a wedged pi
+ * might never answer. Comfortably longer than that SIGTERM grace, so a child
+ * that is going to go has gone, and short enough that quitting pi is never
+ * something to sit and wait through.
+ */
+const REAP_GRACE_MS = 2000;
+
 /** Metadata for the transcript — the Run's identity, not its result. */
 interface SubagentDetails {
 	run: string;
@@ -89,6 +102,16 @@ function unanswerableRun(name: string, run: Run | undefined, runs: Run[]): Error
 /** What went wrong, from whatever a failed spawn threw. */
 function describeError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * A deadline, as a promise.
+ *
+ * Unreferenced, so that waiting on one is never itself the reason a process
+ * that has nothing left to do stays up.
+ */
+function deadline(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms).unref());
 }
 
 export interface SubagentsOptions {
@@ -184,7 +207,108 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 	const roster = options.roster ?? discoverAgents();
 	const spawn = options.spawn ?? spawnRun;
 	const supervisor = new Supervisor();
-	const children = new Map<string, RunChild>();
+	/**
+	 * Every Run's child, from the moment it starts being spawned.
+	 *
+	 * The promise rather than the child, because a Run is at its most orphanable
+	 * while it is starting: the process exists before `spawn` resolves, and a
+	 * session that ends in that window would otherwise have nothing to stop yet.
+	 * The entry goes in when the spawn starts and is swapped for the child itself
+	 * the moment `onStarted` says there is a process to signal, so a reap that
+	 * lands anywhere in that window has something to take it out on.
+	 */
+	const children = new Map<string, Promise<RunChild>>();
+
+	/**
+	 * Put what a Run has to say into the parent conversation.
+	 *
+	 * `options` is the one thing that differs between the two callers, and it is
+	 * the whole difference between the two: a settled Run's message wakes the
+	 * parent, and an ended Run's waits for it.
+	 */
+	function say(message: ParentMessage, options: { triggerTurn: boolean; deliverAs?: "steer" }): void {
+		const details: SubagentDetails = { run: message.run.name, agent: message.run.agent, task: message.run.task };
+		pi.sendMessage(
+			{
+				customType: message.kind === "question" ? "subagent-question" : "subagent-delivery",
+				content: message.text,
+				display: true,
+				details,
+			},
+			options,
+		);
+	}
+
+	/**
+	 * Stop a Run's child and forget it, resolving once it has gone.
+	 *
+	 * Never rejects, and callers that have nothing to wait for do not have to:
+	 * a child that is already dead is no worse off for being asked to stop, and
+	 * a spawn that threw has nothing to stop.
+	 */
+	function reap(name: string): Promise<void> {
+		const spawning = children.get(name);
+		children.delete(name);
+		return spawning?.then((child) => child.stop()).catch(() => {}) ?? Promise.resolve();
+	}
+
+	/**
+	 * End every Run with the session that owns them — ADR-0001's reap.
+	 *
+	 * Every child is SIGTERMed whatever state its Run is in, Waiting and
+	 * still-starting included, because an orphaned pi burns tokens invisibly with
+	 * no session left to report to. The whole thing is bounded: `RunChild.stop`
+	 * SIGKILLs a child that ignores the SIGTERM, and `REAP_GRACE_MS` bounds the
+	 * one case `stop` cannot reach yet.
+	 *
+	 * Every shutdown reason, deliberately. `/reload` and a session switch both
+	 * build a fresh Supervisor with no children in it, so a child left running
+	 * through one is a child nothing can ever reach again.
+	 */
+	async function endEveryRun(reason: string): Promise<void> {
+		// Started first and awaited last, so that nothing between here and there —
+		// a `sendMessage` into a session already half torn down, say — can be what
+		// stops the children being killed.
+		const reaping = [...children.keys()].map(reap);
+		for (const delivery of supervisor.endAll(reason)) {
+			// Into the conversation, and deliberately without waking it — the one
+			// place this departs from ADR-0002's Delivery policy, which wakes an idle
+			// parent. The parent asked for all of this to stop, and starting a turn to
+			// report that it stopped would be the opposite of what it asked for. It is
+			// on the record for whenever the parent next takes a turn.
+			supervisor.markSaid(delivery.run.name);
+			say(delivery, { triggerTurn: false });
+		}
+		// Waited for, so pi does not exit before the signals are even sent — and
+		// only up to the deadline, so that the last case with nothing to signal
+		// yet, a spawn whose process has not come up, cannot hold the session open.
+		// That one stops itself on arrival instead.
+		await Promise.race([Promise.all(reaping), deadline(REAP_GRACE_MS)]);
+	}
+
+	// Awaited by pi, so the children are gone before the session is.
+	pi.on("session_shutdown", () => endEveryRun("the session is shutting down"));
+
+	// The turn's own AbortSignal is the whole of what says a parent abort
+	// happened — pi has no abort event — so each turn is watched as it starts.
+	// Reaping twice is harmless: the second finds nothing left to end.
+	//
+	// It is the agent's signal rather than the user's finger, and pi aborts the
+	// agent for its own reasons too: a `/compact` issued mid-stream reaps, and a
+	// session being replaced reaps under this reason rather than its own, because
+	// pi aborts just before it emits `session_shutdown`. The second is only a
+	// wording difference. The first is a real one, and there is nothing in pi's
+	// extension API that tells the two aborts apart.
+	pi.on("agent_start", (_event, ctx) => {
+		ctx.signal?.addEventListener(
+			"abort",
+			// Nobody is awaiting this one, so its rejection would be an unhandled
+			// one — and taking the session down over a reap would be worse than the
+			// orphan it was trying to prevent.
+			() => void endEveryRun("the parent turn was aborted").catch(() => {}),
+			{ once: true },
+		);
+	});
 
 	pi.registerTool({
 		name: "subagent",
@@ -211,60 +335,59 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 				// A `subagent_wait` that named this Run collects the message instead,
 				// and returns it as its own result. Saying it here as well would say
 				// it twice, which is the whole of the no-double-delivery rule.
-				if (supervisor.post(message) === "conversation") {
-					pi.sendMessage(
-						{
-							customType: message.kind === "question" ? "subagent-question" : "subagent-delivery",
-							content: message.text,
-							display: true,
-							details: { run: message.run.name, agent: message.run.agent, task: message.run.task },
-						},
-						// Both halves of ADR-0002's Delivery policy in one call, because
-						// which one happens is pi's decision, not this file's: an idle
-						// parent is woken, and a streaming one takes it as a steer, which
-						// pi lands at a turn boundary rather than mid-tool-call.
-						{ triggerTurn: true, deliverAs: "steer" },
-					);
-				}
+				// Both halves of ADR-0002's Delivery policy in one call, because which
+				// one happens is pi's decision, not this file's: an idle parent is
+				// woken, and a streaming one takes it as a steer, which pi lands at a
+				// turn boundary rather than mid-tool-call.
+				if (supervisor.post(message) === "conversation") say(message, { triggerTurn: true, deliverAs: "steer" });
 
 				// A Waiting Run keeps its child: the process stays up, doing nothing but
 				// holding the context an answer lands in. Nothing is killed or reaped.
 				if (message.kind === "question") return;
 
 				// A stopped Run has nothing left to say, and an idle pi child is a
-				// process burning nothing but still holding a slot. Reaping a child
-				// that never settles — SIGTERM on parent abort and on
-				// `session_shutdown`, per ADR-0001 — is 07's job.
-				const finished = children.get(message.run.name);
-				children.delete(message.run.name);
-				// Nothing is waiting on this: the Delivery has already landed, and a
-				// child that is already dead is no worse off for being asked to stop.
-				finished?.stop().catch(() => {});
+				// process burning nothing but still holding a slot.
+				void reap(message.run.name);
 			}
 
 			const details: SubagentDetails = { run: run.name, agent: agent.name, task: params.task };
 
+			// Recorded before it is awaited, not after: a Run that settles or is
+			// reaped while its child is still starting has to have something to
+			// reach the child by, and the promise is the only thing that exists yet.
+			const spawning = spawn({
+				agent,
+				name: run.name,
+				task: params.task,
+				model: params.model,
+				onStarted(child) {
+					// From here the reap has something to kill without waiting for the
+					// whole spawn — which a child that never takes its first prompt would
+					// never finish, leaving a live process nothing could reach. A Run
+					// already reaped inside that window has no entry left to replace, and
+					// its child is stopped on arrival instead.
+					if (children.has(run.name)) children.set(run.name, Promise.resolve(child));
+					else void child.stop().catch(() => {});
+				},
+				onEvent(event) {
+					const message = supervisor.observe(run.name, event);
+					if (message) announce(message);
+				},
+				onExit(exit) {
+					// A child that outlives its Run's Delivery is a Run ending rather than
+					// a Run failing, and the Supervisor says which by returning nothing.
+					const message = supervisor.fail(run.name, { kind: "exit", ...exit });
+					if (message) announce(message);
+				},
+			});
+			children.set(run.name, spawning);
+
 			// Awaited because spawning is the part that can fail in the caller's
 			// face; the Run itself is not waited on — that is the whole point.
-			let child: RunChild;
 			try {
-				child = await spawn({
-					agent,
-					name: run.name,
-					task: params.task,
-					model: params.model,
-					onEvent(event) {
-						const message = supervisor.observe(run.name, event);
-						if (message) announce(message);
-					},
-					onExit(exit) {
-						// A child that outlives its Run's Delivery is a Run ending rather than
-						// a Run failing, and the Supervisor says which by returning nothing.
-						const message = supervisor.fail(run.name, { kind: "exit", ...exit });
-						if (message) announce(message);
-					},
-				});
+				await spawning;
 			} catch (error) {
+				children.delete(run.name);
 				// A Run that never started is still a Run. Throwing here would lose it
 				// mid-registration: its name would address something the session could
 				// neither wait for nor account for. Failing it instead leaves it listed,
@@ -276,9 +399,13 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 				// Marked said for the same reason: a later join naming this Run reports
 				// it without repeating a failure the parent already has.
 				supervisor.markSaid(run.name);
-				return { content: [{ type: "text", text: failure?.text ?? describeError(error) }], details };
+				// `fail` returns nothing for a Run that had already stopped — a Run
+				// reaped while it was starting, whose Delivery has already been said.
+				// Naming it is still worth doing: without that this returns a bare RPC
+				// error that says nothing about which Run it was about.
+				const stopped = `Run \`${run.name}\` (agent \`${agent.name}\`) did not start: ${describeError(error)}`;
+				return { content: [{ type: "text", text: failure?.text ?? stopped }], details };
 			}
-			children.set(run.name, child);
 
 			return {
 				content: [
@@ -305,7 +432,7 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 		promptSnippet: "Wait for subagent runs to come back and collect their results",
 		parameters: SubagentWaitParams,
 
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, signal) {
 			// Deduped, because a name given twice is one Run, and collecting it twice
 			// would report the same result twice inside a single join. Nothing is
 			// filtered out: a blank name is rejected below rather than quietly
@@ -316,8 +443,10 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 			for (const name of named) if (!supervisor.get(name)) throw unknownRun(name, supervisor.list());
 
 			// Joining on nothing settles at once with nothing, which is the honest
-			// answer to a session with no Runs left to wait for.
-			const collected = await supervisor.join(named.length > 0 ? named : supervisor.active().map((run) => run.name));
+			// answer to a session with no Runs left to wait for. The turn goes along
+			// so that an aborted one ends the join rather than stranding it holding
+			// results nobody will read.
+			const collected = await supervisor.join(named.length > 0 ? named : supervisor.active().map((run) => run.name), signal);
 
 			const details: SubagentWaitDetails = {
 				runs: collected.map((message) => ({ run: message.run.name, agent: message.run.agent, state: message.run.state })),
@@ -353,8 +482,8 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 
 			// A waiting Run's child is deliberately still up, so this is a guard
 			// against a lifecycle bug rather than something a caller can provoke.
-			const child = children.get(name);
-			if (!child) throw new Error(`Run \`${name}\` is waiting, but its child is gone, so the answer cannot be delivered.`);
+			const spawning = children.get(name);
+			if (!spawning) throw new Error(`Run \`${name}\` is waiting, but its child is gone, so the answer cannot be delivered.`);
 
 			// The Run leaves Waiting here rather than when its child gets round to
 			// starting a turn: this is the moment the caller can sequence against, so
@@ -364,7 +493,9 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 			const question = run.question;
 			supervisor.answered(name);
 			try {
-				await child.prompt(answer);
+				// A Run cannot be Waiting before its spawn resolved, so this is already
+				// settled; awaiting it is how the child is reached, not a wait.
+				await (await spawning).prompt(answer);
 			} catch (error) {
 				// The answer never reached the child, so the Run is waiting on the same
 				// Question it was. Leaving it running would strand it: no turn was

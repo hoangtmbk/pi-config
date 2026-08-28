@@ -56,7 +56,14 @@ export interface ChildExit {
 export interface RunChild {
 	/** Send a new prompt, starting a fresh turn in the child. */
 	prompt(message: string): Promise<void>;
-	/** Terminate the child and clean up after it. Safe to call twice. */
+	/**
+	 * Terminate the child and clean up after it. Safe to call twice.
+	 *
+	 * The reap ADR-0001 turns on: a SIGTERM, then a SIGKILL for a child still
+	 * standing after the grace period, and it does not resolve until the child is
+	 * on its way out. Bounded on purpose — a parent that waits for its children
+	 * to go must not be one a wedged child can keep from going itself.
+	 */
 	stop(): Promise<void>;
 }
 
@@ -89,6 +96,17 @@ export interface SpawnOptions {
 	 * ignores it is a Run that can be waited on forever.
 	 */
 	onExit?: (exit: ChildExit) => void;
+	/**
+	 * The Run's child, handed over the moment its process can be signalled —
+	 * before the task is sent, and so before this call resolves.
+	 *
+	 * A Run is at its most orphanable while it is starting: spawning is not
+	 * finished until the child has taken its first prompt, and a child too wedged
+	 * to take one would leave the caller nothing to kill. Called once, and never
+	 * synchronously, which is what lets the caller record the spawn first and
+	 * still be sure this lands after it.
+	 */
+	onStarted?: (child: RunChild) => void;
 }
 
 /**
@@ -197,6 +215,10 @@ export async function spawnRun(options: SpawnOptions): Promise<RunChild> {
 	const stop = async () => {
 		if (stopped) return;
 		stopped = true;
+		// `RpcClient.stop` is the SIGTERM, the grace period and the SIGKILL, and it
+		// waits for the child to go — which is the whole reap, so nothing here
+		// repeats it. Skipped for a child already known dead only because that wait
+		// is a grace period spent on a process that can no longer answer.
 		if (!hasExited(client)) await client.stop();
 		await rm(promptDir, { recursive: true, force: true });
 	};
@@ -214,19 +236,25 @@ export async function spawnRun(options: SpawnOptions): Promise<RunChild> {
 		});
 	};
 
+	const child: RunChild = { prompt: (message) => client.prompt(message), stop };
+
 	try {
 		await client.start();
-		const child = processOf(client);
-		child?.once("exit", reportExit);
+		const childProcess = processOf(client);
+		childProcess?.once("exit", reportExit);
 		// A child killed on the way up has already emitted its exit by now, and
 		// nothing would ever hear it: `RpcClient.start` only refuses an exit *code*,
 		// so a signalled child gets this far alive as far as it is concerned.
-		if (hasExited(client)) reportExit(child?.exitCode ?? null, child?.signalCode ?? null);
+		if (hasExited(client)) reportExit(childProcess?.exitCode ?? null, childProcess?.signalCode ?? null);
+		// Handed over here and not a line sooner: `RpcClient` has no process to
+		// signal until `start` has resolved, so a `stop` from before this point
+		// would return having killed nothing and let the child come up behind it.
+		options.onStarted?.(child);
 		await client.prompt(options.task);
 	} catch (error) {
 		await stop();
 		throw error;
 	}
 
-	return { prompt: (message) => client.prompt(message), stop };
+	return child;
 }

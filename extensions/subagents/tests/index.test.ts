@@ -8,7 +8,8 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -19,6 +20,7 @@ import { spawnRun } from "../child.ts";
 import { registerSubagents } from "../index.ts";
 import { ASK_QUESTION_TOOL, type QuestionDetails } from "../supervisor.ts";
 import { AGENT_END, AGENT_START, asked, said, SETTLED } from "./child-events.ts";
+import { pidFrom, reaped } from "./processes.ts";
 
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CHILD = join(TESTS_DIR, "fake-rpc-child.ts");
@@ -112,9 +114,15 @@ interface Parent {
 	streaming: boolean;
 }
 
+/** A pi event handler, as the extension hands it over. */
+type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
+
 /** Records everything the extension says to the parent, and how it lands. */
-function recorder(parent: Parent, tools: RegisteredTool[], sent: SentMessage[]) {
+function recorder(parent: Parent, tools: RegisteredTool[], sent: SentMessage[], handlers: Map<string, Handler[]>) {
 	return {
+		on(event: string, handler: Handler) {
+			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+		},
 		registerTool(tool: unknown) {
 			tools.push(tool as RegisteredTool);
 		},
@@ -130,10 +138,46 @@ function recorder(parent: Parent, tools: RegisteredTool[], sent: SentMessage[]) 
 	};
 }
 
+/**
+ * The parent session's own lifecycle, as far as this extension sees it: a turn
+ * that can be aborted, and a session that can be shut down.
+ *
+ * Both are pi's, not the extension's, so a test drives them by firing the events
+ * the extension subscribed to — the same way pi would.
+ */
+function lifecycle(handlers: Map<string, Handler[]>) {
+	const aborting = new AbortController();
+	const ctx = { signal: aborting.signal } as ExtensionContext;
+
+	async function fire(event: string, payload: Record<string, unknown>): Promise<void> {
+		for (const handler of handlers.get(event) ?? []) await handler({ type: event, ...payload }, ctx);
+	}
+
+	return {
+		/** The turn every tool call in a test runs inside. */
+		aborting,
+		/** Start a turn and abort it, the way a parent session that is interrupted does. */
+		async abortTurn(): Promise<void> {
+			await fire("agent_start", {});
+			aborting.abort();
+			// The reap is started by the abort listener and not awaited by it, so
+			// let it get as far as stopping the children before the test looks.
+			await flush();
+		},
+		/** Shut the session down, the way quitting or `/reload` does. */
+		shutdown: (reason = "quit") => fire("session_shutdown", { reason }),
+	};
+}
+
 const started: RunChild[] = [];
 after(async () => {
 	await Promise.all(started.map((child) => child.stop()));
 });
+
+/** The bare pi a registration test needs: it collects tools and ignores the rest. */
+function bareSession(tools: RegisteredTool[]) {
+	return recorder({ streaming: false }, tools, [], new Map());
+}
 
 /** The tool a test is about, named so a missing registration fails loudly. */
 function requireTool(tools: RegisteredTool[], name: string): RegisteredTool {
@@ -146,8 +190,9 @@ function requireTool(tools: RegisteredTool[], name: string): RegisteredTool {
 function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>, cliPath: string = FAKE_CHILD) {
 	const tools: RegisteredTool[] = [];
 	const sent: SentMessage[] = [];
+	const handlers = new Map<string, Handler[]>();
 	const parent: Parent = { streaming: false };
-	const pi = recorder(parent, tools, sent);
+	const pi = recorder(parent, tools, sent, handlers);
 
 	registerSubagents(pi as unknown as ExtensionAPI, {
 		roster,
@@ -165,6 +210,7 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>, cliP
 		tools,
 		sent,
 		parent,
+		...lifecycle(handlers),
 	};
 }
 
@@ -182,8 +228,9 @@ function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error) {
 		prompts: string[];
 		stops: number;
 	}[] = [];
+	const handlers = new Map<string, Handler[]>();
 	const parent: Parent = { streaming: false };
-	const pi = recorder(parent, tools, sent);
+	const pi = recorder(parent, tools, sent, handlers);
 
 	registerSubagents(pi as unknown as ExtensionAPI, {
 		roster: ROSTER,
@@ -216,12 +263,56 @@ function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error) {
 		sent,
 		spawned,
 		parent,
+		...lifecycle(handlers),
+	};
+}
+
+/**
+ * A parent session whose spawn hangs until a test lets the child arrive.
+ *
+ * The window a Run is at its most orphanable in: its process is starting, so
+ * there is nothing yet for anything to stop.
+ */
+function spawningSession() {
+	const tools: RegisteredTool[] = [];
+	const handlers = new Map<string, Handler[]>();
+	let cameUp = () => {};
+	let arrive = () => {};
+	let stops = 0;
+
+	registerSubagents(recorder({ streaming: false }, tools, [], handlers) as unknown as ExtensionAPI, {
+		roster: ROSTER,
+		spawn: (options) =>
+			new Promise<RunChild>((resolve) => {
+				const child: RunChild = { prompt: async () => {}, stop: async () => void stops++ };
+				cameUp = () => options.onStarted?.(child);
+				arrive = () => resolve(child);
+			}),
+	});
+
+	return {
+		...lifecycle(handlers),
+		/** Start a Run, and leave it starting. */
+		async start(): Promise<void> {
+			void call(requireTool(tools, "subagent"), { agent: "scout", task: "look around" });
+			await flush();
+		},
+		/** Bring the child's process up, the way `spawnRun` does before sending the task. */
+		up: () => cameUp(),
+		/** Let the spawn finish, the way the child taking its first prompt does. */
+		arrive: () => arrive(),
+		/** How many times the child has been stopped. */
+		stops: () => stops,
 	};
 }
 
 /** Call a registered tool the way pi would, and read its text back. */
-async function call(tool: RegisteredTool, params: SubagentParams | SubagentAnswerParams | SubagentWaitParams): Promise<string> {
-	const result = await tool.execute("call-1", params, undefined, undefined, CTX);
+async function call(
+	tool: RegisteredTool,
+	params: SubagentParams | SubagentAnswerParams | SubagentWaitParams,
+	signal?: AbortSignal,
+): Promise<string> {
+	const result = await tool.execute("call-1", params, signal, undefined, CTX);
 	return result.content
 		.map((part) => (part.type === "text" ? part.text : ""))
 		.join("");
@@ -514,10 +605,7 @@ describe("ask_question", () => {
 	it("exists in a Run's own session and nowhere else", () => {
 		const parentTools: RegisteredTool[] = [];
 		const childTools: RegisteredTool[] = [];
-		const collect = (into: RegisteredTool[]) => ({
-			registerTool: (tool: unknown) => into.push(tool as RegisteredTool),
-			sendMessage: () => {},
-		});
+		const collect = (into: RegisteredTool[]) => bareSession(into);
 
 		registerSubagents(collect(parentTools) as unknown as ExtensionAPI, { roster: ROSTER });
 		registerSubagents(collect(childTools) as unknown as ExtensionAPI, { roster: ROSTER, runName: "scout" });
@@ -528,7 +616,7 @@ describe("ask_question", () => {
 
 	it("returns straight away, carrying the Question for the Supervisor to read", async () => {
 		const tools: RegisteredTool[] = [];
-		const pi = { registerTool: (tool: unknown) => tools.push(tool as RegisteredTool), sendMessage: () => {} };
+		const pi = bareSession(tools);
 		registerSubagents(pi as unknown as ExtensionAPI, { roster: ROSTER, runName: "scout" });
 		const askQuestion = tools[0];
 
@@ -546,7 +634,7 @@ describe("ask_question", () => {
 
 	it("refuses an empty question, so the Run keeps working rather than waiting on nothing", async () => {
 		const tools: RegisteredTool[] = [];
-		const pi = { registerTool: (tool: unknown) => tools.push(tool as RegisteredTool), sendMessage: () => {} };
+		const pi = bareSession(tools);
 		registerSubagents(pi as unknown as ExtensionAPI, { roster: ROSTER, runName: "scout" });
 
 		await assert.rejects(
@@ -581,6 +669,10 @@ describe("a Run that asks", () => {
 		await call(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." });
 		spawned[0].emit(AGENT_START);
 		spawned[0].emit(SETTLED);
+		// The reap goes through the child's spawn, which may still be in flight when
+		// a Run settles, so stopping one is always a tick behind settling.
+		await flush();
+
 		assert.equal(spawned[0].stops, 1);
 	});
 
@@ -975,5 +1067,160 @@ describe("no double delivery", () => {
 		assert.match(started, /unknown tool `telepathy`/);
 		assert.match(collected, /Run `scout`.*failed/s);
 		assert.doesNotMatch(collected, /telepathy/);
+	});
+});
+
+describe("a session that ends", () => {
+	it("stops every Run's child when the session shuts down", async () => {
+		const { subagent, spawned, shutdown } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "one" });
+		await call(subagent, { agent: "worker", task: "two" });
+
+		await shutdown();
+
+		assert.deepEqual(spawned.map((child) => child.stops), [1, 1]);
+	});
+
+	it("stops a Waiting Run's child too, which nothing else would ever reap", async () => {
+		const { subagent, spawned, shutdown } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+
+		await shutdown();
+
+		assert.equal(spawned[0].stops, 1);
+	});
+
+	it("stops every Run's child when the parent turn is aborted", async () => {
+		const { subagent, spawned, abortTurn } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "one" });
+		await call(subagent, { agent: "worker", task: "two" });
+
+		await abortTurn();
+
+		assert.deepEqual(spawned.map((child) => child.stops), [1, 1]);
+	});
+
+	it("stops a child that was still being spawned when the session ended", async () => {
+		const session = spawningSession();
+		await session.start();
+
+		const shutting = session.shutdown();
+		session.arrive();
+		await shutting;
+
+		assert.equal(session.stops(), 1, "the child arrived mid-reap, and was stopped as soon as it existed");
+	});
+
+	it("stops a child whose process is up but whose first prompt never comes back", async () => {
+		const session = spawningSession();
+		await session.start();
+		session.up();
+		await flush();
+
+		await session.shutdown();
+
+		assert.equal(session.stops(), 1, "the spawn never finished, and the reap did not wait for it to");
+	});
+
+	it("stops a child that comes up after the session has already gone", async () => {
+		const session = spawningSession();
+		await session.start();
+		await session.shutdown();
+
+		session.up();
+		await flush();
+
+		assert.equal(session.stops(), 1, "nothing was left to reap it, so it stops itself on arrival");
+	});
+
+	it("finishes shutting down while a child is still starting, rather than hanging on it", async () => {
+		const session = spawningSession();
+		await session.start();
+
+		// The process never even comes up, so there is nothing to signal and
+		// nothing to wait for. The session still has to end.
+		await session.shutdown();
+	});
+
+	it("reports every Run it ended, without waking the session it just stopped", async () => {
+		const { subagent, sent, abortTurn } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		await abortTurn();
+
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0].customType, "subagent-delivery");
+		assert.match(sent[0].content, /Run `scout` \(agent `scout`\) failed/);
+		assert.match(sent[0].content, /the parent turn was aborted/);
+		assert.equal(sent[0].landed, "transcript", "the parent asked for everything to stop; saying so must not start a turn");
+	});
+
+	it("says nothing more about a Run that had already delivered", async () => {
+		const { subagent, sent, spawned, shutdown } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(said("Found three call sites."));
+		spawned[0].emit(SETTLED);
+
+		await shutdown();
+
+		assert.equal(sent.length, 1, "a finished Run is not failed on the way out");
+		assert.match(sent[0].content, /Found three call sites\./);
+	});
+
+	it("ends a wait in flight when its turn is aborted, and delivers its Runs elsewhere", async () => {
+		const { subagent, subagentWait, sent, aborting, abortTurn } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		const joined = assert.rejects(
+			call(subagentWait, {}, aborting.signal),
+			"a join whose result nobody will read has to end, not resolve",
+		);
+
+		await abortTurn();
+
+		await joined;
+		assert.equal(sent.length, 1);
+		assert.match(sent[0].content, /Run `scout`.*failed/s);
+		assert.match(sent[0].content, /the parent turn was aborted/);
+	});
+
+	it("keeps working after a shutdown it has already handled", async () => {
+		const { subagent, spawned, shutdown } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		await shutdown();
+		await shutdown();
+
+		assert.equal(spawned[0].stops, 1, "the second shutdown has nothing left to stop");
+	});
+
+	it("leaves no pi process behind, even one that ignores the SIGTERM", async () => {
+		const pidPath = join(mkdtempSync(join(tmpdir(), "subagents-shutdown-")), "pid");
+		const { subagent, shutdown } = fakeSession(ROSTER, {
+			FAKE_RPC_PID_OUT: pidPath,
+			FAKE_RPC_IGNORE_SIGTERM: "1",
+			FAKE_RPC_TURNS: JSON.stringify([[]]),
+		});
+		await call(subagent, { agent: "scout", task: "look around" });
+		const pid = Number(readFileSync(pidPath, "utf-8"));
+
+		await shutdown();
+
+		assert.ok(await reaped(pid), `pid ${pid} was still alive after the session shut down`);
+	});
+
+	it("leaves no pi process behind when the session ends before the Run took its task", async () => {
+		const pidPath = join(mkdtempSync(join(tmpdir(), "subagents-starting-")), "pid");
+		const { subagent, shutdown } = fakeSession(ROSTER, { FAKE_RPC_PID_OUT: pidPath, FAKE_RPC_SILENT: "1" });
+		// The child never acknowledges its first prompt, so this call is still
+		// inside `spawn` — the window where the Run has a process and no handle.
+		const starting = call(subagent, { agent: "scout", task: "look around" });
+		const pid = await pidFrom(pidPath);
+
+		await shutdown();
+
+		assert.ok(await reaped(pid), `pid ${pid} outlived the session that was still starting it`);
+		assert.match(await starting, /Run `scout`.*did not start/s, "the Run that never started is named, not lost");
 	});
 });

@@ -17,6 +17,7 @@ import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { Agent } from "../agents.ts";
 import { type ChildExit, type RunChild, RUN_NAME_ENV, runPreamble, spawnRun } from "../child.ts";
 import { ASK_QUESTION_TOOL } from "../supervisor.ts";
+import { reaped } from "./processes.ts";
 
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CHILD = join(TESTS_DIR, "fake-rpc-child.ts");
@@ -66,6 +67,13 @@ async function spawnFake(
 	started.push(child);
 
 	return { child, events, exited, settledOnce };
+}
+
+/** A Run whose child can be asked about by pid, once it has been stopped. */
+async function spawnWithPid(env: Record<string, string> = {}) {
+	const pidPath = join(mkdtempSync(join(tmpdir(), "subagents-pid-")), "pid");
+	const { child } = await spawnFake({ env: { ...env, FAKE_RPC_PID_OUT: pidPath } });
+	return { child, pid: Number(readFileSync(pidPath, "utf-8")) };
 }
 
 /** The arguments the fake child records for itself when it starts. */
@@ -168,6 +176,22 @@ describe("spawnRun", () => {
 		await child.stop();
 
 		assert.deepEqual(exits, []);
+	});
+
+	it("takes down a child that exits on the SIGTERM, leaving no process behind", async () => {
+		const { child, pid } = await spawnWithPid();
+
+		await child.stop();
+
+		assert.ok(await reaped(pid), `pid ${pid} was still alive after being stopped`);
+	});
+
+	it("kills a child that ignores the SIGTERM, so no pi is left burning tokens", async () => {
+		const { child, pid } = await spawnWithPid({ FAKE_RPC_IGNORE_SIGTERM: "1" });
+
+		await child.stop();
+
+		assert.ok(await reaped(pid), `pid ${pid} survived the SIGTERM it ignored and was never killed`);
 	});
 
 	it("hands the child its task and streams the events back", async () => {
