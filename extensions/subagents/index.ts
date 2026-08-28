@@ -86,7 +86,7 @@ function unanswerableRun(name: string, run: Run | undefined, runs: Run[]): Error
 	return unknownRun(name, runs);
 }
 
-/** What went wrong, from something thrown across a process boundary. */
+/** What went wrong, from whatever a failed spawn threw. */
 function describeError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }

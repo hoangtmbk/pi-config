@@ -25,6 +25,10 @@ export type RunState = "running" | "waiting" | "done" | "failed";
  * Deliberately the two causes that exist, rather than one message string: a
  * child that never started and a child that died are different things for the
  * parent to decide about, and only the second has an exit code to report.
+ *
+ * The `exit` arm mirrors `child.ts`'s `ChildExit` field for field, and the two
+ * have to move together. It is spelled out twice rather than imported, because
+ * this file stays pure and `child.ts` already imports from here.
  */
 export type RunFailure =
 	| { kind: "spawn"; message: string }
