@@ -19,6 +19,7 @@
   "scripts": {
     "test": "tsx --test extensions/*/tests/*.test.ts",
     "typecheck": "tsc --noEmit",
+    "live:subagents": "tsx extensions/subagents/test.ts",
     "live:web-fetch": "tsx extensions/web-fetch/test.ts",
     "live:web-search": "tsx extensions/web-search/test.ts"
   },

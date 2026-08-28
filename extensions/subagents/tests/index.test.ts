@@ -8,7 +8,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, globSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -26,6 +26,14 @@ import { pidFrom, reaped } from "./processes.ts";
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CHILD = join(TESTS_DIR, "fake-rpc-child.ts");
 const REPO_ROOT = join(TESTS_DIR, "..", "..", "..");
+
+/** The manual runner, relative to the repo root — the one file here that needs a real pi. */
+const LIVE_RUNNER = "extensions/subagents/test.ts";
+
+/** The package manifest: what pi loads, and what the scripts run. */
+function manifest(): { pi: { extensions: string[] }; scripts: Record<string, string> } {
+	return JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
+}
 
 function agent(name: string, description: string, extra: Partial<Agent> = {}): Agent {
 	return {
@@ -443,10 +451,27 @@ describe("subagent registration", () => {
 	});
 
 	it("is listed in the package manifest, so a fresh session loads it", () => {
-		const manifest = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")) as {
-			pi: { extensions: string[] };
-		};
-		assert.ok(manifest.pi.extensions.includes("./extensions/subagents/index.ts"), manifest.pi.extensions.join(", "));
+		const { pi } = manifest();
+
+		assert.ok(pi.extensions.includes("./extensions/subagents/index.ts"), pi.extensions.join(", "));
+	});
+
+	it("has a manual runner against real pi that `npm test` cannot reach", () => {
+		const { scripts } = manifest();
+
+		assert.ok(existsSync(join(REPO_ROOT, LIVE_RUNNER)), `expected the manual runner at ${LIVE_RUNNER}`);
+		const live = scripts["live:subagents"] ?? "";
+		assert.ok(live.includes(LIVE_RUNNER), `\`live:subagents\` is how the runner is reached, but it runs: ${live || "nothing"}`);
+
+		// The whole point of the exclusion, checked rather than assumed: every glob
+		// `npm test` runs is expanded here, and the runner is among what none of them
+		// picks up. A suite that spawned real pi would be slow, key-dependent and
+		// flaky — which is what the reference repo's real-pi-in-tmux tests were.
+		const globs = scripts.test.split(/\s+/).filter((argument) => argument.includes("*"));
+		assert.ok(globs.length > 0, `no glob in the test script: ${scripts.test}`);
+		const suite = globs.flatMap((glob) => globSync(glob, { cwd: REPO_ROOT }));
+		assert.ok(suite.length > 0, `the test script's globs (${globs.join(", ")}) match nothing at all`);
+		assert.ok(!suite.includes(LIVE_RUNNER), `${LIVE_RUNNER} is in what \`npm test\` runs: ${suite.join(", ")}`);
 	});
 });
 

@@ -7,6 +7,7 @@ every machine, in one repo that pi can install and update itself.
 
 | Path | What |
 |---|---|
+| `extensions/subagents/` | `subagent`, `subagent_wait`, `subagent_answer` — delegate a task to a child pi session, keep working, answer its questions. See its [README](extensions/subagents/README.md). |
 | `extensions/web-fetch/` | `web_fetch` tool — fetches a URL and returns clean, context-lean markdown. See its [README](extensions/web-fetch/README.md). |
 | `extensions/web-search/` | `web_search` tool — turns a query into ranked Brave results with snippets to triage. Needs a Brave API key. See its [README](extensions/web-search/README.md). |
 | `skills/` | Skills (`<name>/SKILL.md`). Auto-discovered; empty for now. |
@@ -53,6 +54,7 @@ shows what is registered.
 ```bash
 npm test                 # offline suites for every extension
 npm run typecheck        # tsc against pi's real .d.ts (pi-coding-agent is a devDependency for this)
+npm run live:subagents   # subagents' manual runner against real pi (spends tokens)
 npm run live:web-fetch   # web-fetch's manual runner against real URLs
 npm run live:web-search  # web-search's manual runner against real queries (needs a Brave API key)
 ```
