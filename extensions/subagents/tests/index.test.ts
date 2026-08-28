@@ -14,7 +14,7 @@ import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext, JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { Agent, Roster } from "../agents.ts";
-import type { RunChild } from "../child.ts";
+import type { ChildExit, RunChild } from "../child.ts";
 import { spawnRun } from "../child.ts";
 import { registerSubagents } from "../index.ts";
 import { ASK_QUESTION_TOOL, type QuestionDetails } from "../supervisor.ts";
@@ -174,14 +174,27 @@ const CTX = {} as ExtensionContext;
 function stubbedSession() {
 	const tools: RegisteredTool[] = [];
 	const sent: SentMessage[] = [];
-	const spawned: { name: string; emit: (event: JsonAgentSessionEvent) => void; prompts: string[]; stops: number }[] = [];
+	const spawned: {
+		name: string;
+		emit: (event: JsonAgentSessionEvent) => void;
+		/** Kill this Run's child out from under it, the way a crash would. */
+		die: (exit: ChildExit) => void;
+		prompts: string[];
+		stops: number;
+	}[] = [];
 	const parent: Parent = { streaming: false };
 	const pi = recorder(parent, tools, sent);
 
 	registerSubagents(pi as unknown as ExtensionAPI, {
 		roster: ROSTER,
 		async spawn(options) {
-			const child = { name: options.name, emit: options.onEvent, prompts: [] as string[], stops: 0 };
+			const child = {
+				name: options.name,
+				emit: options.onEvent,
+				die: (exit: ChildExit) => options.onExit?.(exit),
+				prompts: [] as string[],
+				stops: 0,
+			};
 			spawned.push(child);
 			return {
 				prompt: async (message: string) => {
@@ -361,6 +374,79 @@ describe("Delivery", () => {
 
 		assert.equal(sent[0].customType, "subagent-question");
 		assert.equal(sent[0].landed, "steer");
+	});
+});
+
+describe("a Run that dies", () => {
+	it("delivers a failed result carrying the exit code and the child's last stderr", async () => {
+		const { subagent, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		spawned[0].emit(AGENT_START);
+		spawned[0].die({ exitCode: 3, stderr: "pi: out of tokens" });
+
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0].customType, "subagent-delivery");
+		assert.match(sent[0].content, /Run `scout` \(agent `scout`\) failed/);
+		assert.match(sent[0].content, /code 3/);
+		assert.match(sent[0].content, /pi: out of tokens/);
+		assert.equal(sent[0].landed, "turn", "a failure wakes an idle parent like any other Delivery");
+	});
+
+	it("delivers a failure rather than an empty success when the child says nothing before dying", async () => {
+		const { subagent, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		spawned[0].die({ signal: "SIGKILL" });
+
+		assert.equal(sent.length, 1);
+		assert.match(sent[0].content, /failed/);
+		assert.match(sent[0].content, /SIGKILL/);
+		assert.doesNotMatch(sent[0].content, /is done/);
+	});
+
+	it("fails a Waiting Run whose child dies, rather than leaving an unanswerable question open", async () => {
+		const { subagent, subagentAnswer, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+
+		spawned[0].die({ exitCode: 1 });
+
+		assert.deepEqual(sent.map((message) => message.customType), ["subagent-question", "subagent-delivery"]);
+		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "The one in src/auth.ts." }), (error: Error) => {
+			assert.match(error.message, /failed/);
+			return true;
+		});
+	});
+
+	it("leaves a Run that has already delivered alone when its child exits afterwards", async () => {
+		const { subagent, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		spawned[0].emit(said("Found three call sites."));
+		spawned[0].emit(SETTLED);
+		spawned[0].die({ exitCode: 3 });
+
+		assert.equal(sent.length, 1, "a finished Run's child exiting is how it ends, not a failure");
+		assert.match(sent[0].content, /Found three call sites\./);
+	});
+
+	it("carries a real child's crash all the way through the RPC stream", async () => {
+		const { subagent, sent } = fakeSession(ROSTER, {
+			FAKE_RPC_TURNS: JSON.stringify([[AGENT_START]]),
+			FAKE_RPC_EXIT_AFTER: "1",
+			FAKE_RPC_EXIT_CODE: "3",
+			FAKE_RPC_STDERR: "pi: out of tokens",
+		});
+
+		await call(subagent, { agent: "scout", task: "count the call sites" });
+		const delivered = await messageAt(sent);
+
+		assert.equal(delivered.customType, "subagent-delivery");
+		assert.match(delivered.content, /Run `scout`.*failed/s);
+		assert.match(delivered.content, /code 3/);
+		assert.match(delivered.content, /out of tokens/);
 	});
 });
 
@@ -664,6 +750,34 @@ describe("subagent_wait", () => {
 		const collected = await joined;
 
 		assert.equal(collected.match(/Found three call sites\./g)?.length, 1);
+	});
+
+	it("collects a failed Run the same way it collects a finished one", async () => {
+		const { subagent, subagentWait, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		const joined = call(subagentWait, { names: ["scout"] });
+		spawned[0].die({ exitCode: 3, stderr: "pi: out of tokens" });
+		const collected = await joined;
+
+		assert.match(collected, /Run `scout`.*failed/s);
+		assert.match(collected, /pi: out of tokens/);
+		assert.deepEqual(sent, [], "a joined failure re-enters the conversation once, as the join's own result");
+	});
+
+	it("stops waiting on a Run that has failed, so a join on everything comes back", async () => {
+		const { subagent, subagentWait, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "one" });
+		await call(subagent, { agent: "worker", task: "two" });
+
+		const joined = call(subagentWait, {});
+		spawned[0].die({ exitCode: 3 });
+		spawned[1].emit(said("second result"));
+		spawned[1].emit(SETTLED);
+		const collected = await joined;
+
+		assert.match(collected, /Run `scout`.*failed/s);
+		assert.match(collected, /Run `worker`.*second result/s);
 	});
 
 	it("collects a real child's result over the RPC stream", async () => {

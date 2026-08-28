@@ -17,7 +17,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type Agent, discoverAgents, type Roster } from "./agents.ts";
 import { type RunChild, RUN_NAME_ENV, type SpawnOptions, spawnRun } from "./child.ts";
-import { ASK_QUESTION_TOOL, type QuestionDetails, type Run, type RunState, Supervisor } from "./supervisor.ts";
+import { ASK_QUESTION_TOOL, type ParentMessage, type QuestionDetails, type Run, type RunState, Supervisor } from "./supervisor.ts";
 
 const SubagentParams = Type.Object({
 	agent: Type.String({ description: "Which agent to run — one of the names listed in this tool's description." }),
@@ -194,6 +194,49 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 
 			const run = supervisor.register(agent.name, params.task, params.name);
 
+			/**
+			 * Say what a settled Run has to say, and clean up after it once it has
+			 * stopped for good.
+			 *
+			 * The same path for a Delivery, a Question and a failure, deliberately: a
+			 * Run that dies is reported exactly like one that succeeds, so nothing
+			 * downstream has to know which of the two happened to handle it.
+			 */
+			function announce(message: ParentMessage): void {
+				// A `subagent_wait` that named this Run collects the message instead,
+				// and returns it as its own result. Saying it here as well would say
+				// it twice, which is the whole of the no-double-delivery rule.
+				if (supervisor.post(message) === "conversation") {
+					pi.sendMessage(
+						{
+							customType: message.kind === "question" ? "subagent-question" : "subagent-delivery",
+							content: message.text,
+							display: true,
+							details: { run: message.run.name, agent: message.run.agent, task: message.run.task },
+						},
+						// Both halves of ADR-0002's Delivery policy in one call, because
+						// which one happens is pi's decision, not this file's: an idle
+						// parent is woken, and a streaming one takes it as a steer, which
+						// pi lands at a turn boundary rather than mid-tool-call.
+						{ triggerTurn: true, deliverAs: "steer" },
+					);
+				}
+
+				// A Waiting Run keeps its child: the process stays up, doing nothing but
+				// holding the context an answer lands in. Nothing is killed or reaped.
+				if (message.kind === "question") return;
+
+				// A stopped Run has nothing left to say, and an idle pi child is a
+				// process burning nothing but still holding a slot. Reaping a child
+				// that never settles — SIGTERM on parent abort and on
+				// `session_shutdown`, per ADR-0001 — is 07's job.
+				const finished = children.get(message.run.name);
+				children.delete(message.run.name);
+				// Nothing is waiting on this: the Delivery has already landed, and a
+				// child that is already dead is no worse off for being asked to stop.
+				finished?.stop().catch(() => {});
+			}
+
 			// Awaited because spawning is the part that can fail in the caller's
 			// face; the Run itself is not waited on — that is the whole point.
 			const child = await spawn({
@@ -203,40 +246,13 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 				model: params.model,
 				onEvent(event) {
 					const message = supervisor.observe(run.name, event);
-					if (!message) return;
-
-					// A `subagent_wait` that named this Run collects the message instead,
-					// and returns it as its own result. Saying it here as well would say
-					// it twice, which is the whole of the no-double-delivery rule.
-					if (supervisor.post(message) === "conversation") {
-						pi.sendMessage(
-							{
-								customType: message.kind === "question" ? "subagent-question" : "subagent-delivery",
-								content: message.text,
-								display: true,
-								details: { run: message.run.name, agent: message.run.agent, task: message.run.task },
-							},
-							// Both halves of ADR-0002's Delivery policy in one call, because
-							// which one happens is pi's decision, not this file's: an idle
-							// parent is woken, and a streaming one takes it as a steer, which
-							// pi lands at a turn boundary rather than mid-tool-call.
-							{ triggerTurn: true, deliverAs: "steer" },
-						);
-					}
-
-					// A Waiting Run keeps its child: the process stays up, doing nothing but
-					// holding the context an answer lands in. Nothing is killed or reaped.
-					if (message.kind === "question") return;
-
-					// A done Run has nothing left to say, and an idle pi child is a
-					// process burning nothing but still holding a slot. Reaping a child
-					// that never settles — SIGTERM on parent abort and on
-					// `session_shutdown`, per ADR-0001 — is 07's job.
-					const finished = children.get(message.run.name);
-					children.delete(message.run.name);
-					// Nothing is waiting on this: the Delivery has already landed, and a
-					// child that dies before it can be asked to is no worse off.
-					finished?.stop().catch(() => {});
+					if (message) announce(message);
+				},
+				onExit(exit) {
+					// A child that outlives its Run's Delivery is a Run ending rather than
+					// a Run failing, and the Supervisor says which by returning nothing.
+					const message = supervisor.fail(run.name, { kind: "exit", ...exit });
+					if (message) announce(message);
 				},
 			});
 			children.set(run.name, child);
