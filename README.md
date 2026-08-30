@@ -48,8 +48,16 @@ cd ~/workspace/pi-config && npm install
 pi install ~/workspace/pi-config
 ```
 
-Don't also install the `git:` form on the same machine, or every tool loads twice. `pi list`
-shows what is registered.
+Use exactly one deployment mechanism. Don't also install the `git:` form, and don't copy these
+extensions into `~/.pi/agent/extensions/`: pi auto-loads that directory separately, so either case
+registers every tool twice. `pi list` shows installed packages, but not auto-discovered copies.
+
+To remove copies left by an older manual deployment while keeping this package installed:
+
+```bash
+rm -rf ~/.pi/agent/extensions/{subagents,web-fetch,web-search}
+pi list
+```
 
 ```bash
 npm test                 # offline suites for every extension

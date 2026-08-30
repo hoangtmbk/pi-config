@@ -41,7 +41,10 @@ pi-config/
 - Dev machine: working copy at `~/workspace/pi-config`, registered with `pi install <path>`
   (local path, no copy; edits are live).
 - Other machines: `pi install git:github.com/hoangtmbk/pi-config`; sync with `pi update --all`.
-- Never both on one machine (double-load).
+- Use exactly one deployment mechanism on each machine: never register both local and `git:`
+  package forms, and never copy package extensions into `~/.pi/agent/extensions/`. Pi discovers
+  that directory independently of packages, so either combination double-loads tools. `pi list`
+  reports registered packages but does not reveal those auto-discovered copies.
 
 ## Explicitly excluded
 
