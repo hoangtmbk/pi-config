@@ -201,7 +201,7 @@ function apply(state: Record<string, FileOp>, path: string, op: "read" | "write"
  * only when its result says it succeeded. Operations are applied in order, so a
  * file read and then written was edited, and one written first was created.
  */
-function fileStateAfter(known: Record<string, FileOp>, span: readonly AgentMessage[]): Record<string, FileOp> {
+export function fileStateAfter(known: Record<string, FileOp>, span: readonly AgentMessage[]): Record<string, FileOp> {
 	const state = { ...known };
 	const succeeded = new Set<string>();
 	for (const message of span) if (message.role === "toolResult" && !message.isError) succeeded.add(message.toolCallId);
@@ -229,7 +229,7 @@ function fileStateAfter(known: Record<string, FileOp>, span: readonly AgentMessa
  * own, its read and modified lists. A pi compaction cannot say which of its
  * modified files were created, so they count as edited.
  */
-function knownFiles(previous: CompactionEntry | undefined): Record<string, FileOp> {
+export function knownFiles(previous: Pick<CompactionEntry, "details" | "fromHook"> | undefined): Record<string, FileOp> {
 	const ours = handoffOf(previous?.details);
 	if (ours) return ours.fileState;
 	const state: Record<string, FileOp> = {};
