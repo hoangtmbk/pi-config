@@ -319,6 +319,7 @@ function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error, refuseSpawnAf
 		agent: string;
 		task: string;
 		model?: string;
+		parentModel?: string;
 		emit: (event: JsonAgentSessionEvent) => void;
 		/** Kill this Run's child out from under it, the way a crash would. */
 		die: (exit: ChildExit) => void;
@@ -347,6 +348,7 @@ function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error, refuseSpawnAf
 				agent: options.agent.name,
 				task: options.task,
 				model: options.model,
+				parentModel: options.parentModel,
 				emit: options.onEvent,
 				die: (exit: ChildExit) => options.onExit?.(exit),
 				prompts: [] as string[],
@@ -553,6 +555,24 @@ describe("subagent", () => {
 		assert.match(delivered.content, /Run `scout`/);
 		assert.match(delivered.content, /Result for: count the call sites/);
 		assert.equal(delivered.triggerTurn, true);
+	});
+
+	it("hands the child the parent's current model, provider and all, for it to fall back to", async () => {
+		const { subagent, spawned } = stubbedSession();
+		const ctx = { model: { provider: "openai-codex", id: "gpt-6-luna" } } as unknown as ExtensionContext;
+
+		await call(subagent, { agent: "scout", task: "look around" }, undefined, ctx);
+
+		assert.equal(spawned[0].parentModel, "openai-codex/gpt-6-luna");
+		assert.equal(spawned[0].model, undefined, "the parent's model is the fallback, not an override of the Agent's");
+	});
+
+	it("hands the child no parent model when the parent has none", async () => {
+		const { subagent, spawned } = stubbedSession();
+
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		assert.equal(spawned[0].parentModel, undefined);
 	});
 
 	it("rejects an unknown agent with the names that would have worked", async () => {
@@ -937,6 +957,20 @@ describe("subagent concurrency", () => {
 		assert.equal(spawned[RUN_SLOTS].task, "rewrite the parser");
 		assert.equal(spawned[RUN_SLOTS].agent, "worker");
 		assert.equal(spawned[RUN_SLOTS].model, "a-bigger-model", "the model override outlives the call that queued the Run");
+	});
+
+	it("starts a queued Run on the parent's model as it was when the Run was asked for", async () => {
+		const { subagent, spawned } = stubbedSession();
+		const ctx = { model: { provider: "anthropic", id: "claude-sonnet-5-5" } } as unknown as ExtensionContext;
+		await fanOut(subagent, RUN_SLOTS);
+		await call(subagent, { agent: "worker", task: "rewrite the parser" }, undefined, ctx);
+
+		// The user switches models while the Run waits for a slot.
+		(ctx as { model: unknown }).model = { provider: "openai-codex", id: "gpt-6-luna" };
+		spawned[0].emit(SETTLED);
+		await flush();
+
+		assert.equal(spawned[RUN_SLOTS].parentModel, "anthropic/claude-sonnet-5-5");
 	});
 
 	it("ends a queued Run with the session, though there is no child to reap", async () => {

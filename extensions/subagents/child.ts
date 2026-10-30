@@ -86,6 +86,16 @@ export interface SpawnOptions {
 	task: string;
 	/** The caller's model override, which beats the Agent's own. */
 	model?: string;
+	/**
+	 * The parent session's model, as `provider/id`: what a Run works on when
+	 * neither the caller nor its Agent names one. Without it the child would get
+	 * pi's configured default, which is not the model the parent is talking to
+	 * once the user has switched.
+	 *
+	 * The provider is carried because a bare id can name the same model under
+	 * several providers, and pi refuses to pick one of those on its own.
+	 */
+	parentModel?: string;
 	/** Where the child works. Defaults to the parent session's directory. */
 	cwd?: string;
 	/**
@@ -217,7 +227,7 @@ export async function spawnRun(options: SpawnOptions): Promise<RunChild> {
 		env: { ...options.env, [RUN_NAME_ENV]: options.name },
 		args: childArgs({
 			tools: options.agent.tools,
-			model: options.model ?? options.agent.model,
+			model: options.model ?? options.agent.model ?? options.parentModel,
 			systemPromptPath,
 		}),
 	});

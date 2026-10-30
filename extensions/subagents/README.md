@@ -82,7 +82,7 @@ Answer in this shape:
 | `name` | yes | What `subagent(agent: …)` addresses, and what its Runs are named after. |
 | `description` | yes | One line. It goes into the `subagent` tool's description, so it is the whole basis on which the model picks this Agent. |
 | `tools` | yes | The exact `--tools` allowlist. `tools: read, grep` and `tools: [read, grep]` are both accepted. |
-| `model` | no | Overrides the parent's model. `subagent(model: …)` overrides this in turn. |
+| `model` | no | Overrides the parent's model. `subagent(model: …)` overrides this in turn. With neither, a Run gets the model the parent was on when it called `subagent` (as `provider/id`; a queued Run keeps that one even if the user switches before it starts), not pi's configured default. |
 
 Two rules are worth stating out loud:
 

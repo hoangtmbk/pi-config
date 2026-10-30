@@ -648,7 +648,7 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 	 * `subagent` call returns it, and an admission from the queue delivers it,
 	 * because by then the call that asked for it is long gone.
 	 */
-	async function startRun(run: Run, agent: Agent, model?: string): Promise<void> {
+	async function startRun(run: Run, agent: Agent, models: { model?: string; parentModel?: string }): Promise<void> {
 		// Recorded before it is awaited, not after: a Run that settles or is reaped
 		// while its child is still starting has to have something to reach the child
 		// by, and the promise is the only thing that exists yet.
@@ -656,7 +656,7 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 			agent,
 			name: run.name,
 			task: run.task,
-			model,
+			...models,
 			onStarted(child) {
 				// From here the reap has something to kill without waiting for the
 				// whole spawn — which a child that never takes its first prompt would
@@ -709,8 +709,9 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 	 *
 	 * The Supervisor owns the queue itself — who goes next, and when a slot frees
 	 * — and this owns the one thing it has no business knowing: what the
-	 * `subagent` call that queued the Run asked for, which is the Agent it named
-	 * and the model it overrode. That call is long gone by the time the Run runs.
+	 * `subagent` call that queued the Run asked for, which is the Agent it named,
+	 * and the model it overrode or the parent was on. That call is long gone by
+	 * the time the Run runs.
 	 */
 	const starters = new Map<string, () => Promise<void>>();
 
@@ -1049,6 +1050,10 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 			// settles, is in its transcript.
 			transcripts.start(run.name);
 			const details: SubagentDetails = { run: run.name, agent: agent.name, task: params.task };
+			// Read now rather than when the child spawns: a queued Run starts later,
+			// and the model it falls back to is the one the parent was on when it
+			// asked for the Run, not whichever the user has switched to since.
+			const models = { model: params.model, parentModel: ctx.model && `${ctx.model.provider}/${ctx.model.id}` };
 			// From here on this Run is something the parent is waiting for, whether
 			// it is queued, starting or already going, so it is on the block.
 			paint();
@@ -1058,7 +1063,7 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 			// nothing about how the parent addresses this Run depends on when its
 			// child comes up.
 			if (run.state === "queued") {
-				starters.set(run.name, () => startRun(run, agent, params.model));
+				starters.set(run.name, () => startRun(run, agent, models));
 				return {
 					content: [
 						{
@@ -1073,7 +1078,7 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 			// Awaited because spawning is the part that can fail in the caller's
 			// face; the Run itself is not waited on — that is the whole point.
 			try {
-				await startRun(run, agent, params.model);
+				await startRun(run, agent, models);
 			} catch (error) {
 				// A Run that never started is still a Run. Throwing here would lose it
 				// mid-registration: its name would address something the session could

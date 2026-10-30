@@ -39,7 +39,14 @@ after(async () => {
 
 /** A Run against the fake child, collecting its events. */
 async function spawnFake(
-	options: { agent?: Agent; name?: string; task?: string; model?: string; env?: Record<string, string> } = {},
+	options: {
+		agent?: Agent;
+		name?: string;
+		task?: string;
+		model?: string;
+		parentModel?: string;
+		env?: Record<string, string>;
+	} = {},
 ) {
 	const events: JsonAgentSessionEvent[] = [];
 	let settled: () => void = () => {};
@@ -56,6 +63,7 @@ async function spawnFake(
 		name: options.name ?? "scout",
 		task: options.task ?? "look around",
 		model: options.model,
+		parentModel: options.parentModel,
 		cliPath: FAKE_CHILD,
 		env: options.env,
 		onEvent(event) {
@@ -134,6 +142,15 @@ describe("spawnRun", () => {
 		);
 	});
 
+	it("falls back to the parent's model only when neither the caller nor the Agent names one", async () => {
+		const parentModel = "parent/model";
+		assert.equal(flagValue(await spawnAndReadArgv({ parentModel }), "--model"), "parent/model");
+		assert.equal(
+			flagValue(await spawnAndReadArgv({ agent: { ...SCOUT, model: "agent/model" }, parentModel }), "--model"),
+			"agent/model",
+		);
+		assert.equal(flagValue(await spawnAndReadArgv({ model: "caller/model", parentModel }), "--model"), "caller/model");
+	});
 
 	it("appends the run preamble and the Agent body as a system prompt, via a temp file", async () => {
 		const argv = await spawnAndReadArgv({ name: "scout-2" });
