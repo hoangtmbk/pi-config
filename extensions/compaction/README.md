@@ -37,7 +37,8 @@ This builds on pi's compaction rather than replacing it
 | warning | 150,000 | The status turns the warning colour, one steer to the agent, and one toast to the user. |
 | forced | 170,000 | Compaction, without ending the run. *(Not yet: today nothing happens.)* |
 
-Pressure is read at every `turn_end`, from `ctx.getContextUsage()`. Three rules decide what a
+The defaults can be changed, per model too, and shrink on a small window; see
+[Configuration](#configuration). Pressure is read at every `turn_end`, from `ctx.getContextUsage()`. Three rules decide what a
 boundary does:
 
 - **A level is crossed while pressure is at or above it**, and re-arms only once pressure falls
@@ -50,6 +51,49 @@ boundary does:
   when Escape lands while tools are running, which is caught by the run's abort signal rather
   than the turn's outcome. A boundary with no reading (no model, or a compaction not yet answered)
   does nothing either.
+
+## Configuration
+
+The levels are set in one top-level `pressureLevels` key of pi's `settings.json` — global
+(`~/.pi/agent/settings.json`) or project (`.pi/settings.json`, when the project is trusted) — and
+read merged, with `pi.getSettings()`, at every `turn_end`:
+
+```json
+{
+  "pressureLevels": {
+    "notice": 120000,
+    "warning": 150000,
+    "forced": 170000,
+    "modelOverrides": { "openai/gpt-6.1-sol": { "forced": 600000 } }
+  }
+}
+```
+
+- **Each level resolves on its own**: the model's override, then the plain setting, then the
+  built-in default. Override keys are exact, case-sensitive `provider/modelId`, as in pi's own
+  `compaction.modelOverrides`. So you can set just one level, for one model.
+- **Scaling on a small window.** If no level came from the model's override, the model reports a
+  window, and `forced` is not below pi's own trigger (window − `compaction.reserveTokens`, resolved
+  per model the way pi does), all three levels are multiplied by one factor so that `forced` sits at
+  85% of the trigger, with the same spacing. On a 128K window with pi's default 16,384 reserve that
+  gives about 67K / 84K / 95K.
+- **A model override is used exactly as written.** One that sets any level is never scaled and
+  never warned about, even past pi's trigger — that is how you leave a model to pi's backstop on
+  purpose.
+- **Bad values fall back.** A level that isn't a positive whole number, a `pressureLevels`,
+  `modelOverrides` or override entry that isn't an object, or a set that isn't strictly
+  notice < warning < forced puts that model on the built-in defaults (still scaled), with one
+  warning naming the bad key, once per distinct problem per session. Bad configuration never
+  throws, and a bad `compaction.reserveTokens` is left to pi to report.
+- **A model switch** re-resolves the levels for the new model at the next turn. A level already
+  past counts as crossed, and only the highest crossed level acts: from a 1M-window model at 100K
+  to a 128K one, that is forced.
+- **When an edit takes effect.** pi reads `settings.json` into memory at startup and again on
+  `/reload`, not on every turn. The extension takes pi's settings as they stand at each turn, so a
+  change is what the next turn goes by once pi has it.
+
+The extension never writes pi's settings and adds nothing under `compaction.*`. Nothing is set per
+Agent or per Run.
 
 ## What the user sees
 
@@ -118,7 +162,7 @@ model call the writers make, the folder for pruned copies, and the clock.
 
 ```
 index.ts        extension entry: registerCompaction, event wiring, steers, footer, toasts
-pressure.ts     the Pressure levels, and which one a boundary acts on   (pure — no pi, no I/O)
+pressure.ts     the Pressure levels from settings, and which one a boundary acts on   (pure)
 status.ts       the status codec, shared with the subagents extension  (pure)
 tests/          offline suite and the recording fake pi
 ```
