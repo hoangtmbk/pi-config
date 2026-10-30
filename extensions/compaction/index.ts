@@ -45,33 +45,36 @@ import {
 import { checkPrunes, planPrunes, type Prune, pruneBatch, pruneDrafts, prunedDir, savePrunes } from "./pruning.ts";
 import { serializedWriter } from "./serialized.ts";
 import { formatStatus, STATUS_KEY, thousands } from "./status.ts";
+import { SELF_COMPACT_TOOL } from "./tools.ts";
 import { type Clock, piDefaultWriter, replyModel, retryPolicy, type StreamFn, SYSTEM_CLOCK, type Writer } from "./writers.ts";
 
 export type { Clock } from "./writers.ts";
 
 /**
- * What a test swaps in for pi's real world. Every field is optional, and every
- * default is the real thing: the default export passes none of them.
+ * What a test, or the replay check, swaps in for pi's real world. Every field
+ * is optional, and every default is the real thing: the default export, which
+ * is what pi loads, passes none of them.
  */
 export interface CompactionOptions {
 	/**
 	 * The model call every writer makes — the forked call, serialized mode and
 	 * pi's own summarizer alike. Defaults to the session's
-	 * `ctx.modelRegistry.streamSimple`. Injected by tests, and by nothing else.
+	 * `ctx.modelRegistry.streamSimple`. Injected by tests, with a scripted
+	 * model, and by the replay check, which meters what each call spends.
 	 */
 	stream?: ExtensionContext["modelRegistry"]["streamSimple"];
 	/**
 	 * The folder Pruning saves full copies into. Defaults to one beside the
 	 * session file, or under the OS temp directory for a session with none (a
-	 * Run). Injected by tests, and by nothing else.
+	 * Run). Injected by tests, and by the replay check, which keeps its
+	 * replayed sessions' copies in a temp folder of its own.
 	 */
 	prunedDir?: string;
 	/** Defaults to the system clock. Injected by tests, and by nothing else. */
 	clock?: Clock;
 }
 
-/** The tool the agent Self-compacts with. Every Run is given it, whatever its Agent's allowlist says. */
-export const SELF_COMPACT_TOOL = "self_compact";
+export { SELF_COMPACT_TOOL } from "./tools.ts";
 
 const SelfCompactParams = Type.Object({
 	note: Type.String({ description: "What you're doing and what you'll do next, in your own words." }),
@@ -210,7 +213,6 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 					...shared,
 					transcript,
 					keptTokens: piCompactionTokens(settings, model, "keepRecentTokens"),
-					selfCompactTool: SELF_COMPACT_TOOL,
 					// As pi's settings manager hands them to the agent.
 					transport: settings.transport ?? "auto",
 					thinkingBudgets: settings.thinkingBudgets,

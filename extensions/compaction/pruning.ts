@@ -23,6 +23,7 @@ import {
 	type ProjectedSessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import type { TextContent, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
+import { NEVER_PRUNED } from "./tools.ts";
 
 /** The session as an extension sees it: read-only. */
 type Session = ExtensionContext["sessionManager"];
@@ -39,14 +40,6 @@ const KEPT_BASH_LINES = 10;
 const KEPT_BASH_CHARS = 2_000;
 /** The longest a command or argument gets in a marker. */
 const LABEL_CHARS = 80;
-
-/**
- * Results that are never pruned, whatever their size or age: a Question's
- * answer is the user's words, a Run's result can't be fetched again and is
- * costly to regenerate, and `self_compact`'s line is what the agent carries on
- * from. Names only, so as not to tie this extension to the subagents one.
- */
-const NEVER_PRUNED = new Set(["ask_question", "subagent", "subagent_wait", "subagent_answer", "self_compact"]);
 
 /** Which results a batch may pick. */
 export type PruneScope = "notice" | "kept-tail";

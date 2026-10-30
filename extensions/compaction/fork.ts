@@ -17,6 +17,7 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Message, Model, ThinkingBudgets, ToolCall, ToolResultMessage, TranscriptContext, Transport, Usage } from "@earendil-works/pi-ai";
 import { forkInstruction, parseReply } from "./instruction.ts";
+import { SELF_COMPACT_TOOL } from "./tools.ts";
 import { type Clock, guardStall, type StreamFn, type Writer } from "./writers.ts";
 
 export interface ForkDeps {
@@ -32,8 +33,6 @@ export interface ForkDeps {
 	transcript: readonly Message[];
 	/** About how much of the newest conversation the compaction keeps. */
 	keptTokens: number;
-	/** The tool Self-compaction is, whose own call is pending while it writes. */
-	selfCompactTool: string;
 }
 
 /** What a call still pending is answered with, so that the request is whole: every call has its result. */
@@ -48,7 +47,7 @@ const PLACEHOLDER = {
  * writing this, and any call beside it that hasn't run: their real results
  * come after the cut, in the kept tail.
  */
-function placeholders(transcript: readonly Message[], selfCompactTool: string): ToolResultMessage[] {
+function placeholders(transcript: readonly Message[]): ToolResultMessage[] {
 	let at = transcript.length - 1;
 	while (at >= 0 && transcript[at]!.role !== "assistant") at--;
 	const last = transcript[at];
@@ -58,7 +57,7 @@ function placeholders(transcript: readonly Message[], selfCompactTool: string): 
 		.filter((part) => part.type === "toolCall" && !answered.has(part.id))
 		.map((call) => {
 			const { id, name } = call as ToolCall;
-			const text = name === selfCompactTool ? PLACEHOLDER.self : PLACEHOLDER.other;
+			const text = name === SELF_COMPACT_TOOL ? PLACEHOLDER.self : PLACEHOLDER.other;
 			return { role: "toolResult", toolCallId: id, toolName: name, content: [{ type: "text", text }], isError: false, timestamp: Date.now() };
 		});
 }
@@ -122,7 +121,7 @@ export function forkWriter(deps: ForkDeps): Writer {
 			});
 			const messages: Message[] = [
 				...deps.transcript,
-				...placeholders(deps.transcript, deps.selfCompactTool),
+				...placeholders(deps.transcript),
 				{ role: "user", content: [{ type: "text", text: instruction }], timestamp: Date.now() },
 			];
 			const reply = await guardStall(deps.stream, deps.clock, async (stream) => {
