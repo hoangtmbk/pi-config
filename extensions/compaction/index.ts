@@ -15,23 +15,21 @@
  * backstop — is the hook path. Both get our Handoff instead of pi's summary (see `handoff.ts`).
  */
 
-import type { Message, ThinkingBudgets, Transport } from "@earendil-works/pi-ai";
+import type { Message } from "@earendil-works/pi-ai";
 import {
 	buildSessionProjection,
 	convertToLlm,
 	type ExtensionAPI,
 	type ExtensionContext,
-	getLatestCompactionEntry,
 	type SessionBeforeCompactEvent,
-	type SessionBoundaryDraft,
-	type SessionEntry,
 	type ProjectedSessionEntry,
 	type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { cutFor } from "./cut.ts";
-import { forkWriter } from "./fork.ts";
-import { type HandoffDetails, type HandoffOutcome, handoffOf, writeHandoff } from "./handoff.ts";
+import { writerChain } from "./chain.ts";
+import { cutFor, keptFrom, seenIn } from "./cut.ts";
+import { type HandoffOutcome, writeHandoff } from "./handoff.ts";
+import { type Compacting, GIVE_UP, type GiveUp, Landing, type OurDraft } from "./landing.ts";
 import {
 	Crossings,
 	Forced,
@@ -44,35 +42,37 @@ import {
 	type SettingsLike,
 } from "./pressure.ts";
 import { checkPrunes, planPrunes, type Prune, pruneBatch, pruneDrafts, prunedDir, savePrunes } from "./pruning.ts";
-import { serializedWriter } from "./serialized.ts";
 import { formatStatus, STATUS_KEY, thousands } from "./status.ts";
-import { type Clock, piDefaultWriter, replyModel, retryPolicy, type StreamFn, SYSTEM_CLOCK, type Writer } from "./writers.ts";
+import { SELF_COMPACT_TOOL } from "./tools.ts";
+import type { Clock } from "./writers.ts";
 
 export type { Clock } from "./writers.ts";
 
 /**
- * What a test swaps in for pi's real world. Every field is optional, and every
- * default is the real thing: the default export passes none of them.
+ * What a test, or the replay check, swaps in for pi's real world. Every field
+ * is optional, and every default is the real thing: the default export, which
+ * is what pi loads, passes none of them.
  */
 export interface CompactionOptions {
 	/**
 	 * The model call every writer makes — the forked call, serialized mode and
 	 * pi's own summarizer alike. Defaults to the session's
-	 * `ctx.modelRegistry.streamSimple`. Injected by tests, and by nothing else.
+	 * `ctx.modelRegistry.streamSimple`. Injected by tests, with a scripted
+	 * model, and by the replay check, which meters what each call spends.
 	 */
 	stream?: ExtensionContext["modelRegistry"]["streamSimple"];
 	/**
 	 * The folder Pruning saves full copies into. Defaults to one beside the
 	 * session file, or under the OS temp directory for a session with none (a
-	 * Run). Injected by tests, and by nothing else.
+	 * Run). Injected by tests, and by the replay check, which keeps its
+	 * replayed sessions' copies in a temp folder of its own.
 	 */
 	prunedDir?: string;
 	/** Defaults to the system clock. Injected by tests, and by nothing else. */
 	clock?: Clock;
 }
 
-/** The tool the agent Self-compacts with. Every Run is given it, whatever its Agent's allowlist says. */
-export const SELF_COMPACT_TOOL = "self_compact";
+export { SELF_COMPACT_TOOL } from "./tools.ts";
 
 const SelfCompactParams = Type.Object({
 	note: Type.String({ description: "What you're doing and what you'll do next, in your own words." }),
@@ -128,6 +128,22 @@ function hasToolCalls(message: TurnEndEvent["message"]): boolean {
 	return message.role === "assistant" && message.content.some((part) => part.type === "toolCall");
 }
 
+/** The Context pressure pi reports, or `undefined` for no reading: no model, or a compaction not yet answered. */
+function pressureOf(ctx: ExtensionContext): number | undefined {
+	return ctx.getContextUsage()?.tokens ?? undefined;
+}
+
+/** Why a compaction at a boundary is happening: forced, at a reading, or the agent's own. */
+type Trigger = { forcedAt: number } | "self";
+
+/** A trigger as pi's working row opens with it. */
+function triggerText(trigger: Trigger): string {
+	return trigger === "self" ? "Self-compacting" : `Compacting at ${thousands(trigger.forcedAt)} (forced)`;
+}
+
+/** Why a compaction didn't happen: the last writer's error, or why one that couldn't land was given up. */
+type Failure = { lastError: string } | GiveUp;
+
 /** The toast that says pi's summarizer, the last writer, wrote the Handoff's judgment part. */
 const PI_DEFAULT_TOAST = "Compaction used pi's default summary; the Handoff may be thinner.";
 
@@ -136,50 +152,17 @@ function line(text: string) {
 	return { content: [{ type: "text" as const, text }], details: undefined };
 }
 
-/** A compaction draft, as a boundary returns it. */
-type CompactionDraft = Extract<SessionBoundaryDraft, { type: "compaction" }>;
-
-/** A compaction draft of ours: always a cut, always our Handoff. */
-type OurDraft = CompactionDraft & { firstKeptEntryId: string; details: HandoffDetails };
-
-/** A compaction of ours at a boundary, with the kept tail's Pruning that goes out with it. */
-interface Compacting {
-	draft: OurDraft;
-	/** Checked and saved: their drafts follow the compaction's. */
-	prunes: Prune[];
-}
-
-/** A compaction of ours sent from a boundary, kept until the next one says whether pi committed it. */
-interface Drafted extends Compacting {
-	/** The newest compaction on the branch when it was drafted, which it was to follow. */
-	after: string | undefined;
-	/** Whether this is already the re-draft of one that sank. */
-	redrafted: boolean;
-}
-
-/** A Self-compaction `execute` has written, waiting for its turn's boundary. */
-interface Prepared extends Compacting {
-	/** The `self_compact` call that wrote it. */
-	toolCallId: string;
-}
-
-/** Why a compaction that sank is given up, in the toast that every writer failing shows. */
-const SUNK_TWICE = "pi dropped it twice, with another extension's invalid draft";
-const CUT_GONE = "its kept tail is no longer on the branch";
-
 export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions = {}): void {
 	const crossings = new Crossings();
 	const forced = new Forced();
-	/** The Self-compaction written during this turn, which its `turn_end` applies. */
-	let prepared: Prepared | undefined;
-	/**
-	 * The compaction last drafted at a boundary, until the next boundary has
-	 * seen whether pi committed it: the whole chain's drafts are dropped if any
-	 * one of them is bad, ours included.
-	 */
-	let drafted: Drafted | undefined;
+	/** Our compactions on the boundary path, from written to committed. */
+	const landing = new Landing();
 	/** The footer text last set, so an unchanged one is not set again. */
 	let shown: string | undefined;
+	/** pi's merged settings as they stand, read afresh wherever they are needed. */
+	const settings = () => pi.getSettings() as SettingsLike;
+	/** Where this session's pruned copies go. */
+	const prunedDirOf = (ctx: ExtensionContext) => options.prunedDir ?? prunedDir(ctx.sessionManager);
 
 	/**
 	 * Tell the agent, once. Escape may clear it from pi's queue unread; it is not
@@ -206,7 +189,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 * next turn goes by. A bad setting is told once, never thrown.
 	 */
 	function levelsFor(ctx: ExtensionContext): Levels {
-		const { levels, problems } = resolveLevels(pi.getSettings() as SettingsLike, ctx.model);
+		const { levels, problems } = resolveLevels(settings(), ctx.model);
 		for (const problem of problems) {
 			if (warned.has(problem)) continue;
 			warned.add(problem);
@@ -215,61 +198,21 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		return levels;
 	}
 
-	function show(ctx: ExtensionContext, text: string | undefined): void {
+	/** Set the footer to `text` exactly, or clear it — only when that changes it. */
+	function setFooter(ctx: ExtensionContext, text: string | undefined): void {
 		if (text === shown) return;
 		shown = text;
 		ctx.ui.setStatus(STATUS_KEY, text);
 	}
 
-	function paint(ctx: ExtensionContext, tokens: number, levels: Levels): void {
-		show(ctx, statusText(ctx, tokens, levels));
-	}
-
-	/**
-	 * The writers for one compaction, in chain order: the forked call, then
-	 * serialized mode, then pi's summarizer. The fork is left out when there is
-	 * no `transcript` — the live context — to send: when it overflowed.
-	 */
-	function writers(ctx: ExtensionContext, branch: readonly SessionEntry[], transcript: readonly Message[] | undefined): Writer[] {
-		const stream: StreamFn = (model, context, streamOptions) =>
-			(options.stream ?? ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry))(model, context, streamOptions);
-		const model = replyModel(ctx, branch);
-		const settings = pi.getSettings() as SettingsLike & { transport?: Transport; thinkingBudgets?: ThinkingBudgets };
-		const window = model?.contextWindow;
-		const shared = {
-			model,
-			thinkingLevel: ctx.thinkingLevel,
-			sessionId: ctx.sessionManager.getSessionId(),
-			stream,
-			clock: options.clock ?? SYSTEM_CLOCK,
-		};
-		const fork = transcript
-			? forkWriter({
-					...shared,
-					transcript,
-					keptTokens: piCompactionTokens(settings, model, "keepRecentTokens"),
-					selfCompactTool: SELF_COMPACT_TOOL,
-					// As pi's settings manager hands them to the agent.
-					transport: settings.transport ?? "auto",
-					thinkingBudgets: settings.thinkingBudgets,
-				})
-			: undefined;
-		return [
-			...(fork ? [fork] : []),
-			// What it sends must leave the room pi keeps back for a reply.
-			serializedWriter({
-				...shared,
-				room: model && window && window > 0 ? window - piCompactionTokens(settings, model, "reserveTokens") : undefined,
-			}),
-			piDefaultWriter({ ...shared, retry: retryPolicy(pi.getSettings()) }),
-		];
+	/** The footer for a reading: the level it is at, or nothing below notice. */
+	function showPressure(ctx: ExtensionContext, tokens: number, levels: Levels): void {
+		setFooter(ctx, statusText(ctx, tokens, levels));
 	}
 
 	/** What a compaction from the hook keeps after the Handoff: the branch from pi's cut on, as the model sees it. */
 	function keptTail(event: SessionBeforeCompactEvent) {
-		const entries = buildSessionProjection(event.branchEntries).entries;
-		const from = entries.findIndex((entry) => entry.sourceEntry.id === event.preparation.firstKeptEntryId);
-		return from < 0 ? [] : entries.slice(from).flatMap((entry) => entry.messages.filter((message) => message.role !== "system"));
+		return seenIn(keptFrom(buildSessionProjection(event.branchEntries).entries, event.preparation.firstKeptEntryId) ?? []);
 	}
 
 	/**
@@ -278,15 +221,16 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 * its parent reads, it says `compacting` instead.
 	 */
 	function showCompacting(ctx: ExtensionContext): void {
-		show(ctx, ctx.mode === "tui" ? undefined : formatStatus("compacting"));
+		setFooter(ctx, ctx.mode === "tui" ? undefined : formatStatus("compacting"));
 	}
 
 	/**
 	 * Every writer failing, or what stands for it: nothing is compacted, the
 	 * user is told why, and forced is disarmed for the rest of the run.
 	 */
-	function giveUp(ctx: ExtensionContext, error: string): void {
-		ctx.ui.notify(`Compaction failed (${error}). Context will keep growing until the next run or pi's own compaction.`, "error");
+	function giveUp(ctx: ExtensionContext, failure: Failure): void {
+		const why = typeof failure === "string" ? GIVE_UP[failure] : failure.lastError;
+		ctx.ui.notify(`Compaction failed (${why}). Context will keep growing until the next run or pi's own compaction.`, "error");
 		forced.disarm();
 	}
 
@@ -301,7 +245,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	function settle(ctx: ExtensionContext, outcome: HandoffOutcome): outcome is Extract<HandoffOutcome, { status: "written" }> {
 		if (outcome.status === "aborted") return false;
 		if (outcome.status === "failed") {
-			giveUp(ctx, outcome.error);
+			giveUp(ctx, { lastError: outcome.error });
 			return false;
 		}
 		if (outcome.details.writer === "pi-default") ctx.ui.notify(PI_DEFAULT_TOAST, "warning");
@@ -345,7 +289,13 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 					focus: event.customInstructions,
 					signal: event.signal,
 				},
-				writers(ctx, event.branchEntries, event.reason === "overflow" ? undefined : convertToLlm(buildSessionProjection(event.branchEntries).messages)),
+				writerChain(
+					ctx,
+					settings(),
+					event.branchEntries,
+					event.reason === "overflow" ? undefined : convertToLlm(buildSessionProjection(event.branchEntries).messages),
+					options,
+				),
 			);
 			if (!settle(ctx, outcome)) return { cancel: true };
 			compacted = true;
@@ -363,7 +313,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 			// After a compaction pi has no reading until the next response, and the
 			// next `turn_end` paints the status again if pressure is still at notice
 			// or above. A compaction that didn't happen changed nothing.
-			show(ctx, compacted ? undefined : before);
+			setFooter(ctx, compacted ? undefined : before);
 		}
 	});
 
@@ -377,7 +327,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		return pruneBatch(event.context.contextEntries, {
 			scope: "notice",
 			cwd: ctx.cwd,
-			dir: options.prunedDir ?? prunedDir(ctx.sessionManager),
+			dir: prunedDirOf(ctx),
 			session: ctx.sessionManager,
 		});
 	}
@@ -391,9 +341,9 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 * extension edited here is left to it. Nothing is saved yet.
 	 */
 	function planKeptTail(entries: readonly ProjectedSessionEntry[], ctx: ExtensionContext, firstKeptEntryId: string, dir: string): Prune[] {
-		const at = entries.findIndex((entry) => entry.sourceEntry.id === firstKeptEntryId);
-		if (at < 0) return [];
-		return checkPrunes(planPrunes(entries.slice(at), { scope: "kept-tail", cwd: ctx.cwd, dir }), ctx.sessionManager);
+		const kept = keptFrom(entries, firstKeptEntryId);
+		if (!kept) return [];
+		return checkPrunes(planPrunes(kept, { scope: "kept-tail", cwd: ctx.cwd, dir }), ctx.sessionManager);
 	}
 
 	/**
@@ -419,28 +369,30 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 * the branch then ends at the assistant message making the call, which the
 	 * kept tail ends in; the context it plans Pruning over and the transcript
 	 * are the session's own projection, since there is no boundary preview yet
-	 * — the previous request plus the call; and the agent's `note` goes to the
-	 * writer.
+	 * — the previous request plus the call; and the agent's `note`, with the
+	 * signal pi handed the tool, comes as `asked`.
 	 */
 	async function compactAtBoundary(
 		context: readonly ProjectedSessionEntry[],
 		transcript: readonly Message[],
 		ctx: ExtensionContext,
-		trigger: string,
-		self: { note: string; signal: AbortSignal | undefined } | undefined = undefined,
+		trigger: Trigger,
+		asked: { note: string; signal: AbortSignal | undefined } | undefined = undefined,
 	): Promise<Compacting | undefined> {
-		const keep = piCompactionTokens(pi.getSettings() as SettingsLike, ctx.model, "keepRecentTokens");
+		const keep = piCompactionTokens(settings(), ctx.model, "keepRecentTokens");
 		const cut = cutFor(ctx.sessionManager.buildSessionProjection(), keep);
 		if (!cut) return undefined;
 		const branch = ctx.sessionManager.getBranch();
-		const dir = options.prunedDir ?? prunedDir(ctx.sessionManager);
+		const dir = prunedDirOf(ctx);
+		const before = shown;
+		let compacting: Compacting | undefined;
 		showCompacting(ctx);
 		try {
-			ctx.ui.setWorkingMessage(`${trigger} · pruning old tool output…`);
+			ctx.ui.setWorkingMessage(`${triggerText(trigger)} · pruning old tool output…`);
 			const prunes = planKeptTail(context, ctx, cut.firstKeptEntryId, dir);
-			ctx.ui.setWorkingMessage(`${trigger} · writing Handoff…`);
-			const request = { span: cut.span, tail: cut.tail, branch, note: self?.note, signal: self ? self.signal : ctx.signal };
-			const outcome = await writeHandoff(request, writers(ctx, branch, transcript));
+			ctx.ui.setWorkingMessage(`${triggerText(trigger)} · writing Handoff…`);
+			const request = { span: cut.span, tail: cut.tail, branch, note: asked?.note, signal: asked ? asked.signal : ctx.signal };
+			const outcome = await writeHandoff(request, writerChain(ctx, settings(), branch, transcript, options));
 			if (!settle(ctx, outcome)) return undefined;
 			const draft: OurDraft = {
 				type: "compaction",
@@ -449,50 +401,16 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 				details: outcome.details,
 				usage: outcome.usage,
 			};
-			return { draft, prunes: prunes.length > 0 ? await savePrunes(prunes, dir) : [] };
+			compacting = { draft, prunes: prunes.length > 0 ? await savePrunes(prunes, dir) : [] };
+			return compacting;
 		} finally {
 			// pi's own text again, rather than ours lingering into the next working row.
 			ctx.ui.setWorkingMessage();
+			// A compaction that didn't happen changed nothing: the status goes back
+			// to what it was, even where no boundary follows to paint it — a
+			// Self-compaction that Escape stopped ends on an aborted turn.
+			if (!compacting) setFooter(ctx, before);
 		}
-	}
-
-	/**
-	 * What became of the compaction drafted at the last boundary.
-	 *
-	 * It landed if the newest compaction on the branch is ours with its number,
-	 * and the warning-pause guard hears of it. It sank if no compaction at all
-	 * has landed since it was drafted — "the newest isn't ours" alone can't say
-	 * so, because the newest may be our previous one — and it is handed back to
-	 * be drafted again. A compaction that someone else landed in between leaves
-	 * it nothing to follow, and it is let go.
-	 */
-	function landing(ctx: ExtensionContext): Drafted | undefined {
-		const was = drafted;
-		drafted = undefined;
-		if (!was) return undefined;
-		const latest = getLatestCompactionEntry(ctx.sessionManager.getBranch());
-		if (handoffOf(latest?.details)?.compactionNo === was.draft.details.compactionNo) {
-			forced.compacted();
-			return undefined;
-		}
-		return latest?.id === was.after ? was : undefined;
-	}
-
-	/**
-	 * A compaction that sank, drafted again: the same Handoff over the same
-	 * cut, with no writer run again, so that a neighbour's bad draft doesn't
-	 * silently lose it. Once only — sunk twice, or with its cut entry gone from
-	 * the branch, it is given up as every writer failing.
-	 *
-	 * Its kept tail's Pruning goes with it, checked again against the branch
-	 * as it stands now: copies already saved, so an edit that would fail is
-	 * dropped with its pair, as at the first try.
-	 */
-	function redraft(ctx: ExtensionContext, sank: Drafted): Compacting | undefined {
-		if (sank.redrafted) return void giveUp(ctx, SUNK_TWICE);
-		const cut = sank.draft.firstKeptEntryId;
-		if (!ctx.sessionManager.getBranch().some((entry) => entry.id === cut)) return void giveUp(ctx, CUT_GONE);
-		return { draft: sank.draft, prunes: checkPrunes(sank.prunes, ctx.sessionManager) };
 	}
 
 	/**
@@ -523,58 +441,65 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		async execute(toolCallId, params, signal, _onUpdate, ctx) {
 			const note = params.note.trim();
 			if (!note) throw new Error("A note cannot be empty. Say what you're doing and what you'll do next.");
-			const tokens = ctx.getContextUsage()?.tokens;
-			if (tokens === null || tokens === undefined || tokens < levelsFor(ctx).notice) return line(SELF_COMPACT.refused);
+			const tokens = pressureOf(ctx);
+			if (tokens === undefined || tokens < levelsFor(ctx).notice) return line(SELF_COMPACT.refused);
 			const projection = ctx.sessionManager.buildSessionProjection();
-			const compacting = await compactAtBoundary(projection.entries, convertToLlm(projection.messages), ctx, "Self-compacting", { note, signal });
+			const compacting = await compactAtBoundary(projection.entries, convertToLlm(projection.messages), ctx, "self", { note, signal });
 			if (!compacting) return line(SELF_COMPACT.failed);
-			prepared = { ...compacting, toolCallId };
+			landing.prepare(compacting, toolCallId);
 			return line(SELF_COMPACT.compacted);
 		},
 	});
 
-	/**
-	 * The Self-compaction this turn's `self_compact` wrote, if any; one from any
-	 * other turn is stale, and let go. Its kept tail's Pruning is checked again
-	 * against the branch, which now holds the turn's tool results too.
-	 */
-	function takePrepared(event: TurnEndEvent, ctx: ExtensionContext): Compacting | undefined {
-		const was = prepared;
-		prepared = undefined;
-		if (!was || event.message.role !== "assistant") return undefined;
-		if (!event.message.content.some((part) => part.type === "toolCall" && part.id === was.toolCallId)) return undefined;
-		return { draft: was.draft, prunes: checkPrunes(was.prunes, ctx.sessionManager) };
-	}
-
 	pi.on("agent_start", () => {
 		forced.rearm();
-		prepared = undefined;
+		landing.newRun();
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
-		const sank = landing(ctx);
-		const self = takePrepared(event, ctx);
+		// The warning-pause guard hears of a compaction of ours that landed.
+		if (landing.settle(ctx.sessionManager)) forced.compacted();
+		const selfCompaction = landing.takePrepared(event, ctx.sessionManager);
 		// A turn that was aborted or failed is not one to act on — not even to
-		// draft again a compaction that sank, which is let go, silently, as Escape
-		// lets go of one being written. The outcome alone misses half of an
-		// Escape: one that lands while tools run ends that turn as "completed",
-		// since the model had finished streaming, and only the turn after it
-		// comes back "aborted". The run's signal says it for both. A
+		// draft again a forced compaction that sank, which is let go, silently,
+		// as Escape lets go of one being written. The outcome alone misses half
+		// of an Escape: one that lands while tools run ends that turn as
+		// "completed", since the model had finished streaming, and only the turn
+		// after it comes back "aborted". The run's signal says it for both. A
 		// Self-compaction already written still lands, though: the agent has been
-		// told it did, and a sibling call cut short doesn't make that untrue.
-		if (event.outcome !== "completed" || (ctx.signal?.aborted && !self)) return;
-		// No reading — no model, or a compaction not yet answered — is no action.
-		const tokens = ctx.getContextUsage()?.tokens;
-		if (tokens === null || tokens === undefined) return;
+		// told it did, and a sibling call cut short doesn't make that untrue. On
+		// a turn that didn't complete at all, it is held for the next that does.
+		// No reading — no model, or a compaction not yet answered — is no action
+		// either.
+		const tokens = pressureOf(ctx);
+		if (event.outcome !== "completed" || (ctx.signal?.aborted && !selfCompaction) || tokens === undefined) {
+			if (selfCompaction) {
+				landing.hold(selfCompaction, ctx.sessionManager);
+				// Not `compacting` until it is drafted: the next boundary paints the status.
+				setFooter(ctx, undefined);
+			}
+			landing.pass();
+			return;
+		}
 		// A level already past after a model switch is simply crossed now, and
 		// only the highest of those acts.
 		const levels = levelsFor(ctx);
-		const enabled = forcedEnabled(pi.getSettings() as SettingsLike);
+		const enabled = forcedEnabled(settings());
+		// Ours never go on top of a compaction an earlier extension drafted here.
+		// A Self-compaction is held for the next boundary, which can see whether
+		// theirs landed.
+		const theirs = event.entries.some((entry) => entry.type === "compaction");
+		if (theirs) {
+			if (selfCompaction) landing.hold(selfCompaction, ctx.sessionManager);
+			landing.pass();
+		}
 		// A Self-compaction written during this turn is this boundary's
-		// compaction, whatever pressure reads now, and newer than any that sank.
-		// Otherwise a compaction that sank is, and given up, it disarms forced
-		// from this boundary on.
-		const again = sank && !self ? redraft(ctx, sank) : undefined;
+		// compaction, whatever pressure reads now, and newer than any held.
+		// Otherwise a compaction held is, and given up, it disarms forced from
+		// this boundary on.
+		const held = selfCompaction || theirs ? undefined : landing.redraft(ctx.sessionManager);
+		if (typeof held === "string") giveUp(ctx, held);
+		const heldCompaction = typeof held === "string" ? undefined : held;
 		const { forces, leftHigh } = forced.observe(tokens, levels, enabled);
 		if (leftHigh) {
 			ctx.ui.notify(`Compaction left context at ${thousands(tokens)}, still above warning. Forced compaction is paused until it drops.`, "warning");
@@ -583,16 +508,15 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		// warning's. When a compaction lands here their steers are moot, but they
 		// still count as crossed, so that neither speaks up later.
 		const steered = { ...levels, forced: Number.POSITIVE_INFINITY };
-		let acts = crossings.observe(tokens, steered);
-		if (self || again || forces) {
-			// Not on top of a compaction an earlier extension drafted here.
-			const compacting = event.entries.some((entry) => entry.type === "compaction")
+		let crossed = crossings.observe(tokens, steered);
+		if (selfCompaction || heldCompaction || forces) {
+			const compacting = theirs
 				? undefined
-				: (self ??
-						again ??
-						(await compactAtBoundary(event.context.contextEntries, event.context.llmMessages, ctx, `Compacting at ${thousands(tokens)} (forced)`)));
+				: (selfCompaction ??
+						heldCompaction ??
+						(await compactAtBoundary(event.context.contextEntries, event.context.llmMessages, ctx, { forcedAt: tokens })));
 			if (!compacting) {
-				paint(ctx, tokens, levels);
+				showPressure(ctx, tokens, levels);
 				return;
 			}
 			// pi has no reading after a compaction until the next response, and the
@@ -600,9 +524,9 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 			// or above. Ours go after the drafts before them, so that they stand,
 			// and pi measures `tokensBefore` with them applied. No notice batch
 			// here: the compaction removes what it would prune.
-			show(ctx, undefined);
+			setFooter(ctx, undefined);
 			const { draft, prunes } = compacting;
-			drafted = { draft, prunes, after: getLatestCompactionEntry(ctx.sessionManager.getBranch())?.id, redrafted: compacting === again };
+			landing.drafting(compacting, ctx.sessionManager, compacting === selfCompaction);
 			return { entries: [...event.entries, draft, ...pruneDrafts(prunes)] };
 		}
 		// Pruning first, so that the agent is steered to Self-compact only once
@@ -610,20 +534,20 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		// last measured usage, not on pi's chars/4 count of the edited context,
 		// which runs high until the next response. Pressure that falls back under
 		// notice re-arms it and sends no steer.
-		const batch = acts === "notice" ? await noticeBatch(event, ctx) : undefined;
+		const batch = crossed === "notice" ? await noticeBatch(event, ctx) : undefined;
 		const reading = tokens - (batch?.freed ?? 0);
 		if (batch) {
 			crossings.observe(reading, steered);
-			if (reading < levels.notice) acts = undefined;
+			if (reading < levels.notice) crossed = undefined;
 		}
-		if (acts === "notice" || acts === "warning") steer(acts, event);
+		if (crossed === "notice" || crossed === "warning") steer(crossed, event);
 		// The one toast on the way up, so that forced never comes as a surprise —
 		// or, with `compaction.enabled: false`, so that nobody expects it.
-		if (acts === "warning") {
+		if (crossed === "warning") {
 			const then = enabled ? `; forced at ${thousands(levels.forced)}` : "";
 			ctx.ui.notify(`Context at ${thousands(tokens)} (warning). The agent has been told it's a good time to compact${then}.`, "warning");
 		}
-		paint(ctx, reading, levels);
+		showPressure(ctx, reading, levels);
 		if (batch) return { entries: [...event.entries, ...batch.drafts] };
 	});
 }

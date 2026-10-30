@@ -102,6 +102,18 @@ read merged, with `pi.getSettings()`, at every `turn_end`:
 The extension never writes pi's settings and adds nothing under `compaction.*`. Nothing is set per
 Agent or per Run.
 
+The Pruning and Handoff numbers are code constants, not settings; the replay check is what tunes
+them:
+
+- the notice Pruning batch's minimum: 20K tokens;
+- the protected window: the newest 40K tokens of tool output;
+- the prunable floor: about 1K tokens;
+- the kept `bash` lines: the last ~10, at most ~2,000 characters of them;
+- the user-message budget: ~20K tokens in all, ~2K for any one message;
+- serialized mode's tool-result cut: head 1,200 + tail 800 characters, halving to a 200 floor;
+- the quote minimum: 12 characters;
+- the stall timeout: 60s with nothing streamed.
+
 ## What the user sees
 
 Below notice, nothing: pi's own footer, its percentage and its 70%/90% colouring are untouched.
@@ -205,7 +217,7 @@ straight after, its next request built from the Handoff and the kept tail.
   drafts the same Handoff over the same cut again, whatever pressure reads, with no writer called.
   Its kept-tail edits go with it, checked again against the branch. Sunk twice, or with its cut
   entry no longer on the branch, it is handled as every writer failing. An aborted or failed turn
-  lets it go silently.
+  lets a forced one go silently (a Self-compaction waits; see below).
 - **Forced is not spent by crossing it.** It acts at every boundary at or above it until a
   compaction lands. Three things hold it back: `compaction.enabled: false`; the **warning-pause
   guard** — once a compaction, on either path, leaves pressure at or above warning, a toast says
@@ -238,6 +250,10 @@ description says nothing about running out or a limit.
   `self_compact` call and result. The notice batch and the steers are skipped at that boundary,
   as when forced lands. If an earlier extension's bad draft sinks it, it is re-drafted once like a
   forced one. One a sibling call's Escape cut short still lands, since the agent was told it did.
+  For the same reason, one its own boundary can't draft — an earlier extension compacts there, or
+  the turn didn't complete — is held, through any boundaries that can't draft it either, and drafted
+  at the first that can; if pi drops it there, it is handled as every writer failing. One that
+  someone else's compaction overtakes in the meantime is let go: the context was compacted.
 - **It returns one plain line**, with no token counts: "Context compacted. The Handoff above
   carries the task; continue from its Next step." on success, and "Compaction failed; carry on,
   and it will be retried at the forced level." when every writer fails (with the same error toast
@@ -265,7 +281,10 @@ writes the judgment part:
 | The judgment part | the writer chain: the forked call, then serialized mode, then pi's own summarizer, `generateSummaryWithUsage`, whose text stands in for the six judgment sections. |
 
 `details` is the record: the summary is rendered from it, and the next compaction merges from the
-previous `details` (user messages, file state, ledger) and never parses old summary text. It is
+previous `details` (user messages, file state, ledger) and never parses old summary text. That is
+the newest compaction of ours, even when one that isn't ours (pi's default after our code threw,
+another extension's) has landed on top: such a summary can't be read back, so the user messages and
+file operations it removed are read from the branch itself, and the ledger carries on growing. It is
 marked as ours by `kind: "handoff"`, and records `compactionNo`, the `writer`, the failed
 `attempts` before it and a `log`. The rendered order is Goal, Constraint ledger, Progress,
 Decisions and why, Open problems, Critical context, File state, User messages (verbatim), Next
@@ -289,8 +308,9 @@ drops (into `details.log`) what fails:
   one space, and the entry is stored that way); case and punctuation are not. Under 12 characters
   it is dropped. Assistant text, tool results and custom messages never pass.
 - An add contained in an active entry is a duplicate.
-- A supersede's `old` must name exactly one active entry, exactly or by a part of it only that entry
-  contains, and its `by` must pass the same check as an add. Otherwise the entry stays in force.
+- A supersede's `old` must match exactly one active entry, exactly (whitespace aside, as above; a
+  part of an entry matches none), and its `by` must pass the same check as an add. Otherwise the
+  entry stays in force.
 - A superseded entry stays in `details` with `supersededBy` (the user's words that replaced it), and
   is left out of the rendered Handoff. Nothing else ever leaves the ledger, and it has no size cap.
 - A reply with no `<ledger>` adds nothing, and is logged; pi's summarizer proposes none.
@@ -343,8 +363,10 @@ does pi fall back to its whole default.
 ## The replay check
 
 Handoff quality is judged by replaying recorded sessions: cut them, compact, and compare the Handoff
-with what really happened next. `replay.ts` is its deterministic half, three plain functions that
-score our Handoff and pi's default summary alike (a "Handoff" there is any compaction entry):
+with what really happened next. Its code is in `replay/`, apart from the modules pi loads, since it
+drives the extension through the offline suite's fake pi. `replay/replay.ts` is its deterministic
+half, three plain functions that score our Handoff and pi's default summary alike: each takes any
+compaction entry, ours or pi's.
 
 | Check | What it reports |
 |---|---|
@@ -420,21 +442,25 @@ model call the writers make, the folder for pruned copies, and the clock.
 
 ```
 index.ts        extension entry: registerCompaction, event wiring, steers, self_compact, footer, toasts
+tools.ts        SELF_COMPACT_TOOL and the never-pruned tool names  (a leaf: imports nothing)
 pressure.ts     the Pressure levels from settings, and which one a boundary acts on   (pure)
-cut.ts          pi's cut for the boundary path, over what the model sees               (pure)
+landing.ts      our boundary compactions from written to committed: Self-compaction's wait, re-drafts
+cut.ts          pi's cut for the boundary path, and what a cut keeps, over what the model sees  (pure)
 pruning.ts      Pruning: picks results, writes markers, checks edits, saves full copies
 status.ts       the status codec, shared with the subagents extension  (pure)
 handoff.ts      the Handoff: its details record, the parts code writes, merging, rendering
 writers.ts      the writer chain, the stall timeout, and pi's summarizer as its last writer
+chain.ts        the writer chain for one compaction, assembled from pi's settings and the session
 instruction.ts  the writer's instruction, in both modes' wording, and the reply parser  (pure)
 fork.ts         the forked call: the live context, placeholder results, the cache-miss check
 serialized.ts   serialized mode: the transcript, the tool-result cut and its halving
-replay.ts       the replay check's deterministic checks  (pure)
-replay-corpus.ts        the manifest, reading a recording, its turn boundaries and the chain of cuts  (pure)
-replay-session.ts       one session replayed in both lanes: ours and pi's default
-replay-continuation.ts  the open-loop continuation: match, feed back, stop at the first difference
-replay-judge.ts         the judge's request and the checked reading of its verdict
-replay-report.ts        the spend, the pass bars and the report
+replay/         the replay check, apart from what pi loads:
+  replay.ts               its deterministic checks  (pure)
+  replay-corpus.ts        the manifest, reading a recording, its turn boundaries and the chain of cuts  (pure)
+  replay-session.ts       one session replayed in both lanes: ours and pi's default
+  replay-continuation.ts  the open-loop continuation: match, feed back, stop at the first difference
+  replay-judge.ts         the judge's request and the checked reading of its verdict
+  replay-report.ts        the spend, the pass bars and the report
 test.ts         the live replay check: `npm run live:compaction`, by hand only
-tests/          offline suite, the recording fake pi and the scripted model call
+tests/          offline suite, the recording fake pi, the scripted model call, pi internals reached by path
 ```

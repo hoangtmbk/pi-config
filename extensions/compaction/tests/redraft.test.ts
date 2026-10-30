@@ -11,8 +11,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { getLatestCompactionEntry, type SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
-// pi's own preparation for `/compact`, reached by path as the fake reaches it: the oracle for the cut.
-import { prepareCompaction } from "../../../node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js";
+// pi's own preparation for `/compact`, as the fake takes it: the oracle for the cut.
+import { prepareCompaction } from "./pi-internals.ts";
 import { registerCompaction } from "../index.ts";
 import { aborted, type FakeSetup, fakePi, said, user } from "./fake-pi.ts";
 import { type Reply, scriptModel } from "./scripted-model.ts";

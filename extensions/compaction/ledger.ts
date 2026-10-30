@@ -82,9 +82,8 @@ export function mergeLedger(input: LedgerInput): { ledger: LedgerEntry[]; log: s
 	for (const proposed of input.proposal?.supersedes ?? []) {
 		const old = norm(proposed.old);
 		const by = norm(proposed.by);
-		// The entry it names exactly, or else the one entry that contains it.
-		const exact = active().filter((entry) => entry.quote === old);
-		const targets = exact.length > 0 || old === "" ? exact : active().filter((entry) => entry.quote.includes(old));
+		// The entry it names exactly, whitespace aside: a part of one names none.
+		const targets = active().filter((entry) => entry.quote === old);
 		if (targets.length !== 1) {
 			const why = targets.length === 0 ? "it matches no active entry" : `it matches ${targets.length} active entries`;
 			log.push(`ledger: dropped supersede of "${old}": ${why}`);

@@ -13,7 +13,7 @@ import { existsSync, globSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { type Boundary, boundariesOf, type CutKind, kindsFor, parseManifest, planCuts, readRecording } from "../replay-corpus.ts";
+import { type Boundary, boundariesOf, type CutKind, kindsFor, parseManifest, planCuts, readRecording } from "../replay/replay-corpus.ts";
 import { MODEL } from "./fake-pi.ts";
 import { padded, recorder } from "./recordings.ts";
 

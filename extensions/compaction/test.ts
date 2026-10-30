@@ -30,10 +30,10 @@
  * Each session is read without being touched, and replayed on the model it
  * recorded, with the credentials pi has for it; a session whose model can't be
  * reached is skipped, and so is one too short for a chain. The judge must be
- * reachable, or nothing runs. What each cut does is in `replay-session.ts`,
- * how cuts are placed in `replay-corpus.ts`, the continuation in
- * `replay-continuation.ts`, the judge in `replay-judge.ts` and the bars in
- * `replay-report.ts` — every one of them tested offline, against a scripted
+ * reachable, or nothing runs. What each cut does is in `replay/replay-session.ts`,
+ * how cuts are placed in `replay/replay-corpus.ts`, the continuation in
+ * `replay/replay-continuation.ts`, the judge in `replay/replay-judge.ts` and the bars in
+ * `replay/replay-report.ts` — every one of them tested offline, against a scripted
  * model, on sessions written for the purpose.
  *
  * Settings are pi's global `settings.json`, as the extension would read them,
@@ -46,10 +46,10 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { kindsFor, parseManifest, readRecording } from "./replay-corpus.ts";
-import type { Side } from "./replay-judge.ts";
-import { Meter, renderReport, score } from "./replay-report.ts";
-import { type SessionResult, replaySession } from "./replay-session.ts";
+import { kindsFor, parseManifest, readRecording } from "./replay/replay-corpus.ts";
+import type { Side } from "./replay/replay-judge.ts";
+import { Meter, renderReport, score } from "./replay/replay-report.ts";
+import { type SessionResult, replaySession } from "./replay/replay-session.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_MANIFEST = join(HERE, "replay-manifest.json");

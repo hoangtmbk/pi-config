@@ -14,6 +14,9 @@
  * session's projection rather than its branch, mapped back to entries that
  * carry what the model sees.
  *
+ * What a cut keeps, as the model sees it, is read the same way on both paths
+ * (`keptFrom`, `seenIn`).
+ *
  * Pure: no pi, no I/O.
  */
 
@@ -55,6 +58,17 @@ function asSeen(projected: ProjectedSessionEntry): SessionEntry {
 	return source;
 }
 
+/** The projected entries a compaction keeps, from `firstKeptEntryId` on, or `undefined` if it isn't among them. */
+export function keptFrom(projected: readonly ProjectedSessionEntry[], firstKeptEntryId: string): ProjectedSessionEntry[] | undefined {
+	const at = projected.findIndex((entry) => entry.sourceEntry.id === firstKeptEntryId);
+	return at < 0 ? undefined : projected.slice(at);
+}
+
+/** What the model sees of `entries`, oldest first: their messages, less system messages and compaction summaries. */
+export function seenIn(entries: readonly ProjectedSessionEntry[]): AgentMessage[] {
+	return entries.flatMap((entry) => (entry.sourceEntry.type === "compaction" ? [] : entry.messages.filter((message) => message.role !== "system")));
+}
+
 /**
  * pi's cut for the session as it stands, keeping about `keepRecentTokens`, or
  * `undefined` when there is nothing to remove — the cases where `/compact`
@@ -73,9 +87,7 @@ export function cutFor(projection: SessionProjection, keepRecentTokens: number):
 	const { firstKeptEntryIndex } = findCutPoint(entries, start, entries.length, keepRecentTokens);
 	const firstKept = projected[firstKeptEntryIndex]?.sourceEntry;
 	if (!firstKept) return undefined;
-	const seen = (from: readonly ProjectedSessionEntry[]) =>
-		from.flatMap((entry) => (entry.sourceEntry.type === "compaction" ? [] : entry.messages.filter((message) => message.role !== "system")));
-	const span = seen(projected.slice(start, firstKeptEntryIndex));
+	const span = seenIn(projected.slice(start, firstKeptEntryIndex));
 	if (span.length === 0) return undefined;
-	return { firstKeptEntryId: firstKept.id, span, tail: seen(projected.slice(firstKeptEntryIndex)) };
+	return { firstKeptEntryId: firstKept.id, span, tail: seenIn(projected.slice(firstKeptEntryIndex)) };
 }

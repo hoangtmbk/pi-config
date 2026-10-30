@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { registerCompaction, SELF_COMPACT_TOOL } from "../index.ts";
 import type { SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
-import { aborted, calling, type FakeSetup, fakePi, result, user } from "./fake-pi.ts";
+import { aborted, assistant, calling, type FakeSetup, fakePi, result, user } from "./fake-pi.ts";
 import { type Reply, scriptModel } from "./scripted-model.ts";
 
 /** A writer's reply in exactly the shape the instruction asks for. */
@@ -155,6 +155,16 @@ describe("the `self_compact` tool", () => {
 		assert.equal(model.calls.length, 2);
 	});
 
+	it("in a Run, says compacting while it writes, and no longer once Escape has stopped it", async () => {
+		const { pi } = selfCompacting([{ text: HANDOFF, during: () => pi.escape() }], { ...SETUP, mode: "rpc" });
+		await history(pi);
+		await pi.turnEnd({ tokens: 125_000, message: calling(SELF_COMPACT_TOOL, { note: NOTE }) });
+		assert.equal(resultText(pi), FAILED);
+		assert.ok(pi.statuses.some((s) => s.text === "ctx compacting"), "the status said compacting while it wrote");
+		// Back as it stood before the call, the last reading being below notice.
+		assert.equal(pi.status(), undefined);
+	});
+
 	it("lands at that turn's boundary in place of the notice Pruning batch and steer", async () => {
 		const { pi } = selfCompacting([{ text: HANDOFF }]);
 		await history(pi);
@@ -234,6 +244,72 @@ describe("a Self-compaction another extension's draft sank", () => {
 		assert.deepEqual(await pi.turnEnd({ tokens: 125_000, message: calling(SELF_COMPACT_TOOL, { note: NOTE }), entries: [bad] }), []);
 		const again = compactionIn(await pi.turnEnd({ tokens: 126_000 }));
 		assert.equal((again?.details as any).note, NOTE);
+		assert.equal(model.calls.length, 1);
+	});
+});
+
+describe("a Self-compaction its own boundary can't draft", () => {
+	/** A neighbour's edit of an entry that doesn't exist: pi drops the whole boundary. */
+	const BAD: SessionBoundaryDraft = { type: "context_edit", targetId: "no-such-entry", replacement: { content: [{ type: "text", text: "x" }] } };
+
+	/** An earlier extension's own compaction at the boundary, keeping the newest entry. */
+	function theirs(pi: ReturnType<typeof fakePi>): SessionBoundaryDraft {
+		return { type: "compaction", summary: "Their summary.", firstKeptEntryId: pi.session.getBranch().at(-1)!.id };
+	}
+
+	it("beside an earlier extension's compaction that sinks, is drafted at the next boundary, as written", async () => {
+		const { pi, model } = selfCompacting([{ text: HANDOFF }]);
+		await history(pi);
+		const call = calling(SELF_COMPACT_TOOL, { note: NOTE });
+		// Theirs is drafted before the turn's results are on the branch, so it keeps the entry before.
+		const drafts = await pi.turnEnd({ tokens: 125_000, message: call, entries: [theirs(pi), BAD] });
+		assert.equal(resultText(pi), COMPACTED);
+		assert.deepEqual(drafts, []);
+		const again = compactionIn(await pi.turnEnd({ tokens: 126_000 }));
+		assert.equal((again?.details as any).note, NOTE);
+		assert.equal(model.calls.length, 1);
+		assert.deepEqual(pi.notifications, []);
+	});
+
+	it("beside an earlier extension's compaction that lands, is let go: the context was compacted", async () => {
+		const { pi, model } = selfCompacting([{ text: HANDOFF }]);
+		await history(pi);
+		const drafts = await pi.turnEnd({ tokens: 125_000, message: calling(SELF_COMPACT_TOOL, { note: NOTE }), entries: [theirs(pi)] });
+		assert.deepEqual(drafts.map((draft) => (draft.type === "compaction" ? draft.summary : draft.type)), ["Their summary."]);
+		pi.commit(drafts);
+		assert.equal(compactionIn(await pi.turnEnd({ tokens: 60_000 })), undefined);
+		assert.deepEqual(pi.notifications, []);
+		assert.equal(model.calls.length, 1);
+	});
+
+	it("on a turn that didn't complete, is drafted at the next boundary that did, however many runs on", async () => {
+		const { pi, model } = selfCompacting([{ text: HANDOFF }]);
+		await history(pi);
+		const cutShort = assistant(calling(SELF_COMPACT_TOOL, { note: NOTE }).content, "aborted");
+		assert.deepEqual(await pi.turnEnd({ tokens: 125_000, message: cutShort }), []);
+		assert.equal(resultText(pi), COMPACTED);
+		pi.escape();
+		assert.deepEqual(await pi.turnEnd({ message: aborted() }), []);
+		await pi.startRun();
+		const again = compactionIn(await pi.turnEnd({ tokens: 126_000 }));
+		assert.equal((again?.details as any).note, NOTE);
+		assert.equal(model.calls.length, 1);
+	});
+
+	it("drafted at the next boundary and sunk there, is given up as every writer failing", async () => {
+		const { pi, model } = selfCompacting([{ text: HANDOFF }]);
+		await history(pi);
+		const cutShort = assistant(calling(SELF_COMPACT_TOOL, { note: NOTE }).content, "aborted");
+		await pi.turnEnd({ tokens: 125_000, message: cutShort });
+		await pi.startRun();
+		assert.deepEqual(await pi.turnEnd({ tokens: 126_000, entries: [BAD] }), []);
+		assert.deepEqual(await pi.turnEnd({ tokens: 127_000 }), []);
+		assert.deepEqual(pi.notifications.filter((n) => n.type === "error"), [
+			{
+				message: "Compaction failed (pi dropped it, with another extension's invalid draft). Context will keep growing until the next run or pi's own compaction.",
+				type: "error",
+			},
+		]);
 		assert.equal(model.calls.length, 1);
 	});
 });

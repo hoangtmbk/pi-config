@@ -183,9 +183,10 @@ describe("a ledger supersede", () => {
 		assert.deepEqual(rendered(summary), ['- "keep the public API unchanged"']);
 	});
 
-	it("may name the entry by part of it, as long as only one entry contains that part", async () => {
-		const { details } = await twoRules(reply([supersede("any new dependencies", "you can use p-retry if it makes this simpler")]));
+	it("names its entry exactly, whitespace aside", async () => {
+		const { details } = await twoRules(reply([supersede("don't  add any\nnew dependencies", "you can use p-retry if it makes this simpler")]));
 		assert.equal(details.ledger[0].supersededBy, "you can use p-retry if it makes this simpler");
+		assert.deepEqual(details.log, []);
 	});
 
 	/** Each way a supersede is dropped, and what is logged for it. */
@@ -193,7 +194,12 @@ describe("a ledger supersede", () => {
 	const DEPS = "don't add any new dependencies";
 	const dropped: [string, string, string, string][] = [
 		["names no active entry", "don't change the CLI flags", P_RETRY, 'ledger: dropped supersede of "don\'t change the CLI flags": it matches no active entry'],
-		["names more than one", "an", P_RETRY, 'ledger: dropped supersede of "an": it matches 2 active entries'],
+		[
+			"names only part of an entry",
+			"any new dependencies",
+			P_RETRY,
+			'ledger: dropped supersede of "any new dependencies": it matches no active entry',
+		],
 		[
 			"quotes the assistant as its by",
 			DEPS,
@@ -326,7 +332,10 @@ describe("the ledger across compactions", () => {
 	it("drops an add contained in an active entry as a duplicate, but keeps one that only a superseded entry contains", async () => {
 		const { pi } = compacting(
 			reply([add("Please don't add any new dependencies, and keep the public API unchanged")]),
-			reply([add("keep the public API unchanged"), supersede("Please don't add any new dependencies", "Actually, p-retry is fine as a dependency")]),
+			reply([
+				add("keep the public API unchanged"),
+				supersede("Please don't add any new dependencies, and keep the public API unchanged", "Actually, p-retry is fine as a dependency"),
+			]),
 			reply([add("don't add any new dependencies"), add("keep the public API unchanged")]),
 		);
 		pi.session.appendMessage(user(RULES));
@@ -388,6 +397,42 @@ describe("the ledger across compactions", () => {
 		assert.deepEqual(fourth.details.ledger, [RETIRED, API, TESTS]);
 		assert.deepEqual(fourth.details.log, []);
 		assert.deepEqual(rendered(fourth.summary), ['- "keep the public API unchanged"', '- "run npm test before you tell me something is done"']);
+	});
+
+	it("still only grows when pi's own compaction lands on top of ours: carried from our newest, with what pi's removed gathered from the branch", async () => {
+		const { pi } = compacting(
+			reply([add("don't add any new dependencies")]),
+			// Its quote is from a message only pi's compaction removed.
+			reply([add("Use exponential backoff, capped at 30s")]),
+		);
+		pi.session.appendMessage(user(RULES));
+		const read = calling("read", { path: "src/a.ts" });
+		await pi.turnEnd({ message: read, toolResults: [result(read)] });
+		await pi.turnEnd({ message: said("On it.") });
+		await compact(pi);
+
+		// pi's default, as it lands when our code throws: its summary, its file lists, no record of ours.
+		pi.session.appendMessage(user("Use exponential backoff, capped at 30s."));
+		const write = calling("write", { path: "src/retry.ts", content: "export {}" });
+		await pi.turnEnd({ message: write, toolResults: [result(write)] });
+		await pi.turnEnd({ message: said("Wrote it.") });
+		const kept = pi.session.getBranch().at(-1)!.id;
+		pi.session.appendCompaction("pi's summary of the retry work.", kept, 50_000, { readFiles: [], modifiedFiles: ["src/retry.ts"] }, false);
+
+		pi.session.appendMessage(user("Now wire it in."));
+		const edit = calling("edit", { path: "src/fetch.ts", oldText: "a", newText: "b" });
+		await pi.turnEnd({ message: edit, toolResults: [result(edit)] });
+		await pi.turnEnd({ message: said("Wired.") });
+		const { details } = await compact(pi);
+
+		assert.equal(details.compactionNo, 3);
+		assert.deepEqual(details.ledger, [
+			{ quote: "don't add any new dependencies", kind: "constraint" },
+			{ quote: "Use exponential backoff, capped at 30s", kind: "constraint" },
+		]);
+		assert.deepEqual(details.log, []);
+		assert.deepEqual(details.userMessages, [RULES, "Use exponential backoff, capped at 30s.", "Now wire it in."]);
+		assert.deepEqual(details.fileState, { "src/a.ts": "read", "src/retry.ts": "created", "src/fetch.ts": "edited" });
 	});
 
 	it("has no size cap", async () => {

@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { type JudgeCase, judgeCut, judgeRequest, parseVerdict } from "../replay-judge.ts";
+import { type JudgeCase, judgeCut, judgeRequest, parseVerdict } from "../replay/replay-judge.ts";
 import { assistant, MODEL, result, user } from "./fake-pi.ts";
 import { scriptModel } from "./scripted-model.ts";
 
