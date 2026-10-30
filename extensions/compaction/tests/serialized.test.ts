@@ -402,6 +402,36 @@ describe("Escape while serialized mode writes", () => {
 	});
 });
 
+describe("on the boundary path", () => {
+	/** A forced compaction at the boundary of the turn that says `last`: the compaction it drafted, if any. */
+	async function forced(pi: ReturnType<typeof fakePi>, last: string) {
+		await session(pi);
+		const drafts = await pi.turnEnd({ tokens: 172_000, message: said(last) });
+		return drafts.find((draft) => draft.type === "compaction") as { details: any; summary: string } | undefined;
+	}
+
+	it("a forced compaction gets its Handoff from serialized mode, over pi's cut and the kept tail", async () => {
+		const { pi, model } = compacting([{ text: HANDOFF }]);
+		const compaction = await forced(pi, "Wired it in.");
+		assert.equal(compaction?.details.writer, "serialized");
+		assert.deepEqual(compaction?.details.attempts, []);
+		assert.equal(compaction?.details.sections.nextStep, 'Wire the wrapper into fetch(). "Go ahead."');
+		const [text] = request(model).users as [string];
+		assert.match(text, /<conversation>\n\[User\]: Add retries to the fetcher\.[^]*\[User\]: Go ahead\.[^]*<\/conversation>/);
+		assert.match(text, /<kept-tail>\n\[Assistant\]: Wired it in\.\n<\/kept-tail>/);
+		// Writers stop on the run's own signal there.
+		assert.equal(model.calls[0]?.options?.signal?.aborted, false);
+	});
+
+	it("falls through to pi's summarizer when serialized mode can't write it", async () => {
+		const { pi } = compacting([{ text: "I'll keep going." }, { text: PI_SUMMARY }]);
+		const compaction = await forced(pi, "Wired it in.");
+		assert.equal(compaction?.details.writer, "pi-default");
+		assert.deepEqual(compaction?.details.attempts, [{ writer: "serialized", reason: "the reply has no <handoff> block" }]);
+		assert.deepEqual(compaction?.details.sections, { piDefault: PI_SUMMARY });
+	});
+});
+
 describe("when every writer fails", () => {
 	it("compacts nothing, and an error toast names the last error", async () => {
 		const { pi } = compacting([{ text: "No Handoff here." }, { errorMessage: "invalid_request_error: prompt is too long" }]);
