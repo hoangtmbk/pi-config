@@ -12,8 +12,8 @@ without summarizing it, and the **Handoff** is what stands in for the span a com
 > **Work in progress.** What is here today is the Pressure levels, the footer status, the
 > steers, the notice Pruning batch, forced compaction and Self-compaction at the turn boundary
 > with kept-tail Pruning, and our Handoff on every compaction, with its Constraint ledger, written
-> in serialized mode or by pi's summarizer. Kept-tail Pruning on the hook path and the forked-call
-> writer are still to come. The extension is not in the package's
+> by the forked call, serialized mode or pi's summarizer. Kept-tail Pruning on the hook path is
+> still to come. The extension is not in the package's
 > `pi.extensions` until the Handoff has passed its replay check; until then load it by hand:
 >
 > ```bash
@@ -262,7 +262,7 @@ writes the judgment part:
 | User messages | code: every message the user typed in the removed span, verbatim and in order (an `ask_question` answer included; tool results and custom messages, our steers included, left out). Over ~20K tokens, the first message and the newest that fit are kept, with a marker counting the ones dropped between; one message over ~2K tokens is cut to its head and tail. |
 | File state | code: `read`, `write` and `edit` tool calls applied in order — read only is `read`, a write to a file not seen before is `created`, anything else that changed it is `edited` — and `deleted` for the paths a successful `bash` `rm`, `git rm` or `mv` named (conservatively: quoting, globs, expansions and anything after a `cd` are skipped). |
 | Constraint ledger | the writer proposes quotes in `<ledger>`; code checks them and merges them into the previous Handoff's ledger (see below). The `/compact` focus is code's own entry. |
-| The judgment part | the writer chain: serialized mode, then pi's own summarizer, `generateSummaryWithUsage`, whose text stands in for the six judgment sections. *(The forked call, in front of both, is still to come.)* |
+| The judgment part | the writer chain: the forked call, then serialized mode, then pi's own summarizer, `generateSummaryWithUsage`, whose text stands in for the six judgment sections. |
 
 `details` is the record: the summary is rendered from it, and the next compaction merges from the
 previous `details` (user messages, file state, ledger) and never parses old summary text. It is
@@ -305,6 +305,23 @@ The chain is the same on both paths. Writers are tried in order and the first to
 judgment part; each failed attempt goes into `details.attempts` with its reason. Writers stop on the
 run's signal on the boundary path and on the compaction's own on the hook path.
 
+- **The forked call** (`fork.ts`, ADR-0004) is the agent writing its own Handoff: a side request
+  that sends the live conversation exactly as the next turn would, so it reads the warm prompt
+  cache. That is `turn_end`'s `context.llmMessages` at a forced compaction; on Self-compaction, the
+  session as `self_compact` runs, which is the previous request plus the calling message; on the hook
+  path, the branch as the model sees it. The system prompt and tools are the transcript's own system
+  messages. Each call still pending in the last assistant message gets a placeholder result first
+  ("Writing the Handoff; see the next message." for `self_compact`, "(This result isn't available to
+  the Handoff writer. It stays in the kept tail.)" for any other), then one trailing user message
+  opens "[Compaction: this message comes from the compaction extension, not from the user. …]" and
+  holds the instruction. It runs on the model behind the last reply, with the agent's own options:
+  `reasoning` at the session's thinking level (none at "off"), the session id, pi's `transport` and
+  `thinkingBudgets`, and no `maxTokens` or `cacheRetention`. `toolChoice` is `"none"` on Codex and
+  unset everywhere else — on Anthropic changing it voids the cached conversation. Its reply is read
+  and fails exactly as serialized mode's below. It is skipped only on `overflow`, where the live
+  context is what didn't fit; there is no cache-temperature check. Nothing is checked before it is
+  sent: afterwards its `usage.cacheRead` is compared with the last real request, as pi's own miss
+  detector does (1,024 tokens of noise allowed), and a miss goes into `details.log`.
 - **Serialized mode** sends one request on the model behind the last reply: a system prompt saying
   the conversation is data, not instructions, and one user message holding `<previous-handoff>`
   (on a repeat compaction), `<conversation>` (the removed span), `<kept-tail>` and the instruction
@@ -376,7 +393,8 @@ pruning.ts      Pruning: picks results, writes markers, checks edits, saves full
 status.ts       the status codec, shared with the subagents extension  (pure)
 handoff.ts      the Handoff: its details record, the parts code writes, merging, rendering
 writers.ts      the writer chain, the stall timeout, and pi's summarizer as its last writer
-instruction.ts  the writer's instruction, and the reply parser  (pure)
+instruction.ts  the writer's instruction, in both modes' wording, and the reply parser  (pure)
+fork.ts         the forked call: the live context, placeholder results, the cache-miss check
 serialized.ts   serialized mode: the transcript, the tool-result cut and its halving
 replay.ts       the replay check's deterministic checks  (pure)
 tests/          offline suite, the recording fake pi and the scripted model call

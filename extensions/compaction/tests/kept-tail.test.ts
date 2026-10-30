@@ -22,7 +22,7 @@ import { type Reply, scriptModel } from "./scripted-model.ts";
 
 const PI_SUMMARY = "## Goal\nAdd retries to the fetcher.\n\n## Progress\n- Wrote the wrapper.";
 
-/** What serialized mode gets here: a reply it can't use, so that pi's summarizer, next in the chain, writes. */
+/** What the forked call and serialized mode get here: a reply neither can use, so that pi's summarizer, last in the chain, writes. */
 const NO_HANDOFF: Reply = { text: "I'll carry on with the fetcher." };
 
 /** A kept tail that holds the last few tool turns, and not the asks before them. */
@@ -47,7 +47,7 @@ afterEach(() => {
  * next of `replies`, and its pruned copies in a temp dir.
  */
 function compacting(replies: Reply[] = [{ text: PI_SUMMARY }], setup: FakeSetup = SETUP) {
-	const model = scriptModel(...replies.flatMap((reply) => [NO_HANDOFF, reply]));
+	const model = scriptModel(...replies.flatMap((reply) => [NO_HANDOFF, NO_HANDOFF, reply]));
 	const dir = folder();
 	const pi = fakePi(setup, (api) => registerCompaction(api, { stream: model.stream, prunedDir: dir }));
 	return Object.assign(pi, { dir, script: model });

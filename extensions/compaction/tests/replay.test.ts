@@ -23,16 +23,16 @@ import { type Reply, scriptModel } from "./scripted-model.ts";
 /** pi's summarizer's reply, in pi's own headings. */
 const PI_SUMMARY = "## Goal\nAdd retries to the fetcher.\n\n## Progress\n- Wrote the wrapper.";
 
-/** What serialized mode gets here: a reply it can't use, so that pi's summarizer, next in the chain, writes. */
+/** What the forked call and serialized mode get here: a reply neither can use, so that pi's summarizer, last in the chain, writes. */
 const NO_HANDOFF: Reply = { text: "I'll carry on with the fetcher." };
 
 /**
  * A fake pi with the extension on it, keeping only the newest message or so,
  * and pi's summarizer scripted to answer each compaction with the next of
- * `replies` (serialized mode, ahead of it, failing each time).
+ * `replies` (the forked call and serialized mode, ahead of it, failing each time).
  */
 function session(replies: Reply[] = [{ text: PI_SUMMARY }]): FakePi {
-	const model = scriptModel(...replies.flatMap((reply) => [NO_HANDOFF, reply]));
+	const model = scriptModel(...replies.flatMap((reply) => [NO_HANDOFF, NO_HANDOFF, reply]));
 	return fakePi({ settings: { compaction: { keepRecentTokens: 1 }, retry: { enabled: false } } }, (api) => registerCompaction(api, { stream: model.stream }));
 }
 

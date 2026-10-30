@@ -15,8 +15,10 @@
  * backstop — is the hook path. Both get our Handoff instead of pi's summary (see `handoff.ts`).
  */
 
+import type { Message, ThinkingBudgets, Transport } from "@earendil-works/pi-ai";
 import {
 	buildSessionProjection,
+	convertToLlm,
 	type ExtensionAPI,
 	type ExtensionContext,
 	getLatestCompactionEntry,
@@ -28,6 +30,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { cutFor } from "./cut.ts";
+import { forkWriter } from "./fork.ts";
 import { type HandoffDetails, type HandoffOutcome, handoffOf, writeHandoff } from "./handoff.ts";
 import {
 	Crossings,
@@ -223,14 +226,15 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	}
 
 	/**
-	 * The writers for one compaction, in chain order: serialized mode, then
-	 * pi's summarizer. The forked call goes in front of them.
+	 * The writers for one compaction, in chain order: the forked call, then
+	 * serialized mode, then pi's summarizer. The fork is left out when there is
+	 * no `transcript` — the live context — to send: when it overflowed.
 	 */
-	function writers(ctx: ExtensionContext, branch: readonly SessionEntry[]): Writer[] {
+	function writers(ctx: ExtensionContext, branch: readonly SessionEntry[], transcript: readonly Message[] | undefined): Writer[] {
 		const stream: StreamFn = (model, context, streamOptions) =>
 			(options.stream ?? ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry))(model, context, streamOptions);
 		const model = replyModel(ctx, branch);
-		const settings = pi.getSettings() as SettingsLike;
+		const settings = pi.getSettings() as SettingsLike & { transport?: Transport; thinkingBudgets?: ThinkingBudgets };
 		const window = model?.contextWindow;
 		const shared = {
 			model,
@@ -239,7 +243,19 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 			stream,
 			clock: options.clock ?? SYSTEM_CLOCK,
 		};
+		const fork = transcript
+			? forkWriter({
+					...shared,
+					transcript,
+					keptTokens: piCompactionTokens(settings, model, "keepRecentTokens"),
+					selfCompactTool: SELF_COMPACT_TOOL,
+					// As pi's settings manager hands them to the agent.
+					transport: settings.transport ?? "auto",
+					thinkingBudgets: settings.thinkingBudgets,
+				})
+			: undefined;
 		return [
+			...(fork ? [fork] : []),
 			// What it sends must leave the room pi keeps back for a reply.
 			serializedWriter({
 				...shared,
@@ -300,6 +316,10 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 * turn's start. Writers stop on the event's signal: `/compact` has already
 	 * aborted the run, and Escape here aborts the compaction, not the run.
 	 *
+	 * The forked call sends the branch as the model sees it, which is what the
+	 * next request would send — except on overflow, where that is exactly what
+	 * didn't fit, and the chain starts at serialized mode.
+	 *
 	 * While it writes, the footer status is cleared, so that only pi's own
 	 * compaction indicator shows. Pi's indicator is not ours to relabel:
 	 * `setWorkingMessage` reaches only pi's working row, which a compaction
@@ -325,7 +345,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 					focus: event.customInstructions,
 					signal: event.signal,
 				},
-				writers(ctx, event.branchEntries),
+				writers(ctx, event.branchEntries, event.reason === "overflow" ? undefined : convertToLlm(buildSessionProjection(event.branchEntries).messages)),
 			);
 			if (!settle(ctx, outcome)) return { cancel: true };
 			compacted = true;
@@ -392,14 +412,19 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 * signal — or the signal pi hands `self_compact`, which is the run's: Escape
 	 * here stops the run, and the compaction with it.
 	 *
+	 * `transcript` is what the forked call sends: the live context, as the
+	 * next request would. At a boundary that is the context pi previews there.
+	 *
 	 * Self-compaction drafts it from inside its tool call, before the boundary:
 	 * the branch then ends at the assistant message making the call, which the
-	 * kept tail ends in; the context it plans Pruning over is the session's own
-	 * projection, since there is no boundary preview yet; and the agent's
-	 * `note` goes to the writer.
+	 * kept tail ends in; the context it plans Pruning over and the transcript
+	 * are the session's own projection, since there is no boundary preview yet
+	 * — the previous request plus the call; and the agent's `note` goes to the
+	 * writer.
 	 */
 	async function compactAtBoundary(
 		context: readonly ProjectedSessionEntry[],
+		transcript: readonly Message[],
 		ctx: ExtensionContext,
 		trigger: string,
 		self: { note: string; signal: AbortSignal | undefined } | undefined = undefined,
@@ -415,7 +440,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 			const prunes = planKeptTail(context, ctx, cut.firstKeptEntryId, dir);
 			ctx.ui.setWorkingMessage(`${trigger} · writing Handoff…`);
 			const request = { span: cut.span, tail: cut.tail, branch, note: self?.note, signal: self ? self.signal : ctx.signal };
-			const outcome = await writeHandoff(request, writers(ctx, branch));
+			const outcome = await writeHandoff(request, writers(ctx, branch, transcript));
 			if (!settle(ctx, outcome)) return undefined;
 			const draft: OurDraft = {
 				type: "compaction",
@@ -500,8 +525,8 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 			if (!note) throw new Error("A note cannot be empty. Say what you're doing and what you'll do next.");
 			const tokens = ctx.getContextUsage()?.tokens;
 			if (tokens === null || tokens === undefined || tokens < levelsFor(ctx).notice) return line(SELF_COMPACT.refused);
-			const context = ctx.sessionManager.buildSessionProjection().entries;
-			const compacting = await compactAtBoundary(context, ctx, "Self-compacting", { note, signal });
+			const projection = ctx.sessionManager.buildSessionProjection();
+			const compacting = await compactAtBoundary(projection.entries, convertToLlm(projection.messages), ctx, "Self-compacting", { note, signal });
 			if (!compacting) return line(SELF_COMPACT.failed);
 			prepared = { ...compacting, toolCallId };
 			return line(SELF_COMPACT.compacted);
@@ -563,7 +588,9 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 			// Not on top of a compaction an earlier extension drafted here.
 			const compacting = event.entries.some((entry) => entry.type === "compaction")
 				? undefined
-				: (self ?? again ?? (await compactAtBoundary(event.context.contextEntries, ctx, `Compacting at ${thousands(tokens)} (forced)`)));
+				: (self ??
+						again ??
+						(await compactAtBoundary(event.context.contextEntries, event.context.llmMessages, ctx, `Compacting at ${thousands(tokens)} (forced)`)));
 			if (!compacting) {
 				paint(ctx, tokens, levels);
 				return;

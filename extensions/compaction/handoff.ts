@@ -370,7 +370,7 @@ export async function writeHandoff(request: HandoffRequest, writers: readonly Wr
 		fileState: fileStateAfter(knownFiles(previousEntry), request.span),
 		...(request.note === undefined ? {} : { note: request.note }),
 		sections: chain.written.judgment,
-		log: merged.log,
+		log: [...(chain.written.log ?? []), ...merged.log],
 	};
 	return { status: "written", summary: renderHandoff(details), details, usage: chain.written.usage };
 }

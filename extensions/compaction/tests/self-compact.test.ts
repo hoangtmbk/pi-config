@@ -19,7 +19,7 @@ import type { SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { aborted, calling, type FakeSetup, fakePi, result, user } from "./fake-pi.ts";
 import { type Reply, scriptModel } from "./scripted-model.ts";
 
-/** A serialized-mode reply in exactly the shape the instruction asks for. */
+/** A writer's reply in exactly the shape the instruction asks for. */
 const HANDOFF = [
 	"<handoff>",
 	"## Goal",
@@ -96,7 +96,7 @@ describe("the `self_compact` tool", () => {
 		const compaction = compactionIn(drafts);
 		assert.ok(compaction, "a compaction was drafted");
 		assert.equal((compaction.details as any).kind, "handoff");
-		assert.equal((compaction.details as any).writer, "serialized");
+		assert.equal((compaction.details as any).writer, "fork");
 		assert.match(compaction.summary, /Add retries to the fetcher\./);
 		assert.deepEqual(pi.errors, []);
 	});
@@ -128,7 +128,7 @@ describe("the `self_compact` tool", () => {
 	});
 
 	it("says it failed, compacts nothing and tells the user why, when every writer fails", async () => {
-		const { pi } = selfCompacting([{ text: "I'll carry on." }, { errorMessage: "overloaded" }]);
+		const { pi } = selfCompacting([{ text: "I'll carry on." }, { text: "I'll carry on." }, { errorMessage: "overloaded" }]);
 		await history(pi);
 		const drafts = await pi.turnEnd({ tokens: 125_000, message: calling(SELF_COMPACT_TOOL, { note: NOTE }) });
 		assert.equal(resultText(pi), FAILED);
@@ -246,14 +246,24 @@ describe("the agent's note", () => {
 		assert.equal((compaction?.details as any).note, NOTE);
 		const nextStep = compaction!.summary.slice(compaction!.summary.indexOf("## Next step"));
 		assert.equal(nextStep, `## Next step\nAgent's note (verbatim): "${NOTE}"\n\nRun the suite, then fix what fails. "Go ahead."`);
+		// The forked call is the agent itself: the note is its own.
 		assert.match(
 			model.prompt(0),
-			new RegExp(`The agent called self_compact with this note: "${escape(NOTE)}"\\. Code puts it verbatim at the top of Next step\\. Write the rest of Next step to agree with it`),
+			new RegExp(`You called self_compact with this note: "${escape(NOTE)}"\\. Code puts it verbatim at the top of Next step\\. Write the rest of Next step to agree with it`),
 		);
 	});
 
+	it("is restated to serialized mode as the agent's", async () => {
+		const { pi, model } = selfCompacting([{ text: "I'll carry on." }, { text: HANDOFF }]);
+		await history(pi);
+		const compaction = compactionIn(await pi.turnEnd({ tokens: 125_000, message: calling(SELF_COMPACT_TOOL, { note: NOTE }) }));
+		assert.equal((compaction?.details as any).writer, "serialized");
+		assert.match(model.prompt(1), new RegExp(`The agent called self_compact with this note: "${escape(NOTE)}"\\. Code puts it verbatim at the top of Next step\\.`));
+	});
+
 	it("lasts for that compaction only: the next one neither carries it nor shows it to its writer", async () => {
-		const { pi, model } = selfCompacting([{ text: HANDOFF }, { text: HANDOFF }]);
+		// The second compaction's forked call fails, so that serialized mode shows what the previous Handoff it edits holds.
+		const { pi, model } = selfCompacting([{ text: HANDOFF }, { text: "I'll carry on." }, { text: HANDOFF }]);
 		await history(pi);
 		pi.commit(await pi.turnEnd({ tokens: 125_000, message: calling(SELF_COMPACT_TOOL, { note: NOTE }) }));
 		await history(pi, 3);
@@ -263,10 +273,11 @@ describe("the agent's note", () => {
 		assert.ok(!next!.summary.includes(NOTE));
 		assert.ok(!next!.summary.includes("Agent's note"));
 		// The call itself is still in the conversation the writer reads; the previous Handoff it edits has no note.
-		const previous = /<previous-handoff>\n([\s\S]*?)\n<\/previous-handoff>/.exec(model.prompt(1))?.[1];
+		const previous = /<previous-handoff>\n([\s\S]*?)\n<\/previous-handoff>/.exec(model.prompt(2))?.[1];
 		assert.ok(previous?.includes("## Next step\nRun the suite, then fix what fails."));
 		assert.ok(!previous?.includes(NOTE));
-		assert.ok(!model.prompt(1).includes("The agent called self_compact with this note"));
+		assert.ok(!model.prompt(2).includes("called self_compact with this note"));
+		assert.ok(!model.prompt(1).includes("called self_compact with this note"));
 	});
 
 	it("can't be empty", async () => {
