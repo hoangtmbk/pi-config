@@ -17,6 +17,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Usage } from "@earendil-works/pi-ai";
 import { type CompactionEntry, getLatestCompactionEntry, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { mergeLedger } from "./ledger.ts";
 import { type Attempt, runChain, type Writer, type WriterName } from "./writers.ts";
 
 /** What a file went through, as far as the session's tool calls say. */
@@ -45,7 +46,10 @@ export type Judgment = Record<SectionKey, string> | { piDefault: string };
 export interface LedgerEntry {
 	quote: string;
 	kind: "constraint" | "focus";
-	/** The user's later words that replaced it. A superseded entry stays in `details`, but is not rendered. */
+	/**
+	 * The user's later words that replaced it — for a focus, the next focus. A
+	 * superseded entry stays in `details`, but is not rendered (see `ledger.ts`).
+	 */
 	supersededBy?: string;
 }
 
@@ -109,7 +113,7 @@ function cut(text: string): string {
 }
 
 /**
- * The text of every message the user typed in `span`, in order.
+ * The text of every message the user typed in `span`, in order, whole.
  *
  * Only `user` messages: that includes an `ask_question` answer, which reaches a
  * Run as its next prompt, and a message the user typed while the agent worked.
@@ -125,7 +129,7 @@ function userMessagesIn(span: readonly AgentMessage[]): string[] {
 			typeof message.content === "string"
 				? message.content
 				: message.content.map((part) => (part.type === "text" ? part.text : "[image]")).join("\n");
-		if (text.trim()) texts.push(cut(text));
+		if (text.trim()) texts.push(text);
 	}
 	return texts;
 }
@@ -328,6 +332,7 @@ export async function writeHandoff(request: HandoffRequest, writers: readonly Wr
 	const previousEntry = getLatestCompactionEntry(branch) ?? undefined;
 	const previous = handoffOf(previousEntry?.details);
 
+	const focus = request.focus?.trim() || undefined;
 	const chain = await runChain(writers, {
 		span: request.span,
 		tail: request.tail,
@@ -336,25 +341,36 @@ export async function writeHandoff(request: HandoffRequest, writers: readonly Wr
 		previousJudgment: previous ? judgmentText(previous.sections) : previousEntry?.summary,
 		// Ours rendered again without its note, which lasted that compaction only.
 		previousHandoff: previous ? renderHandoff({ ...previous, note: undefined }) : previousEntry?.summary,
-		focus: request.focus,
+		focus,
 		note: request.note,
 		signal: request.signal,
 	});
 	if (chain.status === "aborted") return chain;
 	if (chain.status === "failed") return { status: "failed", error: chain.attempts.at(-1)?.reason ?? "no writer ran", attempts: chain.attempts };
 
+	const typed = userMessagesIn(request.span);
+	// The quotes are checked against every user message the writer saw — the
+	// kept tail's too, uncut — and against the previous record's, which carries
+	// what earlier compactions removed.
+	const merged = mergeLedger({
+		previous: previous?.ledger ?? [],
+		proposal: chain.written.ledger,
+		missing: chain.writer !== "pi-default" && chain.written.ledger === undefined,
+		userTexts: [...(previous?.userMessages ?? []), ...typed, ...userMessagesIn(request.tail)],
+		focus,
+	});
 	const details: HandoffDetails = {
 		kind: "handoff",
 		version: 1,
 		compactionNo: branch.filter((entry) => entry.type === "compaction").length + 1,
 		writer: chain.writer,
 		attempts: chain.attempts,
-		...keepUserMessages(previous, userMessagesIn(request.span)),
-		ledger: previous?.ledger ?? [],
+		...keepUserMessages(previous, typed.map(cut)),
+		ledger: merged.ledger,
 		fileState: fileStateAfter(knownFiles(previousEntry), request.span),
 		...(request.note === undefined ? {} : { note: request.note }),
 		sections: chain.written.judgment,
-		log: [],
+		log: merged.log,
 	};
 	return { status: "written", summary: renderHandoff(details), details, usage: chain.written.usage };
 }
