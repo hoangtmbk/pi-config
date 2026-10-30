@@ -15,7 +15,7 @@
  * Grown as the extension grows, always by mirroring what pi does: a model call
  * is scripted through `registerCompaction`'s options (pass a `register`), a
  * boundary's drafts land in `boundaries` for committing to `session`, a tool
- * is in `tools` to execute, and `session_before_compact`, whose result pi
+ * the extension registers is in `tools`, and run when a turn calls it, and `session_before_compact`, whose result pi
  * reads, has its own firing in `compact` — beside `fire`, which, like pi's
  * plain events, ignores what handlers return.
  *
@@ -91,7 +91,11 @@ export interface Turn {
 	tokens?: number | null;
 	/** The turn's assistant message. Defaults to one that called a tool, so the run goes on. */
 	message?: AssistantMessage;
-	/** The turn's tool results. Defaults to one plain result per tool call in `message`. */
+	/**
+	 * The turn's tool results. Defaults to what pi would record: a call to a
+	 * tool the extension registered is executed, as pi executes it, and any
+	 * other call gets one plain result.
+	 */
 	toolResults?: ToolResultMessage[];
 	/** Drafts an earlier extension's `turn_end` handler already proposed. */
 	entries?: SessionBoundaryDraft[];
@@ -332,6 +336,25 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 	}
 
 	/**
+	 * One tool call, run the way pi's agent loop runs it: while the run streams,
+	 * with the run's signal, a throw recorded as an errored result.
+	 */
+	async function execute(call: ToolCall): Promise<ToolResultMessage> {
+		const tool = tools.find((t) => t.name === call.name);
+		if (!tool) return result(call);
+		state.streaming = true;
+		try {
+			const done = await tool.execute(call.id, call.arguments, state.run.signal, undefined, ctx());
+			const text = done.content.map((part) => part.text ?? "").join("");
+			return { ...result(call, text, done.isError ?? false), content: done.content as ToolResultMessage["content"] };
+		} catch (error) {
+			return result(call, error instanceof Error ? error.message : String(error), true);
+		} finally {
+			state.streaming = false;
+		}
+	}
+
+	/**
 	 * One `turn_end`, chained the way pi's `ExtensionRunner.emitBoundary` chains it.
 	 *
 	 * The turn's messages are persisted first, as pi does before the boundary.
@@ -346,9 +369,19 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 	async function turnEnd(turn: Turn = {}): Promise<SessionBoundaryDraft[]> {
 		if ("tokens" in turn) setTokens(turn.tokens);
 		const message = turn.message ?? calling();
-		const toolResults = turn.toolResults ?? toolCalls(message).map((call) => result(call));
 		const messageEntryId = session.appendMessage(message);
-		const toolResultEntryIds = toolResults.map((r) => session.appendMessage(r));
+		const toolResultEntryIds: string[] = [];
+		let toolResults = turn.toolResults;
+		if (toolResults) toolResultEntryIds.push(...toolResults.map((r) => session.appendMessage(r)));
+		else {
+			// Each result is persisted as its tool finishes, so a later call sees the earlier ones on the branch.
+			toolResults = [];
+			for (const call of toolCalls(message)) {
+				const done = await execute(call);
+				toolResults.push(done);
+				toolResultEntryIds.push(session.appendMessage(done));
+			}
+		}
 		const outcome = message.stopReason === "aborted" ? "aborted" : message.stopReason === "error" ? "error" : "completed";
 
 		const projection = session.buildSessionProjection();

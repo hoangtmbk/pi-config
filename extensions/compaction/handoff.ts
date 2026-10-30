@@ -339,7 +339,8 @@ export async function writeHandoff(request: HandoffRequest, writers: readonly Wr
 		// What the writer edits rather than rewrites: our previous judgment part,
 		// or a summary pi wrote, which is all there is to go on from one of pi's.
 		previousJudgment: previous ? judgmentText(previous.sections) : previousEntry?.summary,
-		previousHandoff: previousEntry?.summary,
+		// Ours rendered again without its note, which lasted that compaction only.
+		previousHandoff: previous ? renderHandoff({ ...previous, note: undefined }) : previousEntry?.summary,
 		focus,
 		note: request.note,
 		signal: request.signal,
