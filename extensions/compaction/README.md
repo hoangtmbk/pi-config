@@ -265,7 +265,10 @@ writes the judgment part:
 | The judgment part | the writer chain: the forked call, then serialized mode, then pi's own summarizer, `generateSummaryWithUsage`, whose text stands in for the six judgment sections. |
 
 `details` is the record: the summary is rendered from it, and the next compaction merges from the
-previous `details` (user messages, file state, ledger) and never parses old summary text. It is
+previous `details` (user messages, file state, ledger) and never parses old summary text. That is
+the newest compaction of ours, even when one that isn't ours (pi's default after our code threw,
+another extension's) has landed on top: such a summary can't be read back, so the user messages and
+file operations it removed are read from the branch itself, and the ledger carries on growing. It is
 marked as ours by `kind: "handoff"`, and records `compactionNo`, the `writer`, the failed
 `attempts` before it and a `log`. The rendered order is Goal, Constraint ledger, Progress,
 Decisions and why, Open problems, Critical context, File state, User messages (verbatim), Next

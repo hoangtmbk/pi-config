@@ -399,6 +399,42 @@ describe("the ledger across compactions", () => {
 		assert.deepEqual(rendered(fourth.summary), ['- "keep the public API unchanged"', '- "run npm test before you tell me something is done"']);
 	});
 
+	it("still only grows when pi's own compaction lands on top of ours: carried from our newest, with what pi's removed gathered from the branch", async () => {
+		const { pi } = compacting(
+			reply([add("don't add any new dependencies")]),
+			// Its quote is from a message only pi's compaction removed.
+			reply([add("Use exponential backoff, capped at 30s")]),
+		);
+		pi.session.appendMessage(user(RULES));
+		const read = calling("read", { path: "src/a.ts" });
+		await pi.turnEnd({ message: read, toolResults: [result(read)] });
+		await pi.turnEnd({ message: said("On it.") });
+		await compact(pi);
+
+		// pi's default, as it lands when our code throws: its summary, its file lists, no record of ours.
+		pi.session.appendMessage(user("Use exponential backoff, capped at 30s."));
+		const write = calling("write", { path: "src/retry.ts", content: "export {}" });
+		await pi.turnEnd({ message: write, toolResults: [result(write)] });
+		await pi.turnEnd({ message: said("Wrote it.") });
+		const kept = pi.session.getBranch().at(-1)!.id;
+		pi.session.appendCompaction("pi's summary of the retry work.", kept, 50_000, { readFiles: [], modifiedFiles: ["src/retry.ts"] }, false);
+
+		pi.session.appendMessage(user("Now wire it in."));
+		const edit = calling("edit", { path: "src/fetch.ts", oldText: "a", newText: "b" });
+		await pi.turnEnd({ message: edit, toolResults: [result(edit)] });
+		await pi.turnEnd({ message: said("Wired.") });
+		const { details } = await compact(pi);
+
+		assert.equal(details.compactionNo, 3);
+		assert.deepEqual(details.ledger, [
+			{ quote: "don't add any new dependencies", kind: "constraint" },
+			{ quote: "Use exponential backoff, capped at 30s", kind: "constraint" },
+		]);
+		assert.deepEqual(details.log, []);
+		assert.deepEqual(details.userMessages, [RULES, "Use exponential backoff, capped at 30s.", "Now wire it in."]);
+		assert.deepEqual(details.fileState, { "src/a.ts": "read", "src/retry.ts": "created", "src/fetch.ts": "edited" });
+	});
+
 	it("has no size cap", async () => {
 		const rules = Array.from({ length: 60 }, (_, i) => `Rule ${i + 1}: never touch module number ${i + 1}.`);
 		const { pi } = compacting(reply(rules.map(add)));

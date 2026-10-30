@@ -244,6 +244,40 @@ export function knownFiles(previous: Pick<CompactionEntry, "details" | "fromHook
 	return state;
 }
 
+/** What a compaction carries forward from: the compactions before it on the branch. */
+interface Previous {
+	/** The newest compaction: what the agent reads now, and so what the writer edits. */
+	newest: CompactionEntry | undefined;
+	/** The newest compaction of ours, whose record the new one merges from. Not always the newest. */
+	ours: HandoffDetails | undefined;
+	/**
+	 * What compactions not ours removed since ours — pi's default after our
+	 * code threw, another extension's — whose summaries can't be read back:
+	 * the messages themselves, from the branch, oldest first.
+	 */
+	since: AgentMessage[];
+}
+
+/**
+ * The compactions a new one follows. Our record is merged from, so that the
+ * ledger only grows, even with a compaction that isn't ours on top of it.
+ *
+ * What a compaction on top removed is the branch from our compaction's kept
+ * tail up to its own: each compaction re-summarises the one before's kept
+ * tail. Those messages are still on the branch, so they are read from there,
+ * the user's words and the file operations alike.
+ */
+function previousOf(branch: readonly SessionEntry[]): Previous {
+	const newest = getLatestCompactionEntry([...branch]) ?? undefined;
+	const entry = [...branch].reverse().find((e): e is CompactionEntry => e.type === "compaction" && handoffOf(e.details) !== undefined);
+	const ours = handoffOf(entry?.details);
+	if (!entry || !ours || entry === newest) return { newest, ours, since: [] };
+	const from = branch.findIndex((e) => e.id === entry.firstKeptEntryId);
+	const to = branch.findIndex((e) => e.id === newest?.firstKeptEntryId);
+	const span = from < 0 ? [] : branch.slice(from, to < 0 ? branch.indexOf(newest!) : to);
+	return { newest, ours, since: span.flatMap((e) => (e.type === "message" ? [e.message] : [])) };
+}
+
 // ---------- rendering ----------
 
 /** The judgment part on its own, as a writer is shown the previous one to edit. */
@@ -329,18 +363,19 @@ export type HandoffOutcome =
  */
 export async function writeHandoff(request: HandoffRequest, writers: readonly Writer[]): Promise<HandoffOutcome> {
 	const branch = [...request.branch];
-	const previousEntry = getLatestCompactionEntry(branch) ?? undefined;
-	const previous = handoffOf(previousEntry?.details);
+	const { newest, ours: previous, since } = previousOf(branch);
+	const newestIsOurs = previous !== undefined && handoffOf(newest?.details) === previous;
 
 	const focus = request.focus?.trim() || undefined;
 	const chain = await runChain(writers, {
 		span: request.span,
 		tail: request.tail,
 		// What the writer edits rather than rewrites: our previous judgment part,
-		// or a summary pi wrote, which is all there is to go on from one of pi's.
-		previousJudgment: previous ? judgmentText(previous.sections) : previousEntry?.summary,
+		// or the summary someone else wrote on top, which is all there is to go
+		// on from one of theirs.
+		previousJudgment: newestIsOurs ? judgmentText(previous.sections) : newest?.summary,
 		// Ours rendered again without its note, which lasted that compaction only.
-		previousHandoff: previous ? renderHandoff({ ...previous, note: undefined }) : previousEntry?.summary,
+		previousHandoff: newestIsOurs ? renderHandoff({ ...previous, note: undefined }) : newest?.summary,
 		focus,
 		note: request.note,
 		signal: request.signal,
@@ -348,7 +383,9 @@ export async function writeHandoff(request: HandoffRequest, writers: readonly Wr
 	if (chain.status === "aborted") return chain;
 	if (chain.status === "failed") return { status: "failed", error: chain.attempts.at(-1)?.reason ?? "no writer ran", attempts: chain.attempts };
 
-	const typed = userMessagesIn(request.span);
+	// The user's words since our previous record: what compactions not ours
+	// removed in between, then this span.
+	const typed = [...userMessagesIn(since), ...userMessagesIn(request.span)];
 	// The quotes are checked against every user message the writer saw — the
 	// kept tail's too, uncut — and against the previous record's, which carries
 	// what earlier compactions removed.
@@ -367,7 +404,7 @@ export async function writeHandoff(request: HandoffRequest, writers: readonly Wr
 		attempts: chain.attempts,
 		...keepUserMessages(previous, typed.map(cut)),
 		ledger: merged.ledger,
-		fileState: fileStateAfter(knownFiles(previousEntry), request.span),
+		fileState: fileStateAfter(previous ? previous.fileState : knownFiles(newest), [...since, ...request.span]),
 		...(request.note === undefined ? {} : { note: request.note }),
 		sections: chain.written.judgment,
 		log: [...(chain.written.log ?? []), ...merged.log],
