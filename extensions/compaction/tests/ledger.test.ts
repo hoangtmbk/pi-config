@@ -183,9 +183,10 @@ describe("a ledger supersede", () => {
 		assert.deepEqual(rendered(summary), ['- "keep the public API unchanged"']);
 	});
 
-	it("may name the entry by part of it, as long as only one entry contains that part", async () => {
-		const { details } = await twoRules(reply([supersede("any new dependencies", "you can use p-retry if it makes this simpler")]));
+	it("names its entry exactly, whitespace aside", async () => {
+		const { details } = await twoRules(reply([supersede("don't  add any\nnew dependencies", "you can use p-retry if it makes this simpler")]));
 		assert.equal(details.ledger[0].supersededBy, "you can use p-retry if it makes this simpler");
+		assert.deepEqual(details.log, []);
 	});
 
 	/** Each way a supersede is dropped, and what is logged for it. */
@@ -193,7 +194,12 @@ describe("a ledger supersede", () => {
 	const DEPS = "don't add any new dependencies";
 	const dropped: [string, string, string, string][] = [
 		["names no active entry", "don't change the CLI flags", P_RETRY, 'ledger: dropped supersede of "don\'t change the CLI flags": it matches no active entry'],
-		["names more than one", "an", P_RETRY, 'ledger: dropped supersede of "an": it matches 2 active entries'],
+		[
+			"names only part of an entry",
+			"any new dependencies",
+			P_RETRY,
+			'ledger: dropped supersede of "any new dependencies": it matches no active entry',
+		],
 		[
 			"quotes the assistant as its by",
 			DEPS,
@@ -326,7 +332,10 @@ describe("the ledger across compactions", () => {
 	it("drops an add contained in an active entry as a duplicate, but keeps one that only a superseded entry contains", async () => {
 		const { pi } = compacting(
 			reply([add("Please don't add any new dependencies, and keep the public API unchanged")]),
-			reply([add("keep the public API unchanged"), supersede("Please don't add any new dependencies", "Actually, p-retry is fine as a dependency")]),
+			reply([
+				add("keep the public API unchanged"),
+				supersede("Please don't add any new dependencies, and keep the public API unchanged", "Actually, p-retry is fine as a dependency"),
+			]),
 			reply([add("don't add any new dependencies"), add("keep the public API unchanged")]),
 		);
 		pi.session.appendMessage(user(RULES));

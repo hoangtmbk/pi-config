@@ -289,8 +289,9 @@ drops (into `details.log`) what fails:
   one space, and the entry is stored that way); case and punctuation are not. Under 12 characters
   it is dropped. Assistant text, tool results and custom messages never pass.
 - An add contained in an active entry is a duplicate.
-- A supersede's `old` must name exactly one active entry, exactly or by a part of it only that entry
-  contains, and its `by` must pass the same check as an add. Otherwise the entry stays in force.
+- A supersede's `old` must match exactly one active entry, exactly (whitespace aside, as above; a
+  part of an entry matches none), and its `by` must pass the same check as an add. Otherwise the
+  entry stays in force.
 - A superseded entry stays in `details` with `supersededBy` (the user's words that replaced it), and
   is left out of the rendered Handoff. Nothing else ever leaves the ledger, and it has no size cap.
 - A reply with no `<ledger>` adds nothing, and is logged; pi's summarizer proposes none.
