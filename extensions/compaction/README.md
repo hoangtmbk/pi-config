@@ -238,6 +238,20 @@ pi replaces it with its own compaction indicator, which `setWorkingMessage` does
 If the writer fails, nothing is compacted and an error toast says why; Escape stops it with no
 compaction and no toast. Only if our own code throws does pi fall back to its whole default.
 
+## The replay check
+
+Handoff quality is judged by replaying recorded sessions: cut them, compact, and compare the Handoff
+with what really happened next. `replay.ts` is its deterministic half, three plain functions that
+score our Handoff and pi's default summary alike (a "Handoff" there is any compaction entry):
+
+| Check | What it reports |
+|---|---|
+| `fileStateDiff(handoff, removed)` | the Handoff's file state against the true one, read from every message it stands in for with the Handoff's own mapping; `exact` is the pass bar. pi's own compaction can say only read or modified, so a created or deleted file is wrong there. |
+| `recurringDetailRetention(handoff, { removed, tail, after })` | of the identifiers in the removed span (paths, names, flags, error codes, hashes, numbers…) that the kept tail doesn't show and that come up again after the cut, the share found word for word in the Handoff, beside its size. Reported, not gated; below 70% is the trigger to add an identifier dump. |
+| `collapseGuard(chain)` | each Handoff in a chain counted — judgment size, ledger entries, files, user messages (dropped ones included), open items — and a flag for every count that fell from one Handoff to the next. |
+
+They are tested offline on small fixture sessions written for the purpose, never real transcripts.
+
 ## The status codec
 
 `status.ts` exports `formatStatus` and `parseStatus`, which write and read the three statuses —
@@ -277,5 +291,6 @@ pruning.ts      Pruning: picks results, writes markers, checks edits, saves full
 status.ts       the status codec, shared with the subagents extension  (pure)
 handoff.ts      the Handoff: its details record, the parts code writes, merging, rendering
 writers.ts      the writer chain, and pi's summarizer as its last writer
+replay.ts       the replay check's deterministic checks  (pure)
 tests/          offline suite, the recording fake pi and the scripted model call
 ```
