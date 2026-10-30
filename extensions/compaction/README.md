@@ -442,12 +442,15 @@ model call the writers make, the folder for pruned copies, and the clock.
 
 ```
 index.ts        extension entry: registerCompaction, event wiring, steers, self_compact, footer, toasts
+tools.ts        SELF_COMPACT_TOOL and the never-pruned tool names  (a leaf: imports nothing)
 pressure.ts     the Pressure levels from settings, and which one a boundary acts on   (pure)
-cut.ts          pi's cut for the boundary path, over what the model sees               (pure)
+landing.ts      our boundary compactions from written to committed: Self-compaction's wait, re-drafts
+cut.ts          pi's cut for the boundary path, and what a cut keeps, over what the model sees  (pure)
 pruning.ts      Pruning: picks results, writes markers, checks edits, saves full copies
 status.ts       the status codec, shared with the subagents extension  (pure)
 handoff.ts      the Handoff: its details record, the parts code writes, merging, rendering
 writers.ts      the writer chain, the stall timeout, and pi's summarizer as its last writer
+chain.ts        the writer chain for one compaction, assembled from pi's settings and the session
 instruction.ts  the writer's instruction, in both modes' wording, and the reply parser  (pure)
 fork.ts         the forked call: the live context, placeholder results, the cache-miss check
 serialized.ts   serialized mode: the transcript, the tool-result cut and its halving
@@ -459,5 +462,5 @@ replay/         the replay check, apart from what pi loads:
   replay-judge.ts         the judge's request and the checked reading of its verdict
   replay-report.ts        the spend, the pass bars and the report
 test.ts         the live replay check: `npm run live:compaction`, by hand only
-tests/          offline suite, the recording fake pi and the scripted model call
+tests/          offline suite, the recording fake pi, the scripted model call, pi internals reached by path
 ```
