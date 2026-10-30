@@ -21,9 +21,7 @@ import {
 	convertToLlm,
 	type ExtensionAPI,
 	type ExtensionContext,
-	getLatestCompactionEntry,
 	type SessionBeforeCompactEvent,
-	type SessionBoundaryDraft,
 	type SessionEntry,
 	type ProjectedSessionEntry,
 	type TurnEndEvent,
@@ -31,7 +29,8 @@ import {
 import { Type } from "typebox";
 import { cutFor } from "./cut.ts";
 import { forkWriter } from "./fork.ts";
-import { type HandoffDetails, type HandoffOutcome, handoffOf, writeHandoff } from "./handoff.ts";
+import { type HandoffOutcome, writeHandoff } from "./handoff.ts";
+import { type Compacting, GIVE_UP, Landing, type OurDraft } from "./landing.ts";
 import {
 	Crossings,
 	Forced,
@@ -136,48 +135,11 @@ function line(text: string) {
 	return { content: [{ type: "text" as const, text }], details: undefined };
 }
 
-/** A compaction draft, as a boundary returns it. */
-type CompactionDraft = Extract<SessionBoundaryDraft, { type: "compaction" }>;
-
-/** A compaction draft of ours: always a cut, always our Handoff. */
-type OurDraft = CompactionDraft & { firstKeptEntryId: string; details: HandoffDetails };
-
-/** A compaction of ours at a boundary, with the kept tail's Pruning that goes out with it. */
-interface Compacting {
-	draft: OurDraft;
-	/** Checked and saved: their drafts follow the compaction's. */
-	prunes: Prune[];
-}
-
-/** A compaction of ours sent from a boundary, kept until the next one says whether pi committed it. */
-interface Drafted extends Compacting {
-	/** The newest compaction on the branch when it was drafted, which it was to follow. */
-	after: string | undefined;
-	/** Whether this is already the re-draft of one that sank. */
-	redrafted: boolean;
-}
-
-/** A Self-compaction `execute` has written, waiting for its turn's boundary. */
-interface Prepared extends Compacting {
-	/** The `self_compact` call that wrote it. */
-	toolCallId: string;
-}
-
-/** Why a compaction that sank is given up, in the toast that every writer failing shows. */
-const SUNK_TWICE = "pi dropped it twice, with another extension's invalid draft";
-const CUT_GONE = "its kept tail is no longer on the branch";
-
 export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions = {}): void {
 	const crossings = new Crossings();
 	const forced = new Forced();
-	/** The Self-compaction written during this turn, which its `turn_end` applies. */
-	let prepared: Prepared | undefined;
-	/**
-	 * The compaction last drafted at a boundary, until the next boundary has
-	 * seen whether pi committed it: the whole chain's drafts are dropped if any
-	 * one of them is bad, ours included.
-	 */
-	let drafted: Drafted | undefined;
+	/** Our compactions on the boundary path, from written to committed. */
+	const landing = new Landing();
 	/** The footer text last set, so an unchanged one is not set again. */
 	let shown: string | undefined;
 
@@ -464,45 +426,6 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	}
 
 	/**
-	 * What became of the compaction drafted at the last boundary.
-	 *
-	 * It landed if the newest compaction on the branch is ours with its number,
-	 * and the warning-pause guard hears of it. It sank if no compaction at all
-	 * has landed since it was drafted — "the newest isn't ours" alone can't say
-	 * so, because the newest may be our previous one — and it is handed back to
-	 * be drafted again. A compaction that someone else landed in between leaves
-	 * it nothing to follow, and it is let go.
-	 */
-	function landing(ctx: ExtensionContext): Drafted | undefined {
-		const was = drafted;
-		drafted = undefined;
-		if (!was) return undefined;
-		const latest = getLatestCompactionEntry(ctx.sessionManager.getBranch());
-		if (handoffOf(latest?.details)?.compactionNo === was.draft.details.compactionNo) {
-			forced.compacted();
-			return undefined;
-		}
-		return latest?.id === was.after ? was : undefined;
-	}
-
-	/**
-	 * A compaction that sank, drafted again: the same Handoff over the same
-	 * cut, with no writer run again, so that a neighbour's bad draft doesn't
-	 * silently lose it. Once only — sunk twice, or with its cut entry gone from
-	 * the branch, it is given up as every writer failing.
-	 *
-	 * Its kept tail's Pruning goes with it, checked again against the branch
-	 * as it stands now: copies already saved, so an edit that would fail is
-	 * dropped with its pair, as at the first try.
-	 */
-	function redraft(ctx: ExtensionContext, sank: Drafted): Compacting | undefined {
-		if (sank.redrafted) return void giveUp(ctx, SUNK_TWICE);
-		const cut = sank.draft.firstKeptEntryId;
-		if (!ctx.sessionManager.getBranch().some((entry) => entry.id === cut)) return void giveUp(ctx, CUT_GONE);
-		return { draft: sank.draft, prunes: checkPrunes(sank.prunes, ctx.sessionManager) };
-	}
-
-	/**
 	 * Self-compaction: the agent compacts at a natural break, and carries on in
 	 * the same run. Always declared, so the tool list never changes and the
 	 * prompt cache holds; below notice it refuses, since a compaction there
@@ -535,32 +458,20 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 			const projection = ctx.sessionManager.buildSessionProjection();
 			const compacting = await compactAtBoundary(projection.entries, convertToLlm(projection.messages), ctx, "Self-compacting", { note, signal });
 			if (!compacting) return line(SELF_COMPACT.failed);
-			prepared = { ...compacting, toolCallId };
+			landing.prepare(compacting, toolCallId);
 			return line(SELF_COMPACT.compacted);
 		},
 	});
 
-	/**
-	 * The Self-compaction this turn's `self_compact` wrote, if any; one from any
-	 * other turn is stale, and let go. Its kept tail's Pruning is checked again
-	 * against the branch, which now holds the turn's tool results too.
-	 */
-	function takePrepared(event: TurnEndEvent, ctx: ExtensionContext): Compacting | undefined {
-		const was = prepared;
-		prepared = undefined;
-		if (!was || event.message.role !== "assistant") return undefined;
-		if (!event.message.content.some((part) => part.type === "toolCall" && part.id === was.toolCallId)) return undefined;
-		return { draft: was.draft, prunes: checkPrunes(was.prunes, ctx.sessionManager) };
-	}
-
 	pi.on("agent_start", () => {
 		forced.rearm();
-		prepared = undefined;
+		landing.newRun();
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
-		const sank = landing(ctx);
-		const self = takePrepared(event, ctx);
+		// The warning-pause guard hears of a compaction of ours that landed.
+		if (landing.settle(ctx.sessionManager)) forced.compacted();
+		const self = landing.takePrepared(event, ctx.sessionManager);
 		// A turn that was aborted or failed is not one to act on — not even to
 		// draft again a compaction that sank, which is let go, silently, as Escape
 		// lets go of one being written. The outcome alone misses half of an
@@ -581,7 +492,9 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		// compaction, whatever pressure reads now, and newer than any that sank.
 		// Otherwise a compaction that sank is, and given up, it disarms forced
 		// from this boundary on.
-		const again = sank && !self ? redraft(ctx, sank) : undefined;
+		const redrafted = self ? undefined : landing.redraft(ctx.sessionManager);
+		if (typeof redrafted === "string") giveUp(ctx, GIVE_UP[redrafted]);
+		const again = typeof redrafted === "string" ? undefined : redrafted;
 		const { forces, leftHigh } = forced.observe(tokens, levels, enabled);
 		if (leftHigh) {
 			ctx.ui.notify(`Compaction left context at ${thousands(tokens)}, still above warning. Forced compaction is paused until it drops.`, "warning");
@@ -609,7 +522,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 			// here: the compaction removes what it would prune.
 			show(ctx, undefined);
 			const { draft, prunes } = compacting;
-			drafted = { draft, prunes, after: getLatestCompactionEntry(ctx.sessionManager.getBranch())?.id, redrafted: compacting === again };
+			landing.drafting(compacting, ctx.sessionManager, compacting === again);
 			return { entries: [...event.entries, draft, ...pruneDrafts(prunes)] };
 		}
 		// Pruning first, so that the agent is steered to Self-compact only once
