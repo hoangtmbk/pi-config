@@ -192,6 +192,12 @@ straight after, its next request built from the Handoff and the kept tail.
 - **The draft** goes after any drafts earlier extensions proposed at that boundary, which stand;
   pi measures the compaction's `tokensBefore` at that point. Not at a boundary where an earlier
   extension already drafts a compaction.
+- **A sunk compaction is re-drafted once.** pi drops every draft at a boundary when any one of them
+  won't replay, so another extension's bad draft sinks ours with it. The next boundary sees that no
+  compaction landed (ours carries its `compactionNo`, so our previous one doesn't pass for it) and
+  drafts the same Handoff over the same cut again, whatever pressure reads, with no writer called.
+  Sunk twice, or with its cut entry no longer on the branch, it is handled as every writer failing.
+  An aborted or failed turn lets it go silently.
 - **Forced is not spent by crossing it.** It acts at every boundary at or above it until a
   compaction lands. Three things hold it back: `compaction.enabled: false`; the **warning-pause
   guard** — once a compaction, on either path, leaves pressure at or above warning, a toast says
