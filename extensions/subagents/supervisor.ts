@@ -58,7 +58,8 @@ export type RunFailure =
 	  }
 	| {
 			/**
-			 * The session ended the Run on purpose — an abort, or a shutdown.
+			 * The Run was ended on purpose — an abort, a shutdown, or the user
+			 * killing that one Run.
 			 *
 			 * A third arm rather than an `exit` with `signal: "SIGTERM"`, because
 			 * that would read as a Run something killed out from under it. This one
@@ -66,7 +67,10 @@ export type RunFailure =
 			 * and the parent getting what it asked for.
 			 */
 			kind: "stopped";
-			/** Why the session ended it, as the clause a Delivery says it in. */
+			/**
+			 * Why it was ended, in the few words a Delivery says it in: "the
+			 * session is shutting down", "killed by the user".
+			 */
 			reason: string;
 	  };
 
@@ -102,6 +106,16 @@ export interface Run {
 	 * eight as if half of it had not been asked for yet.
 	 */
 	askedAt: number;
+	/**
+	 * When this Run stopped for good — done or failed — as a millisecond clock
+	 * reading. Absent while it is still queued, running or Waiting.
+	 *
+	 * What stops a finished Run's clock. A Run that finished an hour ago took as
+	 * long as it took, and an age that went on counting after it stopped would
+	 * say it was still going; it is also what puts the most recently finished
+	 * Run first wherever finished Runs are listed.
+	 */
+	stoppedAt?: number;
 	/**
 	 * What this Run's child is doing, as of the last tool it started. Absent for
 	 * a Run that has not run a tool yet, and for one that is Waiting.
@@ -177,7 +191,8 @@ export interface SupervisorOptions {
 	 */
 	onAdmit?: (run: Run) => void;
 	/**
-	 * What time it is, in milliseconds, for stamping a Run's `askedAt`.
+	 * What time it is, in milliseconds, for stamping a Run's `askedAt` and
+	 * `stoppedAt`.
 	 *
 	 * Injected rather than read, so that this file keeps reading nothing outside
 	 * itself and a test can say how old a Run is instead of waiting for it to get
@@ -258,7 +273,8 @@ export class Supervisor {
 	 * followed by an automatic retry or a compaction, so a Run that ended on it
 	 * would deliver a half-finished answer and then keep working. A settling turn
 	 * that ran `ask_question` moves the Run to Waiting instead of finishing it —
-	 * see `ASK_QUESTION_TOOL`.
+	 * see `ASK_QUESTION_TOOL` — unless its child read a message from the user
+	 * after asking, which answered it: see `overrule`.
 	 */
 	observe(name: string, event: JsonAgentSessionEvent): SettledMessage | undefined {
 		const record = this.byName.get(name);
@@ -266,6 +282,7 @@ export class Supervisor {
 
 		if (event.type === "message_end") {
 			if (isResultBearing(event.message)) record.lastAssistant = event.message;
+			else if (event.message.role === "user" && record.asked) this.overrule(record);
 			return undefined;
 		}
 
@@ -292,12 +309,15 @@ export class Supervisor {
 			record.lastAssistant = undefined;
 			record.run.state = "waiting";
 			record.run.question = asked.question;
+			// A new Question is one nobody has answered yet, whoever answered the last.
+			record.answeredByUser = false;
 			// Waiting is the whole of what a Waiting Run is doing. The tool it last
 			// started was the `ask_question` that got it here, and reporting that as
 			// activity would say a Run is busy when it is stopped.
 			record.run.activity = undefined;
 		} else {
 			record.run.state = "done";
+			record.run.stoppedAt = this.now();
 			record.run.result = record.lastAssistant && assistantText(record.lastAssistant);
 			// The slot this Run was holding is free, so whatever has been queued
 			// longest starts now rather than when the parent next asks for anything.
@@ -310,6 +330,22 @@ export class Supervisor {
 	}
 
 	/**
+	 * The Question this Run has asked and not yet settled on, if it has: present
+	 * from its `ask_question` ending until the turn settles and it starts Waiting.
+	 * Absent the rest of the time, a Waiting Run's included — that Question is
+	 * `run.question`.
+	 *
+	 * The window is real because `ask_question` does not end the child's run: its
+	 * model takes a closing turn first, and a human watching the Inspector has
+	 * already seen the Question by then. A steer sent in that window is read in
+	 * that closing turn, as the answer — see `overrule`. The `question` inside can
+	 * be absent, for a child that asked without saying what it wanted to know.
+	 */
+	asking(name: string): { question?: string } | undefined {
+		return this.byName.get(name)?.asked;
+	}
+
+	/**
 	 * Report that a Waiting Run has been answered, and is working again.
 	 *
 	 * The parent answering is what takes a Run out of Waiting — not its child
@@ -319,12 +355,32 @@ export class Supervisor {
 	 *
 	 * Does nothing to a Run that is not Waiting: callers check that first,
 	 * because they are the ones who can say what state it is in instead.
+	 *
+	 * `by` is who answered. The user can answer a Question straight into the Run,
+	 * past the parent, and the parent was told about that Question too: a parent
+	 * that then tries to answer it is answering something already answered, and
+	 * the useful refusal says by whom rather than only that the Run is running.
+	 * See `answeredByUser`.
 	 */
-	answered(name: string): void {
+	answered(name: string, by: "parent" | "user" = "parent"): void {
 		const record = this.byName.get(name);
 		if (record?.run.state !== "waiting") return;
 		record.run.state = "running";
 		record.run.question = undefined;
+		record.answeredByUser = by === "user";
+	}
+
+	/**
+	 * Whether the last Question this Run asked was answered by the user rather
+	 * than by the parent.
+	 *
+	 * Kept past the Run finishing, deliberately: the parent may still be holding
+	 * that Question when the Run delivers, and "the user already answered it" is
+	 * the part of why it cannot be answered that the parent did not know. Only a
+	 * new Question clears it, because that one nobody has answered yet.
+	 */
+	answeredByUser(name: string): boolean {
+		return this.byName.get(name)?.answeredByUser === true;
 	}
 
 	/**
@@ -340,6 +396,8 @@ export class Supervisor {
 		if (record?.run.state !== "running") return;
 		record.run.state = "waiting";
 		record.run.question = question;
+		// An answer that never arrived was nobody's answer.
+		record.answeredByUser = false;
 	}
 
 	/**
@@ -353,6 +411,11 @@ export class Supervisor {
 	 *
 	 * A Run that has already delivered is left alone. Its child exiting
 	 * afterwards is how a finished Run ends, not a failure to report.
+	 *
+	 * A queued Run can be failed too — the user killing it before it ever got a
+	 * slot. It leaves the queue by leaving the `queued` state, which is the whole
+	 * of what the queue is, and the slot accounting is untouched because it never
+	 * held one: the drain below finds the same free slots it would have anyway.
 	 */
 	fail(name: string, failure: RunFailure): Delivery | undefined {
 		const record = this.byName.get(name);
@@ -364,6 +427,7 @@ export class Supervisor {
 		record.lastAssistant = undefined;
 		record.run.question = undefined;
 		record.run.state = "failed";
+		record.run.stoppedAt = this.now();
 		record.run.failure = failure;
 		record.said = false;
 		// A Run that died frees its slot exactly like one that finished. Draining
@@ -496,6 +560,32 @@ export class Supervisor {
 	}
 
 	/**
+	 * Take a Question back off a Run whose child read a message from the user
+	 * after asking it and before settling — a steer, read in the closing turn
+	 * `ask_question` leaves the model.
+	 *
+	 * That message is the answer, in the child's own context: the model reads it
+	 * straight after its Question and carries on from it. Leaving `asked` set would
+	 * park the finished Run Waiting on a Question its child has already moved past,
+	 * drop the result that turn produced, and leave the parent free to answer it
+	 * a second time — the two-answerers case ADR-0003 settles in the user's favour.
+	 * So the Question is spent here, and on record as the user's: a later
+	 * `subagent_answer` is refused as already answered by the user, as it is for
+	 * an answer the user typed into a Waiting Run.
+	 *
+	 * The parent was never told of this Question — a Question is only said when
+	 * its turn settles — so nothing it holds is left dangling. The note the steer
+	 * already puts on its record is what says it was asked and answered.
+	 */
+	private overrule(record: RunRecord): void {
+		record.asked = undefined;
+		record.answeredByUser = true;
+		// The message the Question turn ended on was an appeal for help, not a
+		// result, exactly as it is for a Run that goes on to Waiting.
+		record.lastAssistant = undefined;
+	}
+
+	/**
 	 * Whether a Run is still working, or still expected to, and so still worth a
 	 * join's while.
 	 *
@@ -617,9 +707,12 @@ interface RunRecord {
 	 * The Question this turn ran `ask_question` with, if it did. Present means the
 	 * turn moves the Run to Waiting rather than finishing it; the `question`
 	 * inside can still be absent, for a child that asked without saying what it
-	 * wanted to know.
+	 * wanted to know. A message from the user read after it takes it away again:
+	 * see `Supervisor.overrule`.
 	 */
 	asked?: { question?: string };
+	/** Whether the user, not the parent, answered this Run's last Question. See `Supervisor.answeredByUser`. */
+	answeredByUser?: boolean;
 }
 
 /** The parts of an assistant message a result is read from. */
@@ -796,7 +889,9 @@ function failureText(run: Run): string {
 function failureCause(failure: RunFailure | undefined): string {
 	if (!failure) return "it stopped without saying why";
 	if (failure.kind === "spawn") return `it could not be started: ${failure.message}`;
-	if (failure.kind === "stopped") return `it was stopped because ${failure.reason}`;
+	// A colon rather than "because", so a reason can be a clause ("the session is
+	// shutting down") or a bare account of who did it ("killed by the user").
+	if (failure.kind === "stopped") return `it was stopped: ${failure.reason}`;
 	if (failure.signal) return `its child was killed by ${failure.signal}`;
 	// A clean exit still failed the Run — the child stopped without settling — but
 	// blaming "code 0" reads like a fault where there was none. Say what happened.

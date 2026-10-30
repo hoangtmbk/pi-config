@@ -17,6 +17,10 @@
  * Both are pure string functions — nothing here needs a TUI. pi's
  * `truncateToWidth` would do the cut in one call and is deliberately not used:
  * it wraps its ellipsis in ANSI resets, and these lines must stay plain.
+ *
+ * The rows, and the small pieces they are cut and timed with, are exported for
+ * the `/subagents` picker, which lists the same Runs in the same columns: one
+ * layout for a Run wherever it is listed, kept in one place.
  */
 
 import { sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
@@ -64,20 +68,7 @@ const TITLE = "╭─ Runs ";
 export function renderRuns(runs: Run[], now: number): string[] | undefined {
 	if (runs.length === 0) return undefined;
 
-	const times = runs.map((run) => elapsed(now - run.askedAt));
-	// Digits and colons only, so this column is the one place a character is
-	// reliably one column and `padStart` can be trusted.
-	const timeWidth = Math.max(MIN_TIME_WIDTH, ...times.map((time) => time.length));
-	const names = runs.map((run) => clip(oneLine(run.name), MAX_NAME));
-	const nameWidth = Math.max(...names.map(visibleWidth));
-	// Whatever the frame has left once the fixed columns have been paid for. What
-	// a Run is doing is the one column with no natural length, so it is the one
-	// that gives: a child reading a path 200 characters long still gets one line.
-	const doingWidth = MAX_WIDTH - CHROME - timeWidth - GAP.length - nameWidth - GAP.length;
-
-	const rows = runs.map((run, index) =>
-		[times[index].padStart(timeWidth), pad(names[index], nameWidth), clip(oneLine(doing(run)), doingWidth)].join(GAP),
-	);
+	const rows = runRows(runs, now, MAX_WIDTH - CHROME);
 	// The header has a width of its own, and a session of one short-named Run is
 	// narrower than it. Taking the wider of the two — the header needing at least
 	// one fill dash — is what keeps the frame square either way, rather than a top
@@ -86,6 +77,42 @@ export function renderRuns(runs: Run[], now: number): string[] | undefined {
 	const bodyWidth = Math.max(visibleWidth(TITLE) + visibleWidth(tally) + 1 - CHROME, ...rows.map(visibleWidth));
 
 	return [header(tally, bodyWidth), ...rows.map((row) => `│ ${pad(row, bodyWidth)} │`), footer(bodyWidth)];
+}
+
+/**
+ * One line per Run — elapsed, name, and what it is doing — in columns lined up
+ * across the whole set, each line at most `width` columns.
+ *
+ * The widget's rows and the `/subagents` picker's are the same rows on purpose:
+ * a Run a reader has just seen above the editor should be recognisable at a
+ * glance in the list they open to look at it, not re-read in a second layout.
+ * The lines are left unpadded; whoever frames them pads them to their frame.
+ */
+export function runRows(runs: Run[], now: number, width: number): string[] {
+	const times = runs.map((run) => age(run, now));
+	// Digits and colons only, so this column is the one place a character is
+	// reliably one column and `padStart` can be trusted.
+	const timeWidth = Math.max(MIN_TIME_WIDTH, ...times.map((time) => time.length));
+	const names = runs.map((run) => clip(oneLine(run.name), MAX_NAME));
+	const nameWidth = Math.max(0, ...names.map(visibleWidth));
+	// Whatever the line has left once the fixed columns have been paid for. What
+	// a Run is doing is the one column with no natural length, so it is the one
+	// that gives: a child reading a path 200 characters long still gets one line.
+	const doingWidth = width - timeWidth - GAP.length - nameWidth - GAP.length;
+
+	return runs.map((run, index) =>
+		[times[index].padStart(timeWidth), pad(names[index], nameWidth), clip(oneLine(doing(run)), doingWidth)].join(GAP),
+	);
+}
+
+/**
+ * How long a Run has been going, or went on for, as the widget writes a time.
+ *
+ * A finished Run's clock stops when it did: its age is how long it took, and
+ * one that went on counting would read as a Run still working.
+ */
+export function age(run: Run, now: number): string {
+	return elapsed((run.stoppedAt ?? now) - run.askedAt);
 }
 
 /**
@@ -109,9 +136,31 @@ function footer(bodyWidth: number): string {
  *
  * A Waiting Run says only that it is waiting. What it asked is on its way into
  * the conversation, where there is room for it.
+ *
+ * A finished Run is doing nothing, so it says how it ended instead — the tool
+ * it last started is history, and "done · bash" would read as a Run still in
+ * one. Only the picker ever shows one: the widget's Runs are all active.
  */
 function doing(run: Run): string {
+	if (run.state === "done") return "done";
+	if (run.state === "failed") return `failed · ${failedHow(run.failure)}`;
 	return run.activity ? `${run.state} · ${run.activity}` : run.state;
+}
+
+/**
+ * Why a Run failed, in the two or three words a row has room for.
+ *
+ * Shorter than the Delivery's account of it, which the parent reads in full:
+ * this is the line that tells a crash from a kill at a glance, not the place to
+ * read the stderr.
+ */
+function failedHow(failure: Run["failure"]): string {
+	if (!failure) return "stopped";
+	if (failure.kind === "spawn") return "could not start";
+	if (failure.kind === "stopped") return failure.reason;
+	if (failure.signal) return `killed by ${failure.signal}`;
+	if (failure.exitCode !== undefined && failure.exitCode !== 0) return `exited ${failure.exitCode}`;
+	return "child exited early";
 }
 
 /**
@@ -122,7 +171,7 @@ function doing(run: Run): string {
  * Run registered in the same millisecond the widget renders is a Run that has
  * just started, not one that started in the future.
  */
-function elapsed(ms: number): string {
+export function elapsed(ms: number): string {
 	const total = Math.max(0, Math.floor(ms / 1000));
 	const minutes = Math.floor(total / 60) % 60;
 	const seconds = total % 60;
@@ -143,7 +192,7 @@ function twoDigits(value: number): string {
  * is strict, so a two-column character that would straddle the boundary is
  * dropped whole rather than half-drawn.
  */
-function clip(text: string, width: number): string {
+export function clip(text: string, width: number): string {
 	if (width <= 0) return "";
 	if (visibleWidth(text) <= width) return text;
 	// The ellipsis takes the last column, so the text gets one fewer.
@@ -156,7 +205,7 @@ function clip(text: string, width: number): string {
  * `padEnd` counts code units, so it under-fills any line with a wide character
  * in it — which is the frame going ragged one line at a time.
  */
-function pad(text: string, width: number): string {
+export function pad(text: string, width: number): string {
 	return text + " ".repeat(Math.max(0, width - visibleWidth(text)));
 }
 
@@ -167,6 +216,6 @@ function pad(text: string, width: number): string {
  * and one newline in either would split a row in half and leave the frame open.
  * Flattening is what makes "one line per Run" true rather than intended.
  */
-function oneLine(text: string): string {
+export function oneLine(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }

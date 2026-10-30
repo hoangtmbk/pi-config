@@ -57,6 +57,18 @@ export interface RunChild {
 	/** Send a new prompt, starting a fresh turn in the child. */
 	prompt(message: string): Promise<void>;
 	/**
+	 * Queue a message for the turn the child is in the middle of. It is taken at
+	 * the next turn boundary — after the tool calls in flight, before the next
+	 * model call — and starts nothing on its own.
+	 *
+	 * Only meaningful while the child is working. pi accepts a steer into an idle
+	 * child without complaint and simply holds it: nothing reads it until the
+	 * next prompt, which for a finished Run is never. Resolving says the child
+	 * has it queued, not that it has read it — whoever sends one has to watch the
+	 * child's `queue_update` events to know which of the two happened.
+	 */
+	steer(message: string): Promise<void>;
+	/**
 	 * Terminate the child and clean up after it. Safe to call twice.
 	 *
 	 * The reap ADR-0001 turns on: a SIGTERM, then a SIGKILL for a child still
@@ -236,7 +248,7 @@ export async function spawnRun(options: SpawnOptions): Promise<RunChild> {
 		});
 	};
 
-	const child: RunChild = { prompt: (message) => client.prompt(message), stop };
+	const child: RunChild = { prompt: (message) => client.prompt(message), steer: (message) => client.steer(message), stop };
 
 	try {
 		await client.start();

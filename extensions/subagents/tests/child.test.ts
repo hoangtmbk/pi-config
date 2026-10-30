@@ -134,6 +134,7 @@ describe("spawnRun", () => {
 		);
 	});
 
+
 	it("appends the run preamble and the Agent body as a system prompt, via a temp file", async () => {
 		const argv = await spawnAndReadArgv({ name: "scout-2" });
 
@@ -205,5 +206,48 @@ describe("spawnRun", () => {
 		);
 		const answered = events.find((event) => event.type === "message_end");
 		assert.match(JSON.stringify(answered), /count the call sites/);
+	});
+});
+
+/** Wait until `events` holds one of `type`, or give up loudly. */
+async function eventOf(events: JsonAgentSessionEvent[], type: string, count = 1): Promise<void> {
+	for (let attempt = 0; attempt < 200; attempt++) {
+		if (events.filter((event) => event.type === type).length >= count) return;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	throw new Error(`no ${count}th ${type} within 2s; got ${events.map((event) => event.type).join(", ")}`);
+}
+
+describe("RunChild.steer", () => {
+	it("joins the turn in flight: queued, then read at the next boundary, before the turn goes on", async () => {
+		const turn = [{ type: "agent_start" }, { type: "fake:await_steer" }, { type: "agent_end", messages: [], willRetry: false }, { type: "agent_settled" }];
+		const { child, events, settledOnce } = await spawnFake({ env: { FAKE_RPC_TURNS: JSON.stringify([turn]) } });
+
+		await child.steer("Only the auth module, please.");
+		await settledOnce;
+
+		assert.deepEqual(
+			events.map((event) => event.type),
+			["agent_start", "queue_update", "queue_update", "message_start", "message_end", "agent_end", "agent_settled"],
+		);
+		const [taken, read] = events.filter((event) => event.type === "queue_update") as { steering: readonly string[] }[];
+		assert.deepEqual(taken.steering, ["Only the auth module, please."]);
+		assert.deepEqual(read.steering, [], "reading a steer empties the queue, which is how the parent knows it landed");
+	});
+
+	it("is taken and held, unread, by a child that has already settled — starting nothing", async () => {
+		const { child, events, settledOnce } = await spawnFake();
+		await settledOnce;
+
+		await child.steer("Only the auth module, please.");
+		await eventOf(events, "queue_update");
+
+		const after = events.slice(events.findIndex((event) => event.type === "agent_settled") + 1);
+		assert.deepEqual(
+			after.map((event) => event.type),
+			["queue_update"],
+			"no turn starts: the steer sits in the queue for a prompt that, for a finished Run, never comes",
+		);
+		assert.deepEqual((after[0] as { steering: readonly string[] }).steering, ["Only the auth module, please."]);
 	});
 });

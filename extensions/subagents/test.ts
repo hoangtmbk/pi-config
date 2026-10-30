@@ -207,6 +207,9 @@ function parentSession(cliPath: string) {
 		registerTool(tool: unknown) {
 			tools.push(tool as RegisteredTool);
 		},
+		// `/subagents` opens an overlay, and this runner has no terminal to open
+		// one in; the offline suite drives it instead.
+		registerCommand() {},
 		sendMessage(message: { customType: string; content: string; details?: unknown }, options?: { triggerTurn?: boolean }) {
 			said.push({
 				customType: message.customType,

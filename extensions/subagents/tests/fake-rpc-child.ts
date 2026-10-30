@@ -29,6 +29,16 @@
  *  - `FAKE_RPC_SILENT` — never answer a prompt, not even to acknowledge it, so
  *    the spawn that sent it never finishes. A child that is up and unreachable.
  *
+ * A `steer` is taken the way pi takes one. It is queued and announced in a
+ * `queue_update`, and then it waits: nothing reads it until a turn reaches a
+ * boundary, which for a child that has already settled means not until its next
+ * prompt. A turn script can hold a turn open for one with the marker event
+ * `{ "type": "fake:await_steer" }` — the turn stops there, and the next steer
+ * is read (a `queue_update` emptying the queue, then the steer as a user
+ * message) before the rest of the turn is played out. That is a Run that is
+ * still working when it is steered; without the marker, every steer lands on a
+ * child that has already settled, which is the race a steer can lose.
+ *
  * Not a `.test.ts` file, so `npm test` never runs it directly.
  */
 
@@ -57,6 +67,13 @@ const turns: unknown[][] | undefined = process.env.FAKE_RPC_TURNS ? JSON.parse(p
 
 const silent = Boolean(process.env.FAKE_RPC_SILENT);
 
+/**
+ * The marker a turn script holds a turn open with, until a steer arrives.
+ *
+ * Not a pi event, and never emitted: it is consumed here.
+ */
+const AWAIT_STEER = "fake:await_steer";
+
 const exitCode = process.env.FAKE_RPC_EXIT_CODE ? Number(process.env.FAKE_RPC_EXIT_CODE) : undefined;
 const exitAfter = Number(process.env.FAKE_RPC_EXIT_AFTER ?? 0);
 
@@ -77,6 +94,12 @@ if (exitCode !== undefined && exitAfter === 0) die(exitCode);
 /** How many prompts have arrived, which is what picks this turn's script. */
 let promptCount = 0;
 
+/** Steers queued and not yet read, oldest first — pi's own steering queue. */
+const steering: string[] = [];
+
+/** What is left of a turn held open on `AWAIT_STEER`, waiting to be played out. */
+let held: unknown[] | undefined;
+
 /** Strict JSONL: one record, LF-terminated, never anything else on stdout. */
 function emit(record: unknown): void {
 	process.stdout.write(`${JSON.stringify(record)}\n`);
@@ -96,6 +119,38 @@ function defaultEvents(prompt: string): unknown[] {
 	];
 }
 
+/** Say what the steering queue holds now, the way pi does on every change to it. */
+function queueUpdate(): void {
+	emit({ type: "queue_update", steering: [...steering], followUp: [] });
+}
+
+/**
+ * Read every queued steer into the turn, as pi does at a turn boundary: the
+ * queue empties, then each steer goes into the conversation as a user message.
+ */
+function readSteers(): void {
+	if (steering.length === 0) return;
+	const read = steering.splice(0);
+	queueUpdate();
+	for (const text of read) {
+		const message = { role: "user", content: [{ type: "text", text }], timestamp: 0 };
+		emit({ type: "message_start", message });
+		emit({ type: "message_end", message });
+	}
+}
+
+/** Emit a turn's events, stopping at an `AWAIT_STEER` and keeping the rest for it. */
+function play(events: unknown[]): void {
+	for (let index = 0; index < events.length; index++) {
+		if ((events[index] as { type?: string }).type === AWAIT_STEER) {
+			held = events.slice(index + 1);
+			return;
+		}
+		emit(events[index]);
+	}
+	if (exitCode !== undefined && promptCount >= exitAfter) die(exitCode);
+}
+
 function handle(line: string): void {
 	if (!line.trim()) return;
 	const command = JSON.parse(line) as { id?: string; type: string; message?: string };
@@ -105,14 +160,32 @@ function handle(line: string): void {
 	// looks like from the outside.
 	if (silent && command.type === "prompt") return;
 
+	// Queued, and said to be, before the response — the order pi writes them in.
+	if (command.type === "steer") {
+		steering.push(command.message ?? "");
+		queueUpdate();
+	}
+
 	// Every command gets a response; `RpcClient.send` waits for one before its
 	// promise resolves, prompts included.
 	emit({ id: command.id, type: "response", command: command.type, success: true });
 
+	if (command.type === "steer") {
+		// A turn held open for a steer reads it now. A settled child holds it,
+		// unread, until its next prompt — which is what pi does, too.
+		if (!held) return;
+		const rest = held;
+		held = undefined;
+		readSteers();
+		play(rest);
+		return;
+	}
+
 	if (command.type !== "prompt") return;
 	const turn = turns?.[promptCount++];
-	for (const event of turn ?? defaultEvents(command.message ?? "")) emit(event);
-	if (exitCode !== undefined && promptCount >= exitAfter) die(exitCode);
+	// A new run reads whatever was steered into the child while it sat idle.
+	readSteers();
+	play(turn ?? defaultEvents(command.message ?? ""));
 }
 
 let buffer = "";

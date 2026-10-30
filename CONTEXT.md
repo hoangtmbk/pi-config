@@ -56,3 +56,15 @@ _Avoid_: worker, lane, permit, concurrency limit
 The moment a finished or failed run's result re-enters the parent session's conversation.
 Separate from the run finishing — a run can be done for some time before its result is delivered.
 _Avoid_: return, callback, report
+
+**Steer**:
+A human's message into a running run, typed in the Inspector and taken by the child at its next
+turn boundary. The parent is told, without a turn being started (ADR-0003). A message to a Waiting
+run is not a steer but an answer to its question, from the user instead of the parent.
+_Avoid_: nudge, interrupt, redirect, inject
+
+**Inspector**:
+The overlay showing one run's live transcript, rendered like the main chat, with an editor for
+steering it and a key to kill it. Opened from the `/subagents` picker; finished runs stay
+inspectable for the rest of the session.
+_Avoid_: viewer, monitor, debugger, attach

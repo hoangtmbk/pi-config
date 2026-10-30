@@ -21,6 +21,17 @@ export function said(text: string): JsonAgentSessionEvent {
 	} as unknown as JsonAgentSessionEvent;
 }
 
+/**
+ * A message from the user the child has read — a steer, taken at a turn
+ * boundary and put into the conversation as a user `message_end`.
+ */
+export function heard(text: string): JsonAgentSessionEvent {
+	return {
+		type: "message_end",
+		message: { role: "user", content: [{ type: "text", text }], timestamp: 0 },
+	} as unknown as JsonAgentSessionEvent;
+}
+
 /** A completed `ask_question` execution — the event a Question is read from. */
 export function asked(question: string): JsonAgentSessionEvent {
 	const details: QuestionDetails = { question };
@@ -40,6 +51,14 @@ export function ran(toolName: string): JsonAgentSessionEvent {
 /** A tool that ended in an error, which is not an execution the parent heard about. */
 export function failed(toolName: string, message: string): JsonAgentSessionEvent {
 	return toolExecutionEnd(toolName, { content: [{ type: "text", text: message }] }, true);
+}
+
+/**
+ * The child saying what it has queued and not yet read — pi's `queue_update`,
+ * written on every change to its steering queue. Empty is a queue just read.
+ */
+export function queued(...steering: string[]): JsonAgentSessionEvent {
+	return { type: "queue_update", steering, followUp: [] } as JsonAgentSessionEvent;
 }
 
 function toolExecutionEnd(toolName: string, result: unknown, isError: boolean): JsonAgentSessionEvent {

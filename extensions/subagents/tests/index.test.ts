@@ -13,14 +13,23 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import type { AgentToolResult, ExtensionAPI, ExtensionContext, JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import {
+	type AgentToolResult,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+	initTheme,
+	type JsonAgentSessionEvent,
+} from "@earendil-works/pi-coding-agent";
+import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import type { Agent, Roster } from "../agents.ts";
 import type { ChildExit, RunChild } from "../child.ts";
+import type { SendOutcome } from "../control.ts";
 import { spawnRun } from "../child.ts";
 import { registerSubagents } from "../index.ts";
 import { ASK_QUESTION_TOOL, type QuestionDetails, RUN_SLOTS } from "../supervisor.ts";
 // `started` is aliased: this file already has a `started` of its own, the children it must reap.
-import { AGENT_END, AGENT_START, asked, said, SETTLED, started as toolStarted } from "./child-events.ts";
+import { AGENT_END, AGENT_START, asked, heard, queued, said, SETTLED, started as toolStarted } from "./child-events.ts";
 import { pidFrom, reaped } from "./processes.ts";
 
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -106,6 +115,7 @@ interface SendOptions {
 interface SentMessage {
 	content: string;
 	customType: string;
+	details?: unknown;
 	triggerTurn?: boolean;
 	deliverAs?: string;
 	/** Where it landed, given whether the parent was streaming when it was sent. */
@@ -134,8 +144,15 @@ interface Parent {
 /** A pi event handler, as the extension hands it over. */
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 
+/** A slash command, as the extension registers it. */
+interface RegisteredCommand {
+	name: string;
+	description?: string;
+	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+}
+
 /** Records everything the extension says to the parent, and how it lands. */
-function recorder(parent: Parent, tools: RegisteredTool[], sent: SentMessage[], handlers: Map<string, Handler[]>) {
+function recorder(parent: Parent, tools: RegisteredTool[], sent: SentMessage[], handlers: Map<string, Handler[]>, commands: RegisteredCommand[] = []) {
 	return {
 		on(event: string, handler: Handler) {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -143,10 +160,14 @@ function recorder(parent: Parent, tools: RegisteredTool[], sent: SentMessage[], 
 		registerTool(tool: unknown) {
 			tools.push(tool as RegisteredTool);
 		},
-		sendMessage(message: { customType: string; content: string }, options?: SendOptions) {
+		registerCommand(name: string, command: Omit<RegisteredCommand, "name">) {
+			commands.push({ name, ...command });
+		},
+		sendMessage(message: { customType: string; content: string; details?: unknown }, options?: SendOptions) {
 			sent.push({
 				customType: message.customType,
 				content: message.content,
+				details: message.details,
 				triggerTurn: options?.triggerTurn,
 				deliverAs: options?.deliverAs,
 				landed: landing(options, parent.streaming),
@@ -173,9 +194,13 @@ interface WidgetCall {
 function lifecycle(handlers: Map<string, Handler[]>) {
 	const aborting = new AbortController();
 	const widgets: WidgetCall[] = [];
+	const notifications: { message: string; type?: string }[] = [];
 	const ui = {
 		setWidget(key: string, content: string[] | undefined, options?: { placement?: string }) {
 			widgets.push({ key, lines: content, placement: options?.placement });
+		},
+		notify(message: string, type?: string) {
+			notifications.push({ message, type });
 		},
 	} as unknown as ExtensionContext["ui"];
 	const ctx = { signal: aborting.signal, hasUI: true, ui } as ExtensionContext;
@@ -191,6 +216,8 @@ function lifecycle(handlers: Map<string, Handler[]>) {
 		aborting,
 		/** Everything the extension has put above the editor, oldest first. */
 		widgets,
+		/** Everything the extension has told the user in a toast, oldest first. */
+		notifications,
 		/** Start the session, the way pi does before anything else happens. */
 		startSession: (hasUI = true) => fire("session_start", { reason: "startup" }, hasUI ? ctx : headless),
 		/** Start a turn and abort it, the way a parent session that is interrupted does. */
@@ -231,7 +258,7 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>, cliP
 	const parent: Parent = { streaming: false };
 	const pi = recorder(parent, tools, sent, handlers);
 
-	registerSubagents(pi as unknown as ExtensionAPI, {
+	const control = registerSubagents(pi as unknown as ExtensionAPI, {
 		roster,
 		async spawn(options) {
 			const child = await spawnRun({ ...options, cliPath, env });
@@ -239,11 +266,13 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>, cliP
 			return child;
 		},
 	});
+	assert.ok(control, "a parent session hands back its control plane");
 
 	return {
 		subagent: requireTool(tools, "subagent"),
 		subagentWait: requireTool(tools, "subagent_wait"),
 		subagentAnswer: requireTool(tools, "subagent_answer"),
+		control,
 		tools,
 		sent,
 		parent,
@@ -294,13 +323,22 @@ function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error, refuseSpawnAf
 		/** Kill this Run's child out from under it, the way a crash would. */
 		die: (exit: ChildExit) => void;
 		prompts: string[];
+		/** Every steer the child acknowledged, in order. */
+		steers: string[];
+		/**
+		 * What the child does with a steer before acknowledging it — the events it
+		 * writes ahead of its response. Throwing refuses the steer, and a promise
+		 * holds the acknowledgement until it settles, for a send still in flight.
+		 */
+		onSteer?: (text: string) => void | Promise<void>;
 		stops: number;
 	}[] = [];
 	const handlers = new Map<string, Handler[]>();
+	const commands: RegisteredCommand[] = [];
 	const parent: Parent = { streaming: false };
-	const pi = recorder(parent, tools, sent, handlers);
+	const pi = recorder(parent, tools, sent, handlers, commands);
 
-	registerSubagents(pi as unknown as ExtensionAPI, {
+	const control = registerSubagents(pi as unknown as ExtensionAPI, {
 		roster,
 		async spawn(options) {
 			if (refuseSpawn && spawned.length >= refuseSpawnAfter) throw refuseSpawn;
@@ -312,6 +350,8 @@ function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error, refuseSpawnAf
 				emit: options.onEvent,
 				die: (exit: ChildExit) => options.onExit?.(exit),
 				prompts: [] as string[],
+				steers: [] as string[],
+				onSteer: undefined as ((text: string) => void | Promise<void>) | undefined,
 				stops: 0,
 			};
 			spawned.push(child);
@@ -320,6 +360,10 @@ function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error, refuseSpawnAf
 					if (refusePrompt) throw refusePrompt;
 					child.prompts.push(message);
 				},
+				steer: async (message: string) => {
+					await child.onSteer?.(message);
+					child.steers.push(message);
+				},
 				stop: async () => {
 					child.stops++;
 				},
@@ -327,10 +371,14 @@ function stubbedSession(refuseSpawn?: Error, refusePrompt?: Error, refuseSpawnAf
 		},
 	});
 
+	assert.ok(control, "a parent session hands back its control plane");
+
 	return {
 		subagent: requireTool(tools, "subagent"),
 		subagentWait: requireTool(tools, "subagent_wait"),
 		subagentAnswer: requireTool(tools, "subagent_answer"),
+		control,
+		commands,
 		sent,
 		spawned,
 		parent,
@@ -355,7 +403,7 @@ function spawningSession() {
 		roster: ROSTER,
 		spawn: (options) =>
 			new Promise<RunChild>((resolve) => {
-				const child: RunChild = { prompt: async () => {}, stop: async () => void stops++ };
+				const child: RunChild = { prompt: async () => {}, steer: async () => {}, stop: async () => void stops++ };
 				cameUp = () => options.onStarted?.(child);
 				arrive = () => resolve(child);
 			}),
@@ -1536,7 +1584,11 @@ describe("a session that ends", () => {
 		await shutdown();
 
 		assert.ok(await reaped(pid), `pid ${pid} outlived the session that was still starting it`);
-		assert.match(await starting, /Run `scout`.*did not start/s, "the Run that never started is named, not lost");
+		assert.match(
+			await starting,
+			/Run `scout`.*was stopped while it was starting: the session is shutting down\./s,
+			"the Run that never started is named, not lost, and said to have been stopped rather than to have failed",
+		);
 	});
 });
 
@@ -1598,5 +1650,857 @@ describe("subagents widget", () => {
 		session.spawned[0].emit(SETTLED);
 
 		assert.deepEqual(session.widgets, [], "a headless session is told nothing about widgets");
+	});
+});
+
+/** A turn held open until the child is steered — a Run still working when the user types. */
+const AWAIT_STEER = { type: "fake:await_steer" } as unknown as JsonAgentSessionEvent;
+
+describe("steering a running Run", () => {
+	it("hands the message to the Run's child as a steer, not as a fresh prompt", async () => {
+		const { subagent, control, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		const outcome = await control.send("scout", "Only the auth module, please.");
+
+		assert.deepEqual(outcome, { ok: true, as: "steer" });
+		assert.deepEqual(spawned[0].steers, ["Only the auth module, please."]);
+		assert.deepEqual(spawned[0].prompts, [], "a prompt would start a turn of its own; a steer joins the one in flight");
+	});
+
+	it("tells the parent, without waking it and without landing mid-tool-call", async () => {
+		const { subagent, control, sent, parent } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		parent.streaming = true;
+		await control.send("scout", "Only the auth module, please.");
+		parent.streaming = false;
+		await control.send("scout", "And skip the tests.");
+
+		assert.deepEqual(sent.map((message) => message.customType), ["subagent-steer", "subagent-steer"]);
+		// `triggerTurn: false` and no `deliverAs` is the one combination pi holds to
+		// the end of a streaming turn and appends straight away to an idle one.
+		assert.deepEqual(sent.map((message) => [message.triggerTurn, message.deliverAs]), [[false, undefined], [false, undefined]]);
+		assert.deepEqual(sent.map((message) => message.landed), ["transcript", "transcript"]);
+		assert.match(sent[0].content, /Run `scout`|run `scout`/);
+		assert.match(sent[0].content, /Only the auth module, please\./);
+		assert.deepEqual(sent[0].details, { run: "scout", agent: "scout", task: "look around", as: "steer" });
+	});
+
+	it("comes back too late for a Run that settled before the steer reached its child", async () => {
+		const { subagent, control, sent, spawned, notifications } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		await flush();
+		// The child settles, and only then takes the steer — queued into an idle
+		// child that will never read it.
+		spawned[0].onSteer = (text) => {
+			spawned[0].emit(said("Found three call sites."));
+			spawned[0].emit(SETTLED);
+			spawned[0].emit(queued(text));
+		};
+
+		const outcome = await control.send("scout", "Only the auth module, please.");
+
+		assert.deepEqual(outcome, { ok: false, reason: "too late — scout already finished" });
+		assert.deepEqual(sent.map((message) => message.customType), ["subagent-delivery"], "the parent is told nothing about a steer that never landed");
+		assert.deepEqual(notifications, [], "said once, by the send itself");
+	});
+
+	it("counts a steer the child read just before settling, though its acknowledgement came after", async () => {
+		const { subagent, control, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		await flush();
+		// One stdout chunk: the steer queued, read, the turn settling — and the
+		// sender only resumed once all of it has been seen.
+		spawned[0].onSteer = (text) => {
+			spawned[0].emit(queued(text));
+			spawned[0].emit(queued());
+			spawned[0].emit(said("Only the auth module: three call sites."));
+			spawned[0].emit(SETTLED);
+		};
+
+		const outcome = await control.send("scout", "Only the auth module, please.");
+
+		assert.deepEqual(outcome, { ok: true, as: "steer" });
+		assert.deepEqual(sent.map((message) => message.customType), ["subagent-delivery", "subagent-steer"]);
+	});
+
+	it("comes back too late for a steer still queued when the Run settled, and says so once", async () => {
+		const { subagent, control, sent, spawned, notifications } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		await flush();
+		spawned[0].onSteer = (text) => {
+			spawned[0].emit(queued(text));
+			spawned[0].emit(said("Found three call sites."));
+			spawned[0].emit(SETTLED);
+		};
+
+		const outcome = await control.send("scout", "Only the auth module, please.");
+
+		assert.deepEqual(outcome, { ok: false, reason: "too late — scout already finished" });
+		assert.deepEqual(notifications, [], "the send says it; the settle must not say it again");
+		assert.deepEqual(sent.map((message) => message.customType), ["subagent-delivery"]);
+	});
+
+	it("tells the user and the parent when a steer it took was never read before the Run finished", async () => {
+		const { subagent, control, sent, spawned, notifications, startSession } = stubbedSession();
+		await startSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		await flush();
+		spawned[0].onSteer = (text) => spawned[0].emit(queued(text));
+
+		const outcome = await control.send("scout", "Only the auth module, please.");
+		// Acknowledged while it was working, then the turn boundary that would
+		// have read it had already passed.
+		spawned[0].emit(said("Found three call sites."));
+		spawned[0].emit(SETTLED);
+
+		assert.deepEqual(outcome, { ok: true, as: "steer" });
+		assert.equal(notifications.length, 1);
+		assert.match(notifications[0].message, /^Too late — scout finished before reading your message/);
+		assert.equal(notifications[0].type, "warning");
+		// The correction lands before the Delivery, so the turn the Delivery wakes
+		// already knows the result ignores the steer.
+		assert.deepEqual(sent.map((message) => message.customType), ["subagent-steer", "subagent-steer", "subagent-delivery"]);
+		assert.match(sent[1].content, /never reached it/);
+		assert.equal(sent[1].triggerTurn, false);
+	});
+
+	it("says nothing more about a steer the child read before it finished", async () => {
+		const { subagent, control, spawned, notifications, startSession } = stubbedSession();
+		await startSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		await flush();
+		spawned[0].onSteer = (text) => spawned[0].emit(queued(text));
+
+		await control.send("scout", "Only the auth module, please.");
+		spawned[0].emit(queued());
+		spawned[0].emit(said("Only the auth module: three call sites."));
+		spawned[0].emit(SETTLED);
+
+		assert.deepEqual(notifications, []);
+	});
+
+	it("says why it could not reach a child that refused the steer, and tells the parent nothing", async () => {
+		const { subagent, control, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		await flush();
+		spawned[0].onSteer = () => {
+			throw new Error("rpc: stream closed");
+		};
+
+		const outcome = await control.send("scout", "Only the auth module, please.");
+
+		assert.deepEqual(outcome, { ok: false, reason: "could not reach scout: rpc: stream closed" });
+		assert.deepEqual(sent, []);
+	});
+
+	describe("sent after it asked a Question, before the Question settled", () => {
+		/**
+		 * A Run whose child has run `ask_question` and is still in the closing turn
+		 * it takes afterwards — the Question already in its transcript for the user
+		 * to read, and not yet said to the parent.
+		 */
+		async function asking() {
+			const session = stubbedSession();
+			await session.startSession();
+			await call(session.subagent, { agent: "scout", task: "look around" });
+			await flush();
+			session.spawned[0].emit(asked("Which auth module do you mean?"));
+			session.spawned[0].onSteer = (text) => session.spawned[0].emit(queued(text));
+			return session;
+		}
+
+		/** The child reading the steer at its turn boundary, and finishing on it. */
+		function readAndFinish(child: { emit: (event: JsonAgentSessionEvent) => void }, steer: string): void {
+			child.emit(queued());
+			child.emit(heard(steer));
+			child.emit(said("Three call sites in src/auth.ts."));
+			child.emit(AGENT_END);
+			child.emit(SETTLED);
+		}
+
+		it("delivers the result the steer led to, rather than parking the Run on the Question it answered", async () => {
+			const { control, sent, spawned, subagentWait } = await asking();
+
+			const outcome = await control.send("scout", "The one in src/auth.ts.");
+			readAndFinish(spawned[0], "The one in src/auth.ts.");
+
+			assert.deepEqual(outcome, { ok: true, as: "steer" });
+			assert.deepEqual(sent.map((message) => message.customType), ["subagent-steer", "subagent-delivery"]);
+			assert.match(sent[1].content, /Three call sites in src\/auth\.ts\./);
+			assert.match(await call(subagentWait, { names: ["scout"] }), /already delivered/, "done, not Waiting");
+		});
+
+		it("tells the parent the user answered a question it was never asked, so it has nothing to answer", async () => {
+			const { control, sent, spawned } = await asking();
+
+			await control.send("scout", "The one in src/auth.ts.");
+			readAndFinish(spawned[0], "The one in src/auth.ts.");
+
+			const note = sent[0];
+			assert.equal(note.triggerTurn, false);
+			assert.match(note.content, /just after it asked a question/);
+			assert.match(note.content, /nothing for you to answer/);
+			assert.match(note.content, /Which auth module do you mean\?/);
+			assert.match(note.content, /The one in src\/auth\.ts\./);
+			assert.deepEqual(note.details, {
+				run: "scout",
+				agent: "scout",
+				task: "look around",
+				as: "steer",
+				question: "Which auth module do you mean?",
+			});
+		});
+
+		it("refuses the parent's answer to that Question afterwards, as already answered by the user", async () => {
+			const { control, spawned, subagentAnswer } = await asking();
+
+			await control.send("scout", "The one in src/auth.ts.");
+			readAndFinish(spawned[0], "The one in src/auth.ts.");
+
+			await assert.rejects(call(subagentAnswer, { name: "scout", answer: "src/legacy/auth.ts" }), (error: Error) => {
+				assert.match(error.message, /already answered by the user/);
+				return true;
+			});
+			assert.deepEqual(spawned[0].prompts, [], "no second, stale prompt");
+		});
+
+		it("still notes a plain steer for a Run that settled on its Question before reading it", async () => {
+			const { control, sent, spawned } = await asking();
+			spawned[0].onSteer = (text) => {
+				spawned[0].emit(SETTLED);
+				spawned[0].emit(queued(text));
+			};
+
+			const outcome = await control.send("scout", "The one in src/auth.ts.");
+
+			assert.deepEqual(outcome, { ok: true, as: "steer" });
+			assert.deepEqual(sent.map((message) => message.customType), ["subagent-question", "subagent-steer"]);
+			assert.doesNotMatch(sent[1].content, /nothing for you to answer/, "the parent has that Question, and still has to answer it");
+		});
+
+		it("carries the Run from the Question to its result over a real RPC child", async () => {
+			const turns = [[AGENT_START, asked("Which auth module do you mean?"), AWAIT_STEER, said("Three call sites in src/auth.ts."), AGENT_END, SETTLED]];
+			const { subagent, control, sent } = fakeSession(ROSTER, { FAKE_RPC_TURNS: JSON.stringify(turns) });
+			// The fake child plays its turn as far as the marker the moment it takes
+			// its task, so the Question is in the stream ahead of anything the steer
+			// makes it write.
+			await call(subagent, { agent: "scout", task: "count the call sites" });
+
+			const outcome = await control.send("scout", "The one in src/auth.ts.");
+			await messageAt(sent, 1);
+
+			assert.deepEqual(outcome, { ok: true, as: "steer" });
+			assert.deepEqual(sent.map((message) => message.customType).sort(), ["subagent-delivery", "subagent-steer"]);
+			assert.match(sent.find((message) => message.customType === "subagent-delivery")?.content ?? "", /Three call sites in src\/auth\.ts\./);
+		});
+	});
+
+	describe("sent twice with the same words", () => {
+		/**
+		 * A Run with two identical steers on their way to its child, neither
+		 * acknowledged yet, and a way to let both acknowledgements back.
+		 */
+		async function twoInFlight() {
+			const session = stubbedSession();
+			await session.startSession();
+			await call(session.subagent, { agent: "scout", task: "look around" });
+			await flush();
+			const acknowledge: (() => void)[] = [];
+			session.spawned[0].onSteer = () => new Promise<void>((resolve) => acknowledge.push(resolve));
+			const first = session.control.send("scout", "Only the auth module, please.");
+			const second = session.control.send("scout", "Only the auth module, please.");
+			await flush();
+			return {
+				...session,
+				/** Let both acknowledgements back, and say what each send came to. */
+				async outcomes(): Promise<SendOutcome[]> {
+					for (const resolve of acknowledge) resolve();
+					return Promise.all([first, second]);
+				},
+			};
+		}
+
+		it("does not count the second as arrived because the first, already read, had the same words", async () => {
+			const { spawned, sent, outcomes } = await twoInFlight();
+			const steer = "Only the auth module, please.";
+
+			// The first arrives and is read; the Run finishes before the second
+			// arrives, which then lands on an idle child that never reads it.
+			spawned[0].emit(queued(steer));
+			spawned[0].emit(queued());
+			spawned[0].emit(heard(steer));
+			spawned[0].emit(said("Only the auth module: three call sites."));
+			spawned[0].emit(SETTLED);
+			spawned[0].emit(queued(steer));
+
+			assert.deepEqual(await outcomes(), [
+				{ ok: true, as: "steer" },
+				{ ok: false, reason: "too late — scout already finished" },
+			]);
+			assert.deepEqual(sent.map((message) => message.customType), ["subagent-delivery", "subagent-steer"], "one note, for the one that was read");
+		});
+
+		it("calls the one left unread the last one sent, as pi reads its queue oldest first", async () => {
+			const { spawned, notifications, outcomes } = await twoInFlight();
+			const steer = "Only the auth module, please.";
+
+			spawned[0].emit(queued(steer));
+			spawned[0].emit(queued(steer, steer));
+			spawned[0].emit(queued(steer));
+			spawned[0].emit(heard(steer));
+			spawned[0].emit(said("Only the auth module: three call sites."));
+			spawned[0].emit(SETTLED);
+
+			assert.deepEqual(await outcomes(), [
+				{ ok: true, as: "steer" },
+				{ ok: false, reason: "too late — scout already finished" },
+			]);
+			assert.deepEqual(notifications, [], "both were judged by their own sends, so the settle reports neither");
+		});
+	});
+
+	it("keeps nothing of a finished Run's queue, though a steer lands on its idle child afterwards", async (context) => {
+		const { subagent, control, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		await flush();
+		// What a Run's child has queued is kept in a map private to the
+		// registration and read by nothing a test can reach, so what is watched is
+		// whether anything is written under the finished Run's name at all.
+		let kept: unknown[] = [];
+		spawned[0].onSteer = (text) => {
+			spawned[0].emit(said("Found three call sites."));
+			spawned[0].emit(SETTLED);
+			// pi takes the steer into the settled child and says it has queued it.
+			const writes = context.mock.method(Map.prototype, "set");
+			spawned[0].emit(queued(text));
+			kept = writes.mock.calls.filter((write) => write.arguments[0] === "scout").map((write) => write.arguments[1]);
+			writes.mock.restore();
+		};
+
+		assert.deepEqual(await control.send("scout", "Only the auth module, please."), { ok: false, reason: "too late — scout already finished" });
+		assert.deepEqual(kept, [], "a queue nothing will ever judge or clear again");
+	});
+
+	it("carries a steer into a real child's turn, over the RPC stream", async () => {
+		const turns = [[AGENT_START, AWAIT_STEER, said("Only the auth module: three call sites."), AGENT_END, SETTLED]];
+		const { subagent, control, sent } = fakeSession(ROSTER, { FAKE_RPC_TURNS: JSON.stringify(turns) });
+		await call(subagent, { agent: "scout", task: "count the call sites" });
+
+		const outcome = await control.send("scout", "Only the auth module, please.");
+		await messageAt(sent, 1);
+
+		assert.deepEqual(outcome, { ok: true, as: "steer" });
+		// Either order: the fake child reads the steer and finishes with no model
+		// call in between, so under load its Delivery can share the acknowledgement's
+		// stdout chunk — the residue `steerRun` describes, which a real pi turn is
+		// too slow to hit.
+		assert.deepEqual(sent.map((message) => message.customType).sort(), ["subagent-delivery", "subagent-steer"]);
+		const result = sent.find((message) => message.customType === "subagent-delivery");
+		assert.match(result?.content ?? "", /Only the auth module: three call sites\./);
+	});
+});
+
+describe("answering a Waiting Run as the user", () => {
+	async function waiting() {
+		const session = stubbedSession();
+		await call(session.subagent, { agent: "scout", task: "look around" });
+		session.spawned[0].emit(asked("Which auth module do you mean?"));
+		session.spawned[0].emit(SETTLED);
+		return session;
+	}
+
+	it("answers it with a fresh prompt into its child, exactly as subagent_answer would", async () => {
+		const { control, spawned, subagentWait } = await waiting();
+
+		const outcome = await control.send("scout", "The one in src/auth.ts.");
+
+		assert.deepEqual(outcome, { ok: true, as: "answer" });
+		assert.deepEqual(spawned[0].prompts, ["The one in src/auth.ts."]);
+		assert.deepEqual(spawned[0].steers, [], "a steer into an idle child would sit there unread");
+		// It is running again, so a join waits for it rather than collecting the
+		// Question that was just answered.
+		const join = watch(call(subagentWait, {}));
+		await flush();
+		assert.equal(join.text, undefined);
+		spawned[0].emit(said("Three call sites."));
+		spawned[0].emit(SETTLED);
+		await flush();
+		assert.match(join.text ?? "", /Three call sites\./);
+	});
+
+	it("tells the parent before the child can deliver, so the note never trails the result", async () => {
+		const { control, sent, spawned } = await waiting();
+		const answering = control.send("scout", "The one in src/auth.ts.");
+		// The child's turn comes back before the prompt's acknowledgement does.
+		spawned[0].emit(said("Three call sites."));
+		spawned[0].emit(SETTLED);
+		await answering;
+
+		assert.deepEqual(sent.map((message) => message.customType), ["subagent-question", "subagent-steer", "subagent-delivery"]);
+	});
+
+	it("tells the parent its Question is answered, without waking it", async () => {
+		const { control, sent } = await waiting();
+
+		await control.send("scout", "The one in src/auth.ts.");
+
+		const note = sent[1];
+		assert.equal(note.customType, "subagent-steer");
+		assert.equal(note.triggerTurn, false);
+		assert.equal(note.landed, "transcript");
+		assert.match(note.content, /answered/);
+		assert.match(note.content, /Which auth module do you mean\?/);
+		assert.match(note.content, /The one in src\/auth\.ts\./);
+		assert.deepEqual(note.details, {
+			run: "scout",
+			agent: "scout",
+			task: "look around",
+			as: "answer",
+			question: "Which auth module do you mean?",
+		});
+	});
+
+	it("refuses the parent's own answer to that Question afterwards, as already answered by the user", async () => {
+		const { control, spawned, subagentAnswer } = await waiting();
+		await control.send("scout", "The one in src/auth.ts.");
+
+		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "src/legacy/auth.ts" }), (error: Error) => {
+			assert.match(error.message, /already answered by the user/);
+			return true;
+		});
+		assert.deepEqual(spawned[0].prompts, ["The one in src/auth.ts."], "one answer, one turn");
+	});
+
+	it("still says the user answered it once the Run has finished", async () => {
+		const { control, spawned, subagentAnswer } = await waiting();
+		await control.send("scout", "The one in src/auth.ts.");
+		spawned[0].emit(said("Three call sites."));
+		spawned[0].emit(SETTLED);
+
+		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "src/legacy/auth.ts" }), (error: Error) => {
+			assert.match(error.message, /already answered by the user/);
+			assert.match(error.message, /done/);
+			return true;
+		});
+	});
+
+	it("lets the parent answer the Run's next Question, which nobody has answered yet", async () => {
+		const { control, spawned, subagentAnswer } = await waiting();
+		await control.send("scout", "The one in src/auth.ts.");
+		spawned[0].emit(asked("Should I include the tests?"));
+		spawned[0].emit(SETTLED);
+
+		await call(subagentAnswer, { name: "scout", answer: "Yes." });
+
+		assert.deepEqual(spawned[0].prompts, ["The one in src/auth.ts.", "Yes."]);
+	});
+
+	it("leaves the Run waiting, and answerable by the parent, when the answer cannot be sent", async () => {
+		const { subagent, control, sent, spawned, subagentWait } = stubbedSession(undefined, new Error("rpc: stream closed"));
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+
+		const outcome = await control.send("scout", "The one in src/auth.ts.");
+
+		assert.deepEqual(outcome, { ok: false, reason: "could not reach scout: rpc: stream closed" });
+		// Noted before it was sent, so the note is taken back rather than left standing.
+		assert.deepEqual(sent.map((message) => message.customType), ["subagent-question", "subagent-steer", "subagent-steer"]);
+		assert.match(sent[2].content, /never reached it/);
+		assert.match(sent[2].content, /still needs an answer/);
+		assert.match(await call(subagentWait, {}), /Which auth module do you mean\?/);
+	});
+
+	it("carries a Run from a Question to a Delivery over a real RPC child", async () => {
+		const turns = [
+			[AGENT_START, asked("Which auth module do you mean?"), AGENT_END, SETTLED],
+			[AGENT_START, said("Three call sites in src/auth.ts."), AGENT_END, SETTLED],
+		];
+		const { subagent, control, sent } = fakeSession(ROSTER, { FAKE_RPC_TURNS: JSON.stringify(turns) });
+		await call(subagent, { agent: "scout", task: "count the call sites" });
+		await messageAt(sent);
+
+		const outcome = await control.send("scout", "The one in src/auth.ts.");
+		const delivered = await messageAt(sent, 2);
+
+		assert.deepEqual(outcome, { ok: true, as: "answer" });
+		assert.deepEqual(sent.map((message) => message.customType), ["subagent-question", "subagent-steer", "subagent-delivery"]);
+		assert.match(delivered.content, /Three call sites in src\/auth\.ts\./);
+	});
+});
+
+describe("a human message the Run cannot take", () => {
+	it("is refused for a queued Run, which has no child to take it yet", async () => {
+		const { subagent, control, sent } = stubbedSession();
+		await fanOut(subagent, RUN_SLOTS + 1);
+
+		const outcome = await control.send(scout(RUN_SLOTS), "Only the auth module, please.");
+
+		assert.equal(outcome.ok, false);
+		assert.match(outcome.ok ? "" : outcome.reason, /queued/);
+		assert.deepEqual(sent, []);
+	});
+
+	it("is too late for a Run that has finished, whichever way it finished", async () => {
+		const { subagent, control, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "one" });
+		await call(subagent, { agent: "scout", task: "two" });
+		spawned[0].emit(SETTLED);
+		spawned[1].die({ exitCode: 3 });
+
+		assert.deepEqual(await control.send("scout", "hello"), { ok: false, reason: "too late — scout already finished" });
+		assert.deepEqual(await control.send("scout-2", "hello"), { ok: false, reason: "too late — scout-2 already finished" });
+		assert.deepEqual(spawned.map((child) => child.steers), [[], []]);
+	});
+
+	it("is refused for a name this session never started, and for an empty message", async () => {
+		const { subagent, control, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+
+		assert.equal((await control.send("ghost", "hello")).ok, false);
+		assert.equal((await control.send("scout", "   ")).ok, false);
+		assert.deepEqual(spawned[0].steers, []);
+	});
+});
+
+describe("killing a Run", () => {
+	it("fails it as killed by the user, delivers that like any failure, and reaps its child", async () => {
+		const { subagent, control, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		await flush();
+
+		assert.equal(await control.kill("scout"), true);
+
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0].customType, "subagent-delivery");
+		assert.match(sent[0].content, /Run `scout` \(agent `scout`\) failed/);
+		assert.match(sent[0].content, /killed by the user/);
+		assert.equal(sent[0].triggerTurn, true, "woken like any other Delivery");
+		assert.equal(spawned[0].stops, 1);
+	});
+
+	it("kills a Waiting Run too, whose child is otherwise kept up for its answer", async () => {
+		const { subagent, control, spawned, subagentAnswer } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+
+		assert.equal(await control.kill("scout"), true);
+
+		assert.equal(spawned[0].stops, 1);
+		await assert.rejects(call(subagentAnswer, { name: "scout", answer: "too late" }), /failed/);
+	});
+
+	it("takes a queued Run out of the queue for good, and starts the next one in its place", async () => {
+		const { subagent, control, sent, spawned } = stubbedSession();
+		await fanOut(subagent, RUN_SLOTS + 2);
+
+		assert.equal(await control.kill(scout(RUN_SLOTS)), true);
+		assert.equal(spawned.length, RUN_SLOTS, "killing a Run that held no slot frees none");
+		assert.match(sent[0].content, new RegExp(`Run \`${scout(RUN_SLOTS)}\`.*killed by the user`, "s"));
+
+		spawned[0].emit(SETTLED);
+		await flush();
+
+		assert.deepEqual(
+			spawned.map((child) => child.name).slice(RUN_SLOTS),
+			[scout(RUN_SLOTS + 1)],
+			"the killed Run never starts; the one queued behind it takes the slot",
+		);
+	});
+
+	it("frees a running Run's slot for the queue, as any other failure does", async () => {
+		const { subagent, control, spawned } = stubbedSession();
+		await fanOut(subagent, RUN_SLOTS + 1);
+
+		await control.kill("scout");
+		await flush();
+
+		assert.equal(spawned.length, RUN_SLOTS + 1);
+		assert.equal(spawned[RUN_SLOTS].name, scout(RUN_SLOTS));
+	});
+
+	it("hands the failure to a join that is waiting on the Run, rather than saying it twice", async () => {
+		const { subagent, subagentWait, control, sent } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		const join = watch(call(subagentWait, { names: ["scout"] }));
+		await flush();
+
+		await control.kill("scout");
+		await flush();
+
+		assert.match(join.text ?? "", /killed by the user/);
+		assert.deepEqual(sent, []);
+	});
+
+	it("comes back false for a Run that has already stopped, or never existed, and says nothing", async () => {
+		const { subagent, control, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(SETTLED);
+
+		assert.equal(await control.kill("scout"), false);
+		assert.equal(await control.kill("ghost"), false);
+		assert.equal(sent.length, 1, "only the Run's own Delivery");
+	});
+
+	it("tells the subagent call still starting the Run that it was killed, not what killing it broke", async () => {
+		const tools: RegisteredTool[] = [];
+		const sent: SentMessage[] = [];
+		let cameUp = () => {};
+		const control = registerSubagents(recorder({ streaming: false }, tools, sent, new Map()) as unknown as ExtensionAPI, {
+			roster: ROSTER,
+			// A child whose process is up and whose first prompt has not come back:
+			// stopping it is what makes the spawn fail, the way the RPC client fails
+			// a prompt to a process that has exited.
+			spawn: (options) =>
+				new Promise<RunChild>((_resolve, reject) => {
+					const child: RunChild = {
+						prompt: async () => {},
+						steer: async () => {},
+						stop: async () => reject(new Error("Agent process exited with code null")),
+					};
+					cameUp = () => options.onStarted?.(child);
+				}),
+		});
+		assert.ok(control);
+		const starting = call(requireTool(tools, "subagent"), { agent: "scout", task: "look around" });
+		await flush();
+		cameUp();
+
+		assert.equal(await control.kill("scout"), true);
+		const returned = await starting;
+
+		assert.match(returned, /Run `scout` \(agent `scout`\) was stopped while it was starting: killed by the user\./);
+		assert.doesNotMatch(returned, /did not start|exited/, "the kill's own error is not a second fault");
+		assert.deepEqual(sent.map((message) => message.customType), ["subagent-delivery"], "the kill is delivered once, as any failure is");
+	});
+
+	it("leaves no pi process behind", async () => {
+		const pidPath = join(mkdtempSync(join(tmpdir(), "subagents-kill-")), "pid");
+		const { subagent, control, sent } = fakeSession(ROSTER, { FAKE_RPC_PID_OUT: pidPath, FAKE_RPC_TURNS: JSON.stringify([[]]) });
+		await call(subagent, { agent: "scout", task: "look around" });
+		const pid = Number(readFileSync(pidPath, "utf-8"));
+
+		assert.equal(await control.kill("scout"), true);
+
+		assert.ok(await reaped(pid), `pid ${pid} outlived the Run the user killed`);
+		assert.match(sent[0]?.content ?? "", /killed by the user/);
+	});
+});
+
+describe("the /subagents command", () => {
+	// The Inspector draws with pi's own message components, which draw with pi's
+	// global theme — set up by pi before any extension runs, and here by hand.
+	initTheme("dark");
+
+	/** One overlay as the command opens it: drawn, and handed keys. */
+	interface Overlay {
+		render(width: number): string[];
+		handleInput(data: string): void;
+		dispose?(): void;
+	}
+
+	/**
+	 * pi's terminal UI, as far as `/subagents` uses it: toasts, and overlays
+	 * opened one at a time, each kept for the test to draw and press keys on the
+	 * way a person would. `mode` is pi's run mode, which is what says whether
+	 * there is a terminal at all.
+	 */
+	function terminal(mode: ExtensionCommandContext["mode"] = "tui") {
+		const notifications: { message: string; type?: string }[] = [];
+		const opened: { overlay: Overlay; options: unknown }[] = [];
+		const tui = { terminal: { rows: 40, columns: 120 }, requestRender() {} };
+		const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+		const ui = {
+			notify(message: string, type?: string) {
+				notifications.push({ message, type });
+			},
+			custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Overlay, options: unknown) {
+				return new Promise((resolve) => {
+					const overlay = factory(tui, plain, undefined, (value) => {
+						// pi disposes an overlay as it closes it.
+						overlay.dispose?.();
+						resolve(value);
+					});
+					opened.push({ overlay, options });
+				});
+			},
+		};
+		const ctx = { mode, hasUI: mode !== "print" && mode !== "json", cwd: process.cwd(), ui } as unknown as ExtensionCommandContext;
+
+		return {
+			ctx,
+			notifications,
+			opened,
+			/** The `index`th overlay the command opened, once it has. */
+			async overlay(index: number): Promise<Overlay> {
+				for (let attempt = 0; attempt < 200 && opened.length <= index; attempt++) await flush();
+				assert.ok(opened.length > index, `expected overlay ${index + 1} to open; ${opened.length} did`);
+				return opened[index].overlay;
+			},
+		};
+	}
+
+	/** What an overlay draws, colours stripped, as one string to search. */
+	function drawn(overlay: Overlay, width = 100): string {
+		return overlay
+			.render(width)
+			.map((line) => stripTerminalSequences(line))
+			.join("\n");
+	}
+
+	/** The command a test is about, named so a missing registration fails loudly. */
+	function requireCommand(commands: RegisteredCommand[], name: string): RegisteredCommand {
+		const command = commands.find((candidate) => candidate.name === name);
+		assert.ok(command, `expected a /${name} command, got ${commands.map((registered) => registered.name).join(", ") || "none"}`);
+		return command;
+	}
+
+	/** A message settling in the child: the `message_start` and `message_end` pi sends for every one. */
+	function settled(message: unknown): JsonAgentSessionEvent[] {
+		return [
+			{ type: "message_start", message } as unknown as JsonAgentSessionEvent,
+			{ type: "message_end", message } as unknown as JsonAgentSessionEvent,
+		];
+	}
+
+	/** The task, as a Run's child settles it first thing: a user message. */
+	function task(text: string): JsonAgentSessionEvent[] {
+		return settled({ role: "user", content: [{ type: "text", text }], timestamp: 0 });
+	}
+
+	/** A reply the child has started streaming and not finished. */
+	function streaming(text: string): JsonAgentSessionEvent[] {
+		const message = { role: "assistant", content: [], api: "anthropic", provider: "", model: "", usage: {}, stopReason: "stop", timestamp: 0 };
+		return [
+			{ type: "message_start", message } as unknown as JsonAgentSessionEvent,
+			{ type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } } as unknown as JsonAgentSessionEvent,
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text } } as unknown as JsonAgentSessionEvent,
+		];
+	}
+
+	/** Leave the Inspector and close the picker behind it, and let the command finish. */
+	async function closeAll(screen: ReturnType<typeof terminal>, inspectorIndex: number, running: Promise<void>): Promise<void> {
+		(await screen.overlay(inspectorIndex)).handleInput("\x1b");
+		(await screen.overlay(inspectorIndex + 1)).handleInput("\x1b");
+		await running;
+	}
+
+	it("is registered in the parent session, and not in a Run's own", () => {
+		const { commands } = stubbedSession();
+		const childCommands: RegisteredCommand[] = [];
+		registerSubagents(recorder({ streaming: false }, [], [], new Map(), childCommands) as unknown as ExtensionAPI, { runName: "scout" });
+
+		assert.match(requireCommand(commands, "subagents").description ?? "", /transcript/);
+		assert.deepEqual(childCommands, [], "a Run has no Runs of its own to watch");
+	});
+
+	it("refuses outside pi's terminal UI, and opens nothing", async () => {
+		const { subagent, commands } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		const screen = terminal("rpc");
+
+		await requireCommand(commands, "subagents").handler("", screen.ctx);
+
+		assert.equal(screen.opened.length, 0);
+		assert.equal(screen.notifications[0]?.type, "error");
+		assert.match(screen.notifications[0]?.message ?? "", /needs pi's interactive terminal/);
+	});
+
+	it("says so when no Run has been started, and opens nothing", async () => {
+		const { commands } = stubbedSession();
+		const screen = terminal();
+
+		await requireCommand(commands, "subagents").handler("", screen.ctx);
+
+		assert.equal(screen.opened.length, 0);
+		assert.deepEqual(screen.notifications, [{ message: "No subagent runs in this session.", type: "info" }]);
+	});
+
+	it("lists the session's Runs, and opens the Inspector on the one chosen, showing what its child said since it spawned", async () => {
+		const { subagent, commands, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		for (const event of task("look around")) spawned[0].emit(event);
+		spawned[0].emit(said("Found three call sites."));
+		const screen = terminal();
+
+		const running = requireCommand(commands, "subagents").handler("", screen.ctx);
+		const picker = await screen.overlay(0);
+		assert.match(drawn(picker, 80), /› \d\d:\d\d {2}scout {2}running/);
+		picker.handleInput("\r");
+		const inspector = drawn(await screen.overlay(1));
+		await closeAll(screen, 1, running);
+
+		assert.match(inspector, /scout · scout · running/);
+		assert.match(inspector, /look around/);
+		assert.match(inspector, /Found three call sites\./);
+		assert.equal(screen.opened.length, 3, "picker, Inspector, and the picker again on the way out");
+		assert.ok(
+			screen.opened.every(({ options }) => (options as { overlay?: boolean }).overlay === true),
+			"every one of them an overlay",
+		);
+	});
+
+	it("steers the Run from the Inspector, and tells the parent", async () => {
+		const { subagent, commands, spawned, sent } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		const screen = terminal();
+
+		const running = requireCommand(commands, "subagents").handler("", screen.ctx);
+		(await screen.overlay(0)).handleInput("\r");
+		const inspector = await screen.overlay(1);
+		for (const key of [..."Only src/", "\r"]) inspector.handleInput(key);
+		await flush();
+		const after = drawn(inspector);
+		await closeAll(screen, 1, running);
+
+		assert.deepEqual(spawned[0].steers, ["Only src/"]);
+		assert.equal(sent.at(-1)?.customType, "subagent-steer");
+		assert.match(after, /Sent to scout/);
+	});
+
+	it("kills the Run from the Inspector after a y, delivering the failure like any other", async () => {
+		const { subagent, commands, sent } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		const screen = terminal();
+
+		const running = requireCommand(commands, "subagents").handler("", screen.ctx);
+		(await screen.overlay(0)).handleInput("\r");
+		const inspector = await screen.overlay(1);
+		inspector.handleInput("\x18");
+		inspector.handleInput("y");
+		for (let attempt = 0; attempt < 200 && sent.length === 0; attempt++) await flush();
+		await flush();
+		const after = drawn(inspector);
+		await closeAll(screen, 1, running);
+
+		assert.equal(sent[0]?.customType, "subagent-delivery");
+		assert.match(sent[0]?.content ?? "", /killed by the user/);
+		assert.match(after, /scout · scout · failed/);
+		assert.match(after, /A finished run is read-only/);
+	});
+
+	it("keeps a stopped Run's transcript as it stopped: a reply cut off shows as cut off, and later words are not recorded", async () => {
+		const { subagent, commands, control, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		for (const event of task("look around")) spawned[0].emit(event);
+		for (const event of streaming("I was about to say")) spawned[0].emit(event);
+		await control.kill("scout");
+		// A dying child's last words, arriving after its Run was already failed.
+		spawned[0].emit(said("Too late to matter."));
+		const screen = terminal();
+
+		const running = requireCommand(commands, "subagents").handler("", screen.ctx);
+		const picker = await screen.overlay(0);
+		assert.match(drawn(picker, 80), /scout\s+failed · killed by the user/);
+		picker.handleInput("\r");
+		const inspector = drawn(await screen.overlay(1));
+		await closeAll(screen, 1, running);
+
+		assert.match(inspector, /I was about to say/);
+		assert.match(inspector, /Operation aborted/);
+		assert.doesNotMatch(inspector, /Too late to matter/);
 	});
 });

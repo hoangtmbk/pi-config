@@ -8,8 +8,9 @@ conversation when it is done.
 The vocabulary below is the repo's, defined in [`CONTEXT.md`](../../CONTEXT.md): an **Agent** is a
 markdown definition, a **Run** is one execution of an Agent, the **Supervisor** is the parent-side
 owner of every Run, a **Question** is a Run escalating to the parent, **Waiting** is a Run on an
-unanswered Question, a **Slot** is one of the four places a Run may work in, and **Delivery** is the
-moment a result re-enters the parent conversation.
+unanswered Question, a **Slot** is one of the four places a Run may work in, **Delivery** is the
+moment a result re-enters the parent conversation, a **Steer** is a human's message into a running
+Run, and the **Inspector** is the overlay showing one Run's live transcript.
 
 ## Why
 
@@ -139,12 +140,13 @@ Run — waiting for it, answering it — depends on whether its child has come u
         spawn                  agent_settled, no ask_question
   ─────────────▶  running  ──────────────────────────────────▶  done
                    │  ▲                                          │
-   agent_settled,  │  │  subagent_answer                         │  delivery
-   turn contained  │  │  (RPC prompt)                            ▼
-   ask_question    ▼  │                                      (parent)
+   agent_settled,  │  │  subagent_answer, or the user            │  delivery
+   turn contained  │  │  from the Inspector                      ▼
+   ask_question    ▼  │  (RPC prompt)                        (parent)
                  waiting                                         ▲
                                                                  │
-                  child exit != 0, or spawn failure ──▶ failed ───┘
+   child exit != 0, spawn failure,                               │
+   or killed by the user from the Inspector ──────────▶ failed ──┘
 ```
 
 The done-signal is `agent_settled`, not `agent_end` — `agent_end` can be followed by an automatic
@@ -180,6 +182,63 @@ Elapsed, name, state, and what the child is currently inside, derived from its t
 Question's *text* is never here: it is already being delivered into the conversation, and a
 fixed-height block would only truncate it. The whole thing is `hasUI`-guarded, so a `-p` or
 JSON-mode session gets no widget rather than widget lines in its output.
+
+## `/subagents`: watching and steering a Run
+
+The widget says *that* a Run is busy; `/subagents` shows *what* it is doing, and lets you talk to
+it. It opens a picker with one row per Run this session — the widget's columns, active Runs first,
+then finished ones newest-first. Finished Runs stay listed and inspectable for the rest of the
+session: a Run's transcript is recorded from the moment it is spawned, not from the moment someone
+looks. With no Runs at all, the command says so and opens nothing. It is TUI-only, and there is no
+keyboard shortcut for it.
+
+Choosing a Run opens the **Inspector**: that Run's live transcript, rendered the way the main chat
+renders — the same message components, and pi's own renderers for the built-in tools — with a
+header of `name · agent · state · elapsed` and an editor along the bottom.
+
+| Where | Key | Does |
+|---|---|---|
+| picker | Up / Down | Move between Runs |
+| picker | Enter | Open the Inspector on that Run |
+| picker | Esc | Close |
+| Inspector | Enter | Send what is in the editor |
+| Inspector | Shift+Enter | New line |
+| Inspector | PgUp / PgDn | Scroll the transcript; at the bottom it follows the tail |
+| Inspector | ctrl+o | Expand or collapse tool output (collapsed by default) |
+| Inspector | ctrl+t | Show or hide thinking blocks |
+| Inspector | ctrl+x | Kill this Run, after a y/n confirmation |
+| Inspector | Esc | Back to the picker |
+
+What a message means depends on the Run's state when it is sent:
+
+| State | A message is |
+|---|---|
+| `running` | A **Steer**: RPC `steer`, which the child takes at its next turn boundary, not mid-tool-call. |
+| `waiting` | **The answer** to its Question, from you rather than the parent: it arrives as the Run's next prompt and the Run goes back to `running`. |
+| `queued`, `done`, `failed` | Nothing — the editor is disabled with a one-line reason. A queued Run has no child to talk to yet, and a finished one's child is already gone. |
+
+The state is checked again at the moment of sending, not only when the key was pressed. A Run that
+settled in between gets you "too late — *name* already finished", never a steer that silently went
+nowhere.
+
+**The parent is told.** Every Steer and every answer you send is also put into the parent
+conversation as a note, without starting a turn
+([ADR-0003](../../docs/adr/0003-human-steering-informs-the-parent.md)). Otherwise the result, when
+it arrives, would look like a Run that ignored the task it was given. Because your answer comes
+first, a later `subagent_answer` for the same Question fails with "already answered by the user"
+instead of feeding the Run a second, stale prompt. The same goes for a Steer sent in the moment
+between a Run asking and its Question reaching the parent — `ask_question` leaves the child a
+closing turn, and the Question is already in the transcript: the child reads the Steer as its
+answer, the Question is never put to the parent, and the note says it was asked and answered.
+
+**A kill is a failure like any other.** ctrl+x fails that one Run as stopped, "killed by the user",
+reaps its child, and delivers the failure to the parent exactly as a crash would be delivered, so
+the parent still learns the Run is not coming back. A queued Run can be killed too: it leaves the
+queue and never takes a Slot.
+
+The parent's model gets no steering tool of its own. It already has a channel into a Run —
+`subagent_answer`, when the Run asks — and a model redirecting its children mid-task is a
+different feature from a human doing so.
 
 ## When things go wrong
 
@@ -238,13 +297,14 @@ the manual runner instead, where a human starts it and reads the output.
 
 ## Not included, on purpose
 
-Parent→child steering of a running Run; resuming a finished one; cross-restart name registries;
-nested spawning (a Run cannot delegate further — that would turn the identity model from flat to a
-tree); worktree isolation; scheduled or recurring Runs; watchdog review; external CLI runners;
-councils; per-agent memory; an inspector overlay.
+Resuming a finished Run; cross-restart name registries; nested spawning (a Run cannot delegate
+further — that would turn the identity model from flat to a tree); worktree isolation; scheduled or
+recurring Runs; watchdog review; external CLI runners; councils; per-agent memory; persisting
+transcripts past the session.
 
-Steering and an inspector are both cheap *additive* follow-ups on this substrate — RPC already
-carries `steer`, and `RpcClient` already holds each child's transcript. Nested spawning is not.
+Most of these are simply not needed yet. Nested spawning is the exception: it is not an addition
+but a change of shape, because every name, every Slot and every Delivery assumes one parent and a
+flat set of children.
 
 ## Layout
 
@@ -254,6 +314,9 @@ supervisor.ts   run registry + lifecycle state machine   (pure — no I/O)
 child.ts        spawn seam + RpcClient wrapper           (all the I/O)
 agents.ts       agent discovery, and the three scopes
 widget.ts       TUI rendering                            (pure: state → lines)
+transcript.ts   child events → renderable transcript     (pure — no I/O, no TUI)
+control.ts      types for a human's steer and kill
+inspector.ts    the /subagents picker and Inspector overlay
 agents/         the bundled Agents: scout and worker
 tests/          offline suite, fixtures and the fake RPC child
 test.ts         manual live runner against real pi (not loaded by pi, not in npm test)

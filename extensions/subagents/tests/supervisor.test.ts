@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { ASK_QUESTION_TOOL, type ParentMessage, type Run, RUN_SLOTS, type SettledMessage, Supervisor } from "../supervisor.ts";
-import { AGENT_END, AGENT_START, asked, failed, ran, RETRYING, said, SETTLED, started } from "./child-events.ts";
+import { AGENT_END, AGENT_START, asked, failed, heard, ran, RETRYING, said, SETTLED, started } from "./child-events.ts";
 
 /** Feed a whole sequence to one Run and collect whatever it asks the parent to say. */
 function feed(supervisor: Supervisor, name: string, events: JsonAgentSessionEvent[]): SettledMessage[] {
@@ -442,6 +442,111 @@ describe("Supervisor questions", () => {
 		assert.equal(supervisor.get(run.name)?.result, "Found three call sites.");
 	});
 
+	it("remembers a Question the user answered, so the parent's answer to it can be refused as such", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		feed(supervisor, run.name, [asked("Which auth module do you mean?"), SETTLED]);
+
+		supervisor.answered(run.name, "user");
+
+		assert.equal(supervisor.get(run.name)?.state, "running", "answered by whoever, the Run is working again");
+		assert.equal(supervisor.answeredByUser(run.name), true);
+	});
+
+	it("says nothing about the user for a Question the parent answered", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		feed(supervisor, run.name, [asked("Which auth module do you mean?"), SETTLED]);
+
+		supervisor.answered(run.name);
+
+		assert.equal(supervisor.answeredByUser(run.name), false);
+		assert.equal(supervisor.answeredByUser("ghost"), false);
+	});
+
+	it("keeps the user's answer on record once the Run is done, and forgets it at the next Question", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		feed(supervisor, run.name, [asked("Which auth module do you mean?"), SETTLED]);
+		supervisor.answered(run.name, "user");
+
+		feed(supervisor, run.name, [asked("Should I include the tests?"), SETTLED]);
+		assert.equal(supervisor.answeredByUser(run.name), false, "a new Question is one nobody has answered yet");
+
+		supervisor.answered(run.name, "user");
+		feed(supervisor, run.name, [said("Three call sites."), SETTLED]);
+		assert.equal(supervisor.answeredByUser(run.name), true, "the parent may still be holding the Question it answered");
+	});
+
+	it("forgets a user's answer that never reached the child", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		feed(supervisor, run.name, [asked("Which auth module do you mean?"), SETTLED]);
+
+		supervisor.answered(run.name, "user");
+		supervisor.unanswered(run.name, "Which auth module do you mean?");
+
+		assert.equal(supervisor.get(run.name)?.state, "waiting");
+		assert.equal(supervisor.answeredByUser(run.name), false, "an answer that never arrived was nobody's answer");
+	});
+
+	it("finishes a Run whose child read the user's message after asking, which answered the Question", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+
+		// `ask_question` does not end the child's run: its model takes a closing
+		// turn, and a steer sent in the meantime is read in it.
+		const announced = feed(supervisor, run.name, [
+			asked("Which auth module do you mean?"),
+			said("I have asked; ending my turn."),
+			heard("The one in src/auth.ts."),
+			said("Three call sites in src/auth.ts."),
+			AGENT_END,
+			SETTLED,
+		]);
+
+		assert.deepEqual(
+			announced.map((message) => message.kind),
+			["delivery"],
+		);
+		assert.equal(supervisor.get(run.name)?.state, "done");
+		assert.equal(supervisor.get(run.name)?.question, undefined);
+		assert.equal(supervisor.get(run.name)?.result, "Three call sites in src/auth.ts.");
+		assert.equal(supervisor.answeredByUser(run.name), true, "so the parent's answer to it is refused as the user's");
+	});
+
+	it("takes the Question turn's own message for no result, once the user's message has answered it", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+
+		feed(supervisor, run.name, [said("I need to know which module."), asked("Which auth module do you mean?"), heard("src/auth.ts"), SETTLED]);
+
+		assert.equal(supervisor.get(run.name)?.state, "done");
+		assert.equal(supervisor.get(run.name)?.result, undefined);
+	});
+
+	it("says which Question a Run is asking only until it settles on it", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+
+		assert.equal(supervisor.asking(run.name), undefined);
+		feed(supervisor, run.name, [asked("Which auth module do you mean?")]);
+		assert.deepEqual(supervisor.asking(run.name), { question: "Which auth module do you mean?" });
+		feed(supervisor, run.name, [SETTLED]);
+		assert.equal(supervisor.asking(run.name), undefined, "a Waiting Run's Question is `run.question`");
+		assert.equal(supervisor.asking("ghost"), undefined);
+	});
+
+	it("leaves a Question standing for a user message read before it was asked", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+
+		feed(supervisor, run.name, [heard("Only the auth module, please."), asked("Which auth module do you mean?"), SETTLED]);
+
+		assert.equal(supervisor.get(run.name)?.state, "waiting");
+		assert.equal(supervisor.answeredByUser(run.name), false);
+	});
+
 	it("finishes a Run whose ask_question failed, because no Question ever reached the parent", () => {
 		const supervisor = new Supervisor();
 		const run = supervisor.register("scout", "look around");
@@ -624,6 +729,57 @@ describe("Supervisor concurrency", () => {
 	});
 });
 
+describe("Supervisor kills", () => {
+	it("says who stopped a Run the user killed, in the Delivery the parent reads", () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+
+		const delivery = supervisor.fail(run.name, { kind: "stopped", reason: "killed by the user" });
+
+		assert.equal(delivery?.run.state, "failed");
+		assert.deepEqual(delivery?.run.failure, { kind: "stopped", reason: "killed by the user" });
+		assert.match(delivery?.text ?? "", /^Run `scout` \(agent `scout`\) failed: it was stopped: killed by the user\. It produced no result\./);
+	});
+
+	it("takes a queued Run out of the queue without freeing a slot it never held", () => {
+		const { supervisor, admitted } = admitting();
+		const runs = fanOut(supervisor, RUN_SLOTS + 2);
+
+		supervisor.fail(runs[RUN_SLOTS].name, { kind: "stopped", reason: "killed by the user" });
+
+		assert.deepEqual(admitted, [], "every slot is still held, so nothing starts");
+		assert.equal(supervisor.get(runs[RUN_SLOTS].name)?.state, "failed");
+		assert.equal(supervisor.get(runs[RUN_SLOTS + 1].name)?.state, "queued");
+		assert.equal(working(supervisor).length, RUN_SLOTS);
+
+		feed(supervisor, runs[0].name, [said("done"), SETTLED]);
+
+		assert.deepEqual(admitted, [runs[RUN_SLOTS + 1].name], "the killed Run is skipped; the one queued behind it starts");
+	});
+
+	it("frees the slot of a working Run the user killed, for whatever has queued longest", () => {
+		const { supervisor, admitted } = admitting();
+		const runs = fanOut(supervisor, RUN_SLOTS + 1);
+		feed(supervisor, runs[1].name, [asked("Which auth module do you mean?"), SETTLED]);
+
+		supervisor.fail(runs[1].name, { kind: "stopped", reason: "killed by the user" });
+
+		assert.deepEqual(admitted, [runs[RUN_SLOTS].name], "a Waiting Run held its slot until it was killed");
+	});
+
+	it("ends a join on a Run the user killed, with its failure", async () => {
+		const supervisor = new Supervisor();
+		const run = supervisor.register("scout", "look around");
+		const join = supervisor.join([run.name]);
+
+		const delivery = supervisor.fail(run.name, { kind: "stopped", reason: "killed by the user" });
+		if (delivery) supervisor.post(delivery);
+
+		const collected = await join;
+		assert.match(collected[0].text, /killed by the user/);
+	});
+});
+
 describe("Supervisor endings", () => {
 	it("fails every Run still going, saying it was the session that stopped them", () => {
 		const supervisor = new Supervisor();
@@ -771,5 +927,25 @@ describe("Supervisor progress", () => {
 		const second = supervisor.register("worker", "two");
 
 		assert.deepEqual([first.askedAt, second.askedAt], [1000, 4000]);
+	});
+
+	it("stamps a Run with when it stopped, done or failed, so a finished Run's age stops counting", () => {
+		let clock = 1000;
+		const supervisor = new Supervisor({ now: () => clock });
+		const done = supervisor.register("scout", "one");
+		const killed = supervisor.register("worker", "two");
+
+		clock = 2000;
+		feed(supervisor, done.name, [started("read", { path: "src/auth.ts" }), asked("Which auth module?"), SETTLED]);
+		// Waiting is not stopping: the Run is still alive, and its clock still running.
+		assert.equal(supervisor.get(done.name)?.stoppedAt, undefined);
+
+		supervisor.answered(done.name);
+		clock = 3000;
+		feed(supervisor, done.name, [said("Found it."), SETTLED]);
+		clock = 5000;
+		supervisor.fail(killed.name, { kind: "stopped", reason: "killed by the user" });
+
+		assert.deepEqual([supervisor.get(done.name)?.stoppedAt, supervisor.get(killed.name)?.stoppedAt], [3000, 5000]);
 	});
 });

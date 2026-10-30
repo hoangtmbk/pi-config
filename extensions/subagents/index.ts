@@ -10,14 +10,21 @@
  *
  * This file is wiring and nothing else. The lifecycle lives in `supervisor.ts`,
  * which is pure; the subprocess lives in `child.ts`, which is the only thing
- * that knows a process exists.
+ * that knows a process exists. What a human can do to a Run directly — steer
+ * it, answer it, kill it — is typed in `control.ts` and built here, because it
+ * has to reach the same children and the same Supervisor the tools do. What a
+ * human sees of one is recorded by `transcript.ts` from the same events the
+ * Supervisor is fed, and drawn by `inspector.ts` behind `/subagents`.
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type Agent, discoverAgents, type Roster } from "./agents.ts";
 import { type RunChild, RUN_NAME_ENV, type SpawnOptions, spawnRun } from "./child.ts";
+import type { RunControl, SendOutcome } from "./control.ts";
+import { openSubagents } from "./inspector.ts";
 import { ASK_QUESTION_TOOL, type QuestionDetails, type Run, RUN_SLOTS, type RunState, type SettledMessage, Supervisor } from "./supervisor.ts";
+import { Transcripts } from "./transcript.ts";
 import { renderRuns } from "./widget.ts";
 
 const SubagentParams = Type.Object({
@@ -98,6 +105,30 @@ interface SubagentDetails {
 	task: string;
 }
 
+/**
+ * Metadata for the transcript — a human's message into a Run, and which of the
+ * two things it was.
+ */
+interface SubagentSteerDetails extends SubagentDetails {
+	/** How the message was sent: a steer mid-run, or the answer to a Waiting Run's Question. */
+	as: "steer" | "answer";
+	/**
+	 * The Question it answered, for a message that answered one that said what it
+	 * asked — a steer included, when the child read it straight after asking.
+	 */
+	question?: string;
+}
+
+/**
+ * How a Run the user kills is failed.
+ *
+ * A `stopped` failure like a shutdown's, because that is what it is — the Run
+ * ended on purpose, by someone entitled to — and it is delivered down the same
+ * path, so the parent decides what to do about it the way it decides about any
+ * other Run that came back without a result.
+ */
+const KILLED = { kind: "stopped", reason: "killed by the user" } as const;
+
 /** Metadata for the transcript — which Runs a join collected, and how each stopped. */
 interface SubagentWaitDetails {
 	runs: { run: string; agent: string; state: RunState }[];
@@ -115,10 +146,60 @@ function unknownRun(name: string, runs: Run[]): Error {
 	return new Error(`Unknown run \`${name}\`. ${known ? `Runs in this session: ${known}.` : "No runs have been started in this session."}`);
 }
 
-/** Why a name cannot be answered: the wrong state, or no such Run at all. */
-function unanswerableRun(name: string, run: Run | undefined, runs: Run[]): Error {
+/**
+ * Why a name cannot be answered: the user got there first, the wrong state, or
+ * no such Run at all.
+ *
+ * The user comes first because it is the one the parent cannot have known. It
+ * was told about the Question and not, until the note lands, that the user
+ * answered it straight into the Run — and "it is running" alone would read as
+ * the parent's own answer having somehow already gone.
+ */
+function unanswerableRun(name: string, run: Run | undefined, runs: Run[], answeredByUser = false): Error {
+	if (run && answeredByUser) {
+		return new Error(
+			`Run \`${name}\`'s question was already answered by the user, directly in the run, so there is nothing left for you to answer. It is ${run.state} now.`,
+		);
+	}
 	if (run) return new Error(`Run \`${name}\` is ${run.state}, not waiting for an answer. Only a waiting run can be answered.`);
 	return unknownRun(name, runs);
+}
+
+/**
+ * A human's steer on its way into a Run's child, and what the child has said
+ * about it so far.
+ */
+interface InFlightSteer {
+	text: string;
+	/** The child has listed it in a `queue_update`: it reached the child. */
+	queued: boolean;
+	/**
+	 * The Run settled without reading it — never queued by then, or queued and
+	 * still there. Decided as the Run settles, read once the send comes back.
+	 */
+	lost: boolean;
+}
+
+/** Whether a Run has stopped for good, and so has no child left to reach. */
+function hasFinished(run: Run): boolean {
+	return run.state === "done" || run.state === "failed";
+}
+
+/**
+ * The one line a human message comes back with when the Run it was for has
+ * already gone.
+ *
+ * "Finished" for a failed Run as much as a done one: either way its child is
+ * gone, and the person typing wants to know that nothing heard them, not which
+ * way it ended — the Inspector shows that.
+ */
+function tooLate(run: Run): SendOutcome {
+	return { ok: false, reason: `too late — ${run.name} already finished` };
+}
+
+/** How many times `text` is in `queue`. */
+function occurrences(queue: readonly string[], text: string): number {
+	return queue.filter((queued) => queued === text).length;
 }
 
 /** What went wrong, from whatever a failed spawn threw. */
@@ -277,13 +358,21 @@ function registerAskQuestion(pi: ExtensionAPI): void {
 	});
 }
 
-export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = {}): void {
+/**
+ * Register the extension's half for whichever side of a Run this session is,
+ * and hand back the control plane on the parent side.
+ *
+ * Returned rather than kept to itself so a test can drive what the Inspector
+ * drives without a TUI to drive it through. A child has no Runs of its own to
+ * control, and gets nothing back.
+ */
+export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = {}): RunControl | undefined {
 	// A Run loads this same extension, and the two halves are disjoint: a child
 	// can ask and cannot delegate, a parent can delegate and has nothing to ask.
 	const runName = options.runName ?? process.env[RUN_NAME_ENV];
 	if (runName) {
 		registerAskQuestion(pi);
-		return;
+		return undefined;
 	}
 
 	// Discovered here, at registration, because the tool's description carries the
@@ -304,6 +393,40 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 	 * lands anywhere in that window has something to take it out on.
 	 */
 	const children = new Map<string, Promise<RunChild>>();
+
+	/**
+	 * What each Run's child last said it had queued and not yet read, from its
+	 * own `queue_update` events.
+	 *
+	 * The only honest account of whether a human's steer reached a Run. pi takes a
+	 * steer into a child that has already settled without a word and holds it
+	 * there unread, so the send succeeding proves nothing: a steer that lands just
+	 * after the child's last turn boundary is acknowledged and then never read. The
+	 * child's own queue, as of the moment its Run settles, is what says so.
+	 */
+	const unread = new Map<string, readonly string[]>();
+
+	/**
+	 * Steers whose send has not come back yet, by Run, each with what the child
+	 * has said about it so far.
+	 *
+	 * A send's acknowledgement is not the moment to judge it by. `RpcClient` reads
+	 * the child's stdout a chunk at a time and only resumes the sender once the
+	 * chunk is done, so a send can come back to a Run that has already settled
+	 * behind it — whether or not the child read the steer first. Its fate is
+	 * decided as the events go past instead, and the send reads the verdict.
+	 */
+	const sending = new Map<string, InFlightSteer[]>();
+
+	/**
+	 * Every Run's conversation, as the Inspector draws it.
+	 *
+	 * Started the moment a Run is asked for and kept for the rest of the session,
+	 * finished Runs included, so a Run can be looked at after the fact and not
+	 * only by someone who happened to be watching. Fed the same events the
+	 * Supervisor is, from the same place, and nothing else.
+	 */
+	const transcripts = new Transcripts();
 
 	/**
 	 * Where the widget goes, once a session has said it has somewhere to put it.
@@ -379,6 +502,94 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 	}
 
 	/**
+	 * Put a human's message to a Run on the parent's record, without waking it.
+	 *
+	 * The parent delegated the task and will judge the result, so it has to know
+	 * the Run's direction changed before the Delivery says so — otherwise a result
+	 * that answers a question it never asked reads as the Run going off on its
+	 * own.
+	 *
+	 * Never woken, because there is nothing for it to do yet: the Run is still
+	 * working, and the Delivery is what wakes it. And no `deliverAs`, because
+	 * `triggerTurn: false` on its own is the one combination pi holds until the
+	 * end of the turn when the parent is streaming, rather than slipping it in
+	 * between a tool call and its result, and appends straight away when it is
+	 * not.
+	 */
+	function note(content: string, details: SubagentSteerDetails): void {
+		pi.sendMessage({ customType: "subagent-steer", content, display: true, details }, { triggerTurn: false });
+	}
+
+	/**
+	 * Take in what a Run's child says it has queued: the whole of `unread`, and
+	 * the moment a steer still being sent is known to have reached the child.
+	 *
+	 * Counted, not matched: a steer is known by its text alone, and two identical
+	 * ones can be in flight at once. A copy of a text being in the queue says that
+	 * *a* steer with it arrived, which may be one already read and gone, so what
+	 * marks a send as arrived is the queue gaining a copy. pi writes a
+	 * `queue_update` on every change to the queue, so each arrival is a gain of
+	 * one, and it goes to the oldest send of that text not yet marked — pi queues
+	 * steers in the order they were sent.
+	 */
+	function queueUpdated(name: string, steering: readonly string[]): void {
+		const before = unread.get(name) ?? [];
+		unread.set(name, steering);
+		const inFlight = sending.get(name) ?? [];
+		for (const text of new Set(steering)) {
+			let arrived = occurrences(steering, text) - occurrences(before, text);
+			for (const steer of inFlight) {
+				if (arrived <= 0) break;
+				if (steer.text !== text || steer.queued) continue;
+				steer.queued = true;
+				arrived--;
+			}
+		}
+	}
+
+	/**
+	 * Report the steers a Run settled without reading: to the user, who sent them
+	 * believing they would land, and to the parent, which was told they had.
+	 *
+	 * Called before the Delivery is announced, so the parent's record says the
+	 * steer was lost before the result it would otherwise misread arrives — the
+	 * Delivery can wake the parent, and a note sent after that would land after
+	 * the turn that needed it.
+	 *
+	 * Only for a Run that is done. A Run that settled Waiting still has its child,
+	 * and pi reads what was steered into it at the start of the turn its answer
+	 * starts, so nothing was lost; a Run that failed has a failure to report that
+	 * already says why nothing it was told came to anything.
+	 */
+	function reportUnread(run: Run): void {
+		const queued = [...(unread.get(run.name) ?? [])];
+		unread.delete(run.name);
+		// A send still in flight says "too late" itself, so it is judged here and
+		// left out of this report. Lost if the child never had it before settling —
+		// it will arrive at an idle child that holds it unread — or had it and did
+		// not read it. Read is the one way it got there in time.
+		//
+		// Newest first, because pi reads its queue oldest first: of several sends
+		// of one text that all reached the child, the copies still unread are the
+		// last ones sent. Matching the oldest instead would call a steer that was
+		// read too late, and the one that was not, in time.
+		for (const steer of [...(sending.get(run.name) ?? [])].reverse()) {
+			const index = steer.queued ? queued.lastIndexOf(steer.text) : -1;
+			if (index !== -1) queued.splice(index, 1);
+			steer.lost = !steer.queued || index !== -1;
+		}
+		if (queued.length === 0) return;
+
+		const them = queued.length === 1 ? "your message" : `${queued.length} of your messages`;
+		surface?.notify(`Too late — ${run.name} finished before reading ${them}, so it never reached it.`, "warning");
+		const messages = queued.length === 1 ? "message" : "messages";
+		note(
+			`The user's ${messages} to run \`${run.name}\` (agent \`${run.agent}\`) never reached it: it finished first, so its result does not take ${queued.length === 1 ? "it" : "them"} into account.`,
+			{ run: run.name, agent: run.agent, task: run.task, as: "steer" },
+		);
+	}
+
+	/**
 	 * Stop a Run's child and forget it, resolving once it has gone.
 	 *
 	 * Never rejects, and callers that have nothing to wait for do not have to:
@@ -388,6 +599,8 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 	function reap(name: string): Promise<void> {
 		const spawning = children.get(name);
 		children.delete(name);
+		// A child nothing will read from again has nothing queued worth knowing.
+		unread.delete(name);
 		return spawning?.then((child) => child.stop()).catch(() => {}) ?? Promise.resolve();
 	}
 
@@ -412,6 +625,10 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 		// A Waiting Run keeps its child: the process stays up, doing nothing but
 		// holding the context an answer lands in. Nothing is killed or reaped.
 		if (message.kind === "question") return;
+
+		// Nothing that was in flight in the child will finish now, and its
+		// transcript says so rather than streaming on for the rest of the session.
+		transcripts.end(message.run.name);
 
 		// A stopped Run has nothing left to say, and the child left behind is a pi
 		// process nothing will ever prompt again.
@@ -450,7 +667,18 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 				else void child.stop().catch(() => {});
 			},
 			onEvent(event) {
+				// Before the Supervisor sees it, so a transcript has the message a Run
+				// settles on by the time anything announces that it settled. Not once
+				// the Run has stopped: a killed child's dying words would otherwise
+				// land after its transcript was closed, and read as it still going.
+				if (!hasFinished(run)) transcripts.observe(run.name, event);
+				// Not once the Run has stopped, for the reason its transcript stops: its
+				// queue was judged as it settled and forgotten as it was reaped, and a
+				// steer landing on the idle child afterwards would only put back an
+				// entry nothing will ever read or clear.
+				if (event.type === "queue_update" && !hasFinished(run)) queueUpdated(run.name, event.steering);
 				const message = supervisor.observe(run.name, event);
+				if (message?.kind === "delivery") reportUnread(message.run);
 				if (message) announce(message);
 				// Every event, because most of what the widget shows the Supervisor
 				// reports nothing about: a child picking up a tool changes the line
@@ -507,6 +735,216 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 	});
 
 	/**
+	 * Answer a Waiting Run's Question with a fresh prompt into its child. Rejects,
+	 * with the Run Waiting again, when the answer could not be sent.
+	 *
+	 * The one path both answerers take — the parent through `subagent_answer`, the
+	 * user through the Inspector — so the two cannot drift on the part that is
+	 * easy to get wrong: leaving Waiting before the send, and going back to it
+	 * when the send fails. `by` is the only difference, and all it changes is how
+	 * a later answer to the same Question is refused.
+	 *
+	 * The caller has checked the Run is Waiting, synchronously, just before this:
+	 * `answered` is the first thing that happens here, so there is no await
+	 * between the check and the state moving for a second answer to slip into.
+	 */
+	async function answerRun(run: Run, answer: string, by: "parent" | "user"): Promise<void> {
+		// A waiting Run's child is deliberately still up, so this is a guard
+		// against a lifecycle bug rather than something a caller can provoke.
+		const spawning = children.get(run.name);
+		if (!spawning) throw new Error(`Run \`${run.name}\` is waiting, but its child is gone, so the answer cannot be delivered.`);
+
+		// The Run leaves Waiting here rather than when its child gets round to
+		// starting a turn: this is the moment the caller can sequence against, so
+		// a `subagent_wait` issued straight after an answer waits for the resumed
+		// Run instead of collecting the Question it just answered. It also closes
+		// the window a second answer would have been accepted in.
+		const question = run.question;
+		supervisor.answered(run.name, by);
+		try {
+			// A Run cannot be Waiting before its spawn resolved, so this is already
+			// settled; awaiting it is how the child is reached, not a wait.
+			await (await spawning).prompt(answer);
+		} catch (error) {
+			// The answer never reached the child, so the Run is waiting on the same
+			// Question it was. Leaving it running would strand it: no turn was
+			// started to end it, and every join would wait on it forever.
+			supervisor.unanswered(run.name, question);
+			throw error;
+		}
+
+		// The Run has left Waiting, so the block says it is running again.
+		paint();
+	}
+
+	/**
+	 * Steer a running Run: queue the message for its child's next turn boundary,
+	 * and say whether it got there in time.
+	 *
+	 * In time means the child read it before its Run finished. The state check in
+	 * `send` is only where this starts: a Run can settle between that check and
+	 * the steer landing — a window the RPC round trip makes real — and pi takes a
+	 * steer into a settled child without complaint and never reads it. So the
+	 * verdict comes from the child's own `queue_update` events (see `sending`), and
+	 * a steer that missed comes back "too late" rather than claiming to have
+	 * reached a child that will never read it. One acknowledged while the Run was
+	 * still working, and then not read because its last turn boundary had just
+	 * passed, is reported when the Run settles instead: see `reportUnread`.
+	 *
+	 * The note to the parent goes after the acknowledgement, unlike an answer's,
+	 * because noting a steer that turns out too late would cost a correction in a
+	 * race that is real rather than a fault. So a child that reads the steer and
+	 * finishes inside the one stdout chunk that also carries the acknowledgement
+	 * has its Delivery land first. pi only reads a steer at a turn boundary, and a
+	 * turn that reads one goes on to another model call, so that takes a child
+	 * finishing within milliseconds of being steered.
+	 *
+	 * The other residue is a steer pi rewrites on the way in — a `/skill:`
+	 * command or a prompt template, which the child queues expanded and so not
+	 * recognisably as what was sent. If its Run settles while it is in flight it
+	 * is called too late even when it was read, and may be reported a second time
+	 * by the settle. Never a silent loss: both mistakes are on the side of telling
+	 * the user.
+	 */
+	async function steerRun(run: Run, text: string): Promise<SendOutcome> {
+		const spawning = children.get(run.name);
+		if (!spawning) return { ok: false, reason: `${run.name} has no child left to reach` };
+
+		// Read before anything is awaited: a Question still pending now is the one
+		// the user has just seen in the Inspector, and the child reads this steer
+		// straight after it — as its answer. See `Supervisor.overrule`.
+		const asking = supervisor.asking(run.name);
+		const steer: InFlightSteer = { text, queued: false, lost: false };
+		const inFlight = sending.get(run.name) ?? [];
+		sending.set(run.name, inFlight);
+		inFlight.push(steer);
+		try {
+			// Still starting means still being handed its task, and a steer sent
+			// before the task would be read as the first thing the Run is told. So
+			// it waits for the spawn, which a Run that is already working has long
+			// since finished.
+			await (await spawning).steer(text);
+		} catch (error) {
+			if (hasFinished(run)) return tooLate(run);
+			return { ok: false, reason: `could not reach ${run.name}: ${describeError(error)}` };
+		} finally {
+			inFlight.splice(inFlight.indexOf(steer), 1);
+			if (inFlight.length === 0) sending.delete(run.name);
+		}
+
+		// A Run that failed — killed, or its child died — read nothing more, and a
+		// done one that settled while this was in flight was judged as it settled.
+		if (run.state === "failed" || steer.lost) return tooLate(run);
+
+		// A Run that had asked a Question and then read this steer took it as the
+		// answer, and the Question was spent before it ever reached the parent —
+		// a Question is only said when its turn settles. So the note says what was
+		// asked and that nobody else needs to answer it; without it, a result
+		// shaped by an answer the parent never saw to a question it was never
+		// asked reads as the Run deciding on its own.
+		//
+		// Not if the Run settled Waiting in the meantime: then it went to Waiting
+		// before reading the steer, the parent has that Question, and the note below
+		// is right. The residue is a Run that settles Waiting after this note but
+		// before reading the steer — a turn boundary inside a few milliseconds of
+		// the acknowledgement — which tells the parent its Question was answered
+		// just before handing it the Question.
+		if (asking && run.state !== "waiting") {
+			const question = asking.question;
+			const asked = question ? `Its question was:\n\n${question}\n\n` : "";
+			note(
+				`The user sent run \`${run.name}\` (agent \`${run.agent}\`) a message directly, just after it asked a question and before that question reached you. It takes the message as its answer, so the question will not come to you and there is nothing for you to answer; its result may go beyond, or against, the task you gave it. ${asked}The user's message:\n\n${text}`,
+				{ run: run.name, agent: run.agent, task: run.task, as: "steer", question },
+			);
+			return { ok: true, as: "steer" };
+		}
+
+		// A Run that settled Waiting in the meantime still has the steer queued,
+		// and reads it at the start of the turn its answer starts: late, not lost.
+		note(
+			`The user sent run \`${run.name}\` (agent \`${run.agent}\`) a message directly while it was working. It takes it at its next step, so its result may go beyond, or against, the task you gave it:\n\n${text}`,
+			{ run: run.name, agent: run.agent, task: run.task, as: "steer" },
+		);
+		return { ok: true, as: "steer" };
+	}
+
+	/**
+	 * Answer a Waiting Run as the user, and put that on the parent's record.
+	 *
+	 * The parent was told about this Question and may be about to answer it, so
+	 * the note says plainly that it no longer needs to — and if it tries anyway,
+	 * `subagent_answer` refuses it as already answered by the user.
+	 *
+	 * The note goes before the answer, not after it. The child can take the
+	 * answer, finish and deliver in the time its acknowledgement takes to come
+	 * back, and a note behind the Delivery lands after the very turn that
+	 * Delivery wakes. Noting first costs a correction in the one case it was
+	 * wrong — an answer the child never got — and that case is already a fault.
+	 */
+	async function answerAsUser(run: Run, text: string): Promise<SendOutcome> {
+		const question = run.question;
+		const details: SubagentSteerDetails = { run: run.name, agent: run.agent, task: run.task, as: "answer", question };
+		const asked = question ? `Its question was:\n\n${question}\n\n` : "";
+		note(
+			`The user answered run \`${run.name}\` (agent \`${run.agent}\`) directly, so its question no longer needs an answer from you, and it has resumed. ${asked}The user's answer:\n\n${text}`,
+			details,
+		);
+
+		try {
+			await answerRun(run, text, "user");
+		} catch (error) {
+			note(
+				`The user's answer to run \`${run.name}\` (agent \`${run.agent}\`) never reached it: ${describeError(error)}. It is still waiting on its question, which still needs an answer.`,
+				details,
+			);
+			return { ok: false, reason: `could not reach ${run.name}: ${describeError(error)}` };
+		}
+		return { ok: true, as: "answer" };
+	}
+
+	/**
+	 * What the Inspector acts on a Run through. See `control.ts` for the contract.
+	 *
+	 * Everything here goes through the same Supervisor and the same paths the
+	 * parent's tools do — `answerRun` for an answer, `fail` → `announce` → `reap`
+	 * for a kill — so a Run a human touched is reported in exactly the words a Run
+	 * nobody touched would be.
+	 */
+	const control: RunControl = {
+		async send(name, text) {
+			const run = supervisor.get(name);
+			if (!run) return { ok: false, reason: `no run named ${name} in this session` };
+			const message = text.trim();
+			if (!message) return { ok: false, reason: "nothing to send — the message is empty" };
+
+			// Decided here, synchronously, from the state the Run is in now — not the
+			// state it was in when the Inspector drew it, which is the race a human
+			// typing into a moving Run always loses some of the time.
+			if (run.state === "running") return steerRun(run, message);
+			if (run.state === "waiting") return answerAsUser(run, message);
+			if (run.state === "queued") return { ok: false, reason: `${name} has not started yet — it is queued for a run slot` };
+			return tooLate(run);
+		},
+
+		async kill(name) {
+			const failure = supervisor.fail(name, { ...KILLED });
+			if (!failure) return false;
+			// A queued Run was never started, and must never be: forgetting how to
+			// start it is what keeps a later admission from bringing it up anyway.
+			starters.delete(name);
+			// Started before the announce, whose own reap then finds nothing left to
+			// do, so that this call can wait for the child to go.
+			const reaping = reap(name);
+			announce(failure);
+			paint();
+			// Bounded for the reason the session's reap is: a child still being
+			// spawned may never come up far enough to be stopped by this.
+			await Promise.race([reaping, deadline(REAP_GRACE_MS)]);
+			return true;
+		},
+	};
+
+	/**
 	 * End every Run with the session that owns them — ADR-0001's reap.
 	 *
 	 * Every child is SIGTERMed whatever state its Run is in, Waiting and
@@ -535,6 +973,7 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 			// report that it stopped would be the opposite of what it asked for. It is
 			// on the record for whenever the parent next takes a turn.
 			supervisor.markSaid(delivery.run.name);
+			transcripts.end(delivery.run.name);
 			say(delivery, { triggerTurn: false });
 		}
 		// Waited for, so pi does not exit before the signals are even sent — and
@@ -605,6 +1044,10 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 			if (agent.source === "project") await approveProjectAgent(agent, ctx);
 
 			const run = supervisor.register(agent.name, params.task, params.name);
+			// Recorded from here, queued or not, so the Run is inspectable from the
+			// moment its name exists — and its task, the first thing its child
+			// settles, is in its transcript.
+			transcripts.start(run.name);
 			const details: SubagentDetails = { run: run.name, agent: agent.name, task: params.task };
 			// From here on this Run is something the parent is waiting for, whether
 			// it is queued, starting or already going, so it is on the block.
@@ -638,16 +1081,23 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 				// out of the active set, and reported in the same words a Run that died
 				// later would be.
 				const failure = supervisor.fail(run.name, { kind: "spawn", message: describeError(error) });
+				transcripts.end(run.name);
 				// Said here rather than delivered, because this tool call is already
 				// returning into the conversation the Delivery would have landed in.
 				// Marked said for the same reason: a later join naming this Run reports
 				// it without repeating a failure the parent already has.
 				supervisor.markSaid(run.name);
 				// `fail` returns nothing for a Run that had already stopped — a Run
-				// reaped while it was starting, whose Delivery has already been said.
-				// Naming it is still worth doing: without that this returns a bare RPC
-				// error that says nothing about which Run it was about.
-				const stopped = `Run \`${run.name}\` (agent \`${agent.name}\`) did not start: ${describeError(error)}`;
+				// killed or reaped while it was starting, whose Delivery has already
+				// been said. Then the spawn failing is what stopping it did, not why it
+				// failed, and the RPC error it threw would read as a second, unrelated
+				// fault; so this says it was stopped, and by what. Anything else is
+				// still named, rather than returned as a bare error that says nothing
+				// about which Run it was about.
+				const stopped =
+					run.failure?.kind === "stopped"
+						? `Run \`${run.name}\` (agent \`${agent.name}\`) was stopped while it was starting: ${run.failure.reason}.`
+						: `Run \`${run.name}\` (agent \`${agent.name}\`) did not start: ${describeError(error)}`;
 				paint();
 				return { content: [{ type: "text", text: failure?.text ?? stopped }], details };
 			}
@@ -718,39 +1168,14 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 		async execute(_toolCallId, params) {
 			const name = params.name.trim();
 			const run = supervisor.get(name);
-			if (!run || run.state !== "waiting") throw unanswerableRun(name, run, supervisor.list());
+			if (!run || run.state !== "waiting") throw unanswerableRun(name, run, supervisor.list(), supervisor.answeredByUser(name));
 
 			const answer = params.answer.trim();
 			// An answer saying nothing would start a turn anyway and let the Run
 			// settle on a guess. Refusing leaves it waiting, and still answerable.
 			if (!answer) throw new Error(`An answer cannot be empty. Say what run \`${name}\` needs to know.`);
 
-			// A waiting Run's child is deliberately still up, so this is a guard
-			// against a lifecycle bug rather than something a caller can provoke.
-			const spawning = children.get(name);
-			if (!spawning) throw new Error(`Run \`${name}\` is waiting, but its child is gone, so the answer cannot be delivered.`);
-
-			// The Run leaves Waiting here rather than when its child gets round to
-			// starting a turn: this is the moment the caller can sequence against, so
-			// a `subagent_wait` issued straight after an answer waits for the resumed
-			// Run instead of collecting the Question it just answered. It also closes
-			// the window a second answer would have been accepted in.
-			const question = run.question;
-			supervisor.answered(name);
-			try {
-				// A Run cannot be Waiting before its spawn resolved, so this is already
-				// settled; awaiting it is how the child is reached, not a wait.
-				await (await spawning).prompt(answer);
-			} catch (error) {
-				// The answer never reached the child, so the Run is waiting on the same
-				// Question it was. Leaving it running would strand it: no turn was
-				// started to end it, and every join would wait on it forever.
-				supervisor.unanswered(name, question);
-				throw error;
-			}
-
-			// The Run has left Waiting, so the block says it is running again.
-			paint();
+			await answerRun(run, answer, "parent");
 
 			const details: SubagentDetails = { run: run.name, agent: run.agent, task: run.task };
 			return {
@@ -764,6 +1189,17 @@ export function registerSubagents(pi: ExtensionAPI, options: SubagentsOptions = 
 			};
 		},
 	});
+
+	// The human's way in: every Run this session, live, and a hand on the one
+	// being looked at. Steering goes through `control` like everything else a
+	// person does to a Run, so the parent hears of it exactly as it would of any
+	// other steer.
+	pi.registerCommand("subagents", {
+		description: "Watch a subagent run's live transcript, steer it, or kill it",
+		handler: (_args, ctx) => openSubagents(ctx, { runs: () => supervisor.list(), transcripts, control }),
+	});
+
+	return control;
 }
 
 export default function (pi: ExtensionAPI) {

@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { Run } from "../supervisor.ts";
-import { renderRuns } from "../widget.ts";
+import { renderRuns, runRows } from "../widget.ts";
 
 /** A Run as the Supervisor holds one, with only the fields the widget reads. */
 function run(name: string, state: Run["state"], secondsAgo: number, activity?: string): Run {
@@ -107,5 +107,38 @@ describe("the Runs widget", () => {
 			lines.every((line) => !line.includes("generated")),
 			`expected no question text, got ${JSON.stringify(lines)}`,
 		);
+	});
+});
+
+/**
+ * The rows on their own, as the `/subagents` picker lists them — which is where
+ * a finished Run is shown, since the widget never shows one.
+ */
+describe("a Run's row", () => {
+	it("stops a finished Run's clock where it stopped, rather than counting on", () => {
+		const finished: Run = { ...run("scout", "done", 90), stoppedAt: -30_000 };
+
+		assert.deepEqual(runRows([finished], 0, 60), ["01:00  scout  done"]);
+	});
+
+	it("says how a finished Run ended, not the tool it last happened to start", () => {
+		const done: Run = { ...run("scout", "done", 9, "bash"), stoppedAt: 0 };
+		const killed: Run = { ...run("worker", "failed", 9, "edit src/a.ts"), stoppedAt: 0, failure: { kind: "stopped", reason: "killed by the user" } };
+		const crashed: Run = { ...run("fixer", "failed", 9, "bash"), stoppedAt: 0, failure: { kind: "exit", exitCode: 1 } };
+		const unstarted: Run = { ...run("tester", "failed", 9), stoppedAt: 0, failure: { kind: "spawn", message: "ENOENT" } };
+
+		assert.deepEqual(runRows([done, killed, crashed, unstarted], 0, 60), [
+			"00:09  scout   done",
+			"00:09  worker  failed · killed by the user",
+			"00:09  fixer   failed · exited 1",
+			"00:09  tester  failed · could not start",
+		]);
+	});
+
+	it("fits the width it is given, clipping what the Run is doing first", () => {
+		const rows = runRows([run("scout", "running", 1, `read ${"deeply/nested/".repeat(10)}file.ts`)], 0, 40);
+
+		assert.equal(visibleWidth(rows[0]), 40);
+		assert.deepEqual(rows, ["00:01  scout  running · read deeply/nes…"]);
 	});
 });
