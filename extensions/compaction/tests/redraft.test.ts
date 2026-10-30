@@ -17,8 +17,11 @@ import { registerCompaction } from "../index.ts";
 import { aborted, type FakeSetup, fakePi, said, user } from "./fake-pi.ts";
 import { type Reply, scriptModel } from "./scripted-model.ts";
 
-/** pi's summarizer's reply, the only writer so far. */
+/** pi's summarizer's reply. */
 const PI_SUMMARY = "## Goal\nAdd retries to the fetcher.\n\n## Progress\n- Wrote the wrapper.";
+
+/** What serialized mode gets here: a reply it can't use, so that pi's summarizer, next in the chain, writes. */
+const NO_HANDOFF: Reply = { text: "I'll carry on with the fetcher." };
 
 const KEEP = 400;
 
@@ -32,8 +35,13 @@ const FAILED_TWICE =
 const CUT_GONE =
 	"Compaction failed (its kept tail is no longer on the branch). Context will keep growing until the next run or pi's own compaction.";
 
+/**
+ * A fake pi with the extension on it, and pi's summarizer scripted to answer
+ * each compaction written with the next of `replies`. Whether a writer was
+ * called again is read off `model.calls`.
+ */
 function forcing(replies: Reply[], setup: FakeSetup = SETUP) {
-	const model = scriptModel(...replies);
+	const model = scriptModel(...replies.flatMap((reply) => [NO_HANDOFF, reply]));
 	const pi = fakePi(setup, (api) => registerCompaction(api, { stream: model.stream }));
 	return { pi, model };
 }
@@ -75,13 +83,14 @@ describe("a compaction another extension's draft sank", () => {
 	it("is re-drafted at the next boundary from the same Handoff, with no writer called again", async () => {
 		const { pi, model } = forcing([{ text: PI_SUMMARY }, { text: PI_SUMMARY }]);
 		const cut = await sunk(pi);
+		const written = model.calls.length;
 		const drafts = await pi.turnEnd({ tokens: 173_000 });
 		const again = compactionIn(drafts);
 		assert.ok(again, "the compaction was drafted again");
 		assert.equal(again.firstKeptEntryId, cut);
 		assert.equal((again.details as any).compactionNo, 1);
 		assert.match(again.summary, /Add retries to the fetcher\./);
-		assert.equal(model.calls.length, 1);
+		assert.equal(model.calls.length, written);
 		// It lands, and the boundary after it doesn't draft it a third time.
 		pi.commit(drafts);
 		assert.equal((getLatestCompactionEntry(pi.session.getBranch())?.details as any).compactionNo, 1);
@@ -95,9 +104,10 @@ describe("a compaction another extension's draft sank", () => {
 		pi.commit(await pi.turnEnd({ tokens: 172_000 }));
 		await history(pi, 3);
 		assert.deepEqual(await pi.turnEnd({ tokens: 171_000, entries: [BAD] }), []);
+		const written = model.calls.length;
 		const again = compactionIn(await pi.turnEnd({ tokens: 172_000 }));
 		assert.equal((again?.details as any).compactionNo, 2);
-		assert.equal(model.calls.length, 2);
+		assert.equal(model.calls.length, written);
 	});
 
 	it("is re-drafted after the drafts earlier extensions propose at that boundary, which stand", async () => {
@@ -118,38 +128,41 @@ describe("a compaction another extension's draft sank", () => {
 	it("sunk again, is given up as every writer failing: nothing compacted, an error toast, forced disarmed for the run", async () => {
 		const { pi, model } = forcing([{ text: PI_SUMMARY }, { text: PI_SUMMARY }]);
 		await sunk(pi);
+		const written = model.calls.length;
 		assert.deepEqual(await pi.turnEnd({ tokens: 173_000, entries: [BAD] }), []);
 		assert.deepEqual(await pi.turnEnd({ tokens: 174_000 }), []);
 		assert.deepEqual(errorsShown(pi), [{ message: FAILED_TWICE, type: "error" }]);
 		assert.deepEqual(await pi.turnEnd({ tokens: 176_000, message: said("Done.") }), []);
-		assert.equal(model.calls.length, 1);
+		assert.equal(model.calls.length, written);
 		// A new run arms forced again, and writes a new Handoff.
 		await pi.startRun();
 		assert.ok(compactionIn(await pi.turnEnd({ tokens: 177_000 })));
-		assert.equal(model.calls.length, 2);
+		assert.ok(model.calls.length > written);
 	});
 
 	it("whose cut entry has left the branch, is given up as every writer failing", async () => {
 		const { pi, model } = forcing([{ text: PI_SUMMARY }]);
 		const cut = await sunk(pi);
+		const written = model.calls.length;
 		// Back to before the cut, and on along another branch.
 		const before = pi.session.getEntry(cut!)?.parentId;
 		pi.session.branch(before!);
 		assert.deepEqual(await pi.turnEnd({ tokens: 173_000 }), []);
 		assert.deepEqual(errorsShown(pi), [{ message: CUT_GONE, type: "error" }]);
 		assert.deepEqual(await pi.turnEnd({ tokens: 174_000 }), []);
-		assert.equal(model.calls.length, 1);
+		assert.equal(model.calls.length, written);
 	});
 
 	it("is not re-drafted at a boundary Escape cut short, and nothing is said", async () => {
 		const { pi, model } = forcing([{ text: PI_SUMMARY }, { text: PI_SUMMARY }]);
 		await sunk(pi);
+		const written = model.calls.length;
 		pi.escape();
 		assert.deepEqual(await pi.turnEnd({ message: aborted() }), []);
 		assert.deepEqual(errorsShown(pi), []);
 		// Forced stays armed: the next run writes a new Handoff.
 		await pi.startRun();
 		assert.ok(compactionIn(await pi.turnEnd({ tokens: 175_000 })));
-		assert.equal(model.calls.length, 2);
+		assert.ok(model.calls.length > written);
 	});
 });
