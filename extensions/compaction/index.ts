@@ -35,7 +35,7 @@ import {
 	resolveLevels,
 	type SettingsLike,
 } from "./pressure.ts";
-import { pruneBatch, prunedDir } from "./pruning.ts";
+import { checkPrunes, planPrunes, type Prune, pruneBatch, pruneDrafts, prunedDir, savePrunes } from "./pruning.ts";
 import { formatStatus, STATUS_KEY, thousands } from "./status.ts";
 import { piDefaultWriter, replyModel, retryPolicy, type StreamFn, type Writer } from "./writers.ts";
 
@@ -227,6 +227,8 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 * compaction indicator shows. Pi's indicator is not ours to relabel:
 	 * `setWorkingMessage` reaches only pi's working row, which a compaction
 	 * replaces, so it is left alone here rather than set for a row nobody sees.
+	 * Nor is the kept tail pruned here: pi takes a compaction from this hook,
+	 * and no drafts beside it (#43).
 	 *
 	 * A compaction comes back marked ours by its `details`. When every writer
 	 * fails, or Escape stops them, it is cancelled rather than handed to pi's
@@ -283,26 +285,56 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	}
 
 	/**
-	 * A compaction at this boundary, drafted: our Handoff over pi's cut, with
-	 * `trigger` saying why on pi's working row. `undefined` when it didn't come
-	 * to one — nothing to remove, every writer failed, or Escape.
+	 * The kept tail's Pruning at a compaction: superseded reads among the entries
+	 * the compaction keeps, from `firstKeptEntryId` on, and nothing else of the
+	 * tail. No minimum: right after a compaction the cache is cold anyway.
+	 * Planned and checked over the context this boundary sees, so that a result
+	 * an earlier extension edited here is left to it. Nothing is saved yet.
+	 */
+	function planKeptTail(event: TurnEndEvent, ctx: ExtensionContext, firstKeptEntryId: string, dir: string): Prune[] {
+		const entries = event.context.contextEntries;
+		const at = entries.findIndex((entry) => entry.sourceEntry.id === firstKeptEntryId);
+		if (at < 0) return [];
+		return checkPrunes(planPrunes(entries.slice(at), { scope: "kept-tail", cwd: ctx.cwd, dir }), ctx.sessionManager);
+	}
+
+	/**
+	 * A compaction at this boundary, drafted: our Handoff over pi's cut, then the
+	 * kept tail's Pruning, with `trigger` saying why on pi's working row.
+	 * `undefined` when it didn't come to one — nothing to remove, every writer
+	 * failed, or Escape.
+	 *
+	 * The drafts go out compaction first, so that pi measures `tokensBefore` on
+	 * the context before any of them, then edits on kept-tail entries only: one
+	 * in the removed span would do nothing. Pruned copies are saved only once
+	 * there is a compaction for them to go out with.
 	 *
 	 * The run goes on streaming through it, so pi's working row is up, and says
 	 * what is happening until the chain is done. Writers stop on the run's own
 	 * signal: Escape here stops the run, and the compaction with it.
 	 */
-	async function compactAtBoundary(ctx: ExtensionContext, trigger: string): Promise<CompactionDraft | undefined> {
+	async function compactAtBoundary(event: TurnEndEvent, ctx: ExtensionContext, trigger: string): Promise<SessionBoundaryDraft[] | undefined> {
 		const keep = piCompactionTokens(pi.getSettings() as SettingsLike, ctx.model, "keepRecentTokens");
 		const cut = cutFor(ctx.sessionManager.buildSessionProjection(), keep);
 		if (!cut) return undefined;
 		const branch = ctx.sessionManager.getBranch();
+		const dir = options.prunedDir ?? prunedDir(ctx.sessionManager);
 		showCompacting(ctx);
-		ctx.ui.setWorkingMessage(`${trigger} · writing Handoff…`);
 		try {
+			ctx.ui.setWorkingMessage(`${trigger} · pruning old tool output…`);
+			const prunes = planKeptTail(event, ctx, cut.firstKeptEntryId, dir);
+			ctx.ui.setWorkingMessage(`${trigger} · writing Handoff…`);
 			const outcome = await writeHandoff({ span: cut.span, branch, signal: ctx.signal }, writers(ctx, branch));
 			if (!settle(ctx, outcome)) return undefined;
 			drafted = outcome.details.compactionNo;
-			return { type: "compaction", summary: outcome.summary, firstKeptEntryId: cut.firstKeptEntryId, details: outcome.details, usage: outcome.usage };
+			const compaction: CompactionDraft = {
+				type: "compaction",
+				summary: outcome.summary,
+				firstKeptEntryId: cut.firstKeptEntryId,
+				details: outcome.details,
+				usage: outcome.usage,
+			};
+			return [compaction, ...pruneDrafts(prunes.length > 0 ? await savePrunes(prunes, dir) : [])];
 		} finally {
 			// pi's own text again, rather than ours lingering into the next working row.
 			ctx.ui.setWorkingMessage();
@@ -346,19 +378,20 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		let acts = crossings.observe(tokens, steered);
 		if (forces) {
 			// Not on top of a compaction an earlier extension drafted here.
-			const draft = event.entries.some((entry) => entry.type === "compaction")
+			const drafts = event.entries.some((entry) => entry.type === "compaction")
 				? undefined
-				: await compactAtBoundary(ctx, `Compacting at ${thousands(tokens)} (forced)`);
-			if (!draft) {
+				: await compactAtBoundary(event, ctx, `Compacting at ${thousands(tokens)} (forced)`);
+			if (!drafts) {
 				paint(ctx, tokens, levels);
 				return;
 			}
 			// pi has no reading after a compaction until the next response, and the
 			// next boundary paints the status again if pressure is still at notice
-			// or above. Ours goes after the drafts before it, so that they stand,
-			// and pi measures `tokensBefore` with them applied.
+			// or above. Ours go after the drafts before them, so that they stand,
+			// and pi measures `tokensBefore` with them applied. No notice batch
+			// here: the compaction removes what it would prune.
 			show(ctx, undefined);
-			return { entries: [...event.entries, draft] };
+			return { entries: [...event.entries, ...drafts] };
 		}
 		// Pruning first, so that the agent is steered to Self-compact only once
 		// Pruning can no longer free enough. What the batch frees is judged on the
