@@ -123,12 +123,16 @@ interface SentMessage {
 }
 
 /**
- * pi's own routing rule, mirrored from `AgentSession.sendCustomMessage` (0.84.3).
+ * pi's own routing rule, mirrored from `AgentSession.sendCustomMessage` (0.85.1).
  *
  * Which of idle-wake and streaming-steer happens is pi's decision, not this
  * extension's — so the only thing the extension can get right is handing pi the
  * options that make both halves of ADR-0002's Delivery policy come out right.
  * Writing the rule down here is what lets a test see both halves.
+ *
+ * "transcript" is two of pi's paths: appended at once when the parent is idle,
+ * and held to the end of the turn when it is streaming. Either way it is on the
+ * record without waking anything, which is all a test here asks of it.
  */
 function landing(options: SendOptions | undefined, streaming: boolean): Landing {
 	if (options?.deliverAs === "nextTurn") return "nextTurn";

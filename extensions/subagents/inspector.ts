@@ -378,9 +378,11 @@ type ToolRenderer = ConstructorParameters<typeof ToolExecutionComponent>[4];
 /**
  * The TUI an overlay is handed, typed as pi's own components want it.
  *
- * Read off pi's API rather than imported from pi-tui, because a checkout can
- * hold two copies of pi-tui — the one this package resolves as a peer, and the
- * one pi itself depends on — and pi's components are typed against the second.
+ * Read off pi's API rather than imported from pi-tui, because a checkout always
+ * holds two copies of pi-tui — the one this package resolves itself, and the
+ * one pi's shrinkwrap nests under it — and pi's components are typed against
+ * the second. The two agree only while `package.json` keeps pi-tui's version in
+ * step with pi's; this keeps a pi bump that forgets from breaking the build.
  * At runtime there is only one: pi hands an extension its own pi-tui.
  */
 type OverlayTui = ConstructorParameters<typeof ToolExecutionComponent>[5];
