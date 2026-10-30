@@ -59,7 +59,7 @@ import {
 import type { RunControl, SendOutcome } from "./control.ts";
 import type { Run } from "./supervisor.ts";
 import type { AgentMessage, AssistantMessage, ToolExecution, Transcripts, TranscriptSnapshot } from "./transcript.ts";
-import { age, clip, oneLine, runRows } from "./widget.ts";
+import { age, clip, oneLine, pressureLabel, runRows } from "./widget.ts";
 
 /** What the picker and the Inspector read, and act through. */
 export interface InspectorSession {
@@ -332,9 +332,17 @@ export function packHints(hints: readonly string[], width: number): string[] {
 	return lines;
 }
 
-/** The Inspector's header: which Run, of which Agent, where it is, and for how long. */
+/**
+ * The Inspector's header: which Run, of which Agent, where it is, for how long,
+ * and, from notice up, how full its context is.
+ *
+ * The level goes last, after the parts every Run has, so a header without one
+ * reads exactly as it always did.
+ */
 export function inspectorHeader(run: Run, now: number): string {
-	return [oneLine(run.name), run.agent, run.state, age(run, now)].join(DOT);
+	const parts = [oneLine(run.name), run.agent, run.state, age(run, now)];
+	if (run.pressure) parts.push(pressureLabel(run.pressure));
+	return parts.join(DOT);
 }
 
 /**

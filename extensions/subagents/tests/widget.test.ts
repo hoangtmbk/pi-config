@@ -135,6 +135,20 @@ describe("a Run's row", () => {
 		]);
 	});
 
+	it("starts with a Run's Pressure level from notice up, and reads compacting while one runs", () => {
+		const noticed: Run = { ...run("scout", "running", 9, "bash"), pressure: { level: "notice", tokens: 131_000 } };
+		const warned: Run = { ...run("worker", "waiting", 9), pressure: { level: "warning", tokens: 152_000 } };
+		const compacting: Run = { ...run("fixer", "running", 9, "read src/a.ts"), pressure: "compacting" };
+		const calm = run("tester", "running", 9, "bash");
+
+		assert.deepEqual(runRows([noticed, warned, compacting, calm], 0, 60), [
+			"00:09  scout   notice 131k · running · bash",
+			"00:09  worker  warning 152k · waiting",
+			"00:09  fixer   compacting",
+			"00:09  tester  running · bash",
+		]);
+	});
+
 	it("fits the width it is given, clipping what the Run is doing first", () => {
 		const rows = runRows([run("scout", "running", 1, `read ${"deeply/nested/".repeat(10)}file.ts`)], 0, 40);
 

@@ -249,6 +249,14 @@ describe("what the Inspector says about a Run", () => {
 	it("heads the Inspector with the Run's name, Agent, state and age", () => {
 		assert.equal(inspectorHeader(run("scout-2", "running", 75, { agent: "scout" }), 0), "scout-2 · scout · running · 01:15");
 	});
+
+	it("ends the header with the Run's Pressure level from notice up, and with compacting while one runs", () => {
+		const warned = run("scout-2", "running", 75, { pressure: { level: "warning", tokens: 152_000 } });
+		const compacting = run("scout-2", "running", 75, { pressure: "compacting" });
+
+		assert.equal(inspectorHeader(warned, 0), "scout-2 · scout · running · 01:15 · warning 152k");
+		assert.equal(inspectorHeader(compacting, 0), "scout-2 · scout · running · 01:15 · compacting");
+	});
 });
 
 describe("scrolling the transcript", () => {
