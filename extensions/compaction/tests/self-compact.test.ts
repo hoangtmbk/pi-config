@@ -10,6 +10,9 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { registerCompaction, SELF_COMPACT_TOOL } from "../index.ts";
 import type { SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
@@ -165,11 +168,40 @@ describe("the `self_compact` tool", () => {
 		assert.deepEqual(pi.sent, []);
 	});
 
-	it("pi's working row says Self-compacting while the Handoff is written, and is handed back after", async () => {
+	it("prunes a superseded read in the kept tail, its edit going out after the compaction", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "compaction-self-"));
+		try {
+			const model = scriptModel({ text: HANDOFF });
+			const settings = { compaction: { keepRecentTokens: 30_000 }, retry: { enabled: false } };
+			const pi = fakePi({ settings }, (api) => registerCompaction(api, { stream: model.stream, prunedDir: dir }));
+			for (let n = 1; n <= 4; n++) {
+				pi.session.appendMessage(user(words(12_000, `ask ${n}`)));
+				await pi.turnEnd({ tokens: 40_000 + n * 1_000 });
+			}
+			const reads: string[] = [];
+			for (const version of ["v1", "v2"]) {
+				const read = calling("read", { path: "src/a.ts" });
+				await pi.turnEnd({ tokens: 60_000, message: read, toolResults: [result(read, words(2_000, `a.ts ${version}`))] });
+				reads.push(pi.session.getBranch().at(-1)!.id);
+			}
+			const drafts = await pi.turnEnd({ tokens: 125_000, message: calling(SELF_COMPACT_TOOL, { note: NOTE }) });
+			assert.equal(resultText(pi), COMPACTED);
+			assert.deepEqual(drafts.map((draft) => draft.type), ["compaction", "context_edit"]);
+			const edit = drafts[1] as Extract<SessionBoundaryDraft, { type: "context_edit" }>;
+			assert.equal(edit.targetId, reads[0]);
+			assert.equal(readFileSync(join(dir, `${reads[0]}.txt`), "utf8"), words(2_000, "a.ts v1"));
+			pi.commit(drafts);
+			assert.deepEqual(pi.errors, []);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("pi's working row says Self-compacting while it prunes and writes, and is handed back after", async () => {
 		const { pi } = selfCompacting([{ text: HANDOFF }]);
 		await history(pi);
 		await pi.turnEnd({ tokens: 125_000, message: calling(SELF_COMPACT_TOOL, { note: NOTE }) });
-		assert.deepEqual(pi.working, ["Self-compacting · writing Handoff…", undefined]);
+		assert.deepEqual(pi.working, ["Self-compacting · pruning old tool output…", "Self-compacting · writing Handoff…", undefined]);
 	});
 });
 
@@ -190,6 +222,19 @@ describe("the run, after a Self-compaction", () => {
 		await pi.turnEnd({ tokens: 45_000 });
 		assert.equal(pi.status(), undefined);
 		assert.deepEqual(pi.errors, []);
+	});
+});
+
+describe("a Self-compaction another extension's draft sank", () => {
+	it("is re-drafted at the next boundary, as written, without writing it again", async () => {
+		const { pi, model } = selfCompacting([{ text: HANDOFF }]);
+		await history(pi);
+		// A neighbour's edit of an entry that doesn't exist: pi drops the whole boundary.
+		const bad: SessionBoundaryDraft = { type: "context_edit", targetId: "no-such-entry", replacement: { content: [{ type: "text", text: "x" }] } };
+		assert.deepEqual(await pi.turnEnd({ tokens: 125_000, message: calling(SELF_COMPACT_TOOL, { note: NOTE }), entries: [bad] }), []);
+		const again = compactionIn(await pi.turnEnd({ tokens: 126_000 }));
+		assert.equal((again?.details as any).note, NOTE);
+		assert.equal(model.calls.length, 1);
 	});
 });
 

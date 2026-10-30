@@ -10,9 +10,9 @@ how full the context is in raw tokens, a **Pressure level** is one of the three 
 without summarizing it, and the **Handoff** is what stands in for the span a compaction removed.
 
 > **Work in progress.** What is here today is the Pressure levels, the footer status, the
-> steers, the notice Pruning batch, forced compaction at the turn boundary with kept-tail Pruning,
-> and our Handoff on every compaction, written in serialized mode or by pi's summarizer.
-> Self-compaction, kept-tail Pruning on the hook path, the forked-call writer and the Constraint
+> steers, the notice Pruning batch, forced compaction and Self-compaction at the turn boundary
+> with kept-tail Pruning, and our Handoff on every compaction, written in serialized mode or by
+> pi's summarizer. Kept-tail Pruning on the hook path, the forked-call writer and the Constraint
 > ledger's additions are still to come. The extension is not in the package's
 > `pi.extensions` until the Handoff has passed its replay check; until then load it by hand:
 >
@@ -221,9 +221,37 @@ straight after, its next request built from the Handoff and the kept tail.
   above; after a compaction that didn't happen, it shows where pressure stands. Then pi's own
   compaction card, drawn from the entry.
 
+## Self-compaction
+
+The `self_compact` tool (exported as `SELF_COMPACT_TOOL`) lets the agent compact at a natural
+break, from notice up, and carry on in the same run with no user prompt. It is always declared, so
+the tool list never changes and the prompt cache holds. Its one required parameter is `note`:
+what the agent is doing and will do next, in its own words. There is no focus parameter, and the
+description says nothing about running out or a limit.
+
+- **Below notice it refuses**, saying the context isn't large enough yet for a compaction to help.
+- **From notice up, `execute` compacts.** A tool can't append to the session, so it runs the same
+  boundary path as forced — pi's cut, kept-tail Pruning, our Handoff from the writer chain — and
+  keeps the compaction for that turn's `turn_end`, which applies it after the drafts earlier
+  extensions proposed. The branch then ends at the assistant message making the call, so after
+  it the agent sees the system prompt, the Handoff, then the kept tail ending in its own
+  `self_compact` call and result. The notice batch and the steers are skipped at that boundary,
+  as when forced lands. If an earlier extension's bad draft sinks it, it is re-drafted once like a
+  forced one. One a sibling call's Escape cut short still lands, since the agent was told it did.
+- **It returns one plain line**, with no token counts: "Context compacted. The Handoff above
+  carries the task; continue from its Next step." on success, and "Compaction failed; carry on,
+  and it will be retried at the forced level." when every writer fails (with the same error toast
+  and disarming as on any path) or when Escape stops it mid-write (no toast, forced still armed).
+- **The note** opens the Handoff's Next step verbatim, labelled `Agent's note (verbatim)`, and the
+  writer's instruction restates it and asks for the rest of Next step to agree with it, or say why
+  it can't be followed. It lasts for that compaction only: it is not merged forward, and the next
+  compaction's writer is shown the previous Handoff without it.
+- **What the user sees:** pi's working row reads `Self-compacting · pruning old tool output…`, then
+  `Self-compacting · writing Handoff…`, and the footer status as for forced.
+
 ## The Handoff
 
-Every compaction gets our Handoff in place of pi's summary: forced, on the boundary path, and
+Every compaction gets our Handoff in place of pi's summary: forced and Self-compaction, on the boundary path, and
 whatever reaches pi's `session_before_compact` — `/compact`, and pi's own threshold and overflow
 backstop — on the hook path. Either way the cut is pi's, so the kept tail is exactly the one pi
 would keep. Code writes the parts it can extract exactly; a writer
@@ -320,7 +348,7 @@ model call the writers make, the folder for pruned copies, and the clock.
 ## Layout
 
 ```
-index.ts        extension entry: registerCompaction, event wiring, steers, footer, toasts
+index.ts        extension entry: registerCompaction, event wiring, steers, self_compact, footer, toasts
 pressure.ts     the Pressure levels from settings, and which one a boundary acts on   (pure)
 cut.ts          pi's cut for the boundary path, over what the model sees               (pure)
 pruning.ts      Pruning: picks results, writes markers, checks edits, saves full copies
