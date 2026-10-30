@@ -15,9 +15,11 @@
  */
 
 import {
+	buildSessionProjection,
 	type ExtensionAPI,
 	type ExtensionContext,
 	getLatestCompactionEntry,
+	type SessionBeforeCompactEvent,
 	type SessionBoundaryDraft,
 	type SessionEntry,
 	type TurnEndEvent,
@@ -36,15 +38,11 @@ import {
 	type SettingsLike,
 } from "./pressure.ts";
 import { pruneBatch, prunedDir } from "./pruning.ts";
+import { serializedWriter } from "./serialized.ts";
 import { formatStatus, STATUS_KEY, thousands } from "./status.ts";
-import { piDefaultWriter, replyModel, retryPolicy, type StreamFn, type Writer } from "./writers.ts";
+import { type Clock, piDefaultWriter, replyModel, retryPolicy, type StreamFn, SYSTEM_CLOCK, type Writer } from "./writers.ts";
 
-/** A clock and a timer: what the writers' stall timeout runs on. */
-export interface Clock {
-	now(): number;
-	setTimeout(callback: () => void, ms: number): unknown;
-	clearTimeout(handle: unknown): void;
-}
+export type { Clock } from "./writers.ts";
 
 /**
  * What a test swaps in for pi's real world. Every field is optional, and every
@@ -186,21 +184,37 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	}
 
 	/**
-	 * The writers for one compaction, in chain order. Only pi's summarizer so
-	 * far; serialized mode and the forked call go in front of it.
+	 * The writers for one compaction, in chain order: serialized mode, then
+	 * pi's summarizer. The forked call goes in front of them.
 	 */
 	function writers(ctx: ExtensionContext, branch: readonly SessionEntry[]): Writer[] {
 		const stream: StreamFn = (model, context, streamOptions) =>
 			(options.stream ?? ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry))(model, context, streamOptions);
+		const model = replyModel(ctx, branch);
+		const settings = pi.getSettings() as SettingsLike;
+		const window = model?.contextWindow;
+		const shared = {
+			model,
+			thinkingLevel: ctx.thinkingLevel,
+			sessionId: ctx.sessionManager.getSessionId(),
+			stream,
+			clock: options.clock ?? SYSTEM_CLOCK,
+		};
 		return [
-			piDefaultWriter({
-				model: replyModel(ctx, branch),
-				thinkingLevel: ctx.thinkingLevel,
-				sessionId: ctx.sessionManager.getSessionId(),
-				stream,
-				retry: retryPolicy(pi.getSettings()),
+			// What it sends must leave the room pi keeps back for a reply.
+			serializedWriter({
+				...shared,
+				room: model && window && window > 0 ? window - piCompactionTokens(settings, model, "reserveTokens") : undefined,
 			}),
+			piDefaultWriter({ ...shared, retry: retryPolicy(pi.getSettings()) }),
 		];
+	}
+
+	/** What a compaction from the hook keeps after the Handoff: the branch from pi's cut on, as the model sees it. */
+	function keptTail(event: SessionBeforeCompactEvent) {
+		const entries = buildSessionProjection(event.branchEntries).entries;
+		const from = entries.findIndex((entry) => entry.sourceEntry.id === event.preparation.firstKeptEntryId);
+		return from < 0 ? [] : entries.slice(from).flatMap((entry) => entry.messages.filter((message) => message.role !== "system"));
 	}
 
 	/**
@@ -265,6 +279,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 			const outcome = await writeHandoff(
 				{
 					span: [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages],
+					tail: keptTail(event),
 					branch: event.branchEntries,
 					focus: event.customInstructions,
 					signal: event.signal,
@@ -323,7 +338,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		showCompacting(ctx);
 		ctx.ui.setWorkingMessage(`${trigger} · writing Handoff…`);
 		try {
-			const outcome = await writeHandoff({ span: cut.span, branch, signal: ctx.signal }, writers(ctx, branch));
+			const outcome = await writeHandoff({ span: cut.span, tail: cut.tail, branch, signal: ctx.signal }, writers(ctx, branch));
 			if (!settle(ctx, outcome)) return undefined;
 			return { type: "compaction", summary: outcome.summary, firstKeptEntryId: cut.firstKeptEntryId, details: outcome.details, usage: outcome.usage };
 		} finally {

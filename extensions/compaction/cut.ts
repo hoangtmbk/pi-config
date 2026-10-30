@@ -31,6 +31,8 @@ export interface Cut {
 	firstKeptEntryId: string;
 	/** The removed span, oldest first, as the model saw it: what the Handoff stands in for. */
 	span: AgentMessage[];
+	/** What the compaction keeps after the Handoff, oldest first, as the model sees it. */
+	tail: AgentMessage[];
 }
 
 /**
@@ -71,9 +73,9 @@ export function cutFor(projection: SessionProjection, keepRecentTokens: number):
 	const { firstKeptEntryIndex } = findCutPoint(entries, start, entries.length, keepRecentTokens);
 	const firstKept = projected[firstKeptEntryIndex]?.sourceEntry;
 	if (!firstKept) return undefined;
-	const span = projected
-		.slice(start, firstKeptEntryIndex)
-		.flatMap((entry) => (entry.sourceEntry.type === "compaction" ? [] : entry.messages.filter((message) => message.role !== "system")));
+	const seen = (from: readonly ProjectedSessionEntry[]) =>
+		from.flatMap((entry) => (entry.sourceEntry.type === "compaction" ? [] : entry.messages.filter((message) => message.role !== "system")));
+	const span = seen(projected.slice(start, firstKeptEntryIndex));
 	if (span.length === 0) return undefined;
-	return { firstKeptEntryId: firstKept.id, span };
+	return { firstKeptEntryId: firstKept.id, span, tail: seen(projected.slice(firstKeptEntryIndex)) };
 }
