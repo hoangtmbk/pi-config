@@ -39,6 +39,11 @@
  * still working when it is steered; without the marker, every steer lands on a
  * child that has already settled, which is the race a steer can lose.
  *
+ * A turn script's events are written as they stand, so a script can carry
+ * records that are not session events at all: `child-events.ts`'s `status` is
+ * the `extension_ui_request` a child's compaction extension sends when it sets
+ * its footer status, which is how a Run reports its Pressure level.
+ *
  * Not a `.test.ts` file, so `npm test` never runs it directly.
  */
 

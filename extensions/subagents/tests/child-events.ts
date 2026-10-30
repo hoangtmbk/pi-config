@@ -10,7 +10,8 @@
  * Not a `.test.ts` file, so `npm test` never runs it directly.
  */
 
-import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { JsonAgentSessionEvent, RpcExtensionUIRequest } from "@earendil-works/pi-coding-agent";
+import { STATUS_KEY } from "../../compaction/status.ts";
 import { ASK_QUESTION_TOOL, type QuestionDetails } from "../supervisor.ts";
 
 /** An assistant `message_end`, the event a result is read from. */
@@ -59,6 +60,25 @@ export function failed(toolName: string, message: string): JsonAgentSessionEvent
  */
 export function queued(...steering: string[]): JsonAgentSessionEvent {
 	return { type: "queue_update", steering, followUp: [] } as JsonAgentSessionEvent;
+}
+
+/**
+ * The child's compaction extension setting its footer status, as pi in RPC mode
+ * forwards it: an `extension_ui_request`, which is not one of the events
+ * `JsonAgentSessionEvent` lists but arrives on the same stream all the same.
+ * `undefined` is a cleared status: Context pressure back under notice.
+ *
+ * `key` is for a status some other extension of the child's set.
+ */
+export function status(text: string | undefined, key: string = STATUS_KEY): JsonAgentSessionEvent {
+	const request: RpcExtensionUIRequest = { type: "extension_ui_request", id: `status-${text}`, method: "setStatus", statusKey: key, statusText: text };
+	return request as unknown as JsonAgentSessionEvent;
+}
+
+/** The child's extension raising a toast, which pi in RPC mode forwards the same way. */
+export function toast(message: string, type: "info" | "warning" | "error" = "warning"): JsonAgentSessionEvent {
+	const request: RpcExtensionUIRequest = { type: "extension_ui_request", id: `notify-${message}`, method: "notify", message, notifyType: type };
+	return request as unknown as JsonAgentSessionEvent;
 }
 
 function toolExecutionEnd(toolName: string, result: unknown, isError: boolean): JsonAgentSessionEvent {
