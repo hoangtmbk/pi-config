@@ -15,8 +15,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { type SessionBoundaryDraft, SessionManager } from "@earendil-works/pi-coding-agent";
+import type { Model } from "@earendil-works/pi-ai";
 import { registerCompaction } from "../index.ts";
-import { calling, fakePi, result } from "./fake-pi.ts";
+import { calling, type FakeSetup, fakePi, MODEL, result } from "./fake-pi.ts";
 
 const folders: string[] = [];
 
@@ -32,8 +33,8 @@ afterEach(() => {
 });
 
 /** A fake pi whose pruned copies land in a temp dir. */
-function pruningPi(dir = folder()) {
-	const pi = fakePi({}, (api) => registerCompaction(api, { prunedDir: dir }));
+function pruningPi(setup: FakeSetup = {}, dir = folder()) {
+	const pi = fakePi(setup, (api) => registerCompaction(api, { prunedDir: dir }));
 	return Object.assign(pi, { dir });
 }
 
@@ -171,6 +172,16 @@ describe("whether the batch goes out", () => {
 		await history(pi, 30_000);
 		await pi.turnEnd({ tokens: 119_000 });
 		assert.deepEqual(pi.boundaries.flat(), []);
+	});
+
+	it("runs at the scaled notice on a small window", async () => {
+		// On a 128K window with pi's default reserve, notice scales to 66,970 and warning to 83,712.
+		const pi = pruningPi({ model: { ...MODEL, provider: "openai", id: "mini-4", contextWindow: 128_000 } as Model<any> });
+		await history(pi, 30_000, "test", 40_000);
+		assert.deepEqual(await pi.turnEnd({ tokens: 66_969 }), []);
+		await pi.turnEnd({ tokens: 40_000 });
+		assert.equal(edits(await pi.turnEnd({ tokens: 70_000 })).size, 1);
+		assert.equal(pi.sent.length, 0);
 	});
 });
 
