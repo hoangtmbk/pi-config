@@ -13,5 +13,9 @@ trust.json
 .env
 **/.env
 
+# the compaction replay check's local corpus and its reports: transcripts never leave the machine
+extensions/compaction/replay-manifest.json
+extensions/compaction/replay-reports/
+
 # scratch working state (local ticket tracker, etc.)
 .scratch/

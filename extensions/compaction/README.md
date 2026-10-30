@@ -354,6 +354,39 @@ score our Handoff and pi's default summary alike (a "Handoff" there is any compa
 
 They are tested offline on small fixture sessions written for the purpose, never real transcripts.
 
+The live half is `npm run live:compaction` (about $45; `--quick`, the first session only, about
+$5), run by hand and never by `npm test` or CI. It replays the sessions named in
+`replay-manifest.json` beside this README, gitignored like the `replay-reports/` folder it writes
+to, so that transcripts never reach the repo:
+
+```json
+{ "sessions": ["~/.pi/agent/sessions/<project>/<session>.jsonl", { "path": "…", "name": "the refactor" }] }
+```
+
+- **Cuts** (`replay-corpus.ts`): two or three per session, chained, at turn boundaries the recording
+  really had: mid-run, as Self-compaction after the extension's real steer (the agent's own
+  `self_compact` note goes to the Handoff; an agent that doesn't compact when steered is compacted as
+  forced, and the report says so) or as forced; and just before a user message, as `/compact`. The
+  kinds rotate across sessions, every cut has at least three recorded user turns after it, and each
+  removes at least `keepRecentTokens`.
+- **Two lanes** (`replay-session.ts`): the extension, through the same fake pi the offline suite
+  drives, and pi's own `compact`, with no extension, chained on its own summaries. Both run on the
+  session's recorded model; a session whose model can't be reached is skipped.
+- **The continuation** (`replay-continuation.ts`): from each lane's Handoff and kept tail, the model
+  proposes actions; while each matches the recorded one, the recorded result is fed back, for at
+  most three actions. The first that differs is judged. Nothing is executed.
+- **The judge** (`replay-judge.ts`), Claude Fable 5 by default: both Handoffs blind, as A and B in
+  alternating order, scored for ledger recall, violations, re-asks and redone work (re-reads
+  allowed). Every verdict must cite its evidence and every rule must be the user's own words.
+- **The report** (`replay-report.ts`): each pass bar for ours and pi's default — ledger recall ≥95%
+  at every depth with no decline, 0 violations, ≤1/30 re-asks, ≤3/30 redone, exact file state, no
+  worse than pi's default — then retention and the collapse guard (reported, not gated), the actual
+  spend by what it went on, and every cut's findings with their evidence. A cut that errored or went
+  unjudged makes the run inconclusive. A JSON of the raw results sits beside it, to hand-label from.
+
+All of it but the runner itself (`test.ts`) is tested offline, against a scripted model on fixture
+sessions.
+
 ## The status codec
 
 `status.ts` exports `formatStatus` and `parseStatus`, which write and read the three statuses —
@@ -397,5 +430,11 @@ instruction.ts  the writer's instruction, in both modes' wording, and the reply 
 fork.ts         the forked call: the live context, placeholder results, the cache-miss check
 serialized.ts   serialized mode: the transcript, the tool-result cut and its halving
 replay.ts       the replay check's deterministic checks  (pure)
+replay-corpus.ts        the manifest, reading a recording, its turn boundaries and the chain of cuts  (pure)
+replay-session.ts       one session replayed in both lanes: ours and pi's default
+replay-continuation.ts  the open-loop continuation: match, feed back, stop at the first difference
+replay-judge.ts         the judge's request and the checked reading of its verdict
+replay-report.ts        the spend, the pass bars and the report
+test.ts         the live replay check: `npm run live:compaction`, by hand only
 tests/          offline suite, the recording fake pi and the scripted model call
 ```
