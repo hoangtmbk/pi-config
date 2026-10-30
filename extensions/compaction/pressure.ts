@@ -27,8 +27,8 @@ export interface ModelLike {
 	contextWindow?: number;
 }
 
-/** pi's built-in `compaction.reserveTokens`. */
-const DEFAULT_RESERVE_TOKENS = 16_384;
+/** pi's built-in `compaction.*` token settings. */
+const PI_COMPACTION_TOKENS = { reserveTokens: 16_384, keepRecentTokens: 20_000 };
 
 /** Where forced lands when the levels are scaled: this share of pi's own trigger. */
 const SCALED_FORCED = 0.85;
@@ -38,19 +38,34 @@ function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** pi's own `compaction` settings, read but never trusted. */
+function piCompaction(settings: SettingsLike): Record<string, unknown> {
+	return isObject(settings.compaction) ? settings.compaction : {};
+}
+
 /**
- * pi's `reserveTokens` for `model`: its override, then the plain setting, then
- * pi's default — the way pi's `getCompactionTokenSetting` resolves it. pi
- * throws on a bad value; here it falls through instead, and pi will report it
- * itself.
+ * One of pi's `compaction.*` token settings for `model`: its override, then
+ * the plain setting, then pi's default — the way pi's
+ * `getCompactionTokenSetting` resolves it, so that `/compact`, pi's backstop
+ * and our levels go by the same numbers. pi throws on a bad value; here it
+ * falls through instead, and pi will report it itself.
  */
-function reserveTokens(settings: SettingsLike, model: ModelLike): number {
-	const compaction = isObject(settings.compaction) ? settings.compaction : {};
+export function piCompactionTokens(settings: SettingsLike, model: ModelLike | undefined, field: keyof typeof PI_COMPACTION_TOKENS): number {
+	const compaction = piCompaction(settings);
 	const overrides = isObject(compaction.modelOverrides) ? compaction.modelOverrides : {};
-	const override = overrides[`${model.provider}/${model.id}`];
+	const override = model ? overrides[`${model.provider}/${model.id}`] : undefined;
 	const usable = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-	const candidates = [isObject(override) ? override.reserveTokens : undefined, compaction.reserveTokens];
-	return candidates.find(usable) ?? DEFAULT_RESERVE_TOKENS;
+	const candidates = [isObject(override) ? override[field] : undefined, compaction[field]];
+	return candidates.find(usable) ?? PI_COMPACTION_TOKENS[field];
+}
+
+/**
+ * pi's `compaction.enabled`, which here decides only whether forced may
+ * compact. Turned off, notice, warning, the steers and everything else go on
+ * working: nothing compacts unless someone chooses it.
+ */
+export function forcedEnabled(settings: SettingsLike): boolean {
+	return Boolean(piCompaction(settings).enabled ?? true);
 }
 
 /**
@@ -62,7 +77,7 @@ function reserveTokens(settings: SettingsLike, model: ModelLike): number {
 function scaled(levels: Levels, settings: SettingsLike, model: ModelLike | undefined): Levels {
 	const window = model?.contextWindow;
 	if (!model || typeof window !== "number" || window <= 0) return levels;
-	const trigger = window - reserveTokens(settings, model);
+	const trigger = window - piCompactionTokens(settings, model, "reserveTokens");
 	if (trigger <= 0 || levels.forced < trigger) return levels;
 	const target = trigger * SCALED_FORCED;
 	const scale = (tokens: number) => Math.max(1, Math.round((tokens * target) / levels.forced));
@@ -172,5 +187,55 @@ export class Crossings {
 			}
 		}
 		return acts;
+	}
+}
+
+/**
+ * Whether forced compacts at a boundary, and the guards that hold it back.
+ *
+ * Unlike notice and warning, forced is not spent by crossing it: it acts at
+ * every boundary at or above it until a compaction lands, so one that Escape
+ * stopped happens at the next boundary instead. What holds it back:
+ *
+ * - `compaction.enabled: false`, for as long as it is set;
+ * - the warning-pause guard: once a compaction, on either path, has left
+ *   pressure at or above warning, forcing waits until pressure drops below
+ *   warning, so compactions that can't keep up don't follow each other every
+ *   turn;
+ * - every writer failing, which disarms it for the rest of the run.
+ */
+export class Forced {
+	private paused = false;
+	private disarmed = false;
+	/** A compaction landed, and no reading since has said what it left. */
+	private landed = false;
+
+	/** A compaction landed. The next reading says whether it kept up. */
+	compacted(): void {
+		this.landed = true;
+	}
+
+	/** Every writer failed: no forcing again this run. */
+	disarm(): void {
+		this.disarmed = true;
+	}
+
+	/** A new run, in which forcing that failed in the last may be tried again. */
+	rearm(): void {
+		this.disarmed = false;
+	}
+
+	/**
+	 * Take a reading. `leftHigh` says this is the first reading after a
+	 * compaction and it is still at or above warning: the guard has gone on.
+	 */
+	observe(tokens: number, levels: Levels, enabled: boolean): { forces: boolean; leftHigh: boolean } {
+		let leftHigh = false;
+		if (this.landed) {
+			this.landed = false;
+			if (tokens >= levels.warning) this.paused = leftHigh = true;
+		}
+		if (tokens < levels.warning) this.paused = false;
+		return { forces: enabled && !this.paused && !this.disarmed && tokens >= levels.forced, leftHigh };
 	}
 }

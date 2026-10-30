@@ -10,9 +10,9 @@ how full the context is in raw tokens, a **Pressure level** is one of the three 
 without summarizing it, and the **Handoff** is what stands in for the span a compaction removed.
 
 > **Work in progress.** What is here today is the Pressure levels, the footer status, the
-> steers, the notice Pruning batch, and our Handoff on `/compact` and pi's own backstop, written by
-> pi's summarizer. Forced compaction, Self-compaction, kept-tail Pruning and the Handoff's own
-> writers are still to come, so forced does nothing yet. The extension is not in the package's
+> steers, the notice Pruning batch, forced compaction at the turn boundary, and our Handoff on every
+> compaction, written by pi's summarizer. Self-compaction, kept-tail Pruning and the Handoff's own
+> writers are still to come. The extension is not in the package's
 > `pi.extensions` until the Handoff has passed its replay check; until then load it by hand:
 >
 > ```bash
@@ -36,7 +36,7 @@ This builds on pi's compaction rather than replacing it
 |---|---|---|
 | notice | 120,000 | One Pruning batch, if it frees enough; then, unless that brought pressure back under notice, a muted footer status and one steer to the agent. |
 | warning | 150,000 | The status turns the warning colour, one steer to the agent, and one toast to the user. |
-| forced | 170,000 | Compaction, without ending the run. *(Not yet: today nothing happens.)* |
+| forced | 170,000 | Compaction at that turn boundary, without ending the run; see [Forced compaction](#forced-compaction). |
 
 The defaults can be changed, per model too, and shrink on a small window; see
 [Configuration](#configuration). Pressure is read at every `turn_end`, from `ctx.getContextUsage()`. Three rules decide what a
@@ -46,7 +46,7 @@ boundary does:
   below it again. So each level acts once per crossing, not once per turn spent above it.
 - **Only the highest level crossed at a boundary acts.** A turn that jumps from under notice past
   warning gets the warning steer and not notice's; notice is marked crossed all the same. A jump
-  past forced gets no steer at all.
+  past forced compacts, and gets no steer and no toast at all.
 - **A turn that didn't happen does nothing.** A turn the user aborted or the provider failed
   changes nothing and marks no level crossed — including the turn pi still ends as "completed"
   when Escape lands while tools are running, which is caught by the run's abort signal rather
@@ -89,6 +89,11 @@ read merged, with `pi.getSettings()`, at every `turn_end`:
 - **A model switch** re-resolves the levels for the new model at the next turn. A level already
   past counts as crossed, and only the highest crossed level acts: from a 1M-window model at 100K
   to a 128K one, that is forced.
+- **`compaction.enabled: false`** turns off forced, and only forced: notice, warning, the steers,
+  Pruning and our Handoff on `/compact` all go on, and the warning toast no longer says when
+  compaction will be forced. The extension has no on/off switch of its own.
+- **The kept tail** is pi's `compaction.keepRecentTokens`, resolved per model the way pi does, so
+  `/compact`, pi's backstop and forced keep the same tail.
 - **When an edit takes effect.** pi reads `settings.json` into memory at startup and again on
   `/reload`, not on every turn. The extension takes pi's settings as they stand at each turn, so a
   change is what the next turn goes by once pi has it.
@@ -113,7 +118,8 @@ pressure crosses it:
 Context at 152k (warning). The agent has been told it's a good time to compact; forced at 170k.
 ```
 
-There is no toast at notice, and none at forced.
+There is no toast at notice, and none at forced. The other toasts are about compactions; see
+[Forced compaction](#forced-compaction) and [The Handoff](#the-handoff).
 
 ## What the agent hears
 
@@ -172,11 +178,40 @@ bulky tool output and superseded reads with a one-line marker pointing at a save
   target is found, on the active branch, and editable — and one that fails is dropped with its
   pair, unsent and unsaved. The drafts follow earlier extensions' drafts, never replacing them.
 
+## Forced compaction
+
+At the first `turn_end` at or above forced — the turn that ends a run included, with no grace
+period — the extension compacts at that boundary from `turn_end` (the **boundary path**). pi has
+already run and persisted every tool of the turn, so nothing is in flight, and the run goes on
+straight after, its next request built from the Handoff and the kept tail.
+
+- **The cut** is pi's exported `findCutPoint` with pi's `keepRecentTokens`, fed the session's
+  projection rather than its raw branch, starting after the newest compaction: a pruned result
+  counts at its pruned size, as it does in pi's own preparation for `/compact`. So the tail is the
+  one `/compact` would keep.
+- **The draft** goes after any drafts earlier extensions proposed at that boundary, which stand;
+  pi measures the compaction's `tokensBefore` at that point. Not at a boundary where an earlier
+  extension already drafts a compaction.
+- **Forced is not spent by crossing it.** It acts at every boundary at or above it until a
+  compaction lands. Three things hold it back: `compaction.enabled: false`; the **warning-pause
+  guard** — once a compaction, on either path, leaves pressure at or above warning, a toast says
+  so ("Compaction left context at 158k, still above warning. Forced compaction is paused until it
+  drops.") and forcing waits until pressure is below warning; and every writer failing, which
+  disarms it for the rest of the run (an error toast says why) and re-arms it at the next run.
+  Escape during the writer chain stops it with no compaction and no toast, and leaves forced
+  armed.
+- **What the user sees:** pi's working row reads `Compacting at 172k (forced) · writing Handoff…`
+  while it writes, and is handed back to pi after. The footer status is cleared meanwhile (a Run's
+  reads `ctx compacting`), and comes back after a compaction only at a reading still at notice or
+  above; after a compaction that didn't happen, it shows where pressure stands. Then pi's own
+  compaction card, drawn from the entry.
+
 ## The Handoff
 
-Every compaction that reaches pi's `session_before_compact` — `/compact`, and pi's own threshold
-and overflow backstop — gets our Handoff in place of pi's summary. The cut is pi's, so the kept
-tail is exactly the one pi would keep. Code writes the parts it can extract exactly; a writer
+Every compaction gets our Handoff in place of pi's summary: forced, on the boundary path, and
+whatever reaches pi's `session_before_compact` — `/compact`, and pi's own threshold and overflow
+backstop — on the hook path. Either way the cut is pi's, so the kept tail is exactly the one pi
+would keep. Code writes the parts it can extract exactly; a writer
 writes the judgment part:
 
 | Part | Written by |
@@ -251,6 +286,7 @@ model call the writers make, the folder for pruned copies, and the clock.
 ```
 index.ts        extension entry: registerCompaction, event wiring, steers, footer, toasts
 pressure.ts     the Pressure levels from settings, and which one a boundary acts on   (pure)
+cut.ts          pi's cut for the boundary path, over what the model sees               (pure)
 pruning.ts      Pruning: picks results, writes markers, checks edits, saves full copies
 status.ts       the status codec, shared with the subagents extension  (pure)
 handoff.ts      the Handoff: its details record, the parts code writes, merging, rendering
