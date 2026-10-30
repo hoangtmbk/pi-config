@@ -9,7 +9,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, TurnEndEvent } from "@earendil-works/pi-coding-agent";
-import { Crossings, DEFAULT_LEVELS, type Level, levelAt, type Levels } from "./pressure.ts";
+import { Crossings, type Level, levelAt, type Levels, resolveLevels, type SettingsLike } from "./pressure.ts";
 import { formatStatus, STATUS_KEY, thousands } from "./status.ts";
 
 /** A clock and a timer: what the writers' stall timeout runs on. */
@@ -81,7 +81,6 @@ function hasToolCalls(message: TurnEndEvent["message"]): boolean {
 }
 
 export function registerCompaction(pi: ExtensionAPI, _options: CompactionOptions = {}): void {
-	const levels = DEFAULT_LEVELS;
 	const crossings = new Crossings();
 	/** The footer text last set, so an unchanged one is not set again. */
 	let shown: string | undefined;
@@ -102,7 +101,25 @@ export function registerCompaction(pi: ExtensionAPI, _options: CompactionOptions
 		);
 	}
 
-	function paint(ctx: ExtensionContext, tokens: number): void {
+	/** Configuration problems already told to the user: each is told once a session. */
+	const warned = new Set<string>();
+
+	/**
+	 * The levels for the model in use, from pi's settings as they stand. Read
+	 * afresh at each boundary, so a settings change or a model switch is what the
+	 * next turn goes by. A bad setting is told once, never thrown.
+	 */
+	function levelsFor(ctx: ExtensionContext): Levels {
+		const { levels, problems } = resolveLevels(pi.getSettings() as SettingsLike, ctx.model);
+		for (const problem of problems) {
+			if (warned.has(problem)) continue;
+			warned.add(problem);
+			ctx.ui.notify(problem, "warning");
+		}
+		return levels;
+	}
+
+	function paint(ctx: ExtensionContext, tokens: number, levels: Levels): void {
 		const text = statusText(ctx, tokens, levels);
 		if (text === shown) return;
 		shown = text;
@@ -118,6 +135,9 @@ export function registerCompaction(pi: ExtensionAPI, _options: CompactionOptions
 		// No reading — no model, or a compaction not yet answered — is no action.
 		const tokens = ctx.getContextUsage()?.tokens;
 		if (tokens === null || tokens === undefined) return;
+		// A level already past after a model switch is simply crossed now, and
+		// only the highest of those acts.
+		const levels = levelsFor(ctx);
 		const acts = crossings.observe(tokens, levels);
 		if (acts === "notice" || acts === "warning") steer(acts, event);
 		// The one toast on the way up, so that forced never comes as a surprise.
@@ -127,7 +147,7 @@ export function registerCompaction(pi: ExtensionAPI, _options: CompactionOptions
 				"warning",
 			);
 		}
-		paint(ctx, tokens);
+		paint(ctx, tokens, levels);
 	});
 }
 
