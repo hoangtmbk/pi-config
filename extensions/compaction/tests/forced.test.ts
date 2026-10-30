@@ -13,12 +13,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { findCutPoint, getLatestCompactionEntry, type SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
-// pi's own preparation for `/compact` and its measure of the context, reached
-// by path as the fake reaches them: what a forced compaction must agree with.
-import {
-	estimateProjectedContextTokens,
-	prepareCompaction,
-} from "../../../node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js";
+// pi's own preparation for `/compact` and its measure of the context, as the
+// fake takes them: what a forced compaction must agree with.
+import { estimateProjectedContextTokens, prepareCompaction } from "./pi-internals.ts";
 import { registerCompaction } from "../index.ts";
 import { aborted, calling, type FakeSetup, failed, fakePi, result, said, user } from "./fake-pi.ts";
 import { type Reply, scriptModel } from "./scripted-model.ts";

@@ -42,7 +42,7 @@ import {
 	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 // pi's own preparation for a compaction, not exported from the package root.
-import { prepareCompaction } from "../../../node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js";
+import { prepareCompaction } from "../tests/pi-internals.ts";
 import { type CompactionOptions, registerCompaction, SELF_COMPACT_TOOL, STEER_TYPE } from "../index.ts";
 import { piCompactionTokens, resolveLevels, type SettingsLike } from "../pressure.ts";
 import { type CollapseReport, collapseGuard, type FileStateDiff, fileStateDiff, type Retention, recurringDetailRetention } from "./replay.ts";

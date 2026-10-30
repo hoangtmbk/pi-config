@@ -32,13 +32,8 @@ import {
 	type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Model, StopReason, ToolCall, ToolResultMessage, Usage, UserMessage } from "@earendil-works/pi-ai";
-// pi's own preparation for `/compact` and its backstop. Not exported from the
-// package root, so it is reached by path: the fake prepares exactly what pi would.
-import {
-	type CompactionPreparation,
-	estimateProjectedContextTokens,
-	prepareCompaction,
-} from "../../../node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js";
+// pi's own preparation for `/compact` and its backstop: the fake prepares exactly what pi would.
+import { type CompactionPreparation, estimateProjectedContextTokens, prepareCompaction } from "./pi-internals.ts";
 import { registerCompaction } from "../index.ts";
 
 /** Where a sent message landed, given whether pi was streaming when it was sent. */
