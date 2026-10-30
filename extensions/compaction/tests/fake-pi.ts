@@ -15,9 +15,9 @@
  * Grown as the extension grows, always by mirroring what pi does: a model call
  * is scripted through `registerCompaction`'s options (pass a `register`), a
  * boundary's drafts land in `boundaries` for committing to `session`, a tool
- * is in `tools` to execute, and an event whose result pi reads —
- * `session_before_compact` — wants its own firing beside `fire`, which, like
- * pi's plain events, ignores what handlers return.
+ * is in `tools` to execute, and `session_before_compact`, whose result pi
+ * reads, has its own firing in `compact` — beside `fire`, which, like pi's
+ * plain events, ignores what handlers return.
  *
  * Not a `.test.ts` file, so `npm test` does not run it on its own.
  */
@@ -31,7 +31,10 @@ import {
 	SessionManager,
 	type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage, Model, StopReason, ToolCall, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model, StopReason, ToolCall, ToolResultMessage, Usage, UserMessage } from "@earendil-works/pi-ai";
+// pi's own preparation for `/compact` and its backstop. Not exported from the
+// package root, so it is reached by path: the fake prepares exactly what pi would.
+import { type CompactionPreparation, prepareCompaction } from "../../../node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js";
 import { registerCompaction } from "../index.ts";
 
 /** Where a sent message landed, given whether pi was streaming when it was sent. */
@@ -104,6 +107,28 @@ export interface FakeSetup {
 	mode?: ExtensionContext["mode"];
 	/** Defaults to an in-memory one, as a `--no-session` Run has. Pass one with a session file to have a session dir. */
 	session?: SessionManager;
+	/** Defaults to "medium". */
+	thinkingLevel?: ExtensionContext["thinkingLevel"];
+}
+
+/** How a compaction reaches `session_before_compact`: `/compact`, or pi's own backstop. */
+export interface Compaction {
+	/** Defaults to "manual", which is `/compact`. */
+	reason?: "manual" | "threshold" | "overflow";
+	/** What followed `/compact`. */
+	customInstructions?: string;
+}
+
+/** What one `session_before_compact` came to, after the whole chain. */
+export interface Compacted {
+	/** What the chain returned, as pi's runner composes it: the last truthy result wins. */
+	result:
+		| { cancel?: boolean; compaction?: { summary: string; firstKeptEntryId: string; tokensBefore: number; details?: unknown; usage?: Usage } }
+		| undefined;
+	/** What pi prepared and handed the hook. */
+	preparation: CompactionPreparation;
+	/** The id of the compaction entry pi appended from the result, if it took one. */
+	entryId?: string;
 }
 
 /** A model with a 200K window, which the built-in Pressure levels sit well inside. */
@@ -166,6 +191,11 @@ export function failed(): AssistantMessage {
 	return { ...assistant([], "error"), errorMessage: "overloaded" };
 }
 
+/** A message the user typed. */
+export function user(text: string): UserMessage {
+	return { role: "user", content: text, timestamp: Date.now() };
+}
+
 /** The result pi records for a tool call — or for the first one a turn made. */
 export function result(call: ToolCall | AssistantMessage, text = "ok", isError = false): ToolResultMessage {
 	const of = "role" in call ? toolCalls(call)[0] : call;
@@ -207,6 +237,9 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 		usage: undefined as ContextUsage | undefined,
 		/** The run in progress: its signal is `ctx.signal`, and Escape aborts it. */
 		run: new AbortController(),
+		/** The hook compaction in progress: its signal is `session_before_compact`'s, and Escape aborts it. */
+		compacting: undefined as AbortController | undefined,
+		thinkingLevel: setup.thinkingLevel ?? "medium",
 		streaming: false,
 		turnIndex: 0,
 	};
@@ -258,6 +291,15 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 			cwd: "/work",
 			sessionManager: session,
 			model: state.model,
+			thinkingLevel: state.thinkingLevel,
+			// Only what the extension resolves models through. The model call itself
+			// is never real: a test scripts it through `registerCompaction`'s options.
+			modelRegistry: {
+				find: (provider: string, id: string) => (state.model?.provider === provider && state.model.id === id ? state.model : undefined),
+				streamSimple: () => {
+					throw new Error("fake pi: no model call scripted (pass one through registerCompaction's options)");
+				},
+			},
 			signal: state.streaming ? state.run.signal : undefined,
 			getContextUsage: () => state.usage,
 			isIdle: () => !state.streaming,
@@ -345,6 +387,60 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 		return entries;
 	}
 
+	/**
+	 * One compaction through the hook, the way pi's `AgentSession.compact()` and
+	 * its backstop run it (1.4.0): pi's own preparation of the branch, then
+	 * `session_before_compact` through every handler, the last truthy result
+	 * winning and a `cancel` ending the chain there. A compaction in the result
+	 * is appended to the session as pi appends it, marked as an extension's.
+	 *
+	 * Returns `undefined` where pi refuses before the hook: "Already compacted",
+	 * or nothing to compact.
+	 */
+	async function compact(how: Compaction = {}): Promise<Compacted | undefined> {
+		const settings = (state.settings.compaction ?? {}) as { keepRecentTokens?: number; reserveTokens?: number };
+		const preparation = prepareCompaction(session.getBranch(), {
+			enabled: true,
+			reserveTokens: settings.reserveTokens ?? 16_384,
+			keepRecentTokens: settings.keepRecentTokens ?? 20_000,
+		});
+		if (!preparation) return undefined;
+		const reason = how.reason ?? "manual";
+		// `/compact` aborts the run before the hook; the backstop runs between turns.
+		if (reason === "manual") state.run.abort();
+		state.compacting = new AbortController();
+		const event = {
+			type: "session_before_compact",
+			preparation,
+			branchEntries: session.getBranch(),
+			customInstructions: how.customInstructions,
+			reason,
+			willRetry: reason === "overflow",
+			signal: state.compacting.signal,
+		};
+		let result: Compacted["result"];
+		try {
+			for (const handler of handlers.get("session_before_compact") ?? []) {
+				try {
+					const answer = (await handler(event, ctx())) as Compacted["result"];
+					if (answer) result = answer;
+					if (answer?.cancel) break;
+				} catch (error) {
+					errors.push({ event: "session_before_compact", error: String(error) });
+				}
+			}
+		} finally {
+			state.compacting = undefined;
+		}
+		const taken = result?.cancel ? undefined : result?.compaction;
+		const entryId = taken
+			? session.appendCompaction(taken.summary, taken.firstKeptEntryId, taken.tokensBefore, taken.details, true, taken.usage)
+			: undefined;
+		// pi has no reading after a compaction until the next response.
+		if (taken) setTokens(null);
+		return { result, preparation, entryId };
+	}
+
 	register(pi as unknown as ExtensionAPI);
 
 	return {
@@ -359,6 +455,11 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 		boundaries,
 		fire,
 		turnEnd,
+		compact,
+		/** Escape while a hook compaction runs: abort the signal pi handed `session_before_compact`. */
+		escapeCompaction(): void {
+			state.compacting?.abort();
+		},
 		/** Set what pi will report as Context pressure from now on. */
 		pressure: setTokens,
 		/** Escape: abort the run in progress. Its next boundary is an aborted one. */

@@ -7,12 +7,18 @@
  * time pressure crosses notice and again at warning. Before notice's steer, one
  * Pruning batch may win the room back without a compaction. Pi's own compaction
  * stays on underneath as the backstop (ADR-0005).
+ *
+ * Every compaction that reaches `session_before_compact` — `/compact`, and pi's
+ * own threshold and overflow backstop — gets our Handoff instead of pi's
+ * summary (see `handoff.ts`).
  */
 
-import type { ExtensionAPI, ExtensionContext, TurnEndEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionBeforeCompactEvent, TurnEndEvent } from "@earendil-works/pi-coding-agent";
+import { writeHandoff } from "./handoff.ts";
 import { Crossings, type Level, levelAt, type Levels, resolveLevels, type SettingsLike } from "./pressure.ts";
 import { pruneBatch, prunedDir } from "./pruning.ts";
 import { formatStatus, STATUS_KEY, thousands } from "./status.ts";
+import { piDefaultWriter, replyModel, retryPolicy, type StreamFn, type Writer } from "./writers.ts";
 
 /** A clock and a timer: what the writers' stall timeout runs on. */
 export interface Clock {
@@ -82,6 +88,9 @@ function hasToolCalls(message: TurnEndEvent["message"]): boolean {
 	return message.role === "assistant" && message.content.some((part) => part.type === "toolCall");
 }
 
+/** The toast that says pi's summarizer, the last writer, wrote the Handoff's judgment part. */
+const PI_DEFAULT_TOAST = "Compaction used pi's default summary; the Handoff may be thinner.";
+
 export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions = {}): void {
 	const crossings = new Crossings();
 	/** The footer text last set, so an unchanged one is not set again. */
@@ -121,12 +130,90 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		return levels;
 	}
 
-	function paint(ctx: ExtensionContext, tokens: number, levels: Levels): void {
-		const text = statusText(ctx, tokens, levels);
+	function show(ctx: ExtensionContext, text: string | undefined): void {
 		if (text === shown) return;
 		shown = text;
 		ctx.ui.setStatus(STATUS_KEY, text);
 	}
+
+	function paint(ctx: ExtensionContext, tokens: number, levels: Levels): void {
+		show(ctx, statusText(ctx, tokens, levels));
+	}
+
+	/**
+	 * The writers for one compaction, in chain order. Only pi's summarizer so
+	 * far; serialized mode and the forked call go in front of it.
+	 */
+	function writers(ctx: ExtensionContext, event: SessionBeforeCompactEvent): Writer[] {
+		const stream: StreamFn = (model, context, streamOptions) =>
+			(options.stream ?? ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry))(model, context, streamOptions);
+		return [
+			piDefaultWriter({
+				model: replyModel(ctx, event.branchEntries),
+				thinkingLevel: ctx.thinkingLevel,
+				sessionId: ctx.sessionManager.getSessionId(),
+				stream,
+				retry: retryPolicy(pi.getSettings()),
+			}),
+		];
+	}
+
+	/**
+	 * `/compact` and pi's backstop: our Handoff in place of pi's summary.
+	 *
+	 * The cut is pi's own, so the tail kept is the same as pi's would be. The
+	 * removed span is what pi prepared — including, on a cut inside a turn, that
+	 * turn's start. Writers stop on the event's signal: `/compact` has already
+	 * aborted the run, and Escape here aborts the compaction, not the run.
+	 *
+	 * While it writes, the footer status is cleared, so that only pi's own
+	 * compaction indicator shows; in a Run, whose status its parent reads, it
+	 * says `compacting`. Pi's indicator is not ours to relabel: `setWorkingMessage`
+	 * reaches only pi's working row, which a compaction replaces, so it is left
+	 * alone here rather than set for a row nobody sees.
+	 *
+	 * A compaction comes back marked ours by its `details`. When every writer
+	 * fails, or Escape stops them, it is cancelled rather than handed to pi's
+	 * default: nothing is compacted. Only if our own code throws does pi's
+	 * runner fall back to pi's whole default.
+	 */
+	pi.on("session_before_compact", async (event, ctx) => {
+		const before = shown;
+		show(ctx, ctx.mode === "tui" ? undefined : formatStatus("compacting"));
+		let compacted = false;
+		try {
+			const outcome = await writeHandoff(
+				{
+					span: [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages],
+					branch: event.branchEntries,
+					focus: event.customInstructions,
+					signal: event.signal,
+				},
+				writers(ctx, event),
+			);
+			if (outcome.status === "aborted") return { cancel: true };
+			if (outcome.status === "failed") {
+				ctx.ui.notify(`Compaction failed (${outcome.error}). Context will keep growing until the next run or pi's own compaction.`, "error");
+				return { cancel: true };
+			}
+			if (outcome.details.writer === "pi-default") ctx.ui.notify(PI_DEFAULT_TOAST, "warning");
+			compacted = true;
+			return {
+				compaction: {
+					summary: outcome.summary,
+					firstKeptEntryId: event.preparation.firstKeptEntryId,
+					tokensBefore: event.preparation.tokensBefore,
+					details: outcome.details,
+					usage: outcome.usage,
+				},
+			};
+		} finally {
+			// After a compaction pi has no reading until the next response, and the
+			// next `turn_end` paints the status again if pressure is still at notice
+			// or above. A compaction that didn't happen changed nothing.
+			show(ctx, compacted ? undefined : before);
+		}
+	});
 
 	/**
 	 * The notice batch: one per notice crossing, at the crossing boundary, and
