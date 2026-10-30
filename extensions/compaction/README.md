@@ -10,9 +10,9 @@ how full the context is in raw tokens, a **Pressure level** is one of the three 
 without summarizing it, and the **Handoff** is what stands in for the span a compaction removed.
 
 > **Work in progress.** What is here today is the Pressure levels, the footer status, the
-> steers, the notice Pruning batch, and our Handoff on `/compact` and pi's own backstop, written by
-> pi's summarizer. Forced compaction, Self-compaction, kept-tail Pruning and the Handoff's own
-> writers are still to come, so forced does nothing yet. The extension is not in the package's
+> steers, the notice Pruning batch, and our Handoff on `/compact` and pi's own backstop, written in
+> serialized mode or by pi's summarizer. Forced compaction, Self-compaction, kept-tail Pruning, the
+> forked-call writer and the Constraint ledger's additions are still to come, so forced does nothing yet. The extension is not in the package's
 > `pi.extensions` until the Handoff has passed its replay check; until then load it by hand:
 >
 > ```bash
@@ -184,7 +184,7 @@ writes the judgment part:
 | User messages | code: every message the user typed in the removed span, verbatim and in order (an `ask_question` answer included; tool results and custom messages, our steers included, left out). Over ~20K tokens, the first message and the newest that fit are kept, with a marker counting the ones dropped between; one message over ~2K tokens is cut to its head and tail. |
 | File state | code: `read`, `write` and `edit` tool calls applied in order — read only is `read`, a write to a file not seen before is `created`, anything else that changed it is `edited` — and `deleted` for the paths a successful `bash` `rm`, `git rm` or `mv` named (conservatively: quoting, globs, expansions and anything after a `cd` are skipped). |
 | Constraint ledger | carried forward from the previous Handoff. *(Not yet added to.)* |
-| The judgment part | the writer chain. *Today only its last writer: pi's own summarizer, `generateSummaryWithUsage`, whose text stands in for the six judgment sections.* |
+| The judgment part | the writer chain: serialized mode, then pi's own summarizer, `generateSummaryWithUsage`, whose text stands in for the six judgment sections. *(The forked call, in front of both, is still to come.)* |
 
 `details` is the record: the summary is rendered from it, and the next compaction merges from the
 previous `details` (user messages, file state, ledger) and never parses old summary text. It is
@@ -200,8 +200,28 @@ cleared while compacting (a Run's reads `ctx compacting`) and comes back at the 
 pressure is still at notice or above. pi's working row is not relabelled: during a hook compaction
 pi replaces it with its own compaction indicator, which `setWorkingMessage` does not reach.
 
-If the writer fails, nothing is compacted and an error toast says why; Escape stops it with no
-compaction and no toast. Only if our own code throws does pi fall back to its whole default.
+### The writer chain
+
+Writers are tried in order and the first to succeed writes the judgment part; each failed attempt
+goes into `details.attempts` with its reason.
+
+- **Serialized mode** sends one request on the model behind the last reply: a system prompt saying
+  the conversation is data, not instructions, and one user message holding `<previous-handoff>`
+  (on a repeat compaction), `<conversation>` (the removed span), `<kept-tail>` and the instruction
+  (`instruction.ts`). Thinking and custom messages are left out. Each tool result keeps its first
+  1,200 and last 800 characters; if the request doesn't fit the model's window less pi's
+  `reserveTokens`, the cut halves (1,000, 500, 250) down to a 200 floor, and past that the attempt
+  fails. Code takes the reply's last `<handoff>` block and splits it on the six exact headings. It
+  fails on a provider error, a reply stopped at the token cap, no `<handoff>` block, a missing
+  heading, or an empty or "(none)" Goal or Next step. A tool call beside a usable block is ignored,
+  never run. The `<ledger>` block is read but not yet applied.
+- **pi's summarizer** is last, with pi's own prompt and retry policy.
+
+Any writer's attempt fails after 60s with nothing streamed; there is no cap on a reply that keeps
+streaming, and no retry of our own. If every writer fails, nothing is compacted and an error toast
+reads "Compaction failed (<last error>). Context will keep growing until the next run or pi's own
+compaction." Escape stops the chain with no compaction and no toast. Only if our own code throws
+does pi fall back to its whole default.
 
 ## The status codec
 
@@ -240,6 +260,8 @@ pressure.ts     the Pressure levels from settings, and which one a boundary acts
 pruning.ts      Pruning: picks results, writes markers, checks edits, saves full copies
 status.ts       the status codec, shared with the subagents extension  (pure)
 handoff.ts      the Handoff: its details record, the parts code writes, merging, rendering
-writers.ts      the writer chain, and pi's summarizer as its last writer
+writers.ts      the writer chain, the stall timeout, and pi's summarizer as its last writer
+instruction.ts  the writer's instruction, and the reply parser  (pure)
+serialized.ts   serialized mode: the transcript, the tool-result cut and its halving
 tests/          offline suite, the recording fake pi and the scripted model call
 ```

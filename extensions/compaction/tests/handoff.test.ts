@@ -1,7 +1,8 @@
 /**
  * The Handoff on the hook path: what `/compact` and pi's own backstop get from
  * `session_before_compact` — our compaction entry, its `details` record and the
- * summary rendered from it — with pi's summarizer as the writer.
+ * summary rendered from it — with pi's summarizer as the writer, serialized
+ * mode in front of it scripted to fail.
  *
  * Driven only through the recording fake pi, with the model call scripted: a
  * test builds a session, compacts it the way pi would, and reads back what was
@@ -20,9 +21,17 @@ const PI_SUMMARY = "## Goal\nAdd retries to the fetcher.\n\n## Progress\n- Wrote
 /** A session whose compaction keeps only the newest message or so, so nearly everything is in the removed span. */
 const SMALL_TAIL: FakeSetup = { settings: { compaction: { keepRecentTokens: 1 }, retry: { enabled: false } } };
 
-/** A fake pi with the extension on it and its model call scripted with `replies`. */
+/** What serialized mode gets here: a reply it can't use, so that pi's summarizer, next in the chain, writes. */
+const NO_HANDOFF: Reply = { text: "I'll carry on with the fetcher." };
+const SERIALIZED_FAILED = { writer: "serialized", reason: "the reply has no <handoff> block" };
+
+/**
+ * A fake pi with the extension on it, and pi's summarizer scripted to answer
+ * each compaction with the next of `replies`. Each model call is two: serialized
+ * mode's, which fails, and then pi's summarizer's.
+ */
 function compacting(replies: Reply[], setup: FakeSetup = SMALL_TAIL) {
-	const model = scriptModel(...replies);
+	const model = scriptModel(...replies.flatMap((reply) => [NO_HANDOFF, reply]));
 	const pi = fakePi(setup, (api) => registerCompaction(api, { stream: model.stream }));
 	return { pi, model };
 }
@@ -214,14 +223,14 @@ describe("a repeat compaction", () => {
 		const details = detailsOf(second);
 		assert.equal(details.compactionNo, 2);
 		assert.equal(details.writer, "pi-default");
-		assert.deepEqual(details.attempts, []);
+		assert.deepEqual(details.attempts, [SERIALIZED_FAILED]);
 		assert.deepEqual(details.log, []);
 		assert.deepEqual(details.userMessages, ["Add retries to the fetcher.", "Now run the tests."]);
 		assert.deepEqual(details.sections, { piDefault: SECOND });
 		// pi's summarizer updates the previous judgment part rather than starting over —
 		// handed the record's own text, not the old summary with our parts in it.
-		assert.match(model.prompt(1), /<previous-summary>\n## Goal\nAdd retries to the fetcher\.\n\n## Progress\n- Wrote the wrapper\.\n<\/previous-summary>/);
-		assert.doesNotMatch(model.prompt(1), /<previous-summary>[^]*## User messages/);
+		assert.match(model.prompt(3), /<previous-summary>\n## Goal\nAdd retries to the fetcher\.\n\n## Progress\n- Wrote the wrapper\.\n<\/previous-summary>/);
+		assert.doesNotMatch(model.prompt(3), /<previous-summary>[^]*## User messages/);
 	});
 
 	it("carries the previous Constraint ledger forward, superseded entries included, and renders only the active ones", async () => {
@@ -293,13 +302,13 @@ describe("pi's summarizer as the writer", () => {
 		await pi.turnEnd({ message: said("Done.") });
 
 		await pi.compact({ customInstructions: "the retry path" });
-		assert.equal(model.calls.length, 1);
-		const [call] = model.calls;
+		assert.equal(model.calls.length, 2);
+		const call = model.calls[1];
 		assert.equal(call?.model.id, "fable-5");
 		assert.equal(call?.options?.reasoning, "high");
 		assert.equal(call?.options?.sessionId, pi.session.getSessionId());
-		assert.match(model.prompt(), /<conversation>[^]*Add retries to the fetcher\.[^]*<\/conversation>/);
-		assert.match(model.prompt(), /Additional focus: the retry path$/);
+		assert.match(model.prompt(1), /<conversation>[^]*Add retries to the fetcher\.[^]*<\/conversation>/);
+		assert.match(model.prompt(1), /Additional focus: the retry path$/);
 	});
 
 	it("writes the Handoff for pi's threshold and overflow backstop too", async () => {
@@ -388,7 +397,7 @@ describe("when the Handoff can't be written", () => {
 		await pi.turnEnd({ tokens: 125_000, message: said("Done.") });
 		const done = await pi.compact();
 		// The writer stops on the compaction's own signal: `/compact` had already aborted the run's.
-		assert.equal(model.calls[0]?.options?.signal?.aborted, true);
+		assert.equal(model.calls[1]?.options?.signal?.aborted, true);
 		assert.deepEqual(done?.result, { cancel: true });
 		assert.deepEqual(pi.notifications, []);
 		assert.equal(pi.status(), "<muted>ctx notice · 125k</muted>");

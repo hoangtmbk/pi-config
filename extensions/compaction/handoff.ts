@@ -300,6 +300,8 @@ export function renderHandoff(details: HandoffDetails): string {
 export interface HandoffRequest {
 	/** The removed span, oldest first, as the model saw it. */
 	span: readonly AgentMessage[];
+	/** What stays after the Handoff, verbatim, oldest first, as the model saw it. */
+	tail: readonly AgentMessage[];
 	/** The branch as it stands before this compaction. The previous record is read from it. */
 	branch: readonly SessionEntry[];
 	/** What the user asked this compaction to care about: `/compact <instructions>`. */
@@ -328,10 +330,13 @@ export async function writeHandoff(request: HandoffRequest, writers: readonly Wr
 
 	const chain = await runChain(writers, {
 		span: request.span,
+		tail: request.tail,
 		// What the writer edits rather than rewrites: our previous judgment part,
 		// or a summary pi wrote, which is all there is to go on from one of pi's.
 		previousJudgment: previous ? judgmentText(previous.sections) : previousEntry?.summary,
+		previousHandoff: previousEntry?.summary,
 		focus: request.focus,
+		note: request.note,
 		signal: request.signal,
 	});
 	if (chain.status === "aborted") return chain;

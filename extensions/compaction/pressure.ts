@@ -44,7 +44,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
  * throws on a bad value; here it falls through instead, and pi will report it
  * itself.
  */
-function reserveTokens(settings: SettingsLike, model: ModelLike): number {
+export function reserveTokens(settings: SettingsLike, model: ModelLike): number {
 	const compaction = isObject(settings.compaction) ? settings.compaction : {};
 	const overrides = isObject(compaction.modelOverrides) ? compaction.modelOverrides : {};
 	const override = overrides[`${model.provider}/${model.id}`];
