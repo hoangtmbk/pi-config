@@ -205,6 +205,15 @@ renders — the same message components, and pi's own renderers for the built-in
 header of `name · agent · state · elapsed` (then `· warning 152k` from notice up, or
 `· compacting` while one runs) and an editor along the bottom.
 
+Where a Run compacted, the transcript shows pi's compaction card at that point, collapsed, with the
+Handoff behind ctrl+o, and keeps everything above it: unlike the main chat, which redraws itself
+from what the compaction kept, the Inspector is the record of what the Run did. The card comes from
+the child's `entry_appended` for a compaction drafted at a turn boundary, or its `compaction_end`
+for one on pi's hook paths (`/compact`, pi's threshold, overflow recovery). Pruning is not shown,
+and nor is the compaction extension's steer towards Self-compaction, which is a hidden custom
+message: it never enters the child's steering queue, so it is never mistaken for a Steer of yours
+that the Run did not read.
+
 | Where | Key | Does |
 |---|---|---|
 | picker | Up / Down | Move between Runs |
@@ -213,7 +222,7 @@ header of `name · agent · state · elapsed` (then `· warning 152k` from notic
 | Inspector | Enter | Send what is in the editor |
 | Inspector | Shift+Enter | New line |
 | Inspector | PgUp / PgDn | Scroll the transcript; at the bottom it follows the tail |
-| Inspector | ctrl+o | Expand or collapse tool output (collapsed by default) |
+| Inspector | ctrl+o | Expand or collapse tool output and compaction cards (collapsed by default) |
 | Inspector | ctrl+t | Show or hide thinking blocks |
 | Inspector | ctrl+x | Kill this Run, after a y/n confirmation |
 | Inspector | Esc | Back to the picker |

@@ -30,6 +30,15 @@
  * - A tool's execution is its own trio of events keyed by `toolCallId`, and an
  *   update's `partialResult` is everything so far rather than the newest piece,
  *   so it replaces the last one instead of being appended to it.
+ * - A compaction is not a message the child settles, so it arrives as one of
+ *   two other events, depending on who started it. One drafted at a turn
+ *   boundary — the compaction extension's forced level and Self-compaction — is
+ *   an `entry_appended` carrying the compaction entry, which the same event
+ *   sends for every other entry committed there, Pruning's edits included. One
+ *   on pi's hook paths is a `compaction_end` with its result, and nothing else.
+ *   Either way it is folded in as the `compactionSummary` message pi's chat
+ *   draws its compaction card from, at the point it landed; what came before it
+ *   stays, since a reader wants to see what the Run carried forward from.
  *
  * The shapes chosen, which the contract left open:
  *
@@ -82,7 +91,7 @@ export interface ToolExecution {
 }
 
 export interface TranscriptSnapshot {
-	/** Settled messages in the order the child settled them: user, assistant, toolResult, custom. */
+	/** Settled messages in the order the child settled them: user, assistant, toolResult, custom, compactionSummary. */
 	messages: AgentMessage[];
 	/** The assistant message currently streaming, if any — built from `message_start` and each delta. */
 	streaming?: AssistantMessage;
@@ -217,9 +226,36 @@ function apply(transcript: Transcript, event: JsonAgentSessionEvent): boolean {
 			tool.running = false;
 			return true;
 		}
+		case "entry_appended": {
+			// The boundary path. Only a compaction is drawn: the same event carries
+			// every other entry pi commits there, Pruning's edits among them, and
+			// those are not shown.
+			const entry = event.entry;
+			if (entry.type !== "compaction") return false;
+			transcript.messages.push(compactionCard(entry.summary, entry.tokensBefore, Date.parse(entry.timestamp)));
+			return true;
+		}
+		case "compaction_end":
+			// The hook paths — `/compact`, pi's threshold, its overflow recovery —
+			// append the entry with no `entry_appended`, so this is the only word of
+			// it, and a boundary compaction sends no `compaction_end`: never both.
+			// One that was cancelled or failed has no result and left nothing. The
+			// event has no time of its own, so it is stamped on arrival, as pi's chat
+			// stamps it.
+			if (!event.result) return false;
+			transcript.messages.push(compactionCard(event.result.summary, event.result.tokensBefore, Date.now()));
+			return true;
 		default:
 			return false;
 	}
+}
+
+/**
+ * The message a compaction is drawn from, as pi's chat builds it: a
+ * `compactionSummary` carrying the Handoff and the size it was compacted from.
+ */
+function compactionCard(summary: string, tokensBefore: number, timestamp: number): AgentMessage {
+	return { role: "compactionSummary", summary, tokensBefore, timestamp };
 }
 
 /** One delta of a streaming assistant message. */
