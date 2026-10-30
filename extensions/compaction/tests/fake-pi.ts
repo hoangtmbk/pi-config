@@ -34,7 +34,11 @@ import {
 import type { AssistantMessage, Model, StopReason, ToolCall, ToolResultMessage, Usage, UserMessage } from "@earendil-works/pi-ai";
 // pi's own preparation for `/compact` and its backstop. Not exported from the
 // package root, so it is reached by path: the fake prepares exactly what pi would.
-import { type CompactionPreparation, prepareCompaction } from "../../../node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js";
+import {
+	type CompactionPreparation,
+	estimateProjectedContextTokens,
+	prepareCompaction,
+} from "../../../node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js";
 import { registerCompaction } from "../index.ts";
 
 /** Where a sent message landed, given whether pi was streaming when it was sent. */
@@ -335,7 +339,7 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 	 * them. The outcome comes from the message's `stopReason`, exactly as pi
 	 * derives it. Returns the drafts pi would commit.
 	 *
-	 * Drafts are recorded, not yet committed to the session.
+	 * Drafts are recorded, not yet committed to the session: `commit` does that.
 	 */
 	async function turnEnd(turn: Turn = {}): Promise<SessionBoundaryDraft[]> {
 		if ("tokens" in turn) setTokens(turn.tokens);
@@ -385,6 +389,25 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 		}
 		boundaries.push(entries);
 		return entries;
+	}
+
+	/**
+	 * Commit a boundary's drafts to the session, the way pi's
+	 * `AgentSession._applyBoundaryDrafts` does once the chain is done (1.4.0):
+	 * in order, each a real entry. A compaction draft carries no size; pi
+	 * measures the context as the drafts before it left it, and appends it
+	 * marked as an extension's. Throws where pi's replay would.
+	 */
+	function commit(drafts: readonly SessionBoundaryDraft[]): void {
+		for (const draft of drafts) {
+			if (draft.type === "custom") session.appendCustomEntry(draft.customType, draft.data);
+			else if (draft.type === "custom_message") session.appendCustomMessageEntry(draft.customType, draft.content, draft.display, draft.details);
+			else if (draft.type === "context_edit") session.appendContextEdit(draft.targetId, draft.replacement);
+			else {
+				const tokensBefore = estimateProjectedContextTokens(session.buildSessionProjection(), session.getBranch()).tokens;
+				session.appendCompaction(draft.summary, draft.firstKeptEntryId, tokensBefore, draft.details, true, draft.usage);
+			}
+		}
 	}
 
 	/**
@@ -455,6 +478,7 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 		boundaries,
 		fire,
 		turnEnd,
+		commit,
 		compact,
 		/** Escape while a hook compaction runs: abort the signal pi handed `session_before_compact`. */
 		escapeCompaction(): void {
