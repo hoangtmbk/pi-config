@@ -24,8 +24,9 @@ import {
 	type SessionEntry,
 	type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { cutFor } from "./cut.ts";
-import { type HandoffOutcome, handoffOf, writeHandoff } from "./handoff.ts";
+import { type HandoffDetails, type HandoffOutcome, handoffOf, writeHandoff } from "./handoff.ts";
 import {
 	Crossings,
 	Forced,
@@ -64,6 +65,23 @@ export interface CompactionOptions {
 	/** Defaults to the system clock. Injected by tests, and by nothing else. */
 	clock?: Clock;
 }
+
+/** The tool the agent Self-compacts with. Every Run is given it, whatever its Agent's allowlist says. */
+export const SELF_COMPACT_TOOL = "self_compact";
+
+const SelfCompactParams = Type.Object({
+	note: Type.String({ description: "What you're doing and what you'll do next, in your own words." }),
+});
+
+/**
+ * What `self_compact` says back: one plain line, true to what happened, with
+ * no token counts — the agent is meant to simply carry on.
+ */
+const SELF_COMPACT = {
+	compacted: "Context compacted. The Handoff above carries the task; continue from its Next step.",
+	failed: "Compaction failed; carry on, and it will be retried at the forced level.",
+	refused: "Not compacted: the context isn't large enough yet for a compaction to help. Carry on with the task; you'll be told when it's a good time.",
+};
 
 /** The custom message type our steers go out as. */
 export const STEER_TYPE = "compaction";
@@ -108,12 +126,29 @@ function hasToolCalls(message: TurnEndEvent["message"]): boolean {
 /** The toast that says pi's summarizer, the last writer, wrote the Handoff's judgment part. */
 const PI_DEFAULT_TOAST = "Compaction used pi's default summary; the Handoff may be thinner.";
 
+/** A tool result of one plain line. */
+function line(text: string) {
+	return { content: [{ type: "text" as const, text }], details: undefined };
+}
+
 /** A compaction draft, as a boundary returns it. */
 type CompactionDraft = Extract<SessionBoundaryDraft, { type: "compaction" }>;
+
+/** A compaction draft of ours: always a cut, always our Handoff. */
+type OurDraft = CompactionDraft & { firstKeptEntryId: string; details: HandoffDetails };
+
+/** A Self-compaction `execute` has written, waiting for its turn's boundary. */
+interface Prepared {
+	draft: OurDraft;
+	/** The `self_compact` call that wrote it. */
+	toolCallId: string;
+}
 
 export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions = {}): void {
 	const crossings = new Crossings();
 	const forced = new Forced();
+	/** The Self-compaction written during this turn, which its `turn_end` applies. */
+	let prepared: Prepared | undefined;
 	/**
 	 * The number of the compaction last drafted at a boundary, until the next
 	 * boundary has seen whether pi committed it: the whole chain's drafts are
@@ -304,9 +339,18 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 *
 	 * The run goes on streaming through it, so pi's working row is up, and says
 	 * what is happening until the chain is done. Writers stop on the run's own
-	 * signal: Escape here stops the run, and the compaction with it.
+	 * signal — or the signal pi hands `self_compact`, which is the run's: Escape
+	 * here stops the run, and the compaction with it.
+	 *
+	 * Self-compaction drafts it from inside its tool call, before the boundary:
+	 * the branch then ends at the assistant message making the call, which the
+	 * kept tail ends in, and the agent's `note` goes to the writer.
 	 */
-	async function compactAtBoundary(ctx: ExtensionContext, trigger: string): Promise<CompactionDraft | undefined> {
+	async function compactAtBoundary(
+		ctx: ExtensionContext,
+		trigger: string,
+		self: { note: string; signal: AbortSignal | undefined } | undefined = undefined,
+	): Promise<OurDraft | undefined> {
 		const keep = piCompactionTokens(pi.getSettings() as SettingsLike, ctx.model, "keepRecentTokens");
 		const cut = cutFor(ctx.sessionManager.buildSessionProjection(), keep);
 		if (!cut) return undefined;
@@ -314,9 +358,9 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		showCompacting(ctx);
 		ctx.ui.setWorkingMessage(`${trigger} · writing Handoff…`);
 		try {
-			const outcome = await writeHandoff({ span: cut.span, tail: cut.tail, branch, signal: ctx.signal }, writers(ctx, branch));
+			const request = { span: cut.span, tail: cut.tail, branch, note: self?.note, signal: self ? self.signal : ctx.signal };
+			const outcome = await writeHandoff(request, writers(ctx, branch));
 			if (!settle(ctx, outcome)) return undefined;
-			drafted = outcome.details.compactionNo;
 			return { type: "compaction", summary: outcome.summary, firstKeptEntryId: cut.firstKeptEntryId, details: outcome.details, usage: outcome.usage };
 		} finally {
 			// pi's own text again, rather than ours lingering into the next working row.
@@ -332,17 +376,66 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		drafted = undefined;
 	}
 
+	/**
+	 * Self-compaction: the agent compacts at a natural break, and carries on in
+	 * the same run. Always declared, so the tool list never changes and the
+	 * prompt cache holds; below notice it refuses, since a compaction there
+	 * gains little.
+	 *
+	 * A tool can't append to the session, so `execute` runs the writer chain
+	 * itself and keeps the compaction for this turn's `turn_end`, which pi fires
+	 * once every tool of the turn has finished. The result line says what really
+	 * happened. Escape mid-write is a failure, as is every writer failing, and
+	 * forced compaction tries again: after Escape at the next boundary at forced,
+	 * after every writer failing (which disarms it, as on any path) from the
+	 * next run.
+	 */
+	pi.registerTool({
+		name: SELF_COMPACT_TOOL,
+		label: "Self-compact",
+		description: [
+			"Compact your context at a natural break in your work, such as after finishing a step or before starting a new subtask, and carry on straight after in the same run.",
+			"The older part of the conversation is replaced by a Handoff: the goal, progress, decisions, the user's own words and rules, the files touched, and a Next step that opens with your note, word for word. The newest messages stay as they are.",
+			"Use it when you are told it's a good time. Finish what you are doing first, and don't shorten or skip work to get there.",
+		].join(" "),
+		promptSnippet: "Compact your context at a natural break in your work, then carry on",
+		parameters: SelfCompactParams,
+
+		async execute(toolCallId, params, signal, _onUpdate, ctx) {
+			const note = params.note.trim();
+			if (!note) throw new Error("A note cannot be empty. Say what you're doing and what you'll do next.");
+			const tokens = ctx.getContextUsage()?.tokens;
+			if (tokens === null || tokens === undefined || tokens < levelsFor(ctx).notice) return line(SELF_COMPACT.refused);
+			const draft = await compactAtBoundary(ctx, "Self-compacting", { note, signal });
+			if (!draft) return line(SELF_COMPACT.failed);
+			prepared = { draft, toolCallId };
+			return line(SELF_COMPACT.compacted);
+		},
+	});
+
+	/** The Self-compaction this turn's `self_compact` wrote, if any; one from any other turn is stale, and let go. */
+	function takePrepared(event: TurnEndEvent): OurDraft | undefined {
+		const was = prepared;
+		prepared = undefined;
+		if (!was || event.message.role !== "assistant") return undefined;
+		return event.message.content.some((part) => part.type === "toolCall" && part.id === was.toolCallId) ? was.draft : undefined;
+	}
+
 	pi.on("agent_start", () => {
 		forced.rearm();
+		prepared = undefined;
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
 		checkLanded(ctx);
+		const self = takePrepared(event);
 		// A turn that was aborted or failed is not one to act on. The outcome alone
 		// misses half of an Escape: one that lands while tools run ends that turn
 		// as "completed", since the model had finished streaming, and only the
 		// turn after it comes back "aborted". The run's signal says it for both.
-		if (event.outcome !== "completed" || ctx.signal?.aborted) return;
+		// A Self-compaction already written still lands, though: the agent has
+		// been told it did, and a sibling call cut short doesn't make that untrue.
+		if (event.outcome !== "completed" || (ctx.signal?.aborted && !self)) return;
 		// No reading — no model, or a compaction not yet answered — is no action.
 		const tokens = ctx.getContextUsage()?.tokens;
 		if (tokens === null || tokens === undefined) return;
@@ -355,15 +448,17 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 			ctx.ui.notify(`Compaction left context at ${thousands(tokens)}, still above warning. Forced compaction is paused until it drops.`, "warning");
 		}
 		// Forced is decided on its own, above; the crossings are notice's and
-		// warning's. When forced acts their steers are moot, but they still count
-		// as crossed, so that neither speaks up later.
+		// warning's. When a compaction lands here their steers are moot, but they
+		// still count as crossed, so that neither speaks up later.
 		const steered = { ...levels, forced: Number.POSITIVE_INFINITY };
 		let acts = crossings.observe(tokens, steered);
-		if (forces) {
+		// A Self-compaction written during this turn is this boundary's compaction,
+		// whatever pressure reads now; forced has nothing left to do here.
+		if (self || forces) {
 			// Not on top of a compaction an earlier extension drafted here.
 			const draft = event.entries.some((entry) => entry.type === "compaction")
 				? undefined
-				: await compactAtBoundary(ctx, `Compacting at ${thousands(tokens)} (forced)`);
+				: (self ?? (await compactAtBoundary(ctx, `Compacting at ${thousands(tokens)} (forced)`)));
 			if (!draft) {
 				paint(ctx, tokens, levels);
 				return;
@@ -373,6 +468,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 			// or above. Ours goes after the drafts before it, so that they stand,
 			// and pi measures `tokensBefore` with them applied.
 			show(ctx, undefined);
+			drafted = draft.details.compactionNo;
 			return { entries: [...event.entries, draft] };
 		}
 		// Pruning first, so that the agent is steered to Self-compact only once
