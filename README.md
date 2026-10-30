@@ -7,6 +7,7 @@ every machine, in one repo that pi can install and update itself.
 
 | Path | What |
 |---|---|
+| `extensions/compaction/` | Pressure levels — a quiet footer status and one calm steer to the agent as context fills. Work in progress, not loaded by default (`pi -e` it). See its [README](extensions/compaction/README.md). |
 | `extensions/subagents/` | `subagent`, `subagent_wait`, `subagent_answer` — delegate a task to a child pi session, keep working, answer its questions. See its [README](extensions/subagents/README.md). |
 | `extensions/web-fetch/` | `web_fetch` tool — fetches a URL and returns clean, context-lean markdown. See its [README](extensions/web-fetch/README.md). |
 | `extensions/web-search/` | `web_search` tool — turns a query into ranked Brave results with snippets to triage. Needs a Brave API key. See its [README](extensions/web-search/README.md). |
