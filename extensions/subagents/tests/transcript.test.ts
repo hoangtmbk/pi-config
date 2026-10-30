@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { type AgentMessage, type AssistantMessage, Transcripts } from "../transcript.ts";
-import { AGENT_END, AGENT_START, ran, said, SETTLED, started } from "./child-events.ts";
+import { AGENT_END, AGENT_START, compacted, compactionEnded, pruned, ran, said, SETTLED, started } from "./child-events.ts";
 
 /** A transcript for one Run, `scout`, with `events` already fed to it. */
 function transcriptOf(events: JsonAgentSessionEvent[]): Transcripts {
@@ -277,6 +277,58 @@ describe("Transcripts", () => {
 		const transcripts = transcriptOf([...settled(user("look around")), said("Done."), AGENT_END, SETTLED]);
 
 		assert.deepEqual(roles(transcripts.get("scout")?.messages ?? []), ["user", "assistant"]);
+	});
+});
+
+describe("a compaction in the transcript", () => {
+	it("folds in a compaction drafted at a turn boundary where it landed, keeping everything before it", () => {
+		const snapshot = transcriptOf([
+			...settled(user("look around")),
+			said("Read the whole tree."),
+			compacted("## Plan\nFix auth.", 172_000),
+			said("Carrying on."),
+		]).get("scout");
+
+		assert.deepEqual(roles(snapshot?.messages ?? []), ["user", "assistant", "compactionSummary", "assistant"]);
+		const card = snapshot?.messages[2] as Extract<AgentMessage, { role: "compactionSummary" }>;
+		assert.equal(card.summary, "## Plan\nFix auth.");
+		assert.equal(card.tokensBefore, 172_000);
+		assert.equal(card.timestamp, Date.parse("2026-10-31T00:00:00.000Z"));
+	});
+
+	it("folds in a compaction on one of pi's hook paths when it ends, which is all pi says of it", () => {
+		const snapshot = transcriptOf([
+			...settled(user("look around")),
+			said("Read the whole tree."),
+			{ type: "compaction_start", reason: "manual" } as JsonAgentSessionEvent,
+			compactionEnded("## Plan\nFix auth.", 98_000, "manual"),
+		]).get("scout");
+
+		assert.deepEqual(roles(snapshot?.messages ?? []), ["user", "assistant", "compactionSummary"]);
+		const card = snapshot?.messages[2] as Extract<AgentMessage, { role: "compactionSummary" }>;
+		assert.equal(card.summary, "## Plan\nFix auth.");
+		assert.equal(card.tokensBefore, 98_000);
+	});
+
+	it("draws nothing for a compaction that was cancelled, or for one that started and has not ended", () => {
+		const transcripts = transcriptOf([said("Read the whole tree.")]);
+		const before = transcripts.get("scout")?.version;
+
+		transcripts.observe("scout", { type: "compaction_start", reason: "threshold" } as JsonAgentSessionEvent);
+		transcripts.observe("scout", compactionEnded("", 0, "threshold", true));
+
+		assert.deepEqual(roles(transcripts.get("scout")?.messages ?? []), ["assistant"]);
+		assert.equal(transcripts.get("scout")?.version, before);
+	});
+
+	it("does not show Pruning, which pi commits at a boundary alongside a compaction", () => {
+		const transcripts = transcriptOf([said("Read the whole tree.")]);
+		const before = transcripts.get("scout")?.version;
+
+		transcripts.observe("scout", pruned("e3", "[pruned: 400 lines of output]"));
+
+		assert.deepEqual(roles(transcripts.get("scout")?.messages ?? []), ["assistant"]);
+		assert.equal(transcripts.get("scout")?.version, before);
 	});
 });
 

@@ -42,7 +42,11 @@
  * A turn script's events are written as they stand, so a script can carry
  * records that are not session events at all: `child-events.ts`'s `status` is
  * the `extension_ui_request` a child's compaction extension sends when it sets
- * its footer status, which is how a Run reports its Pressure level.
+ * its footer status, which is how a Run reports its Pressure level. Its
+ * `compacted`, `compactionEnded` and `pruned` are what pi writes when the child
+ * compacts or prunes — the boundary path's `entry_appended` and the hook paths'
+ * `compaction_end` — and `nudged` is the compaction extension's steer coming
+ * back as a custom message, so a script plays a Run that compacts mid-task.
  *
  * Not a `.test.ts` file, so `npm test` never runs it directly.
  */

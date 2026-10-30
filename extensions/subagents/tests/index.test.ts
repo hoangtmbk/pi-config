@@ -29,7 +29,22 @@ import { spawnRun } from "../child.ts";
 import { registerSubagents } from "../index.ts";
 import { ASK_QUESTION_TOOL, type QuestionDetails, RUN_SLOTS } from "../supervisor.ts";
 // `started` is aliased: this file already has a `started` of its own, the children it must reap.
-import { AGENT_END, AGENT_START, asked, heard, queued, said, SETTLED, status, started as toolStarted, toast } from "./child-events.ts";
+import {
+	AGENT_END,
+	AGENT_START,
+	asked,
+	compacted,
+	compactionEnded,
+	heard,
+	nudged,
+	pruned,
+	queued,
+	said,
+	SETTLED,
+	status,
+	started as toolStarted,
+	toast,
+} from "./child-events.ts";
 import { pidFrom, reaped } from "./processes.ts";
 
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -259,8 +274,9 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>, cliP
 	const tools: RegisteredTool[] = [];
 	const sent: SentMessage[] = [];
 	const handlers = new Map<string, Handler[]>();
+	const commands: RegisteredCommand[] = [];
 	const parent: Parent = { streaming: false };
-	const pi = recorder(parent, tools, sent, handlers);
+	const pi = recorder(parent, tools, sent, handlers, commands);
 
 	const control = registerSubagents(pi as unknown as ExtensionAPI, {
 		roster,
@@ -277,6 +293,7 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>, cliP
 		subagentWait: requireTool(tools, "subagent_wait"),
 		subagentAnswer: requireTool(tools, "subagent_answer"),
 		control,
+		commands,
 		tools,
 		sent,
 		parent,
@@ -1944,6 +1961,35 @@ describe("steering a running Run", () => {
 		assert.deepEqual(notifications, []);
 	});
 
+	it("never takes the compaction extension's own steers for a human Steer the Run did not read", async () => {
+		const { subagent, control, sent, spawned, notifications, startSession } = stubbedSession();
+		await startSession();
+		await call(subagent, { agent: "scout", task: "one" });
+		await call(subagent, { agent: "worker", task: "two" });
+		await flush();
+		spawned[0].onSteer = (text) => spawned[0].emit(queued(text));
+
+		// One Run steered by the user and nudged towards Self-compaction around
+		// it; the other only nudged. Both compact and finish.
+		await control.send("scout", "Only the auth module, please.");
+		spawned[0].emit(nudged("notice"));
+		spawned[0].emit(queued());
+		spawned[0].emit(heard("Only the auth module, please."));
+		spawned[0].emit(nudged("warning"));
+		spawned[0].emit(compacted("## Plan\nFix auth.", 172_000));
+		spawned[0].emit(said("Only the auth module: three call sites."));
+		spawned[0].emit(SETTLED);
+		spawned[1].emit(nudged("notice"));
+		spawned[1].emit(nudged("warning"));
+		spawned[1].emit(compactionEnded("## Plan\nFix it.", 98_000));
+		spawned[1].emit(said("Fixed."));
+		spawned[1].emit(SETTLED);
+
+		assert.deepEqual(notifications, []);
+		assert.deepEqual(sent.map((message) => message.customType), ["subagent-steer", "subagent-delivery", "subagent-delivery"]);
+		for (const message of sent) assert.doesNotMatch(message.content, /never reached it|Self-compact/);
+	});
+
 	it("says why it could not reach a child that refused the steer, and tells the parent nothing", async () => {
 		const { subagent, control, sent, spawned } = stubbedSession();
 		await call(subagent, { agent: "scout", task: "look around" });
@@ -2687,6 +2733,39 @@ describe("the /subagents command", () => {
 		assert.match(listed, /scout\s+done/);
 		assert.doesNotMatch(listed, /notice|warning|1\d\dk/);
 		assert.doesNotMatch(inspector.split("\n")[0] ?? "", /notice|warning|1\d\dk/);
+	});
+
+	it("draws pi's compaction card wherever a real child compacted, collapsed, with what came before kept", async () => {
+		const events = [
+			AGENT_START,
+			...task("look around"),
+			said("Read the whole tree."),
+			nudged("warning"),
+			pruned("e3", "[pruned: 400 lines of output]"),
+			compacted("## Plan\nFix the token refresh.", 172_000),
+			said("Carrying on with the refresh."),
+			compactionEnded("## Plan\nShip the fix.", 98_000),
+			said("Found three call sites."),
+			AGENT_END,
+			SETTLED,
+		];
+		const session = fakeSession(ROSTER, { FAKE_RPC_TURNS: JSON.stringify([events]) });
+		await call(session.subagent, { agent: "scout", task: "look around" });
+		await messageAt(session.sent);
+		const screen = terminal();
+
+		const running = requireCommand(session.commands, "subagents").handler("", screen.ctx);
+		(await screen.overlay(0)).handleInput("\r");
+		const inspector = drawn(await screen.overlay(1));
+		await closeAll(screen, 1, running);
+		await session.shutdown();
+
+		assert.match(
+			inspector,
+			/look around[\s\S]*Read the whole tree\.[\s\S]*\[compaction\][\s\S]*Compacted from 172,000 tokens[\s\S]*Carrying on with the refresh\.[\s\S]*\[compaction\][\s\S]*Compacted from 98,000 tokens[\s\S]*Found three call sites\./,
+		);
+		assert.doesNotMatch(inspector, /Fix the token refresh|Ship the fix/, "each Handoff is behind expand");
+		assert.doesNotMatch(inspector, /pruned|Self-compact/, "neither Pruning nor the extension's steer is drawn");
 	});
 
 	it("keeps a stopped Run's transcript as it stopped: a reply cut off shows as cut off, and later words are not recorded", async () => {
