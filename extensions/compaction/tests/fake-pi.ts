@@ -88,6 +88,12 @@ export interface Turn {
 	toolResults?: ToolResultMessage[];
 	/** Drafts an earlier extension's `turn_end` handler already proposed. */
 	entries?: SessionBoundaryDraft[];
+	/**
+	 * Reshapes the context preview pi hands the handlers, for a test whose
+	 * preview must disagree with the session behind it. Leave it out for pi's
+	 * own: the session's projection.
+	 */
+	preview?: (context: TurnEndEvent["context"]) => TurnEndEvent["context"];
 }
 
 export interface FakeSetup {
@@ -96,6 +102,8 @@ export interface FakeSetup {
 	model?: Model<any>;
 	/** Defaults to "tui". A Run is "rpc". */
 	mode?: ExtensionContext["mode"];
+	/** Defaults to an in-memory one, as a `--no-session` Run has. Pass one with a session file to have a session dir. */
+	session?: SessionManager;
 }
 
 /** A model with a 200K window, which the built-in Pressure levels sit well inside. */
@@ -190,7 +198,7 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 	/** What each `turn_end` came back with after the whole chain, oldest first. */
 	const boundaries: SessionBoundaryDraft[][] = [];
 
-	const session = SessionManager.inMemory("/work");
+	const session = setup.session ?? SessionManager.inMemory("/work");
 	const state = {
 		settings: setup.settings ?? {},
 		model: setup.model ?? MODEL,
@@ -296,13 +304,14 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 		const outcome = message.stopReason === "aborted" ? "aborted" : message.stopReason === "error" ? "error" : "completed";
 
 		const projection = session.buildSessionProjection();
-		const context = {
+		const own = {
 			contextEntries: projection.entries,
 			contextMessages: projection.messages,
 			llmMessages: convertToLlm(projection.messages),
 			pendingMessages: [],
 			canContinue: true,
 		};
+		const context = turn.preview ? turn.preview(own) : own;
 		let entries = [...(turn.entries ?? [])];
 		let carryOn = false;
 		state.streaming = true;
