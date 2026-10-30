@@ -11,9 +11,9 @@ without summarizing it, and the **Handoff** is what stands in for the span a com
 
 > **Work in progress.** What is here today is the Pressure levels, the footer status, the
 > steers, the notice Pruning batch, forced compaction at the turn boundary with kept-tail Pruning,
-> and our Handoff on every compaction, written in serialized mode or by pi's summarizer.
-> Self-compaction, kept-tail Pruning on the hook path, the forked-call writer and the Constraint
-> ledger's additions are still to come. The extension is not in the package's
+> and our Handoff on every compaction, with its Constraint ledger, written in serialized mode or by
+> pi's summarizer. Self-compaction, kept-tail Pruning on the hook path and the forked-call writer
+> are still to come. The extension is not in the package's
 > `pi.extensions` until the Handoff has passed its replay check; until then load it by hand:
 >
 > ```bash
@@ -233,7 +233,7 @@ writes the judgment part:
 |---|---|
 | User messages | code: every message the user typed in the removed span, verbatim and in order (an `ask_question` answer included; tool results and custom messages, our steers included, left out). Over ~20K tokens, the first message and the newest that fit are kept, with a marker counting the ones dropped between; one message over ~2K tokens is cut to its head and tail. |
 | File state | code: `read`, `write` and `edit` tool calls applied in order — read only is `read`, a write to a file not seen before is `created`, anything else that changed it is `edited` — and `deleted` for the paths a successful `bash` `rm`, `git rm` or `mv` named (conservatively: quoting, globs, expansions and anything after a `cd` are skipped). |
-| Constraint ledger | carried forward from the previous Handoff. *(Not yet added to.)* |
+| Constraint ledger | the writer proposes quotes in `<ledger>`; code checks them and merges them into the previous Handoff's ledger (see below). The `/compact` focus is code's own entry. |
 | The judgment part | the writer chain: serialized mode, then pi's own summarizer, `generateSummaryWithUsage`, whose text stands in for the six judgment sections. *(The forked call, in front of both, is still to come.)* |
 
 `details` is the record: the summary is rendered from it, and the next compaction merges from the
@@ -250,6 +250,27 @@ cleared while compacting (a Run's reads `ctx compacting`) and comes back at the 
 pressure is still at notice or above. pi's working row is not relabelled: during a hook compaction
 pi replaces it with its own compaction indicator, which `setWorkingMessage` does not reach.
 
+### The Constraint ledger
+
+The user's rules, preferences and exclusions, as exact quotes (`ledger.ts`). The writer proposes
+`<add>` quotes and `<supersede><old>…</old><by>…</by></supersede>` pairs; code checks every one and
+drops (into `details.log`) what fails:
+
+- A quote must be found in a real user message: one the writer saw, kept tail included, or one in
+  the previous `details`' user messages. Only whitespace differences are forgiven (each run counts as
+  one space, and the entry is stored that way); case and punctuation are not. Under 12 characters
+  it is dropped. Assistant text, tool results and custom messages never pass.
+- An add contained in an active entry is a duplicate.
+- A supersede's `old` must name exactly one active entry, exactly or by a part of it only that entry
+  contains, and its `by` must pass the same check as an add. Otherwise the entry stays in force.
+- A superseded entry stays in `details` with `supersededBy` (the user's words that replaced it), and
+  is left out of the rendered Handoff. Nothing else ever leaves the ledger, and it has no size cap.
+- A reply with no `<ledger>` adds nothing, and is logged; pi's summarizer proposes none.
+
+`/compact <instructions>` is the compaction focus: the writer is told to give it the most care, and
+it is stored as a `focus` entry, rendered `Compaction focus: "…"`. It lasts until the next `/compact`
+with instructions, which supersedes it. The writer can't supersede it, and no add counts as its duplicate.
+
 ### The writer chain
 
 The chain is the same on both paths. Writers are tried in order and the first to succeed writes the
@@ -265,7 +286,7 @@ run's signal on the boundary path and on the compaction's own on the hook path.
   fails. Code takes the reply's last `<handoff>` block and splits it on the six exact headings. It
   fails on a provider error, a reply stopped at the token cap, no `<handoff>` block, a missing
   heading, or an empty or "(none)" Goal or Next step. A tool call beside a usable block is ignored,
-  never run. The `<ledger>` block is read but not yet applied.
+  never run. The `<ledger>` after it is checked as below.
 - **pi's summarizer** is last, with pi's own prompt and retry policy.
 
 Any writer's attempt fails after 60s with nothing streamed; there is no cap on a reply that keeps
