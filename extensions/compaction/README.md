@@ -10,9 +10,10 @@ how full the context is in raw tokens, a **Pressure level** is one of the three 
 without summarizing it, and the **Handoff** is what stands in for the span a compaction removed.
 
 > **Work in progress.** What is here today is the Pressure levels, the footer status, the
-> steers, the notice Pruning batch, forced compaction at the turn boundary, and our Handoff on every
-> compaction, written in serialized mode or by pi's summarizer. Self-compaction, kept-tail Pruning,
-> and the forked-call writer are still to come. The extension is not in the package's
+> steers, the notice Pruning batch, forced compaction at the turn boundary with kept-tail Pruning,
+> and our Handoff on every compaction, with its Constraint ledger, written in serialized mode or by
+> pi's summarizer. Self-compaction, kept-tail Pruning on the hook path and the forked-call writer
+> are still to come. The extension is not in the package's
 > `pi.extensions` until the Handoff has passed its replay check; until then load it by hand:
 >
 > ```bash
@@ -189,9 +190,22 @@ straight after, its next request built from the Handoff and the kept tail.
   projection rather than its raw branch, starting after the newest compaction: a pruned result
   counts at its pruned size, as it does in pi's own preparation for `/compact`. So the tail is the
   one `/compact` would keep.
-- **The draft** goes after any drafts earlier extensions proposed at that boundary, which stand;
-  pi measures the compaction's `tokensBefore` at that point. Not at a boundary where an earlier
-  extension already drafts a compaction.
+- **The drafts** go after any drafts earlier extensions proposed at that boundary, which stand:
+  our compaction first, so pi measures its `tokensBefore` on the context as it was, then the kept
+  tail's Pruning. Not at a boundary where an earlier extension already drafts a compaction.
+- **Kept-tail Pruning.** The cache is cold after a compaction anyway, so the tail it keeps is
+  pruned too, with no minimum gain: superseded reads only, with the same rules, marker, saved copy
+  and edit checks as the notice batch. The rest of the tail stays verbatim — old bulk included —
+  and nothing in the removed span is edited. Copies are saved only once the Handoff is written.
+  The notice batch never runs at a boundary where a compaction lands. On the hook path pi takes no
+  drafts from `session_before_compact`, so the kept tail is not pruned there (#43).
+- **A sunk compaction is re-drafted once.** pi drops every draft at a boundary when any one of them
+  won't replay, so another extension's bad draft sinks ours with it. The next boundary sees that no
+  compaction landed (ours carries its `compactionNo`, so our previous one doesn't pass for it) and
+  drafts the same Handoff over the same cut again, whatever pressure reads, with no writer called.
+  Its kept-tail edits go with it, checked again against the branch. Sunk twice, or with its cut
+  entry no longer on the branch, it is handled as every writer failing. An aborted or failed turn
+  lets it go silently.
 - **Forced is not spent by crossing it.** It acts at every boundary at or above it until a
   compaction lands. Three things hold it back: `compaction.enabled: false`; the **warning-pause
   guard** — once a compaction, on either path, leaves pressure at or above warning, a toast says
@@ -200,8 +214,9 @@ straight after, its next request built from the Handoff and the kept tail.
   disarms it for the rest of the run (an error toast says why) and re-arms it at the next run.
   Escape during the writer chain stops it with no compaction and no toast, and leaves forced
   armed.
-- **What the user sees:** pi's working row reads `Compacting at 172k (forced) · writing Handoff…`
-  while it writes, and is handed back to pi after. The footer status is cleared meanwhile (a Run's
+- **What the user sees:** pi's working row reads `Compacting at 172k (forced) · pruning old tool
+  output…`, then `Compacting at 172k (forced) · writing Handoff…` while it writes, and is handed
+  back to pi after. The footer status is cleared meanwhile (a Run's
   reads `ctx compacting`), and comes back after a compaction only at a reading still at notice or
   above; after a compaction that didn't happen, it shows where pressure stands. Then pi's own
   compaction card, drawn from the entry.

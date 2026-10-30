@@ -325,7 +325,11 @@ describe("what the user sees", () => {
 		const { pi } = forcing([{ text: PI_SUMMARY }]);
 		await history(pi);
 		await pi.turnEnd({ tokens: 172_400 });
-		assert.deepEqual(pi.working, ["Compacting at 172k (forced) · writing Handoff…", undefined]);
+		assert.deepEqual(pi.working, [
+			"Compacting at 172k (forced) · pruning old tool output…",
+			"Compacting at 172k (forced) · writing Handoff…",
+			undefined,
+		]);
 	});
 
 	it("the status is cleared while compacting, and stays clear after a compaction", async () => {
