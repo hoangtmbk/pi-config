@@ -363,8 +363,10 @@ does pi fall back to its whole default.
 ## The replay check
 
 Handoff quality is judged by replaying recorded sessions: cut them, compact, and compare the Handoff
-with what really happened next. `replay.ts` is its deterministic half, three plain functions that
-score our Handoff and pi's default summary alike (a "Handoff" there is any compaction entry):
+with what really happened next. Its code is in `replay/`, apart from the modules pi loads, since it
+drives the extension through the offline suite's fake pi. `replay/replay.ts` is its deterministic
+half, three plain functions that score our Handoff and pi's default summary alike: each takes any
+compaction entry, ours or pi's.
 
 | Check | What it reports |
 |---|---|
@@ -449,12 +451,13 @@ writers.ts      the writer chain, the stall timeout, and pi's summarizer as its 
 instruction.ts  the writer's instruction, in both modes' wording, and the reply parser  (pure)
 fork.ts         the forked call: the live context, placeholder results, the cache-miss check
 serialized.ts   serialized mode: the transcript, the tool-result cut and its halving
-replay.ts       the replay check's deterministic checks  (pure)
-replay-corpus.ts        the manifest, reading a recording, its turn boundaries and the chain of cuts  (pure)
-replay-session.ts       one session replayed in both lanes: ours and pi's default
-replay-continuation.ts  the open-loop continuation: match, feed back, stop at the first difference
-replay-judge.ts         the judge's request and the checked reading of its verdict
-replay-report.ts        the spend, the pass bars and the report
+replay/         the replay check, apart from what pi loads:
+  replay.ts               its deterministic checks  (pure)
+  replay-corpus.ts        the manifest, reading a recording, its turn boundaries and the chain of cuts  (pure)
+  replay-session.ts       one session replayed in both lanes: ours and pi's default
+  replay-continuation.ts  the open-loop continuation: match, feed back, stop at the first difference
+  replay-judge.ts         the judge's request and the checked reading of its verdict
+  replay-report.ts        the spend, the pass bars and the report
 test.ts         the live replay check: `npm run live:compaction`, by hand only
 tests/          offline suite, the recording fake pi and the scripted model call
 ```

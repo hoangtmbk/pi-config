@@ -19,7 +19,7 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { CompactionEntry } from "@earendil-works/pi-coding-agent";
-import { type FileOp, fileStateAfter, handoffOf, judgmentText, knownFiles } from "./handoff.ts";
+import { type FileOp, fileStateAfter, handoffOf, judgmentText, knownFiles } from "../handoff.ts";
 
 /** What is checked: a compaction entry, ours or pi's, as far as the checks read it. */
 export type Handoff = Pick<CompactionEntry, "summary" | "details"> & Partial<Pick<CompactionEntry, "fromHook">>;

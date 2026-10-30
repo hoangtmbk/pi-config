@@ -17,7 +17,7 @@ import { resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Message, Model, ToolCall, TranscriptContext } from "@earendil-works/pi-ai";
 import { convertToLlm, type SessionEntry, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
-import type { StreamFn } from "./writers.ts";
+import type { StreamFn } from "../writers.ts";
 
 /** How many actions a continuation proposes at most. */
 export const MAX_ACTIONS = 3;

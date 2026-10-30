@@ -9,8 +9,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { Usage } from "@earendil-works/pi-ai";
-import { Meter, renderReport, score } from "../replay-report.ts";
-import type { CutResult, LaneCut, SessionResult } from "../replay-session.ts";
+import { Meter, renderReport, score } from "../replay/replay-report.ts";
+import type { CutResult, LaneCut, SessionResult } from "../replay/replay-session.ts";
 import { MODEL } from "./fake-pi.ts";
 import { scriptModel } from "./scripted-model.ts";
 

@@ -16,7 +16,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { CompactionEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { HandoffDetails } from "../handoff.ts";
 import { registerCompaction } from "../index.ts";
-import { collapseGuard, fileStateDiff, recurringDetailRetention } from "../replay.ts";
+import { collapseGuard, fileStateDiff, recurringDetailRetention } from "../replay/replay.ts";
 import { calling, type FakePi, fakePi, result, said, user } from "./fake-pi.ts";
 import { type Reply, scriptModel } from "./scripted-model.ts";
 
