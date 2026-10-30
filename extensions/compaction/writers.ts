@@ -47,6 +47,8 @@ export interface Written {
 	usage?: Usage;
 	/** What the writer proposed for the Constraint ledger. `undefined` from a writer that proposes none, or a reply with no `<ledger>`. */
 	ledger?: LedgerProposal;
+	/** What the writer noticed that nobody is shown, for `details.log`: the forked call's cache miss. */
+	log?: string[];
 }
 
 export interface Writer {

@@ -20,7 +20,7 @@ import { type Reply, scriptModel } from "./scripted-model.ts";
 /** pi's summarizer's reply. */
 const PI_SUMMARY = "## Goal\nAdd retries to the fetcher.\n\n## Progress\n- Wrote the wrapper.";
 
-/** What serialized mode gets here: a reply it can't use, so that pi's summarizer, next in the chain, writes. */
+/** What the forked call and serialized mode get here: a reply neither can use, so that pi's summarizer, last in the chain, writes. */
 const NO_HANDOFF: Reply = { text: "I'll carry on with the fetcher." };
 
 const KEEP = 400;
@@ -41,7 +41,7 @@ const CUT_GONE =
  * called again is read off `model.calls`.
  */
 function forcing(replies: Reply[], setup: FakeSetup = SETUP) {
-	const model = scriptModel(...replies.flatMap((reply) => [NO_HANDOFF, reply]));
+	const model = scriptModel(...replies.flatMap((reply) => [NO_HANDOFF, NO_HANDOFF, reply]));
 	const pi = fakePi(setup, (api) => registerCompaction(api, { stream: model.stream }));
 	return { pi, model };
 }

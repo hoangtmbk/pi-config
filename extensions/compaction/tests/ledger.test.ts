@@ -5,8 +5,8 @@
  * grows — and the `/compact` focus, which code writes into it and the next
  * focus replaces.
  *
- * Driven only through the recording fake pi, with serialized mode — the first
- * writer in the chain here — scripted to propose the ledger.
+ * Driven only through the recording fake pi, with the forked call — the first
+ * writer in the chain — scripted to propose the ledger.
  */
 
 import assert from "node:assert/strict";
@@ -42,7 +42,7 @@ const supersede = (old: string, by: string) => `<supersede><old>${old}</old><by>
 /** A session whose compaction keeps only the newest message or so, so nearly everything is in the removed span. */
 const SMALL_TAIL: FakeSetup = { settings: { compaction: { keepRecentTokens: 1 }, retry: { enabled: false } } };
 
-/** A fake pi with the extension on it, and serialized mode answering each compaction with the next of `replies`. */
+/** A fake pi with the extension on it, and the forked call answering each compaction with the next of `replies`. */
 function compacting(...replies: Reply[]) {
 	return compactingWith(SMALL_TAIL, ...replies);
 }
@@ -359,7 +359,8 @@ describe("the ledger across compactions", () => {
 			reply([add("don't add any new dependencies"), add("keep the public API unchanged")]),
 			reply([add("run npm test before you tell me something is done")]),
 			reply([supersede("don't add any new dependencies", "you can use p-retry if it makes this simpler")]),
-			// The fourth is written by pi's summarizer, after serialized mode fails: it proposes no ledger.
+			// The fourth is written by pi's summarizer, after the forked call and serialized mode fail: it proposes no ledger.
+			{ text: "No Handoff here." },
 			{ text: "No Handoff here." },
 			{ text: "## Goal\nRetries." },
 		);

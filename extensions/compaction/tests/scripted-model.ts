@@ -170,9 +170,13 @@ export function scriptModel(...replies: Reply[]) {
 			if (!paced) throw new Error("scripted model: no paced reply is streaming");
 			paced.finish();
 		},
-		/** The text of the one user message a summarizer was sent on call `n` (0-based). */
+		/**
+		 * The text of the instruction a writer was sent on call `n` (0-based): the
+		 * last user message, which is the only one serialized mode and pi's
+		 * summarizer send, and the forked call's trailing one.
+		 */
 		prompt(n = 0): string {
-			const message = calls[n]?.context.messages.find((m) => m.role === "user");
+			const message = calls[n]?.context.messages.filter((m) => m.role === "user").at(-1);
 			if (!message) return "";
 			return typeof message.content === "string"
 				? message.content

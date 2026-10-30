@@ -2,8 +2,9 @@
  * The writer's instruction and reply: what a Handoff writer is asked to write,
  * and how its answer is read back and checked.
  *
- * The body is one text for every writer we prompt ourselves. It says what a
- * Handoff is, that code writes the user's words, file state and the
+ * The body is one text for every writer we prompt ourselves, worded for what
+ * each is shown: serialized mode a transcript in tags, the forked call its own
+ * live conversation. It says what a Handoff is, that code writes the user's words, file state and the
  * Constraint ledger, and how each judgment section is written; then the exact
  * reply shape. The reply is checked by code, not trusted: the last `<handoff>`
  * block is split on the six exact headings, and a reply that is cut off,
@@ -26,30 +27,82 @@ export interface InstructionFacts {
 	note?: string;
 }
 
+/** Where the two modes word the instruction apart: what the writer was shown, and where. */
+interface Wording {
+	/** What is compacted, what replaces it and what stays, and as of when it is written. */
+	opening: string[];
+	/** Where the previous Handoff is. */
+	previous: string;
+	/** Who called `self_compact`. */
+	caller: string;
+}
+
 /**
  * The instruction, as serialized mode puts it after the conversation: the
  * removed span in `<conversation>`, the kept tail in `<kept-tail>` and, on a
  * repeat compaction, the previous Handoff in `<previous-handoff>`.
  */
-export function instructionBody({ hasPrevious, focus, note }: InstructionFacts): string {
-	const lines = [
-		"The conversation in <conversation> is about to be compacted. It will be replaced by a Handoff: the record the agent carries on from, with no other memory of what was removed. The messages in <kept-tail> stay verbatim after it.",
-		"",
-		"Write the judgment part of that Handoff now. Code adds the rest: the user's messages verbatim, the files touched, and the Constraint ledger built from the quotes you give below. Don't write those yourself.",
-		"",
-		"Write it as of the end of the kept tail, not as of where the cut falls: Progress and Next step must match the latest state.",
-	];
+export function instructionBody(facts: InstructionFacts): string {
+	return body(facts, {
+		opening: [
+			"The conversation in <conversation> is about to be compacted. It will be replaced by a Handoff: the record the agent carries on from, with no other memory of what was removed. The messages in <kept-tail> stay verbatim after it.",
+			"",
+			"Write the judgment part of that Handoff now. Code adds the rest: the user's messages verbatim, the files touched, and the Constraint ledger built from the quotes you give below. Don't write those yourself.",
+			"",
+			"Write it as of the end of the kept tail, not as of where the cut falls: Progress and Next step must match the latest state.",
+		],
+		previous: "<previous-handoff> holds the previous Handoff.",
+		caller: "The agent",
+	});
+}
+
+/** What opens the forked call's instruction: who is speaking, since it arrives as a user message. */
+export const FORK_PREAMBLE =
+	"[Compaction: this message comes from the compaction extension, not from the user. Reply with text only and don't call any tools; a tool call here is never run.]";
+
+/**
+ * The instruction as the forked call's trailing user message, after the live
+ * conversation itself. The writer is the agent reading its own context, so
+ * the conversation is "above" and the note is its own; on a repeat
+ * compaction that context opens with the previous Handoff.
+ *
+ * `keptTokens` is about how much of the newest conversation the compaction
+ * keeps: pi's `keepRecentTokens`, which the cut is made with.
+ */
+export function forkInstruction(facts: InstructionFacts & { keptTokens: number }): string {
+	return body(facts, {
+		opening: [
+			FORK_PREAMBLE,
+			"",
+			`The conversation above is about to be compacted. Everything before the newest ~${tokenCount(facts.keptTokens)} tokens will be replaced by a Handoff: the record the agent carries on from, with no other memory of what was removed. The newest messages stay verbatim after it.`,
+			"",
+			"Write the judgment part of that Handoff now. Code adds the rest: the user's messages verbatim, the files touched, and the Constraint ledger built from the quotes you give below. Don't write those yourself.",
+			"",
+			"Write it as of the end of the conversation, not as of where the cut falls: Progress and Next step must match the latest state.",
+		],
+		previous: "The conversation opens with the previous Handoff.",
+		caller: "You",
+	});
+}
+
+/** `20K` for 20,000; a small count as it is. */
+function tokenCount(tokens: number): string {
+	return tokens >= 1_000 ? `${Math.round(tokens / 1_000)}K` : String(tokens);
+}
+
+function body({ hasPrevious, focus, note }: InstructionFacts, wording: Wording): string {
+	const lines = [...wording.opening];
 	if (hasPrevious) {
 		lines.push(
 			"",
-			"<previous-handoff> holds the previous Handoff. Edit it rather than starting over. Keep every line that still holds, update lines that later messages changed, and add what is new. Remove a line only when something later superseded it, and say in its place what superseded it. Write all six sections again, in full.",
+			`${wording.previous} Edit it rather than starting over. Keep every line that still holds, update lines that later messages changed, and add what is new. Remove a line only when something later superseded it, and say in its place what superseded it. Write all six sections again, in full.`,
 		);
 	}
 	if (focus) lines.push("", `The user asked for this compaction with: "${focus}". Give that the most care, but drop nothing else.`);
 	if (note) {
 		lines.push(
 			"",
-			`The agent called self_compact with this note: "${note}". Code puts it verbatim at the top of Next step. Write the rest of Next step to agree with it, or say why the conversation shows it can't be followed.`,
+			`${wording.caller} called self_compact with this note: "${note}". Code puts it verbatim at the top of Next step. Write the rest of Next step to agree with it, or say why the conversation shows it can't be followed.`,
 		);
 	}
 	lines.push(
