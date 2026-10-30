@@ -205,7 +205,7 @@ straight after, its next request built from the Handoff and the kept tail.
   drafts the same Handoff over the same cut again, whatever pressure reads, with no writer called.
   Its kept-tail edits go with it, checked again against the branch. Sunk twice, or with its cut
   entry no longer on the branch, it is handled as every writer failing. An aborted or failed turn
-  lets it go silently.
+  lets a forced one go silently (a Self-compaction waits; see below).
 - **Forced is not spent by crossing it.** It acts at every boundary at or above it until a
   compaction lands. Three things hold it back: `compaction.enabled: false`; the **warning-pause
   guard** — once a compaction, on either path, leaves pressure at or above warning, a toast says
@@ -238,6 +238,10 @@ description says nothing about running out or a limit.
   `self_compact` call and result. The notice batch and the steers are skipped at that boundary,
   as when forced lands. If an earlier extension's bad draft sinks it, it is re-drafted once like a
   forced one. One a sibling call's Escape cut short still lands, since the agent was told it did.
+  For the same reason, one its own boundary can't draft — an earlier extension compacts there, or
+  the turn didn't complete — is held, through any boundaries that can't draft it either, and drafted
+  at the first that can; if pi drops it there, it is handled as every writer failing. One that
+  someone else's compaction overtakes in the meantime is let go: the context was compacted.
 - **It returns one plain line**, with no token counts: "Context compacted. The Handoff above
   carries the task; continue from its Next step." on success, and "Compaction failed; carry on,
   and it will be retried at the forced level." when every writer fails (with the same error toast

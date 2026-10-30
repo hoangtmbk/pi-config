@@ -473,26 +473,43 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		if (landing.settle(ctx.sessionManager)) forced.compacted();
 		const self = landing.takePrepared(event, ctx.sessionManager);
 		// A turn that was aborted or failed is not one to act on — not even to
-		// draft again a compaction that sank, which is let go, silently, as Escape
-		// lets go of one being written. The outcome alone misses half of an
-		// Escape: one that lands while tools run ends that turn as "completed",
-		// since the model had finished streaming, and only the turn after it
-		// comes back "aborted". The run's signal says it for both. A
+		// draft again a forced compaction that sank, which is let go, silently,
+		// as Escape lets go of one being written. The outcome alone misses half
+		// of an Escape: one that lands while tools run ends that turn as
+		// "completed", since the model had finished streaming, and only the turn
+		// after it comes back "aborted". The run's signal says it for both. A
 		// Self-compaction already written still lands, though: the agent has been
-		// told it did, and a sibling call cut short doesn't make that untrue.
-		if (event.outcome !== "completed" || (ctx.signal?.aborted && !self)) return;
-		// No reading — no model, or a compaction not yet answered — is no action.
+		// told it did, and a sibling call cut short doesn't make that untrue. On
+		// a turn that didn't complete at all, it is held for the next that does.
+		// No reading — no model, or a compaction not yet answered — is no action
+		// either.
 		const tokens = ctx.getContextUsage()?.tokens;
-		if (tokens === null || tokens === undefined) return;
+		if (event.outcome !== "completed" || (ctx.signal?.aborted && !self) || tokens === null || tokens === undefined) {
+			if (self) {
+				landing.hold(self, ctx.sessionManager);
+				// Not `compacting` until it is drafted: the next boundary paints the status.
+				show(ctx, undefined);
+			}
+			landing.pass();
+			return;
+		}
 		// A level already past after a model switch is simply crossed now, and
 		// only the highest of those acts.
 		const levels = levelsFor(ctx);
 		const enabled = forcedEnabled(pi.getSettings() as SettingsLike);
+		// Ours never go on top of a compaction an earlier extension drafted here.
+		// A Self-compaction is held for the next boundary, which can see whether
+		// theirs landed.
+		const theirs = event.entries.some((entry) => entry.type === "compaction");
+		if (theirs) {
+			if (self) landing.hold(self, ctx.sessionManager);
+			landing.pass();
+		}
 		// A Self-compaction written during this turn is this boundary's
-		// compaction, whatever pressure reads now, and newer than any that sank.
-		// Otherwise a compaction that sank is, and given up, it disarms forced
-		// from this boundary on.
-		const redrafted = self ? undefined : landing.redraft(ctx.sessionManager);
+		// compaction, whatever pressure reads now, and newer than any held.
+		// Otherwise a compaction held is, and given up, it disarms forced from
+		// this boundary on.
+		const redrafted = self || theirs ? undefined : landing.redraft(ctx.sessionManager);
 		if (typeof redrafted === "string") giveUp(ctx, GIVE_UP[redrafted]);
 		const again = typeof redrafted === "string" ? undefined : redrafted;
 		const { forces, leftHigh } = forced.observe(tokens, levels, enabled);
@@ -505,8 +522,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		const steered = { ...levels, forced: Number.POSITIVE_INFINITY };
 		let acts = crossings.observe(tokens, steered);
 		if (self || again || forces) {
-			// Not on top of a compaction an earlier extension drafted here.
-			const compacting = event.entries.some((entry) => entry.type === "compaction")
+			const compacting = theirs
 				? undefined
 				: (self ??
 						again ??
@@ -522,7 +538,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 			// here: the compaction removes what it would prune.
 			show(ctx, undefined);
 			const { draft, prunes } = compacting;
-			landing.drafting(compacting, ctx.sessionManager, compacting === again);
+			landing.drafting(compacting, ctx.sessionManager, compacting === self);
 			return { entries: [...event.entries, draft, ...pruneDrafts(prunes)] };
 		}
 		// Pruning first, so that the agent is steered to Self-compact only once
