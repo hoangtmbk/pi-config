@@ -339,7 +339,9 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 	 * them. The outcome comes from the message's `stopReason`, exactly as pi
 	 * derives it. Returns the drafts pi would commit.
 	 *
-	 * Drafts are recorded, not yet committed to the session: `commit` does that.
+	 * Drafts pi would refuse are all dropped, as pi drops them: one bad draft
+	 * sinks the boundary. The rest are recorded, not yet committed to the
+	 * session: `commit` does that.
 	 */
 	async function turnEnd(turn: Turn = {}): Promise<SessionBoundaryDraft[]> {
 		if ("tokens" in turn) setTokens(turn.tokens);
@@ -387,27 +389,54 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 			state.streaming = false;
 			state.turnIndex++;
 		}
+		// One bad draft, whoever proposed it, and pi drops the whole boundary:
+		// every handler's drafts, with only an error line to say so.
+		const refused = refusal(entries);
+		if (refused !== undefined) {
+			errors.push({ event: "turn_end", error: `Invalid boundary entries: ${refused}` });
+			entries = [];
+		}
 		boundaries.push(entries);
 		return entries;
 	}
 
 	/**
-	 * Commit a boundary's drafts to the session, the way pi's
-	 * `AgentSession._applyBoundaryDrafts` does once the chain is done (1.4.0):
-	 * in order, each a real entry. A compaction draft carries no size; pi
-	 * measures the context as the drafts before it left it, and appends it
-	 * marked as an extension's. Throws where pi's replay would.
+	 * Apply drafts to `manager` the way pi's `AgentSession._applyBoundaryDrafts`
+	 * does (1.4.0): in order, each a real entry. A compaction draft carries no
+	 * size; pi measures the context as the drafts before it left it, and appends
+	 * it marked as an extension's. Throws where pi's replay would.
 	 */
-	function commit(drafts: readonly SessionBoundaryDraft[]): void {
+	function apply(manager: SessionManager, drafts: readonly SessionBoundaryDraft[]): void {
 		for (const draft of drafts) {
-			if (draft.type === "custom") session.appendCustomEntry(draft.customType, draft.data);
-			else if (draft.type === "custom_message") session.appendCustomMessageEntry(draft.customType, draft.content, draft.display, draft.details);
-			else if (draft.type === "context_edit") session.appendContextEdit(draft.targetId, draft.replacement);
+			if (draft.type === "custom") manager.appendCustomEntry(draft.customType, draft.data);
+			else if (draft.type === "custom_message") manager.appendCustomMessageEntry(draft.customType, draft.content, draft.display, draft.details);
+			else if (draft.type === "context_edit") manager.appendContextEdit(draft.targetId, draft.replacement);
 			else {
-				const tokensBefore = estimateProjectedContextTokens(session.buildSessionProjection(), session.getBranch()).tokens;
-				session.appendCompaction(draft.summary, draft.firstKeptEntryId, tokensBefore, draft.details, true, draft.usage);
+				const tokensBefore = estimateProjectedContextTokens(manager.buildSessionProjection(), manager.getBranch()).tokens;
+				manager.appendCompaction(draft.summary, draft.firstKeptEntryId, tokensBefore, draft.details, true, draft.usage);
 			}
 		}
+	}
+
+	/**
+	 * Why pi would refuse a boundary's drafts, or `undefined` if it would take
+	 * them: applied to a copy of the branch, as pi's `_buildBoundaryContext`
+	 * previews them, the first one that throws.
+	 */
+	function refusal(drafts: readonly SessionBoundaryDraft[]): string | undefined {
+		const header = session.getHeader();
+		if (!header) return "Session header is missing";
+		try {
+			apply(SessionManager.inMemory(session.getCwd(), undefined, [header, ...session.getBranch()]), drafts);
+			return undefined;
+		} catch (error) {
+			return error instanceof Error ? error.message : String(error);
+		}
+	}
+
+	/** Commit a boundary's drafts to the session, as pi does once the chain is done. */
+	function commit(drafts: readonly SessionBoundaryDraft[]): void {
+		apply(session, drafts);
 	}
 
 	/**
