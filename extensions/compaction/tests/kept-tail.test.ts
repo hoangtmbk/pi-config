@@ -22,6 +22,9 @@ import { type Reply, scriptModel } from "./scripted-model.ts";
 
 const PI_SUMMARY = "## Goal\nAdd retries to the fetcher.\n\n## Progress\n- Wrote the wrapper.";
 
+/** What serialized mode gets here: a reply it can't use, so that pi's summarizer, next in the chain, writes. */
+const NO_HANDOFF: Reply = { text: "I'll carry on with the fetcher." };
+
 /** A kept tail that holds the last few tool turns, and not the asks before them. */
 const KEEP = 30_000;
 
@@ -39,9 +42,12 @@ afterEach(() => {
 	for (const dir of folders.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-/** A fake pi with its model call scripted with `replies` and its pruned copies in a temp dir. */
+/**
+ * A fake pi with pi's summarizer scripted to answer each compaction with the
+ * next of `replies`, and its pruned copies in a temp dir.
+ */
 function compacting(replies: Reply[] = [{ text: PI_SUMMARY }], setup: FakeSetup = SETUP) {
-	const model = scriptModel(...replies);
+	const model = scriptModel(...replies.flatMap((reply) => [NO_HANDOFF, reply]));
 	const dir = folder();
 	const pi = fakePi(setup, (api) => registerCompaction(api, { stream: model.stream, prunedDir: dir }));
 	return Object.assign(pi, { dir, script: model });
@@ -242,5 +248,43 @@ describe("pi's working row", () => {
 			"Compacting at 172k (forced) · writing Handoff…",
 			undefined,
 		]);
+	});
+});
+
+describe("a compaction another extension's draft sank", () => {
+	/** A neighbour's draft pi won't replay: an edit of an entry that doesn't exist. */
+	const BAD: SessionBoundaryDraft = { type: "context_edit", targetId: "no-such-entry", replacement: { content: [{ type: "text", text: "x" }] } };
+
+	it("is re-drafted with its kept tail's edits, which replay after it", async () => {
+		const pi = compacting();
+		await asks(pi);
+		const first = await turn(pi, "read", { path: "src/a.ts" }, output(2_000, "a.ts v1"));
+		await turn(pi, "read", { path: "src/a.ts" }, output(2_000, "a.ts v2"));
+		assert.deepEqual(await pi.turnEnd({ tokens: 172_000, entries: [BAD] }), []);
+		const written = pi.script.calls.length;
+
+		const drafts = await pi.turnEnd({ tokens: 173_000 });
+		assert.deepEqual(drafts.map((draft) => draft.type), ["compaction", "context_edit"]);
+		assert.deepEqual([...edits(drafts).keys()], [first]);
+		assert.equal(pi.script.calls.length, written);
+		pi.commit(drafts);
+		assert.equal(readFileSync(join(pi.dir, `${first}.txt`), "utf8"), output(2_000, "a.ts v1"));
+	});
+
+	it("re-checks those edits against the branch as it stands, dropping one whose target has left it", async () => {
+		const pi = compacting();
+		await asks(pi);
+		const fork = pi.session.getLeafId()!;
+		// A stale read in the kept tail, after the point the branch goes back to.
+		const a = await turn(pi, "read", { path: "src/a.ts" }, output(2_000, "a.ts v1"));
+		await turn(pi, "read", { path: "src/a.ts" }, output(2_000, "a.ts v2"));
+		assert.deepEqual(await pi.turnEnd({ tokens: 172_000, entries: [BAD] }), []);
+		// Edits are planned at the boundary that sank; then the branch moves back.
+		pi.session.branch(fork);
+
+		const drafts = await pi.turnEnd({ tokens: 173_000 });
+		assert.ok(compactionIn(drafts), "the compaction was drafted again");
+		assert.equal(edits(drafts).has(a), false);
+		pi.commit(drafts);
 	});
 });
