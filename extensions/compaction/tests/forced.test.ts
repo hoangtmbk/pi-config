@@ -23,17 +23,24 @@ import { registerCompaction } from "../index.ts";
 import { aborted, calling, type FakeSetup, failed, fakePi, result, said, user } from "./fake-pi.ts";
 import { type Reply, scriptModel } from "./scripted-model.ts";
 
-/** pi's summarizer's reply, the only writer so far. */
+/** pi's summarizer's reply. */
 const PI_SUMMARY = "## Goal\nAdd retries to the fetcher.\n\n## Progress\n- Wrote the wrapper.";
+
+/** What serialized mode gets here: a reply it can't use, so that pi's summarizer, next in the chain, writes. */
+const NO_HANDOFF: Reply = { text: "I'll carry on with the fetcher." };
 
 /** A small kept tail, so a short session has something to remove. */
 const KEEP = 400;
 
 const SETUP: FakeSetup = { settings: { compaction: { keepRecentTokens: KEEP }, retry: { enabled: false } } };
 
-/** A fake pi with the extension on it and its model call scripted with `replies`. */
+/**
+ * A fake pi with the extension on it, and pi's summarizer scripted to answer
+ * each compaction with the next of `replies`. Each compaction is two model
+ * calls: serialized mode's, which fails, and then pi's summarizer's.
+ */
 function forcing(replies: Reply[], setup: FakeSetup = SETUP) {
-	const model = scriptModel(...replies);
+	const model = scriptModel(...replies.flatMap((reply) => [NO_HANDOFF, reply]));
 	const pi = fakePi(setup, (api) => registerCompaction(api, { stream: model.stream }));
 	return { pi, model };
 }
@@ -75,7 +82,7 @@ describe("at the forced level", () => {
 		assert.match(compaction.summary, /Add retries to the fetcher\./);
 		// About 165 tokens an exchange: a 400-token tail keeps asks 2 to 4, and removes ask 1.
 		assert.deepEqual((compaction.details as any).userMessages.map((text: string) => text.split(" x")[0]), ["ask 1"]);
-		assert.equal(model.calls.length, 1);
+		assert.equal(model.calls.length, 2);
 		assert.deepEqual(pi.sent, []);
 		assert.deepEqual(pi.errors, []);
 	});
@@ -233,11 +240,11 @@ describe("the warning-pause guard", () => {
 		await pi.turnEnd({ tokens: 158_000 });
 		assert.ok(pi.notifications.some((n) => n.message === LEFT_HIGH && n.type === "warning"));
 		assert.deepEqual(await pi.turnEnd({ tokens: 175_000 }), []);
-		assert.equal(model.calls.length, 1);
+		assert.equal(model.calls.length, 2);
 		// Below warning, forcing is armed again.
 		await pi.turnEnd({ tokens: 149_000 });
 		assert.ok(compactionIn(await pi.turnEnd({ tokens: 171_000 })));
-		assert.equal(model.calls.length, 2);
+		assert.equal(model.calls.length, 4);
 	});
 
 	it("goes on after /compact or pi's backstop too", async () => {
@@ -247,7 +254,7 @@ describe("the warning-pause guard", () => {
 		await pi.turnEnd({ tokens: 158_000 });
 		assert.ok(pi.notifications.some((n) => n.message === LEFT_HIGH));
 		assert.deepEqual(await pi.turnEnd({ tokens: 175_000 }), []);
-		assert.equal(model.calls.length, 1);
+		assert.equal(model.calls.length, 2);
 	});
 
 	it("stays off after a compaction that brought pressure under warning", async () => {
@@ -284,7 +291,7 @@ describe("when every writer fails", () => {
 		assert.deepEqual(pi.notifications, [{ message: FAILED, type: "error" }]);
 		assert.deepEqual(await pi.turnEnd({ tokens: 175_000 }), []);
 		assert.deepEqual(await pi.turnEnd({ tokens: 178_000, message: said("Done.") }), []);
-		assert.equal(model.calls.length, 1);
+		assert.equal(model.calls.length, 2);
 		// The status says where pressure stands, as it did before the attempt.
 		assert.equal(pi.status(), "<warning>ctx warning · 178k</warning>");
 	});
@@ -295,7 +302,7 @@ describe("when every writer fails", () => {
 		await pi.turnEnd({ tokens: 172_000, message: said("Done.") });
 		await pi.startRun();
 		assert.ok(compactionIn(await pi.turnEnd({ tokens: 174_000 })));
-		assert.equal(model.calls.length, 2);
+		assert.equal(model.calls.length, 4);
 	});
 });
 
@@ -309,7 +316,7 @@ describe("Escape during the writer chain", () => {
 		await pi.turnEnd({ message: aborted() });
 		await pi.startRun();
 		assert.ok(compactionIn(await pi.turnEnd({ tokens: 173_000 })));
-		assert.equal(model.calls.length, 2);
+		assert.equal(model.calls.length, 4);
 	});
 });
 
