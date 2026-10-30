@@ -68,3 +68,32 @@ The overlay showing one run's live transcript, rendered like the main chat, with
 steering it and a key to kill it. Opened from the `/subagents` picker; finished runs stay
 inspectable for the rest of the session.
 _Avoid_: viewer, monitor, debugger, attach
+
+### Compaction
+
+**Context pressure**:
+How full a session's context is, measured in tokens rather than as a share of the model's
+window — rot and cost grow with the raw count, whatever the window holds.
+_Avoid_: context usage, fill, load
+
+**Pressure level**:
+One of three bands context pressure crosses: *notice*, then *warning*, then *forced*, at which
+compaction happens whether or not the agent chose it. Each level is a fixed token count, not a
+percentage.
+_Avoid_: threshold (when you mean the band), alert, tier
+
+**Self-compaction**:
+A compaction the agent itself starts, at a natural break in its work, before the forced level
+makes the choice for it.
+_Avoid_: manual compaction (that is the user's `/compact`), auto-compaction, checkpoint
+
+**Pruning**:
+Shrinking context without summarizing it: dropping or shortening entries that no longer matter,
+such as a file read since edited or an old command's output. Nothing is rewritten in the agent's
+words.
+_Avoid_: trimming, cleanup, compaction (when nothing is summarized)
+
+**Handoff**:
+What stands in for the span a compaction removed — everything the agent needs to carry on the
+same task as though nothing had been taken away.
+_Avoid_: summary (when you mean what this extension produces), digest, recap
