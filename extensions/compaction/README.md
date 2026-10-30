@@ -102,6 +102,18 @@ read merged, with `pi.getSettings()`, at every `turn_end`:
 The extension never writes pi's settings and adds nothing under `compaction.*`. Nothing is set per
 Agent or per Run.
 
+The Pruning and Handoff numbers are code constants, not settings; the replay check is what tunes
+them:
+
+- the notice Pruning batch's minimum: 20K tokens;
+- the protected window: the newest 40K tokens of tool output;
+- the prunable floor: about 1K tokens;
+- the kept `bash` lines: the last ~10, at most ~2,000 characters of them;
+- the user-message budget: ~20K tokens in all, ~2K for any one message;
+- serialized mode's tool-result cut: head 1,200 + tail 800 characters, halving to a 200 floor;
+- the quote minimum: 12 characters;
+- the stall timeout: 60s with nothing streamed.
+
 ## What the user sees
 
 Below notice, nothing: pi's own footer, its percentage and its 70%/90% colouring are untouched.
