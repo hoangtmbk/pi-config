@@ -9,9 +9,10 @@ how full the context is in raw tokens, a **Pressure level** is one of the three 
 **Self-compaction** is a compaction the agent starts at a natural break, **Pruning** shrinks context
 without summarizing it, and the **Handoff** is what stands in for the span a compaction removed.
 
-> **Work in progress.** What is here today is the Pressure levels, the footer status and the
-> steers. Forced compaction, Self-compaction, Pruning and the Handoff are still to come, so
-> nothing compacts yet and forced does nothing. The extension is not in the package's
+> **Work in progress.** What is here today is the Pressure levels, the footer status, the
+> steers, and our Handoff on `/compact` and pi's own backstop, written by pi's summarizer. Forced
+> compaction, Self-compaction, Pruning and the Handoff's own writers are still to come, so forced
+> does nothing yet. The extension is not in the package's
 > `pi.extensions` until the Handoff has passed its replay check; until then load it by hand:
 >
 > ```bash
@@ -88,6 +89,37 @@ turn just to answer it, so it is held with `deliverAs: "nextTurn"` and arrives w
 prompt. A steer that Escape clears from pi's queue unread is not sent again; the level still counts
 as crossed.
 
+## The Handoff
+
+Every compaction that reaches pi's `session_before_compact` — `/compact`, and pi's own threshold
+and overflow backstop — gets our Handoff in place of pi's summary. The cut is pi's, so the kept
+tail is exactly the one pi would keep. Code writes the parts it can extract exactly; a writer
+writes the judgment part:
+
+| Part | Written by |
+|---|---|
+| User messages | code: every message the user typed in the removed span, verbatim and in order (an `ask_question` answer included; tool results and custom messages, our steers included, left out). Over ~20K tokens, the first message and the newest that fit are kept, with a marker counting the ones dropped between; one message over ~2K tokens is cut to its head and tail. |
+| File state | code: `read`, `write` and `edit` tool calls applied in order — read only is `read`, a write to a file not seen before is `created`, anything else that changed it is `edited` — and `deleted` for the paths a successful `bash` `rm`, `git rm` or `mv` named (conservatively: quoting, globs, expansions and anything after a `cd` are skipped). |
+| Constraint ledger | carried forward from the previous Handoff. *(Not yet added to.)* |
+| The judgment part | the writer chain. *Today only its last writer: pi's own summarizer, `generateSummaryWithUsage`, whose text stands in for the six judgment sections.* |
+
+`details` is the record: the summary is rendered from it, and the next compaction merges from the
+previous `details` (user messages, file state, ledger) and never parses old summary text. It is
+marked as ours by `kind: "handoff"`, and records `compactionNo`, the `writer`, the failed
+`attempts` before it and a `log`. The rendered order is Goal, Constraint ledger, Progress,
+Decisions and why, Open problems, Critical context, File state, User messages (verbatim), Next
+step; when pi's summarizer wrote the judgment part, its text stands where the judgment sections
+begin and the code-written parts follow it.
+
+What the user sees: a warning toast, "Compaction used pi's default summary; the Handoff may be
+thinner.", whenever pi's summarizer wrote it, and then pi's own compaction card. The footer status is
+cleared while compacting (a Run's reads `ctx compacting`) and comes back at the next reading only if
+pressure is still at notice or above. pi's working row is not relabelled: during a hook compaction
+pi replaces it with its own compaction indicator, which `setWorkingMessage` does not reach.
+
+If the writer fails, nothing is compacted and an error toast says why; Escape stops it with no
+compaction and no toast. Only if our own code throws does pi fall back to its whole default.
+
 ## The status codec
 
 `status.ts` exports `formatStatus` and `parseStatus`, which write and read the three statuses —
@@ -109,9 +141,11 @@ npm run typecheck        # tsc --noEmit against pi's real .d.ts
 The suite drives the extension only through a **recording fake pi**
 ([`tests/fake-pi.ts`](tests/fake-pi.ts)) around `registerCompaction(pi, options)`. A test sets
 pi's side of the world — the pressure pi would report, the turn's messages, the mode, an Escape —
-fires `turn_end` the way pi's runner chains it, and reads back what crossed pi's boundary: steers
-and how they landed, footer statuses, toasts and working-row text. The session behind it is a real
-in-memory `SessionManager`. `options` is how a test injects what would otherwise be real: the
+fires `turn_end` the way pi's runner chains it — or compacts through `session_before_compact`,
+with pi's own preparation of the branch — and reads back what crossed pi's boundary: steers and how
+they landed, compaction entries and their `details`, footer statuses, toasts and working-row text.
+The model call is scripted ([`tests/scripted-model.ts`](tests/scripted-model.ts)). The session
+behind it is a real in-memory `SessionManager`. `options` is how a test injects what would otherwise be real: the
 model call the writers make, the folder for pruned copies, and the clock.
 
 ## Layout
@@ -120,5 +154,7 @@ model call the writers make, the folder for pruned copies, and the clock.
 index.ts        extension entry: registerCompaction, event wiring, steers, footer, toasts
 pressure.ts     the Pressure levels, and which one a boundary acts on   (pure — no pi, no I/O)
 status.ts       the status codec, shared with the subagents extension  (pure)
-tests/          offline suite and the recording fake pi
+handoff.ts      the Handoff: its details record, the parts code writes, merging, rendering
+writers.ts      the writer chain, and pi's summarizer as its last writer
+tests/          offline suite, the recording fake pi and the scripted model call
 ```
