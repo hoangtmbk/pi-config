@@ -1,20 +1,20 @@
 /**
- * The replay check's deterministic half: what can be scored about a Handoff
- * without a model, given the session it was written for and what really
- * happened next.
+ * The replay check's deterministic half: what can be scored about a
+ * compaction without a model, given the session it was written for and what
+ * really happened next.
  *
- * - The file-state diff compares the Handoff's file state with the true one at
- *   the cut. "Exact" is the pass bar.
+ * - The file-state diff compares the compaction's file state with the true
+ *   one at the cut. "Exact" is the pass bar.
  * - Recurring-detail retention is the share of identifiers from the removed
- *   span that come up again after the cut and survive in the Handoff. It is
- *   reported, not gated; below 70% is the trigger to add an identifier dump.
- * - The collapse guard flags a chained Handoff that has lost content compared
- *   with the one before it.
+ *   span that come up again after the cut and survive in the compaction's
+ *   summary. It is reported, not gated; below 70% is the trigger to add an
+ *   identifier dump.
+ * - The collapse guard flags a chained compaction that has lost content
+ *   compared with the one before it.
  *
- * Plain functions over messages and compaction entries, so the live runner can
- * score both our Handoff and pi's default summary with them. A Handoff here is
- * whatever stands in for the removed span: our compaction entry, or pi's own.
- * No pi, no I/O, no model.
+ * Plain functions over messages and compaction entries — a `CompactionRecord`
+ * is either kind, our Handoff or pi's default summary — so the live runner
+ * can score both with them. No pi, no I/O, no model.
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -22,7 +22,7 @@ import type { CompactionEntry } from "@earendil-works/pi-coding-agent";
 import { type FileOp, fileStateAfter, handoffOf, judgmentText, knownFiles } from "../handoff.ts";
 
 /** What is checked: a compaction entry, ours or pi's, as far as the checks read it. */
-export type Handoff = Pick<CompactionEntry, "summary" | "details"> & Partial<Pick<CompactionEntry, "fromHook">>;
+export type CompactionRecord = Pick<CompactionEntry, "summary" | "details"> & Partial<Pick<CompactionEntry, "fromHook">>;
 
 // ---------- the file-state diff ----------
 
@@ -51,9 +51,9 @@ export interface FileStateDiff {
  * `mv` deleted it. pi's own compaction can say only read or modified, so its
  * modified files count as edited, and a created or deleted file is wrong there.
  */
-export function fileStateDiff(handoff: Handoff, removed: readonly AgentMessage[]): FileStateDiff {
+export function fileStateDiff(record: CompactionRecord, removed: readonly AgentMessage[]): FileStateDiff {
 	const truth = fileStateAfter({}, removed);
-	const carried = knownFiles(handoff);
+	const carried = knownFiles(record);
 	const missing = Object.keys(truth).filter((path) => !(path in carried));
 	const extra = Object.keys(carried).filter((path) => !(path in truth));
 	const wrong = Object.keys(truth)
@@ -166,17 +166,17 @@ export interface Retention {
  * the Handoff's to carry, so it is not counted. Each is looked up as an exact
  * substring: in what happened next, and in the Handoff's text.
  */
-export function recurringDetailRetention(handoff: Handoff, cut: Cut): Retention {
+export function recurringDetailRetention(record: CompactionRecord, cut: Cut): Retention {
 	const tail = textOf(cut.tail);
 	const after = textOf(cut.after);
 	const recurring = detailsIn(textOf(cut.removed)).filter((detail) => !tail.includes(detail) && after.includes(detail));
-	const retained = recurring.filter((detail) => handoff.summary.includes(detail));
+	const retained = recurring.filter((detail) => record.summary.includes(detail));
 	return {
 		recurring,
 		retained,
 		lost: recurring.filter((detail) => !retained.includes(detail)),
 		share: recurring.length === 0 ? undefined : retained.length / recurring.length,
-		handoffChars: handoff.summary.length,
+		handoffChars: record.summary.length,
 	};
 }
 
@@ -189,7 +189,7 @@ export function recurringDetailRetention(handoff: Handoff, cut: Cut): Retention 
  * A count our record has and pi's compaction lacks is `undefined` for pi's,
  * and so is the open-item count when pi's summarizer wrote our judgment part.
  */
-export interface HandoffMeasure {
+export interface CompactionMeasure {
 	/** The judgment part's size in characters: what a writer wrote. For pi's own compaction, its whole summary. */
 	size: number;
 	/** Constraint ledger entries, superseded ones included: the ledger only grows. */
@@ -209,11 +209,11 @@ function itemsIn(section: string): number {
 	return /^\(?(?:none|nothing)?\.?\)?$/i.test(section.trim()) ? 0 : 1;
 }
 
-/** One Handoff, counted. */
-export function measureHandoff(handoff: Handoff): HandoffMeasure {
-	const ours = handoffOf(handoff.details);
-	const files = Object.keys(knownFiles(handoff)).length;
-	if (!ours) return { size: handoff.summary.length, ledger: undefined, files, userMessages: undefined, openItems: undefined };
+/** One compaction, counted. */
+export function measureCompaction(record: CompactionRecord): CompactionMeasure {
+	const ours = handoffOf(record.details);
+	const files = Object.keys(knownFiles(record)).length;
+	if (!ours) return { size: record.summary.length, ledger: undefined, files, userMessages: undefined, openItems: undefined };
 	return {
 		size: judgmentText(ours.sections).length,
 		ledger: ours.ledger.length,
@@ -227,14 +227,14 @@ export function measureHandoff(handoff: Handoff): HandoffMeasure {
 export interface CollapseFlag {
 	/** The Handoff that lost it: its place in the chain, the first compaction being 1. */
 	depth: number;
-	measure: keyof HandoffMeasure;
+	measure: keyof CompactionMeasure;
 	before: number;
 	after: number;
 }
 
 export interface CollapseReport {
 	/** Each Handoff in the chain, counted, oldest first. */
-	measures: HandoffMeasure[];
+	measures: CompactionMeasure[];
 	/** Every measure that fell, by depth. */
 	flags: CollapseFlag[];
 	/** Whether any Handoff in the chain lost content compared with the one before it. */
@@ -250,13 +250,13 @@ export interface CollapseReport {
  * Handoff, removing only what was superseded. A measure one of the two lacks
  * is not compared.
  */
-export function collapseGuard(chain: readonly Handoff[]): CollapseReport {
-	const measures = chain.map(measureHandoff);
+export function collapseGuard(chain: readonly CompactionRecord[]): CollapseReport {
+	const measures = chain.map(measureCompaction);
 	const flags: CollapseFlag[] = [];
 	for (let i = 1; i < measures.length; i++) {
 		const before = measures[i - 1]!;
 		const after = measures[i]!;
-		for (const measure of Object.keys(after) as (keyof HandoffMeasure)[]) {
+		for (const measure of Object.keys(after) as (keyof CompactionMeasure)[]) {
 			const was = before[measure];
 			const is = after[measure];
 			if (was !== undefined && is !== undefined && is < was) flags.push({ depth: i + 1, measure, before: was, after: is });
