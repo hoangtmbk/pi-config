@@ -155,6 +155,16 @@ describe("the `self_compact` tool", () => {
 		assert.equal(model.calls.length, 2);
 	});
 
+	it("in a Run, says compacting while it writes, and no longer once Escape has stopped it", async () => {
+		const { pi } = selfCompacting([{ text: HANDOFF, during: () => pi.escape() }], { ...SETUP, mode: "rpc" });
+		await history(pi);
+		await pi.turnEnd({ tokens: 125_000, message: calling(SELF_COMPACT_TOOL, { note: NOTE }) });
+		assert.equal(resultText(pi), FAILED);
+		assert.ok(pi.statuses.some((s) => s.text === "ctx compacting"), "the status said compacting while it wrote");
+		// Back as it stood before the call, the last reading being below notice.
+		assert.equal(pi.status(), undefined);
+	});
+
 	it("lands at that turn's boundary in place of the notice Pruning batch and steer", async () => {
 		const { pi } = selfCompacting([{ text: HANDOFF }]);
 		await history(pi);

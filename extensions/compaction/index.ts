@@ -434,6 +434,8 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		if (!cut) return undefined;
 		const branch = ctx.sessionManager.getBranch();
 		const dir = options.prunedDir ?? prunedDir(ctx.sessionManager);
+		const before = shown;
+		let compacting: Compacting | undefined;
 		showCompacting(ctx);
 		try {
 			ctx.ui.setWorkingMessage(`${trigger} · pruning old tool output…`);
@@ -449,10 +451,15 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 				details: outcome.details,
 				usage: outcome.usage,
 			};
-			return { draft, prunes: prunes.length > 0 ? await savePrunes(prunes, dir) : [] };
+			compacting = { draft, prunes: prunes.length > 0 ? await savePrunes(prunes, dir) : [] };
+			return compacting;
 		} finally {
 			// pi's own text again, rather than ours lingering into the next working row.
 			ctx.ui.setWorkingMessage();
+			// A compaction that didn't happen changed nothing: the status goes back
+			// to what it was, even where no boundary follows to paint it — a
+			// Self-compaction that Escape stopped ends on an aborted turn.
+			if (!compacting) show(ctx, before);
 		}
 	}
 
