@@ -97,3 +97,9 @@ _Avoid_: trimming, cleanup, compaction (when nothing is summarized)
 What stands in for the span a compaction removed — everything the agent needs to carry on the
 same task as though nothing had been taken away.
 _Avoid_: summary (when you mean what this extension produces), digest, recap
+
+**Constraint ledger**:
+The part of a Handoff that lists the user's rules, preferences and exclusions as exact quotes
+of what they said. It only grows across compactions; an entry leaves it only when a later quote
+from the user supersedes it.
+_Avoid_: rules list, constraints summary, memory
