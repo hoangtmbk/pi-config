@@ -10,9 +10,9 @@ how full the context is in raw tokens, a **Pressure level** is one of the three 
 without summarizing it, and the **Handoff** is what stands in for the span a compaction removed.
 
 > **Work in progress.** What is here today is the Pressure levels, the footer status, the
-> steers, and our Handoff on `/compact` and pi's own backstop, written by pi's summarizer. Forced
-> compaction, Self-compaction, Pruning and the Handoff's own writers are still to come, so forced
-> does nothing yet. The extension is not in the package's
+> steers, the notice Pruning batch, and our Handoff on `/compact` and pi's own backstop, written by
+> pi's summarizer. Forced compaction, Self-compaction, kept-tail Pruning and the Handoff's own
+> writers are still to come, so forced does nothing yet. The extension is not in the package's
 > `pi.extensions` until the Handoff has passed its replay check; until then load it by hand:
 >
 > ```bash
@@ -34,11 +34,12 @@ This builds on pi's compaction rather than replacing it
 
 | Level | Default | What happens as pressure crosses it |
 |---|---|---|
-| notice | 120,000 | A muted footer status, and one steer to the agent. |
+| notice | 120,000 | One Pruning batch, if it frees enough; then, unless that brought pressure back under notice, a muted footer status and one steer to the agent. |
 | warning | 150,000 | The status turns the warning colour, one steer to the agent, and one toast to the user. |
 | forced | 170,000 | Compaction, without ending the run. *(Not yet: today nothing happens.)* |
 
-Pressure is read at every `turn_end`, from `ctx.getContextUsage()`. Three rules decide what a
+The defaults can be changed, per model too, and shrink on a small window; see
+[Configuration](#configuration). Pressure is read at every `turn_end`, from `ctx.getContextUsage()`. Three rules decide what a
 boundary does:
 
 - **A level is crossed while pressure is at or above it**, and re-arms only once pressure falls
@@ -51,6 +52,49 @@ boundary does:
   when Escape lands while tools are running, which is caught by the run's abort signal rather
   than the turn's outcome. A boundary with no reading (no model, or a compaction not yet answered)
   does nothing either.
+
+## Configuration
+
+The levels are set in one top-level `pressureLevels` key of pi's `settings.json` — global
+(`~/.pi/agent/settings.json`) or project (`.pi/settings.json`, when the project is trusted) — and
+read merged, with `pi.getSettings()`, at every `turn_end`:
+
+```json
+{
+  "pressureLevels": {
+    "notice": 120000,
+    "warning": 150000,
+    "forced": 170000,
+    "modelOverrides": { "openai/gpt-6.1-sol": { "forced": 600000 } }
+  }
+}
+```
+
+- **Each level resolves on its own**: the model's override, then the plain setting, then the
+  built-in default. Override keys are exact, case-sensitive `provider/modelId`, as in pi's own
+  `compaction.modelOverrides`. So you can set just one level, for one model.
+- **Scaling on a small window.** If no level came from the model's override, the model reports a
+  window, and `forced` is not below pi's own trigger (window − `compaction.reserveTokens`, resolved
+  per model the way pi does), all three levels are multiplied by one factor so that `forced` sits at
+  85% of the trigger, with the same spacing. On a 128K window with pi's default 16,384 reserve that
+  gives about 67K / 84K / 95K.
+- **A model override is used exactly as written.** One that sets any level is never scaled and
+  never warned about, even past pi's trigger — that is how you leave a model to pi's backstop on
+  purpose.
+- **Bad values fall back.** A level that isn't a positive whole number, a `pressureLevels`,
+  `modelOverrides` or override entry that isn't an object, or a set that isn't strictly
+  notice < warning < forced puts that model on the built-in defaults (still scaled), with one
+  warning naming the bad key, once per distinct problem per session. Bad configuration never
+  throws, and a bad `compaction.reserveTokens` is left to pi to report.
+- **A model switch** re-resolves the levels for the new model at the next turn. A level already
+  past counts as crossed, and only the highest crossed level acts: from a 1M-window model at 100K
+  to a 128K one, that is forced.
+- **When an edit takes effect.** pi reads `settings.json` into memory at startup and again on
+  `/reload`, not on every turn. The extension takes pi's settings as they stand at each turn, so a
+  change is what the next turn goes by once pi has it.
+
+The extension never writes pi's settings and adds nothing under `compaction.*`. Nothing is set per
+Agent or per Run.
 
 ## What the user sees
 
@@ -88,6 +132,45 @@ one exception is the boundary that ends the run: a steer queued there would make
 turn just to answer it, so it is held with `deliverAs: "nextTurn"` and arrives with the user's next
 prompt. A steer that Escape clears from pi's queue unread is not sent again; the level still counts
 as crossed.
+
+## Pruning at notice
+
+At the first `turn_end` at or above notice, before the steer, one **Pruning batch** replaces old
+bulky tool output and superseded reads with a one-line marker pointing at a saved full copy:
+
+```
+[Pruned: output of `npm test` (120,000 chars, exit 0). Full output: <session-dir>/<session-id>.pruned/<entry-id>.txt]
+```
+
+- **What it picks.** Old bulk: any tool result above about 1K tokens outside the newest 40K tokens
+  of tool output (a result straddling that edge is inside it). Superseded reads, at any age: a
+  `read` followed by a later successful `read` of the same file and range, or a whole-file
+  `write`. An `edit` does not supersede a read — most of it stays true, and the agent builds its
+  next edit from it.
+- **What it never touches.** `ask_question`, `subagent`, `subagent_wait`, `subagent_answer` and
+  `self_compact` results; any result with `isError: true`; a result with an image in it; one
+  already edited, by us or another extension; and anything that isn't a tool result.
+- **How.** Only by replacing a result's content with `context_edit` drafts, never omitting it, so
+  every call keeps its result. A `bash` result keeps its last ~10 lines (at most 2,000 characters)
+  after the marker. Its exit is always `exit 0`: pi marks every non-zero exit as an error, and
+  errors are never pruned. Other tools get the marker alone, naming the tool and its first
+  argument (`read src/a.ts`).
+- **Only if it pays.** The batch costs one cache miss over everything after its earliest edit, so
+  it goes out only if it frees at least 20K tokens. Below that, nothing is pruned and the steer
+  goes out as usual. It runs once per notice crossing, never at warning, never on any other turn,
+  and not at a boundary where a compaction already lands.
+- **Then the steer.** Whether to steer is judged on the last measured usage minus what the batch
+  frees — pi's own chars/4 count of the edited context runs high until the next response. Below
+  notice there is no steer, the footer clears, and notice re-arms; so the agent is steered to
+  Self-compact only once Pruning can no longer free enough.
+- **Saved copies** go to `<session-dir>/<session-id>.pruned/<entry-id>.txt`, beside the session
+  file, or, for a session with none (a `--no-session` Run), to `<os-tmpdir>/<session-id>.pruned/`.
+  The agent reopens one with plain `read`. Nothing of ours cleans them up. A copy that can't be
+  written drops its edit, so a marker never points at nothing.
+- **Checked before it is returned.** If any draft at a boundary fails pi's replay, pi drops every
+  extension's drafts there. So each edit is checked the way `appendContextEdit` checks it — the
+  target is found, on the active branch, and editable — and one that fails is dropped with its
+  pair, unsent and unsaved. The drafts follow earlier extensions' drafts, never replacing them.
 
 ## The Handoff
 
@@ -142,17 +225,19 @@ The suite drives the extension only through a **recording fake pi**
 ([`tests/fake-pi.ts`](tests/fake-pi.ts)) around `registerCompaction(pi, options)`. A test sets
 pi's side of the world — the pressure pi would report, the turn's messages, the mode, an Escape —
 fires `turn_end` the way pi's runner chains it — or compacts through `session_before_compact`,
-with pi's own preparation of the branch — and reads back what crossed pi's boundary: steers and how
-they landed, compaction entries and their `details`, footer statuses, toasts and working-row text.
-The model call is scripted ([`tests/scripted-model.ts`](tests/scripted-model.ts)). The session
-behind it is a real in-memory `SessionManager`. `options` is how a test injects what would otherwise be real: the
+with pi's own preparation of the branch — and reads back what crossed pi's boundary: steers and
+how they landed, footer statuses, toasts, working-row text, the boundary's drafts, the pruned
+copies written, and compaction entries with their `details`. The model call is scripted
+([`tests/scripted-model.ts`](tests/scripted-model.ts)). The session behind it is a real
+in-memory `SessionManager`. `options` is how a test injects what would otherwise be real: the
 model call the writers make, the folder for pruned copies, and the clock.
 
 ## Layout
 
 ```
 index.ts        extension entry: registerCompaction, event wiring, steers, footer, toasts
-pressure.ts     the Pressure levels, and which one a boundary acts on   (pure — no pi, no I/O)
+pressure.ts     the Pressure levels from settings, and which one a boundary acts on   (pure)
+pruning.ts      Pruning: picks results, writes markers, checks edits, saves full copies
 status.ts       the status codec, shared with the subagents extension  (pure)
 handoff.ts      the Handoff: its details record, the parts code writes, merging, rendering
 writers.ts      the writer chain, and pi's summarizer as its last writer

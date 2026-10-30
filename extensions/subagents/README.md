@@ -183,6 +183,14 @@ Question's *text* is never here: it is already being delivered into the conversa
 fixed-height block would only truncate it. The whole thing is `hasUI`-guarded, so a `-p` or
 JSON-mode session gets no widget rather than widget lines in its output.
 
+A Run whose child loads the `compaction` extension reports its **Pressure level** too. From notice
+up, the row starts with it, `notice 131k · running · bash`, and while the child compacts the row
+reads just `compacting`. The child's footer status (`ctx notice · 131k`) reaches the parent as an
+RPC `extension_ui_request`, and is read with the compaction extension's own status codec. A
+cleared status removes the level, a Waiting Run keeps its last one, and a done or failed Run shows
+none. A Run's crossings raise no toast, and the level is display only: it never reaches a
+Delivery, a Question or what the `subagent` tools return.
+
 ## `/subagents`: watching and steering a Run
 
 The widget says *that* a Run is busy; `/subagents` shows *what* it is doing, and lets you talk to
@@ -194,7 +202,8 @@ keyboard shortcut for it.
 
 Choosing a Run opens the **Inspector**: that Run's live transcript, rendered the way the main chat
 renders — the same message components, and pi's own renderers for the built-in tools — with a
-header of `name · agent · state · elapsed` and an editor along the bottom.
+header of `name · agent · state · elapsed` (then `· warning 152k` from notice up, or
+`· compacting` while one runs) and an editor along the bottom.
 
 | Where | Key | Does |
 |---|---|---|

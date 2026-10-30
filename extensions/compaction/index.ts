@@ -4,8 +4,9 @@
  * At every `turn_end` the Context pressure pi reports is checked against three
  * Pressure levels: notice, warning and forced. The user sees nothing below
  * notice, then one quiet footer status; the agent gets one calm steer the first
- * time pressure crosses notice and again at warning. Pi's own compaction stays
- * on underneath as the backstop (ADR-0005).
+ * time pressure crosses notice and again at warning. Before notice's steer, one
+ * Pruning batch may win the room back without a compaction. Pi's own compaction
+ * stays on underneath as the backstop (ADR-0005).
  *
  * Every compaction that reaches `session_before_compact` — `/compact`, and pi's
  * own threshold and overflow backstop — gets our Handoff instead of pi's
@@ -14,7 +15,8 @@
 
 import type { ExtensionAPI, ExtensionContext, SessionBeforeCompactEvent, TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { writeHandoff } from "./handoff.ts";
-import { Crossings, DEFAULT_LEVELS, type Level, levelAt, type Levels } from "./pressure.ts";
+import { Crossings, type Level, levelAt, type Levels, resolveLevels, type SettingsLike } from "./pressure.ts";
+import { pruneBatch, prunedDir } from "./pruning.ts";
 import { formatStatus, STATUS_KEY, thousands } from "./status.ts";
 import { piDefaultWriter, replyModel, retryPolicy, type StreamFn, type Writer } from "./writers.ts";
 
@@ -90,7 +92,6 @@ function hasToolCalls(message: TurnEndEvent["message"]): boolean {
 const PI_DEFAULT_TOAST = "Compaction used pi's default summary; the Handoff may be thinner.";
 
 export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions = {}): void {
-	const levels = DEFAULT_LEVELS;
 	const crossings = new Crossings();
 	/** The footer text last set, so an unchanged one is not set again. */
 	let shown: string | undefined;
@@ -111,13 +112,31 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		);
 	}
 
+	/** Configuration problems already told to the user: each is told once a session. */
+	const warned = new Set<string>();
+
+	/**
+	 * The levels for the model in use, from pi's settings as they stand. Read
+	 * afresh at each boundary, so a settings change or a model switch is what the
+	 * next turn goes by. A bad setting is told once, never thrown.
+	 */
+	function levelsFor(ctx: ExtensionContext): Levels {
+		const { levels, problems } = resolveLevels(pi.getSettings() as SettingsLike, ctx.model);
+		for (const problem of problems) {
+			if (warned.has(problem)) continue;
+			warned.add(problem);
+			ctx.ui.notify(problem, "warning");
+		}
+		return levels;
+	}
+
 	function show(ctx: ExtensionContext, text: string | undefined): void {
 		if (text === shown) return;
 		shown = text;
 		ctx.ui.setStatus(STATUS_KEY, text);
 	}
 
-	function paint(ctx: ExtensionContext, tokens: number): void {
+	function paint(ctx: ExtensionContext, tokens: number, levels: Levels): void {
 		show(ctx, statusText(ctx, tokens, levels));
 	}
 
@@ -196,7 +215,22 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		}
 	});
 
-	pi.on("turn_end", (event, ctx) => {
+	/**
+	 * The notice batch: one per notice crossing, at the crossing boundary, and
+	 * only if it frees enough to be worth the cache miss. Not when a compaction
+	 * already lands here, which removes that span anyway.
+	 */
+	async function noticeBatch(event: TurnEndEvent, ctx: ExtensionContext) {
+		if (event.entries.some((draft) => draft.type === "compaction")) return undefined;
+		return pruneBatch(event.context.contextEntries, {
+			scope: "notice",
+			cwd: ctx.cwd,
+			dir: options.prunedDir ?? prunedDir(ctx.sessionManager),
+			session: ctx.sessionManager,
+		});
+	}
+
+	pi.on("turn_end", async (event, ctx) => {
 		// A turn that was aborted or failed is not one to act on. The outcome alone
 		// misses half of an Escape: one that lands while tools run ends that turn
 		// as "completed", since the model had finished streaming, and only the
@@ -205,7 +239,21 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		// No reading — no model, or a compaction not yet answered — is no action.
 		const tokens = ctx.getContextUsage()?.tokens;
 		if (tokens === null || tokens === undefined) return;
-		const acts = crossings.observe(tokens, levels);
+		// A level already past after a model switch is simply crossed now, and
+		// only the highest of those acts.
+		const levels = levelsFor(ctx);
+		let acts = crossings.observe(tokens, levels);
+		// Pruning first, so that the agent is steered to Self-compact only once
+		// Pruning can no longer free enough. What the batch frees is judged on the
+		// last measured usage, not on pi's chars/4 count of the edited context,
+		// which runs high until the next response. Pressure that falls back under
+		// notice re-arms it and sends no steer.
+		const batch = acts === "notice" ? await noticeBatch(event, ctx) : undefined;
+		const reading = tokens - (batch?.freed ?? 0);
+		if (batch) {
+			crossings.observe(reading, levels);
+			if (reading < levels.notice) acts = undefined;
+		}
 		if (acts === "notice" || acts === "warning") steer(acts, event);
 		// The one toast on the way up, so that forced never comes as a surprise.
 		if (acts === "warning") {
@@ -214,7 +262,8 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 				"warning",
 			);
 		}
-		paint(ctx, tokens);
+		paint(ctx, reading, levels);
+		if (batch) return { entries: [...event.entries, ...batch.drafts] };
 	});
 }
 
