@@ -24,6 +24,7 @@
  */
 
 import { sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
+import { type PressureStatus, thousands } from "../compaction/status.ts";
 import type { Run } from "./supervisor.ts";
 
 /**
@@ -144,7 +145,26 @@ function footer(bodyWidth: number): string {
 function doing(run: Run): string {
 	if (run.state === "done") return "done";
 	if (run.state === "failed") return `failed · ${failedHow(run.failure)}`;
-	return run.activity ? `${run.state} · ${run.activity}` : run.state;
+	if (run.pressure === "compacting") return "compacting";
+	const state = run.activity ? `${run.state} · ${run.activity}` : run.state;
+	return run.pressure ? `${pressureLabel(run.pressure)} · ${state}` : state;
+}
+
+/**
+ * How full a Run's context is, in the words a row or a header has room for:
+ * `notice 131k`, `warning 152k`, or `compacting`.
+ *
+ * Re-said from the parsed status rather than echoed from the child's text,
+ * which is written for a footer (`ctx notice · 131k`): the `ctx` is what a
+ * footer needs to say which line it is, and a Run's row already says whose.
+ *
+ * First in the doing column, ahead of the state, so that a Run under pressure
+ * is the one that stands out in a column of `running`. While a compaction runs
+ * it is the whole column: the tool the child last started is history by then,
+ * because a compaction happens between turns.
+ */
+export function pressureLabel(pressure: PressureStatus): string {
+	return pressure === "compacting" ? "compacting" : `${pressure.level} ${thousands(pressure.tokens)}`;
 }
 
 /**
