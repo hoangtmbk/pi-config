@@ -258,7 +258,15 @@ export async function spawnRun(options: SpawnOptions): Promise<RunChild> {
 		});
 	};
 
-	const child: RunChild = { prompt: (message) => client.prompt(message), steer: (message) => client.steer(message), stop };
+	// pi says what it did with each prompt and steer, and the answer is dropped:
+	// the one outcome worth acting on, "handled", needs an `input` handler to
+	// swallow the message, and the only extension a child loads registers none.
+	// A steer's "queued" is what `queue_update` already reports, and in order.
+	const child: RunChild = {
+		prompt: async (message) => void (await client.prompt(message)),
+		steer: async (message) => void (await client.steer(message)),
+		stop,
+	};
 
 	try {
 		await client.start();

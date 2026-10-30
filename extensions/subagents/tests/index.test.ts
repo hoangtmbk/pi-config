@@ -123,7 +123,7 @@ interface SentMessage {
 }
 
 /**
- * pi's own routing rule, mirrored from `AgentSession.sendCustomMessage` (0.85.1).
+ * pi's own routing rule, mirrored from `AgentSession.sendCustomMessage` (1.4.0).
  *
  * Which of idle-wake and streaming-steer happens is pi's decision, not this
  * extension's — so the only thing the extension can get right is handing pi the

@@ -167,8 +167,11 @@ function handle(line: string): void {
 	}
 
 	// Every command gets a response; `RpcClient.send` waits for one before its
-	// promise resolves, prompts included.
-	emit({ id: command.id, type: "response", command: command.type, success: true });
+	// promise resolves, prompts included. A prompt or steer also says what pi did
+	// with it, and `RpcClient` reads that whether or not anybody wants it: a
+	// steer is queued, and a prompt into this child always starts a run.
+	const disposition = command.type === "steer" ? "queued" : command.type === "prompt" ? "started" : undefined;
+	emit({ id: command.id, type: "response", command: command.type, success: true, ...(disposition && { data: { disposition } }) });
 
 	if (command.type === "steer") {
 		// A turn held open for a steer reads it now. A settled child holds it,
