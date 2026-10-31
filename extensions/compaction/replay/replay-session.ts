@@ -30,7 +30,16 @@
  */
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Message, Model, ToolCall, ToolResultMessage, TranscriptContext } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	type AssistantMessageEventStream,
+	createAssistantMessageEventStream,
+	type Message,
+	type Model,
+	type ToolCall,
+	type ToolResultMessage,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai";
 import {
 	buildSessionProjection,
 	type CompactionEntry,
@@ -50,13 +59,87 @@ import { type Continuation, continueFrom, futureAfter, proposer } from "./replay
 import { type Boundary, boundariesOf, type CutKind, type PlannedCut, planCuts, type Recording, USER_TURNS_AFTER } from "./replay-corpus.ts";
 import { type Cited, type ContinuationVerdict, judgeCut, type Side } from "./replay-judge.ts";
 import { type FakePi, fakePi } from "../tests/fake-pi.ts";
-import { retryPolicy } from "../writers.ts";
+import { type Clock, retryPolicy, STALL_MS, SYSTEM_CLOCK } from "../writers.ts";
 
 /** What a model call is spent on, as the report totals it. */
 export type Spending = "writer" | "steered" | "pi-default" | "continuation" | "judge";
 
 /** A model call as pi's model registry makes it: `ctx.modelRegistry.streamSimple`. */
 export type ModelCall = NonNullable<CompactionOptions["stream"]>;
+
+/** How long a replay call may go with nothing streamed: the writers' own stall timeout. */
+export const CALL_STALL_MS = STALL_MS;
+/** How long a replay call may run in all, however much it streams. */
+export const CALL_CAP_MS = 10 * 60_000;
+
+/**
+ * A model call that can't hang the run. The provider's events are relayed as
+ * they stream, and each one resets a 60s timer; when it fires, or once the
+ * call has run 10 minutes however much it streams, the provider is aborted and
+ * the call ends at once in an error, without waiting on a provider that may
+ * ignore the abort. The error keeps the usage the provider had reported so
+ * far, so that the meter counts it. A failed call fails its cut, and the run
+ * moves on.
+ */
+export function guardCall(call: ModelCall, clock: Clock = SYSTEM_CLOCK): ModelCall {
+	return (model, context, options) => {
+		const stop = new AbortController();
+		const signal = options?.signal ? AbortSignal.any([options.signal, stop.signal]) : stop.signal;
+		const out = createAssistantMessageEventStream();
+		let partial: AssistantMessage | undefined;
+		let over = false;
+		let stall: unknown;
+		const disarm = () => clock.clearTimeout(stall);
+		const fail = (why: string) => {
+			if (over) return;
+			over = true;
+			disarm();
+			clock.clearTimeout(cap);
+			stop.abort();
+			const usage = partial?.usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+			const error: AssistantMessage = { role: "assistant", content: partial?.content ?? [], api: model.api, provider: model.provider, model: model.id, usage, stopReason: "error", errorMessage: why, timestamp: Date.now() };
+			out.push({ type: "error", reason: "error", error });
+			out.end();
+		};
+		const arm = () => {
+			disarm();
+			stall = clock.setTimeout(() => fail(`the provider streamed nothing for ${CALL_STALL_MS / 1000}s`), CALL_STALL_MS);
+		};
+		const cap = clock.setTimeout(() => fail(`the call ran past ${CALL_CAP_MS / 60_000} minutes`), CALL_CAP_MS);
+		arm();
+		let events: AssistantMessageEventStream;
+		try {
+			events = call(model, context, { ...options, signal });
+		} catch (error) {
+			over = true;
+			disarm();
+			clock.clearTimeout(cap);
+			throw error;
+		}
+		void (async () => {
+			try {
+				for await (const event of events) {
+					if (over) return;
+					if ("partial" in event) partial = event.partial;
+					if (event.type === "done" || event.type === "error") {
+						over = true;
+						disarm();
+						clock.clearTimeout(cap);
+						out.push(event);
+						out.end();
+						return;
+					}
+					arm();
+					out.push(event);
+				}
+				fail("the provider's stream ended with no reply");
+			} catch (error) {
+				fail(error instanceof Error ? error.message : String(error));
+			}
+		})();
+		return out;
+	};
+}
 
 export interface ReplayDeps {
 	/** pi's settings, as the extension would read them. */
@@ -99,6 +182,8 @@ export interface CutResult {
 	requested: CutKind;
 	/** A Self-compaction cut whose agent didn't compact when steered to, so that it compacted as forced. */
 	declined?: boolean;
+	/** What the agent did instead, when it declined: the tools it called, or that it replied in text. */
+	declinedWith?: string;
 	ours?: LaneCut;
 	pi?: LaneCut;
 	verdict?: CutVerdict;
@@ -227,7 +312,14 @@ async function steered(lanes: Lanes, cut: PlannedCut, turn: ReturnType<typeof tu
 	const call = reply.content.find((part): part is ToolCall => part.type === "toolCall" && part.name === SELF_COMPACT_TOOL);
 	const note = call?.arguments.note;
 	const compacts = call && typeof note === "string" && note.trim() ? { ...reply, content: reply.content.filter((part) => part.type !== "toolCall" || part === call) } : undefined;
-	return { steer, compacts };
+	return { steer, compacts, answered: answered(reply) };
+}
+
+/** What a reply did, in a few words: the tools it called, or that it only replied in text. */
+function answered(reply: AssistantMessage): string {
+	const called = reply.content.flatMap((part) => (part.type === "toolCall" ? [part.name === SELF_COMPACT_TOOL ? `${part.name} with no note` : part.name] : []));
+	if (called.length) return `called ${called.join(", ")}`;
+	return reply.content.some((part) => part.type === "text" && part.text.trim()) ? "replied in text" : "replied with nothing";
 }
 
 /** What every cut of one session shares. */
@@ -242,8 +334,8 @@ interface CutContext {
 	sessionId: string;
 }
 
-/** Our lane at a cut: the extension compacts, the way the cut's kind does. Returns whether a Self-compaction was declined. */
-async function compactOurs(lanes: Lanes, cut: PlannedCut, turn: ReturnType<typeof turnAt>, context: CutContext): Promise<{ kind: CutKind; declined?: boolean }> {
+/** Our lane at a cut: the extension compacts, the way the cut's kind does. Returns what the agent did instead, if it declined a Self-compaction. */
+async function compactOurs(lanes: Lanes, cut: PlannedCut, turn: ReturnType<typeof turnAt>, context: CutContext): Promise<{ kind: CutKind; declinedWith?: string }> {
 	const { ours } = lanes;
 	ours.model = context.model;
 	if (cut.kind === "before-user") {
@@ -253,7 +345,7 @@ async function compactOurs(lanes: Lanes, cut: PlannedCut, turn: ReturnType<typeo
 		return { kind: "before-user" };
 	}
 	if (cut.kind === "self") {
-		const { steer, compacts } = await steered(lanes, cut, turn, context);
+		const { steer, compacts, answered } = await steered(lanes, cut, turn, context);
 		if (compacts) {
 			ours.commit(await ours.turnEnd({ ...turn, tokens: context.levels.warning }));
 			ours.session.appendCustomMessageEntry(steer.customType, steer.content as string, steer.display ?? false, steer.details);
@@ -261,7 +353,7 @@ async function compactOurs(lanes: Lanes, cut: PlannedCut, turn: ReturnType<typeo
 			return { kind: "self" };
 		}
 		compacted(ours, await ours.turnEnd({ ...turn, tokens: context.levels.forced }), "forced compaction wrote no Handoff");
-		return { kind: "forced", declined: true };
+		return { kind: "forced", declinedWith: answered };
 	}
 	compacted(ours, await ours.turnEnd({ ...turn, tokens: context.levels.forced }), "forced compaction wrote no Handoff");
 	return { kind: "forced" };
@@ -369,6 +461,8 @@ export async function replaySession(recording: Recording, name: string, deps: Re
 		),
 		pi: SessionManager.inMemory(recording.header.cwd, undefined, seed),
 	};
+	// The recording predates the extension, so its tool is declared from here on, as pi would once the extension is loaded.
+	lanes.ours.declareTools();
 	await lanes.ours.startRun();
 
 	const cuts: CutResult[] = [];
@@ -382,7 +476,7 @@ export async function replaySession(recording: Recording, name: string, deps: Re
 			await replay(lanes, recording.branch, cursor, cut.boundary.at);
 			const done = await compactOurs(lanes, cut, turnAt(recording.branch, cut.boundary), context);
 			result.kind = done.kind;
-			if (done.declined) result.declined = true;
+			if (done.declinedWith) Object.assign(result, { declined: true, declinedWith: done.declinedWith });
 			await compactPi(lanes, recording.branch, cut, context);
 			result.ours = await laneCut(lanes.ours.session, recording, cut, plan[i + 1], context);
 			result.pi = await laneCut(lanes.pi, recording, cut, plan[i + 1], context);

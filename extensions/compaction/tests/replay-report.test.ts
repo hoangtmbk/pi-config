@@ -177,4 +177,11 @@ describe("the report", () => {
 		assert.match(report, /Recurring-detail retention/);
 		assert.match(report, /claude-fable-5/);
 	});
+
+	it("is inconclusive, and says why, while the run is unfinished", () => {
+		const sessions = run(() => {});
+		const report = renderReport({ sessions, scored: score(sessions), meter: new Meter(), mode: "full", startedAt: new Date("2026-10-31T09:00:00Z"), judge: "anthropic/claude-fable-5", unfinished: "stopped after 3 of 10 sessions" });
+		assert.match(report, /\*\*INCONCLUSIVE\.\*\*/);
+		assert.match(report, /## Inconclusive\n\n- stopped after 3 of 10 sessions/);
+	});
 });

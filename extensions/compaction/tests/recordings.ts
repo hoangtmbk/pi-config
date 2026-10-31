@@ -50,11 +50,11 @@ export function recorder(cwd = "/work", model: Model<any> = MODEL) {
 	const r = {
 		session,
 		/** The system prompt and the tools, as pi records them at the start of a session. */
-		system(prompt = "You are a coding agent.") {
+		system(prompt = "You are a coding agent.", tools = ["read", "write", "edit", "bash", "self_compact"]) {
 			session.appendMessage({
 				role: "system",
 				content: prompt,
-				toolsAdded: ["read", "write", "edit", "bash", "self_compact"].map((name) => ({
+				toolsAdded: tools.map((name) => ({
 					name,
 					description: `The ${name} tool.`,
 					parameters: { type: "object", properties: {} },

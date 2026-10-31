@@ -15,7 +15,7 @@
  * Grown as the extension grows, always by mirroring what pi does: a model call
  * is scripted through `registerCompaction`'s options (pass a `register`), a
  * boundary's drafts land in `boundaries` for committing to `session`, a tool
- * the extension registers is in `tools`, and run when a turn calls it, and `session_before_compact`, whose result pi
+ * the extension registers is in `tools`, declared to the model by `declareTools`, and run when a turn calls it, and `session_before_compact`, whose result pi
  * reads, has its own firing in `compact` — beside `fire`, which, like pi's
  * plain events, ignores what handlers return.
  *
@@ -31,7 +31,18 @@ import {
 	SessionManager,
 	type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage, Model, StopReason, ToolCall, ToolResultMessage, Usage, UserMessage } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	getCurrentTools,
+	type Model,
+	type StopReason,
+	type Tool,
+	type ToolCall,
+	type ToolResultMessage,
+	toToolDeclaration,
+	type Usage,
+	type UserMessage,
+} from "@earendil-works/pi-ai";
 // pi's own preparation for `/compact` and its backstop: the fake prepares exactly what pi would.
 import { type CompactionPreparation, estimateProjectedContextTokens, prepareCompaction } from "./pi-internals.ts";
 import { registerCompaction } from "../index.ts";
@@ -73,6 +84,8 @@ type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 /** A tool, as the extension registers it. */
 export interface RegisteredTool {
 	name: string;
+	description: string;
+	parameters: unknown;
 	execute: (toolCallId: string, params: unknown, signal: AbortSignal | undefined, onUpdate: unknown, ctx: ExtensionContext) => Promise<{ content: { type: string; text?: string }[]; isError?: boolean }>;
 }
 
@@ -549,6 +562,17 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 		/** Escape: abort the prompt in progress. Its next boundary is an aborted one. */
 		escape(): void {
 			state.run.abort();
+		},
+		/**
+		 * Declare the tools the extension registered that the branch doesn't
+		 * declare yet, as pi does before its next request (`declareToolChanges`,
+		 * 1.4.0): one system message, appended, whose `toolsAdded` holds them. A
+		 * session recorded before the extension was loaded declares none of them.
+		 */
+		declareTools(): void {
+			const declared = new Set(getCurrentTools(session.buildSessionProjection().messages).map((tool) => tool.name));
+			const added = tools.filter((tool) => !declared.has(tool.name)).map((tool) => toToolDeclaration(tool as unknown as Tool));
+			if (added.length) session.appendMessage({ role: "system", content: "", toolsAdded: added, timestamp: Date.now() });
 		},
 		/** Start a new prompt, with a signal of its own, as the user's next message does. */
 		async startRun(): Promise<void> {
