@@ -17,7 +17,7 @@ The fork is always used while the context fits, even on a cold cache, where it c
 pi's default (a dollar or so on Fable 5): rot, not cost, decides here, and a cold cache mostly
 means a `/compact` typed after a pause. Serialized mode, the same instruction over a serialized
 transcript, exists only for overflow, where the live context can't be sent, and as the fallback
-when the fork fails. Pi's default summary comes last, and only on the hook path. Building the fork
+when the fork fails. Pi's default summary comes last, on both paths. Building the fork
 means following pi's request shape: the system prompt and tools come from the transcript's system
 messages and not from `getSystemPrompt`, `cacheRetention` stays unset, and on Anthropic
 `tool_choice` must not be set, since changing it drops the cached conversation. So on Anthropic
