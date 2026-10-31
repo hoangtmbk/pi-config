@@ -21,7 +21,6 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import {
-	type CompactionEntry,
 	estimateTokens,
 	parseSessionEntries,
 	type SessionEntry,
@@ -111,6 +110,11 @@ export interface Recording {
  * Refused when it carries no system message: pi keeps the system prompt and
  * the tool declarations in the transcript, and without them neither the
  * writers nor the continuation could send the session as its own requests did.
+ *
+ * Refused too when pi compacted it: with the extension loaded from the start,
+ * every compaction is the extension's, so one of pi's means the extension came
+ * in partway, and the rules given before it live on only in pi's summary,
+ * where no Handoff could copy them word for word.
  */
 export function readRecording(text: string): Recording | { problem: string } {
 	const entries = parseSessionEntries(text);
@@ -120,6 +124,9 @@ export function readRecording(text: string): Recording | { problem: string } {
 	const branch = SessionManager.inMemory(header.cwd, undefined, entries).getBranch();
 	if (!branch.some((entry) => entry.type === "message" && entry.message.role === "system")) {
 		return { problem: "it records no system message, so its prompt and tools can't be replayed (recorded before pi kept them in the transcript)" };
+	}
+	if (branch.some((entry) => entry.type === "compaction")) {
+		return { problem: "pi compacted it before the extension could, so the rules given before that compaction survive only in pi's summary" };
 	}
 	return { header, branch };
 }
@@ -165,16 +172,10 @@ function messageOf(entry: SessionEntry | undefined): AgentMessage | undefined {
  * - Before a user message: after a turn that answered in text and ended the
  *   prompt, where the user spoke next.
  *
- * A turn cut short or failed is no boundary, and nor is anything at or before
- * the newest compaction the recording has: a replayed chain is the
- * extension's alone. The tokens are counted from that compaction's kept tail
- * on, its summary included, since that is the context the session held.
+ * A turn cut short or failed is no boundary.
  */
 export function boundariesOf(recording: Recording): Boundary[] {
 	const { branch } = recording;
-	let lastCompaction = -1;
-	branch.forEach((entry, i) => entry.type === "compaction" && (lastCompaction = i));
-	const keptFrom = lastCompaction < 0 ? 0 : Math.max(0, branch.findIndex((entry) => entry.id === (branch[lastCompaction] as CompactionEntry).firstKeptEntryId));
 
 	const userAt: number[] = [];
 	branch.forEach((entry, i) => messageOf(entry)?.role === "user" && userAt.push(i));
@@ -189,11 +190,11 @@ export function boundariesOf(recording: Recording): Boundary[] {
 
 	const boundaries: Boundary[] = [];
 	let tokens = 0;
-	for (let i = keptFrom; i < branch.length; i++) {
+	for (let i = 0; i < branch.length; i++) {
 		const entry = branch[i]!;
 		tokens += removable(entry);
 		const message = messageOf(entry);
-		if (i <= lastCompaction || message?.role !== "assistant") continue;
+		if (message?.role !== "assistant") continue;
 		const calls = message.content.filter((part) => part.type === "toolCall");
 		let end = i;
 		let kind: BoundaryKind;

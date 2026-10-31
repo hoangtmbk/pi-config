@@ -400,7 +400,9 @@ to, so that transcripts never reach the repo:
   `self_compact` note goes to the Handoff; an agent that doesn't compact when steered is compacted as
   forced, and the report says so) or as forced; and just before a user message, as `/compact`. The
   kinds rotate across sessions, every cut has at least one recorded user turn after it (the judge sees up to three), and each
-  removes at least `keepRecentTokens`.
+  removes at least `keepRecentTokens`. A session pi already compacted is skipped: with the
+  extension loaded from the start pi never compacts first, and the rules before pi's compaction
+  live on only in its summary.
 - **Two lanes** (`replay-session.ts`): the extension, through the same fake pi the offline suite
   drives, and pi's own `compact`, with no extension, chained on its own summaries. Both run on the
   session's recorded model; a session whose model can't be reached is skipped.
