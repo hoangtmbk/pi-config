@@ -125,7 +125,7 @@ describe("a compaction another extension's draft sank", () => {
 		assert.deepEqual(pi.sent, []);
 	});
 
-	it("sunk again, is given up as every writer failing: nothing compacted, an error toast, forced disarmed for the run", async () => {
+	it("sunk again, is given up as every writer failing: nothing compacted, an error toast, forced disarmed for the rest of the prompt", async () => {
 		const { pi, model } = forcing([{ text: PI_SUMMARY }, { text: PI_SUMMARY }]);
 		await sunk(pi);
 		const written = model.calls.length;
@@ -134,7 +134,7 @@ describe("a compaction another extension's draft sank", () => {
 		assert.deepEqual(errorsShown(pi), [{ message: FAILED_TWICE, type: "error" }]);
 		assert.deepEqual(await pi.turnEnd({ tokens: 176_000, message: said("Done.") }), []);
 		assert.equal(model.calls.length, written);
-		// A new run arms forced again, and writes a new Handoff.
+		// A new prompt arms forced again, and writes a new Handoff.
 		await pi.startRun();
 		assert.ok(compactionIn(await pi.turnEnd({ tokens: 177_000 })));
 		assert.ok(model.calls.length > written);
@@ -160,7 +160,7 @@ describe("a compaction another extension's draft sank", () => {
 		pi.escape();
 		assert.deepEqual(await pi.turnEnd({ message: aborted() }), []);
 		assert.deepEqual(errorsShown(pi), []);
-		// Forced stays armed: the next run writes a new Handoff.
+		// Forced stays armed: the next prompt writes a new Handoff.
 		await pi.startRun();
 		assert.ok(compactionIn(await pi.turnEnd({ tokens: 175_000 })));
 		assert.ok(model.calls.length > written);

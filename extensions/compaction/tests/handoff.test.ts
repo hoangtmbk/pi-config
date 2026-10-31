@@ -43,6 +43,24 @@ function detailsOf(done: Awaited<ReturnType<ReturnType<typeof fakePi>["compact"]
 	return done?.result?.compaction?.details;
 }
 
+/** A first compaction's `details`, as ours records them, with `overrides` in place of its fields. */
+function handoffRecord(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		kind: "handoff",
+		version: 1,
+		compactionNo: 1,
+		writer: "pi-default",
+		attempts: [],
+		userMessages: [],
+		droppedUserMessages: 0,
+		ledger: [],
+		fileState: {},
+		sections: { piDefault: PI_SUMMARY },
+		log: [],
+		...overrides,
+	};
+}
+
 describe("the hook path", () => {
 	it("gives /compact our compaction entry, carrying our details, with pi's summarizer as the writer", async () => {
 		const { pi } = compacting([{ text: PI_SUMMARY }]);
@@ -65,25 +83,13 @@ describe("the hook path", () => {
 		assert.deepEqual(pi.errors, []);
 	});
 
-	it("leaves pi its whole default only when our own code throws", async () => {
+	it("leaves pi its whole default when our own code throws", async () => {
 		const { pi } = compacting([{ text: PI_SUMMARY }]);
 		pi.session.appendMessage(user("Add retries to the fetcher."));
 		await pi.turnEnd({ message: said("Started.") });
 		const kept = pi.session.appendMessage(user("Go on."));
 		// A record of ours that our merge can't read: the ledger isn't a list.
-		pi.session.appendCompaction("(earlier Handoff)", kept, 50_000, {
-			kind: "handoff",
-			version: 1,
-			compactionNo: 1,
-			writer: "pi-default",
-			attempts: [],
-			userMessages: ["Add retries to the fetcher."],
-			droppedUserMessages: 0,
-			ledger: 5,
-			fileState: {},
-			sections: { piDefault: PI_SUMMARY },
-			log: [],
-		});
+		pi.session.appendCompaction("(earlier Handoff)", kept, 50_000, handoffRecord({ ledger: 5 }));
 		pi.session.appendMessage(user("Keep going."));
 		await pi.turnEnd({ message: said("Done.") });
 
@@ -276,20 +282,13 @@ describe("a repeat compaction", () => {
 			{ quote: "Keep the public API unchanged", kind: "constraint" },
 			{ quote: "the retry path", kind: "focus" },
 		];
-		pi.session.appendCompaction("(earlier Handoff)", kept, 50_000, {
-			kind: "handoff",
-			version: 1,
-			compactionNo: 1,
-			writer: "pi-default",
-			attempts: [],
+		const record = handoffRecord({
 			userMessages: ["Don't add any new dependencies, please."],
-			droppedUserMessages: 0,
 			ledger,
-			fileState: {},
 			note: "Next I wire the wrapper in.",
 			sections: { piDefault: "## Goal\nRetries." },
-			log: [],
-		}, true);
+		});
+		pi.session.appendCompaction("(earlier Handoff)", kept, 50_000, record, true);
 		await pi.turnEnd({ message: said("Using p-retry.") });
 
 		const done = await pi.compact();
@@ -442,7 +441,7 @@ describe("when the Handoff can't be written", () => {
 		pi.session.appendMessage(user("Add retries to the fetcher."));
 		await pi.turnEnd({ tokens: 125_000, message: said("Done.") });
 		const done = await pi.compact();
-		// The writer stops on the compaction's own signal: `/compact` had already aborted the run's.
+		// The writer stops on the compaction's own signal: `/compact` had already aborted the prompt's.
 		assert.equal(model.calls[2]?.options?.signal?.aborted, true);
 		assert.deepEqual(done?.result, { cancel: true });
 		assert.deepEqual(pi.notifications, []);

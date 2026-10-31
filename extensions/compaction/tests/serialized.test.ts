@@ -1,7 +1,7 @@
 /**
  * The serialized-mode writer: our instruction over a serialized transcript,
  * its reply parsed and checked, and every way it can fail falling through to
- * pi's summarizer without ever hanging the run.
+ * pi's summarizer without ever hanging the prompt.
  *
  * Driven only through the recording fake pi, with the model call scripted: a
  * test builds a session, compacts it the way pi would, and reads back the
@@ -430,7 +430,7 @@ describe("on the boundary path", () => {
 		const [text] = request(model, 1).users as [string];
 		assert.match(text, /<conversation>\n\[User\]: Add retries to the fetcher\.[^]*\[User\]: Go ahead\.[^]*<\/conversation>/);
 		assert.match(text, /<kept-tail>\n\[Assistant\]: Wired it in\.\n<\/kept-tail>/);
-		// Writers stop on the run's own signal there.
+		// Writers stop on the prompt's own signal there.
 		assert.equal(model.calls[1]?.options?.signal?.aborted, false);
 	});
 

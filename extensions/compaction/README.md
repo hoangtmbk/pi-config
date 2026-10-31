@@ -36,7 +36,7 @@ This builds on pi's compaction rather than replacing it
 |---|---|---|
 | notice | 120,000 | One Pruning batch, if it frees enough; then, unless that brought pressure back under notice, a muted footer status and one steer to the agent. |
 | warning | 150,000 | The status turns the warning colour, one steer to the agent, and one toast to the user. |
-| forced | 170,000 | Compaction at that turn boundary, without ending the run; see [Forced compaction](#forced-compaction). |
+| forced | 170,000 | Compaction at that turn boundary, without ending the prompt; see [Forced compaction](#forced-compaction). |
 
 The defaults can be changed, per model too, and shrink on a small window; see
 [Configuration](#configuration). Pressure is read at every `turn_end`, from `ctx.getContextUsage()`. Three rules decide what a
@@ -49,7 +49,7 @@ boundary does:
   past forced compacts, and gets no steer and no toast at all.
 - **A turn that didn't happen does nothing.** A turn the user aborted or the provider failed
   changes nothing and marks no level crossed — including the turn pi still ends as "completed"
-  when Escape lands while tools are running, which is caught by the run's abort signal rather
+  when Escape lands while tools are running, which is caught by the prompt's abort signal rather
   than the turn's outcome. A boundary with no reading (no model, or a compaction not yet answered)
   does nothing either.
 
@@ -149,10 +149,10 @@ They are deliberately calm: no token counts, nothing about running out or a limi
 forced, because pressure that reads as a deadline makes a model cut corners.
 
 A steer goes out with `deliverAs: "steer"`, so the agent takes it at its next turn boundary. The
-one exception is the boundary that ends the run: a steer queued there would make pi run one more
-turn just to answer it, so it is held with `deliverAs: "nextTurn"` and arrives with the user's next
-prompt. A steer that Escape clears from pi's queue unread is not sent again; the level still counts
-as crossed.
+one exception is the boundary that ends the prompt: a steer queued there would make pi run one
+more turn just to answer it, so it is held with `deliverAs: "nextTurn"` and arrives with the user's
+next prompt. A steer that Escape clears from pi's queue unread is not sent again; the level still
+counts as crossed.
 
 ## Pruning at notice
 
@@ -195,9 +195,9 @@ bulky tool output and superseded reads with a one-line marker pointing at a save
 
 ## Forced compaction
 
-At the first `turn_end` at or above forced — the turn that ends a run included, with no grace
+At the first `turn_end` at or above forced — the turn that ends a prompt included, with no grace
 period — the extension compacts at that boundary from `turn_end` (the **boundary path**). pi has
-already run and persisted every tool of the turn, so nothing is in flight, and the run goes on
+already run and persisted every tool of the turn, so nothing is in flight, and the prompt goes on
 straight after, its next request built from the Handoff and the kept tail.
 
 - **The cut** is pi's exported `findCutPoint` with pi's `keepRecentTokens`, fed the session's
@@ -216,7 +216,8 @@ straight after, its next request built from the Handoff and the kept tail.
   nothing for later ([#43](https://github.com/hoangtmbk/pi-config/issues/43)). pi takes no drafts
   from `session_before_compact`, and deferring the edits to the next `turn_end` would cost a cache
   miss of its own, since the first request after the compaction has already rebuilt the cache.
-  That tail is pruned at the next notice batch or the next boundary compaction.
+  That tail is pruned at the next notice batch that clears its minimum, or the next boundary
+  compaction.
 - **A sunk compaction is re-drafted once.** pi drops every draft at a boundary when any one of them
   won't replay, so another extension's bad draft sinks ours with it. The next boundary sees that no
   compaction landed (ours carries its `compactionNo`, so our previous one doesn't pass for it) and
@@ -242,10 +243,10 @@ straight after, its next request built from the Handoff and the kept tail.
 ## Self-compaction
 
 The `self_compact` tool (exported as `SELF_COMPACT_TOOL`) lets the agent compact at a natural
-break, from notice up, and carry on in the same run with no user prompt. It is always declared, so
-the tool list never changes and the prompt cache holds. Its one required parameter is `note`:
-what the agent is doing and will do next, in its own words. There is no focus parameter, and the
-description says nothing about running out or a limit.
+break, from notice up, and carry on in the same prompt, with nothing from the user. It is always
+declared, so the tool list never changes and the prompt cache holds. Its one required parameter is
+`note`: what the agent is doing and will do next, in its own words. There is no focus parameter,
+and the description says nothing about running out or a limit.
 
 - **Below notice it refuses**, saying the context isn't large enough yet for a compaction to help.
 - **From notice up, `execute` compacts.** A tool can't append to the session, so it runs the same
@@ -331,7 +332,7 @@ with instructions, which supersedes it. The writer can't supersede it, and no ad
 
 The chain is the same on both paths. Writers are tried in order and the first to succeed writes the
 judgment part; each failed attempt goes into `details.attempts` with its reason. Writers stop on the
-run's signal on the boundary path and on the compaction's own on the hook path.
+prompt's signal on the boundary path and on the compaction's own on the hook path.
 
 - **The forked call** (`fork.ts`, ADR-0004) is the agent writing its own Handoff: a side request
   that sends the live conversation exactly as the next turn would, so it reads the warm prompt

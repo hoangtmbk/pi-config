@@ -174,7 +174,7 @@ describe("a settings change", () => {
 		}
 	});
 
-	it("made to `settings.json` mid-session applies after `/reload` or a restart, from the first turn", async () => {
+	it("pi takes in on `/reload` or a restart is what the freshly loaded extension goes by from its first turn", async () => {
 		const before = fakePi();
 		await before.turnEnd({ tokens: 60_000 });
 		assert.deepEqual(steered(before), []);

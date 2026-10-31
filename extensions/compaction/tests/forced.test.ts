@@ -1,7 +1,7 @@
 /**
  * Forced compaction at the turn boundary: what `turn_end` does once Context
  * pressure reaches the forced Pressure level — compacts there, without ending
- * the run, with our Handoff and pi's own cut — and the guards around it.
+ * the prompt, with our Handoff and pi's own cut — and the guards around it.
  *
  * Driven only through the recording fake pi, with the model call scripted: a
  * test builds a session out of turns, takes pressure to forced, and reads back
@@ -85,7 +85,7 @@ describe("at the forced level", () => {
 		assert.deepEqual(pi.errors, []);
 	});
 
-	it("compacts at the turn that ends the run too", async () => {
+	it("compacts at the turn that ends the prompt too", async () => {
 		const { pi } = forcing([{ text: PI_SUMMARY }]);
 		await history(pi);
 		const drafts = await pi.turnEnd({ tokens: 172_000, message: said("All done.") });
@@ -181,18 +181,18 @@ describe("the drafts", () => {
 	});
 });
 
-describe("the run, after a forced compaction", () => {
-	it("carries on from the Handoff and the kept tail, in the same run", async () => {
+describe("the prompt, after a forced compaction", () => {
+	it("carries on from the Handoff and the kept tail, in the same prompt", async () => {
 		const { pi } = forcing([{ text: PI_SUMMARY }]);
 		await history(pi);
 		const drafts = await pi.turnEnd({ tokens: 172_000 });
 		const last = pi.session.getLeafId();
 		pi.commit(drafts);
-		// What the next request of the run is built from: the Handoff, then the tail.
+		// What the next request of the prompt is built from: the Handoff, then the tail.
 		const [first, ...rest] = pi.session.buildSessionProjection().messages.filter((m) => m.role !== "system");
 		assert.equal(first?.role, "compactionSummary");
 		assert.equal(rest.at(-1), pi.session.getEntry(last!)?.type === "message" ? (pi.session.getEntry(last!) as any).message : undefined);
-		// The next boundary of the same run goes on as usual.
+		// The next boundary of the same prompt goes on as usual.
 		await pi.turnEnd({ tokens: 45_000 });
 		assert.equal(pi.status(), undefined);
 		assert.deepEqual(pi.errors, []);
@@ -282,7 +282,7 @@ describe("the warning-pause guard", () => {
 describe("when every writer fails", () => {
 	const FAILED = "Compaction failed (Summarization failed: overloaded). Context will keep growing until your next message or pi's own compaction.";
 
-	it("compacts nothing, says why, and disarms forced for the rest of the run", async () => {
+	it("compacts nothing, says why, and disarms forced for the rest of the prompt", async () => {
 		const { pi, model } = forcing([{ errorMessage: "overloaded" }, { text: PI_SUMMARY }]);
 		await history(pi);
 		assert.deepEqual(await pi.turnEnd({ tokens: 172_000 }), []);
@@ -294,7 +294,7 @@ describe("when every writer fails", () => {
 		assert.equal(pi.status(), "<warning>ctx warning · 178k</warning>");
 	});
 
-	it("re-arms forced at the next run", async () => {
+	it("re-arms forced at the next prompt", async () => {
 		const { pi, model } = forcing([{ errorMessage: "overloaded" }, { text: PI_SUMMARY }]);
 		await history(pi);
 		await pi.turnEnd({ tokens: 172_000, message: said("Done.") });
@@ -305,12 +305,12 @@ describe("when every writer fails", () => {
 });
 
 describe("Escape during the writer chain", () => {
-	it("compacts nothing, says nothing, and leaves forced armed for the next run", async () => {
+	it("compacts nothing, says nothing, and leaves forced armed for the next prompt", async () => {
 		const { pi, model } = forcing([{ text: PI_SUMMARY, during: () => pi.escape() }, { text: PI_SUMMARY }]);
 		await history(pi);
 		assert.deepEqual(await pi.turnEnd({ tokens: 172_000 }), []);
 		assert.deepEqual(pi.notifications, []);
-		// pi goes round once more into an aborted stream, and that ends the run.
+		// pi goes round once more into an aborted stream, and that ends the prompt.
 		await pi.turnEnd({ message: aborted() });
 		await pi.startRun();
 		assert.ok(compactionIn(await pi.turnEnd({ tokens: 173_000 })));

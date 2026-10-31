@@ -80,7 +80,7 @@ export class Landing {
 		this.prepared = { ...compacting, toolCallId };
 	}
 
-	/** A new run: a Self-compaction written in the last, and not yet at its boundary, is stale. */
+	/** A new prompt: a Self-compaction written in the last, and not yet at its boundary, is stale. */
 	newRun(): void {
 		this.prepared = undefined;
 	}

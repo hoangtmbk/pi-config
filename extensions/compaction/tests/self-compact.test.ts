@@ -1,6 +1,6 @@
 /**
  * Self-compaction: the `self_compact` tool, with which the agent compacts at a
- * natural break, from notice up, and carries on in the same run.
+ * natural break, from notice up, and carries on in the same prompt.
  *
  * Driven only through the recording fake pi, with the model call scripted: a
  * test builds a session out of turns, has the agent call `self_compact`, and
@@ -215,7 +215,7 @@ describe("the `self_compact` tool", () => {
 	});
 });
 
-describe("the run, after a Self-compaction", () => {
+describe("the prompt, after a Self-compaction", () => {
 	it("carries on from the Handoff and then the kept tail, which ends in its own self_compact call and result", async () => {
 		const { pi } = selfCompacting([{ text: HANDOFF }]);
 		await history(pi);
@@ -228,7 +228,7 @@ describe("the run, after a Self-compaction", () => {
 		assert.equal(answer.role, "toolResult");
 		assert.equal(answer.toolCallId, call.content[0]!.type === "toolCall" ? call.content[0]!.id : undefined);
 		assert.equal(answer.content[0].text, COMPACTED);
-		// The next boundary of the same run goes on as usual.
+		// The next boundary of the same prompt goes on as usual.
 		await pi.turnEnd({ tokens: 45_000 });
 		assert.equal(pi.status(), undefined);
 		assert.deepEqual(pi.errors, []);

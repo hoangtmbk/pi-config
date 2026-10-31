@@ -46,10 +46,11 @@ afterEach(() => {
 
 /**
  * A fake pi with pi's summarizer scripted to answer each compaction with the
- * next of `replies`, and its pruned copies in a temp dir.
+ * next of `replies`, and its pruned copies in a temp dir. On overflow the
+ * forked call is skipped, so only serialized mode fails before pi's summarizer.
  */
-function compacting(replies: Reply[] = [{ text: PI_SUMMARY }], setup: FakeSetup = SETUP) {
-	const model = scriptModel(...replies.flatMap((reply) => [NO_HANDOFF, NO_HANDOFF, reply]));
+function compacting(replies: Reply[] = [{ text: PI_SUMMARY }], setup: FakeSetup = SETUP, overflow = false) {
+	const model = scriptModel(...replies.flatMap((reply) => [...(overflow ? [] : [NO_HANDOFF]), NO_HANDOFF, reply]));
 	const dir = folder();
 	const pi = fakePi(setup, (api) => registerCompaction(api, { stream: model.stream, prunedDir: dir }));
 	return Object.assign(pi, { dir, script: model });
@@ -170,9 +171,11 @@ describe("at a compaction through `session_before_compact`", () => {
 		return message?.role === "toolResult" && message.content[0]?.type === "text" ? message.content[0].text : undefined;
 	}
 
-	for (const reason of ["manual", "threshold"] as const) {
-		it(`(${reason === "manual" ? "/compact" : "pi's backstop"}) leaves the kept tail as it is, and prunes none of it at the next turn_end`, async () => {
-			const pi = compacting();
+	const PATHS = { manual: "/compact", threshold: "pi's threshold backstop", overflow: "pi's overflow backstop" } as const;
+
+	for (const reason of ["manual", "threshold", "overflow"] as const) {
+		it(`(${PATHS[reason]}) leaves the kept tail as it is, and prunes none of it at the next turn_end`, async () => {
+			const pi = compacting(undefined, SETUP, reason === "overflow");
 			await asks(pi);
 			// The superseded read the boundary path prunes at a forced compaction.
 			const first = await turn(pi, "read", { path: "src/a.ts" }, output(2_000, "a.ts v1"));

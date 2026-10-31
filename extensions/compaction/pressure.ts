@@ -202,7 +202,7 @@ export class Crossings {
  *   pressure at or above warning, forcing waits until pressure drops below
  *   warning, so compactions that can't keep up don't follow each other every
  *   turn;
- * - every writer failing, which disarms it for the rest of the run.
+ * - every writer failing, which disarms it for the rest of the prompt.
  */
 export class Forced {
 	private paused = false;
@@ -215,12 +215,12 @@ export class Forced {
 		this.landed = true;
 	}
 
-	/** Every writer failed: no forcing again this run. */
+	/** Every writer failed: no forcing again this prompt. */
 	disarm(): void {
 		this.disarmed = true;
 	}
 
-	/** A new run, in which forcing that failed in the last may be tried again. */
+	/** A new prompt, in which forcing that failed in the last may be tried again. */
 	rearm(): void {
 		this.disarmed = false;
 	}

@@ -55,8 +55,8 @@ describe("the steers", () => {
 		assert.equal(pi.sent[0]?.landed, "steer");
 	});
 
-	it("holds a steer for the next prompt when the crossing turn is the one that ends the run", async () => {
-		// A steer queued at the run's last boundary would start a turn nobody
+	it("holds a steer for the next prompt when the crossing turn is the one that ends the prompt", async () => {
+		// A steer queued at the prompt's last boundary would start a turn nobody
 		// asked for, just to answer it. The agent has stopped, which is itself
 		// the natural break; it hears this with whatever the user says next.
 		const pi = fakePi();

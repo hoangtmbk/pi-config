@@ -67,7 +67,7 @@ export function recorder(cwd = "/work", model: Model<any> = MODEL) {
 			session.appendMessage({ role: "user", content: padded(text, tokens), timestamp: Date.now() });
 			return r;
 		},
-		/** A turn that called tools, each with its recorded result: the run goes on after it. */
+		/** A turn that called tools, each with its recorded result: the prompt goes on after it. */
 		turn(calls: RecordedCall[], options: { text?: string; tokens?: number; model?: Model<any> } = {}) {
 			const toolCalls: ToolCall[] = calls.map((call) => ({
 				type: "toolCall",
@@ -92,7 +92,7 @@ export function recorder(cwd = "/work", model: Model<any> = MODEL) {
 			});
 			return r;
 		},
-		/** A turn that answered in text and called nothing: the end of a run. */
+		/** A turn that answered in text and called nothing: the end of a prompt. */
 		say(text: string, tokens = 0, on: Model<any> = model) {
 			session.appendMessage(assistant([{ type: "text", text: padded(text, tokens) }], "stop", on));
 			return r;
