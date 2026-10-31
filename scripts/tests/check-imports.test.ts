@@ -85,6 +85,28 @@ describe("checkImports: the code pi loads must not depend on tests/", () => {
 		assert.deepEqual(checkImports(root), []);
 	});
 
+	it("flags a tests/ import that is not a .ts file, or does not exist", () => {
+		const root = repo({
+			"extensions/demo/index.ts": [
+				`import data from "./tests/fixtures/data.json" with { type: "json" };`,
+				`import { gone } from "./tests/gone.ts";`,
+			].join("\n"),
+			"extensions/demo/tests/fixtures/data.json": `{}`,
+		});
+		const problems = checkImports(root);
+		assert.equal(problems.length, 2);
+		assert.match(problems[0]!, /^extensions\/demo\/index\.ts:1: imports "\.\/tests\/fixtures\/data\.json"/);
+		assert.match(problems[1]!, /^extensions\/demo\/index\.ts:2: imports "\.\/tests\/gone\.ts"/);
+	});
+
+	it("fails closed on a pi.extensions folder or pattern, which it does not follow", () => {
+		const root = repo({ "extensions/demo/index.ts": `` }, ["./extensions/demo", "./extensions/*/index.ts"]);
+		assert.deepEqual(checkImports(root), [
+			"package.json: pi.extensions lists the folder ./extensions/demo; check:imports follows file paths only",
+			"package.json: pi.extensions lists the pattern ./extensions/*/index.ts; check:imports follows file paths only",
+		]);
+	});
+
 	it("reports a pi.extensions entry that does not exist", () => {
 		const root = repo({}, ["./extensions/gone/index.ts"]);
 		assert.deepEqual(checkImports(root), [

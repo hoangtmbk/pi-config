@@ -102,10 +102,16 @@ function specifiersOf(file: string): Specifier[] {
 	return found;
 }
 
+/** The absolute path a relative specifier names, before any extension is tried; undefined for a bare one. */
+function namedPath(from: string, specifier: string): string | undefined {
+	if (!specifier.startsWith("./") && !specifier.startsWith("../")) return undefined;
+	return resolve(dirname(from), specifier);
+}
+
 /** The `.ts` file a relative specifier names, or undefined if it is not one. */
 function resolveLocal(from: string, specifier: string): string | undefined {
-	if (!specifier.startsWith("./") && !specifier.startsWith("../")) return undefined;
-	const base = resolve(dirname(from), specifier);
+	const base = namedPath(from, specifier);
+	if (!base) return undefined;
 	const candidates = [base, base.replace(/\.js$/, ".ts"), `${base}.ts`, join(base, "index.ts")];
 	return candidates.find((path) => path.endsWith(".ts") && existsSync(path) && statSync(path).isFile());
 }
@@ -119,8 +125,17 @@ function entriesOf(root: string): { entries: string[]; problems: string[] } {
 	};
 	for (const listed of manifest.pi?.extensions ?? []) {
 		const path = resolve(root, listed);
-		if (existsSync(path)) entries.add(path);
-		else problems.push(`package.json: pi.extensions lists ${listed}, which does not exist`);
+		// pi also takes folders and globs here; this check follows files only, so it
+		// fails closed on the rest rather than silently skipping what pi would load.
+		if (/[*?[\]{}!]/.test(listed)) {
+			problems.push(`package.json: pi.extensions lists the pattern ${listed}; check:imports follows file paths only`);
+		} else if (!existsSync(path)) {
+			problems.push(`package.json: pi.extensions lists ${listed}, which does not exist`);
+		} else if (!statSync(path).isFile()) {
+			problems.push(`package.json: pi.extensions lists the folder ${listed}; check:imports follows file paths only`);
+		} else {
+			entries.add(path);
+		}
 	}
 	const extensions = join(root, "extensions");
 	const folders = existsSync(extensions)
@@ -170,16 +185,18 @@ export function checkImports(root: string): string[] {
 		while (queue.length > 0) {
 			const file = queue.shift()!;
 			for (const { text, line } of specifiers.get(file) ?? specifiersOf(file)) {
-				const target = resolveLocal(file, text);
-				if (!target) continue;
-				if (isTestsPath(rel(root, target)) && !isTestsPath(rel(root, file))) {
+				// Judged by the path the specifier names, so a tests/ import that is not a
+				// .ts file (fixture JSON, a .js helper, a typo) is still caught.
+				const named = namedPath(file, text);
+				if (named && isTestsPath(rel(root, named)) && !isTestsPath(rel(root, file))) {
 					const chain: string[] = [];
 					for (let at: string | undefined = file; at; at = reachedVia.get(at)) chain.unshift(rel(root, at));
 					problems.push(
 						`${rel(root, file)}:${line}: imports "${text}" from a tests/ folder, but is load-path code (${chain.join(" -> ")})`,
 					);
 				}
-				if (!reachedVia.has(target)) {
+				const target = resolveLocal(file, text);
+				if (target && !reachedVia.has(target)) {
 					reachedVia.set(target, file);
 					queue.push(target);
 				}
