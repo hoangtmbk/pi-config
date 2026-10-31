@@ -27,10 +27,10 @@ Infer the repo from `git remote -v`; `gh` does this automatically when run insid
 
 When set to `yes`, PRs run through the same labels and states as issues, using the commands under "Pull requests" above and these:
 
-- **List external PRs for triage**: `gh pr list --state open --json number,title,body,labels,author,authorAssociation,comments` then keep only `authorAssociation` of `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, or `NONE` (drop `OWNER`/`MEMBER`/`COLLABORATOR`).
+- **List external PRs for triage**: `gh api "repos/hoangtmbk/pi-config/pulls?state=open" --jq '[.[] | select(.author_association | IN("CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE")) | {number, title, body, labels: [.labels[].name], author: .user.login, author_association}]'` (`gh pr list --json` has no `authorAssociation` field). Comments are a separate read per PR.
 - **Comment / close**: `gh pr comment`, `gh pr close`.
 
-GitHub shares one number space across issues and PRs, so a bare `#42` may be either: resolve with `gh pr view 42 --json number` and fall back to `gh issue view 42 --json number`.
+GitHub shares one number space across issues and PRs, so a bare `#42` may be either: resolve with `gh api repos/hoangtmbk/pi-config/issues/42 --jq 'if .pull_request then "pr" else "issue" end'`. (`gh pr view 42 --json number` succeeds on an issue number too, so it can't tell them apart.)
 
 ## When a skill says "publish to the issue tracker"
 
