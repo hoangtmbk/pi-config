@@ -9,7 +9,7 @@
  *   touching the file: pi's in-memory `SessionManager`, never one that persists.
  * - A cut sits at a turn boundary the recording really had: mid-run, after a
  *   turn whose tool calls the prompt went on from, or just before a user message,
- *   after the turn that ended a prompt. Each cut needs at least three user turns
+ *   after the turn that ended a prompt. Each cut needs at least one user turn
  *   recorded after it, so that there is a future to compare with; a session
  *   is cut two or three times in a chain.
  *
@@ -259,8 +259,13 @@ export interface CutPlan {
 	gap: number;
 }
 
-/** Recorded user turns a cut needs after it, so that there is a future to compare the continuation with. */
-export const USER_TURNS_AFTER = 3;
+/**
+ * Recorded user turns a cut needs after it, so that there is a future to
+ * compare the continuation with. One, not more: recorded main sessions are
+ * mostly one long prompt worked through alone, and three left a single session
+ * in the corpus (#57).
+ */
+export const USER_TURNS_AFTER = 1;
 
 /** The shortest chain worth replaying. */
 const MIN_DEPTH = 2;
@@ -272,7 +277,7 @@ const boundaryFor = (kind: CutKind): BoundaryKind => (kind === "before-user" ? "
  * shorter, down to two; none if not even two fit.
  *
  * The cuts are spread evenly over the boundaries that qualify — from the first
- * with twice the gap before it to the last with three user turns after it —
+ * with twice the gap before it to the last with a user turn after it —
  * each taking the boundary of its kind nearest its even share, while leaving
  * the gap before it and room for the cuts still to come. When no boundary of
  * the kind fits, the nearest of the other does, and the cut says what it was
