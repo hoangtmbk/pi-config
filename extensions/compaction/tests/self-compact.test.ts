@@ -114,6 +114,16 @@ describe("the `self_compact` tool", () => {
 		assert.deepEqual(pi.working, []);
 	});
 
+	it("from notice up, says nothing was compacted, not that it failed, when pi's cut has nothing to remove", async () => {
+		const { pi, model } = selfCompacting([], { settings: { compaction: { keepRecentTokens: 20_000 }, retry: { enabled: false } } });
+		await history(pi);
+		const drafts = await pi.turnEnd({ tokens: 125_000, message: calling(SELF_COMPACT_TOOL, { note: NOTE }) });
+		assert.equal(resultText(pi), "Not compacted: the older part of the conversation is too small to replace yet. Carry on with the task.");
+		assert.deepEqual(drafts, []);
+		assert.equal(model.calls.length, 0);
+		assert.deepEqual(pi.notifications, []);
+	});
+
 	it("is declared with one required note, and no wording about running out or a limit", () => {
 		const { pi } = selfCompacting();
 		const tool = pi.tools.find((t) => t.name === SELF_COMPACT_TOOL) as any;

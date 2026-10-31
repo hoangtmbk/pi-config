@@ -249,6 +249,10 @@ declared, so the tool list never changes and the prompt cache holds. Its one req
 and the description says nothing about running out or a limit.
 
 - **Below notice it refuses**, saying the context isn't large enough yet for a compaction to help.
+- **When pi's cut has nothing to remove**, from notice up, it compacts nothing and says so: "Not
+  compacted: the older part of the conversation is too small to replace yet. Carry on with the
+  task." No writer runs, so there is no toast and forced stays armed. This can happen when notice
+  sits near `keepRecentTokens`, as with a model override or very low `pressureLevels`.
 - **From notice up, `execute` compacts.** A tool can't append to the session, so it runs the same
   boundary path as forced — pi's cut, kept-tail Pruning, our Handoff from the writer chain — and
   keeps the compaction for that turn's `turn_end`, which applies it after the drafts earlier
