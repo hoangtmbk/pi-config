@@ -10,6 +10,9 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { Model } from "@earendil-works/pi-ai";
 import { fakePi, MODEL } from "./fake-pi.ts";
@@ -134,8 +137,8 @@ describe("scaling on a small window", () => {
 });
 
 describe("a settings change", () => {
-	it("is what the next turn goes by", async () => {
-		// pi's in-memory settings, which change on `/reload` or pi's own setters.
+	it("that pi has taken in is what the next turn goes by", async () => {
+		// pi's in-memory settings, which change on `/reload` or through pi's own setters.
 		const pi = fakePi();
 		await pi.turnEnd({ tokens: 90_000 });
 		pi.settings = { pressureLevels: { notice: 85_000 } };
@@ -144,6 +147,43 @@ describe("a settings change", () => {
 		pi.settings = {};
 		await pi.turnEnd({ tokens: 95_000 });
 		assert.equal(pi.status(), undefined);
+	});
+
+	it("made to `settings.json` mid-session is not read from the file: only pi's copy counts", async () => {
+		// The edit is on disk, global and project, but pi has not reloaded it.
+		const project = mkdtempSync(join(tmpdir(), "levels-project-"));
+		const agentDir = mkdtempSync(join(tmpdir(), "levels-agent-"));
+		const edited = JSON.stringify({ pressureLevels: { notice: 50_000 } });
+		mkdirSync(join(project, ".pi"));
+		writeFileSync(join(project, ".pi", "settings.json"), edited);
+		writeFileSync(join(agentDir, "settings.json"), edited);
+		const agentDirWas = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		try {
+			const pi = fakePi({ cwd: project });
+			await pi.turnEnd({ tokens: 60_000 });
+			await pi.turnEnd({ tokens: 100_000 });
+			assert.deepEqual(steered(pi), []);
+			assert.equal(pi.status(), undefined);
+			assert.deepEqual(pi.errors, []);
+		} finally {
+			if (agentDirWas === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = agentDirWas;
+			rmSync(project, { recursive: true, force: true });
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("made to `settings.json` mid-session applies after `/reload` or a restart, from the first turn", async () => {
+		const before = fakePi();
+		await before.turnEnd({ tokens: 60_000 });
+		assert.deepEqual(steered(before), []);
+		// `/reload` ends this load of the extension and loads it afresh over the
+		// same session, with pi's copy of the settings read again from disk.
+		await before.fire("session_shutdown", { reason: "reload" });
+		const after = fakePi({ session: before.session, settings: { pressureLevels: { notice: 50_000 } } });
+		await after.turnEnd({ tokens: 60_000 });
+		assert.deepEqual(steered(after), ["notice"]);
 	});
 });
 
