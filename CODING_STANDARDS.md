@@ -1,8 +1,8 @@
 # Coding standards
 
 The judgement calls a reviewer checks a change against. Each rule names where the repo already
-follows it; when a change breaks one, cite the rule and the evidence. Mechanical rules (what may
-import what) are enforced by script and are not repeated here.
+follows it; when a change breaks one, cite the rule and the evidence. Rules a script can check
+(what may import what) belong in a script, not here.
 
 ## Tests go through the seams, with fakes at the edge
 
@@ -13,7 +13,7 @@ production. A seam is an optional parameter whose default is the real thing, inj
 by nothing else. `npm test` stays offline, key-free and deterministic.
 
 Evidence: `SubagentsOptions` and `fakeSession` / `recorder` in
-`extensions/subagents/tests/index.test.ts`; `tests/fake-rpc-child.ts`; `deps.fetch` in
+`extensions/subagents/tests/index.test.ts`; `extensions/subagents/tests/fake-rpc-child.ts`; `deps.fetch` in
 `extensions/web-search/brave.ts` with `fakeFetch` in its `tests/helpers.ts`; each extension
 README's "Testing" section.
 
