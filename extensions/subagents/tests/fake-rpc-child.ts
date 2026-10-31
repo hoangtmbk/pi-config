@@ -213,7 +213,7 @@ process.on("SIGUSR2", () => {
 });
 
 let buffer = "";
-process.stdin.on("data",(chunk: Buffer) => {
+process.stdin.on("data", (chunk: Buffer) => {
 	buffer += chunk.toString("utf-8");
 	for (;;) {
 		const lineEnd = buffer.indexOf("\n");
