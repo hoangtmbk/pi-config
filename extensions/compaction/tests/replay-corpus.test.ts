@@ -79,6 +79,13 @@ describe("a recording", () => {
 			problem: "it records no system message, so its prompt and tools can't be replayed (recorded before pi kept them in the transcript)",
 		});
 	});
+
+	it("is refused when pi compacted it already, since a session with the extension loaded from the start never is", () => {
+		const compacted = recorder().system().user("Old work.").say("Done.").user("Add retries.").compaction("Summary of the old work.", 1).say("Done.").user("Thanks.").text();
+		assert.deepEqual(readRecording(compacted), {
+			problem: "pi compacted it before the extension could, so the rules given before that compaction survive only in pi's summary",
+		});
+	});
 });
 
 describe("planning a chain of cuts", () => {
@@ -202,23 +209,20 @@ describe("the turn boundaries a recording offers", () => {
 		assert.deepEqual(boundaries[0]!.model, { provider: MODEL.provider, id: MODEL.id });
 	});
 
-	it("count the context's tokens as pi estimates them, from the newest recorded compaction's kept tail on, but for the system prompt", () => {
+	it("count the context's tokens as pi estimates them, but for the system prompt", () => {
 		const recording = read(
 			recorder()
 				.system(padded("You are a coding agent.", 10_000))
-				.user("Old work.", 5_000)
-				.say("Done.")
-				.user("Add retries.", 1_000) // 3: the compaction keeps this on
-				.compaction("Summary of the old work.", 1)
-				.turn([READ], { tokens: 2_000 }) // 5
-				.turn([READ]) // 7
+				.user("Add retries.", 1_000)
+				.turn([READ], { tokens: 2_000 }) // 2
+				.turn([READ]) // 4
 				.say("Done.")
 				.user("Thanks.")
 				.text(),
 		);
 		const [first, second] = boundariesOf(recording);
-		assert.equal(first!.at, 5, "nothing before the compaction is a boundary");
-		assert.ok(first!.tokens >= 3_000 && first!.tokens < 3_100, `kept tail and the turn, but not the old work or the system prompt: ${first!.tokens}`);
+		assert.equal(first!.at, 2);
+		assert.ok(first!.tokens >= 3_000 && first!.tokens < 3_100, `the user's words and the turn, but not the system prompt: ${first!.tokens}`);
 		assert.ok(second!.tokens > first!.tokens && second!.tokens < first!.tokens + 100, `${second!.tokens}`);
 	});
 
