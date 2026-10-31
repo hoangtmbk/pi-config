@@ -1,8 +1,8 @@
 # pi's extension API, as installed
 
 **Pinned to pi 1.4.0** (`@earendil-works/pi-coding-agent`, `pi-ai` and `pi-agent-core`, all 1.4.0).
-Every claim here was read from the installed `dist/`, not from pi's docs, and none was run against a
-model. If `package.json` now pins a different pi, treat each claim as a lead: re-read the cited file
+Every claim cites the installed `dist/`, not pi's docs; a sample was re-read against it, and none was
+run against a model. A claim marked "unverified" is a lead, not a fact. If `package.json` now pins a different pi, treat each claim as a lead: re-read the cited file
 before a spec, ticket or line of code depends on it, then fix the claim and move this pin.
 
 What this adds over pi's own docs: the behaviour the `.d.ts` files and
