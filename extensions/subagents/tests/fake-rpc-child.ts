@@ -23,7 +23,8 @@
  *    that many prompts have been served (default 0: die before the parent's
  *    first prompt, which is what a child that cannot start looks like).
  *  - `FAKE_RPC_PID_OUT` — a path to write its own pid to, so a test can ask the
- *    operating system whether the process is really gone.
+ *    operating system whether the process is really gone, or send it the
+ *    SIGUSR2 that releases a turn held on `fake:await_release` (see below).
  *  - `FAKE_RPC_IGNORE_SIGTERM` — swallow SIGTERM, standing in for a child too
  *    wedged to take the polite way out. Only SIGKILL ends it.
  *  - `FAKE_RPC_SILENT` — never answer a prompt, not even to acknowledge it, so
@@ -38,6 +39,12 @@
  * message) before the rest of the turn is played out. That is a Run that is
  * still working when it is steered; without the marker, every steer lands on a
  * child that has already settled, which is the race a steer can lose.
+ *
+ * A turn script can also hold a turn open with `{ "type": "fake:await_release" }`,
+ * until the process is sent SIGUSR2 (its pid is in `FAKE_RPC_PID_OUT`). That is a
+ * Run still working for as long as the test needs: without it, a turn settles
+ * the moment its prompt is acknowledged, so a `subagent_wait` placed next races
+ * the Run's own Delivery.
  *
  * A turn script's events are written as they stand, so a script can carry
  * records that are not session events at all: `child-events.ts`'s `status` is
@@ -83,6 +90,16 @@ const silent = Boolean(process.env.FAKE_RPC_SILENT);
  */
 const AWAIT_STEER = "fake:await_steer";
 
+/**
+ * The marker a turn script holds a turn open with, until the process is sent
+ * SIGUSR2. Not a pi event either.
+ *
+ * That is a Run still working for as long as the test needs it to be. Without
+ * a hold, a turn settles the moment its prompt is acknowledged, so whatever the
+ * parent does next — a `subagent_wait`, say — races the Run's own Delivery.
+ */
+const AWAIT_RELEASE = "fake:await_release";
+
 const exitCode = process.env.FAKE_RPC_EXIT_CODE ? Number(process.env.FAKE_RPC_EXIT_CODE) : undefined;
 const exitAfter = Number(process.env.FAKE_RPC_EXIT_AFTER ?? 0);
 
@@ -106,8 +123,8 @@ let promptCount = 0;
 /** Steers queued and not yet read, oldest first — pi's own steering queue. */
 const steering: string[] = [];
 
-/** What is left of a turn held open on `AWAIT_STEER`, waiting to be played out. */
-let held: unknown[] | undefined;
+/** What is left of a turn held open on a marker, and which marker it is waiting on. */
+let held: { on: typeof AWAIT_STEER | typeof AWAIT_RELEASE; rest: unknown[] } | undefined;
 
 /** Strict JSONL: one record, LF-terminated, never anything else on stdout. */
 function emit(record: unknown): void {
@@ -148,11 +165,12 @@ function readSteers(): void {
 	}
 }
 
-/** Emit a turn's events, stopping at an `AWAIT_STEER` and keeping the rest for it. */
+/** Emit a turn's events, stopping at a hold marker and keeping the rest for it. */
 function play(events: unknown[]): void {
 	for (let index = 0; index < events.length; index++) {
-		if ((events[index] as { type?: string }).type === AWAIT_STEER) {
-			held = events.slice(index + 1);
+		const type = (events[index] as { type?: string }).type;
+		if (type === AWAIT_STEER || type === AWAIT_RELEASE) {
+			held = { on: type, rest: events.slice(index + 1) };
 			return;
 		}
 		emit(events[index]);
@@ -185,8 +203,8 @@ function handle(line: string): void {
 	if (command.type === "steer") {
 		// A turn held open for a steer reads it now. A settled child holds it,
 		// unread, until its next prompt — which is what pi does, too.
-		if (!held) return;
-		const rest = held;
+		if (held?.on !== AWAIT_STEER) return;
+		const { rest } = held;
 		held = undefined;
 		readSteers();
 		play(rest);
@@ -199,6 +217,15 @@ function handle(line: string): void {
 	readSteers();
 	play(turn ?? defaultEvents(command.message ?? ""));
 }
+
+// Always listened for, so a stray SIGUSR2 never takes the child down: with no
+// turn held on `AWAIT_RELEASE` it does nothing.
+process.on("SIGUSR2", () => {
+	if (held?.on !== AWAIT_RELEASE) return;
+	const { rest } = held;
+	held = undefined;
+	play(rest);
+});
 
 let buffer = "";
 process.stdin.on("data", (chunk: Buffer) => {

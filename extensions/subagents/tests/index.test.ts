@@ -1391,13 +1391,24 @@ describe("subagent_wait", () => {
 	});
 
 	it("collects a real child's result over the RPC stream", async () => {
-		const { subagent, subagentWait } = fakeSession();
+		// Held open until the join is in place. A child that settles on the spot
+		// races the join, and one that wins is delivered on its own, so the join
+		// would rightly say "already delivered" instead (ADR-0002).
+		const pidPath = join(mkdtempSync(join(tmpdir(), "subagents-wait-")), "pid");
+		const turn = [AGENT_START, AWAIT_RELEASE, said("Result for: count the call sites"), AGENT_END, SETTLED];
+		const { subagent, subagentWait, sent } = fakeSession(ROSTER, {
+			FAKE_RPC_PID_OUT: pidPath,
+			FAKE_RPC_TURNS: JSON.stringify([turn]),
+		});
 		await call(subagent, { agent: "scout", task: "count the call sites" });
 
-		const collected = await call(subagentWait, { names: ["scout"] });
+		const joined = call(subagentWait, { names: ["scout"] });
+		process.kill(Number(readFileSync(pidPath, "utf-8")), "SIGUSR2");
+		const collected = await joined;
 
 		assert.match(collected, /Run `scout`/);
 		assert.match(collected, /Result for: count the call sites/);
+		assert.deepEqual(sent, [], "the join collected the result, so it was not also delivered on its own");
 	});
 });
 
@@ -1835,6 +1846,9 @@ describe("a Run's Pressure level", () => {
 
 /** A turn held open until the child is steered — a Run still working when the user types. */
 const AWAIT_STEER = { type: "fake:await_steer" } as unknown as JsonAgentSessionEvent;
+
+/** A turn held open until the child is sent SIGUSR2 — a Run still working for as long as a test needs. */
+const AWAIT_RELEASE = { type: "fake:await_release" } as unknown as JsonAgentSessionEvent;
 
 describe("steering a running Run", () => {
 	it("hands the message to the Run's child as a steer, not as a fresh prompt", async () => {

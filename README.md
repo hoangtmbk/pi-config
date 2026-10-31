@@ -61,8 +61,10 @@ pi list
 ```
 
 ```bash
+npm run check            # what CI runs: typecheck, check:imports, then test
 npm test                 # offline suites for every extension
 npm run typecheck        # tsc against pi's real .d.ts (pi-coding-agent is a devDependency for this)
+npm run check:imports    # pi's load path stays out of tests/, pi's dist/ internals stay in one module
 npm run live:subagents   # subagents' manual runner against real pi (spends tokens)
 npm run live:web-fetch   # web-fetch's manual runner against real URLs
 npm run live:web-search  # web-search's manual runner against real queries (needs a Brave API key)
