@@ -215,6 +215,8 @@ export interface Run {
 	startedAt: Date;
 	/** `provider/id` of the judge. */
 	judge: string;
+	/** Why the run stopped short of its corpus, for a report written before the end. */
+	unfinished?: string;
 }
 
 const dollars = (cost: number) => `$${cost.toFixed(2)}`;
@@ -258,7 +260,7 @@ function findings(cut: CutResult, lane: Lane): string[] {
 }
 
 function cutSection(cut: CutResult): string[] {
-	const kind = cut.kind === cut.requested ? cut.kind : `${cut.kind} (asked for ${cut.requested}${cut.declined ? "; the agent didn't Self-compact when steered" : ""})`;
+	const kind = cut.kind === cut.requested ? cut.kind : `${cut.kind} (asked for ${cut.requested}${cut.declined ? `; the agent didn't Self-compact when steered${cut.declinedWith ? `, it ${cut.declinedWith}` : ""}` : ""})`;
 	const lines = [`- Cut ${cut.depth}, ${kind}`];
 	if (cut.error) return [...lines, `  - error: ${cut.error}`];
 	lines.push(laneLine("ours", cut.ours), ...findings(cut, "ours"), laneLine("pi's default", cut.pi), ...findings(cut, "pi"));
@@ -275,7 +277,8 @@ export function renderReport(run: Run): string {
 	const allCuts = replayed.flatMap((s) => s.cuts);
 	const kinds = (["self", "forced", "before-user"] as const).map((kind) => `${allCuts.filter((c) => c.kind === kind).length} ${kind}`).join(", ");
 	const declined = allCuts.filter((c) => c.declined).length;
-	const result = scored.inconclusive.length ? "INCONCLUSIVE" : scored.pass ? "PASS" : "FAIL";
+	const inconclusive = [...(run.unfinished ? [run.unfinished] : []), ...scored.inconclusive];
+	const result = inconclusive.length ? "INCONCLUSIVE" : scored.pass ? "PASS" : "FAIL";
 
 	const lines = [
 		`# Replay check, ${run.startedAt.toISOString()} (${run.mode})`,
@@ -290,7 +293,7 @@ export function renderReport(run: Run): string {
 		"|---|---|---|---|---|",
 		...scored.bars.map((b) => `| ${b.check} | ${b.bar} | ${b.ours} | ${b.pi} | ${b.pass ? "yes" : "**no**"} |`),
 	];
-	if (scored.inconclusive.length) lines.push("", "## Inconclusive", "", ...scored.inconclusive.map((why) => `- ${why}`));
+	if (inconclusive.length) lines.push("", "## Inconclusive", "", ...inconclusive.map((why) => `- ${why}`));
 	lines.push(
 		"",
 		"## Reported, not gated",

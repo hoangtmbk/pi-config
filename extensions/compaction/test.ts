@@ -49,7 +49,7 @@ import { getAgentDir, ModelRegistry, ModelRuntime } from "@earendil-works/pi-cod
 import { kindsFor, parseManifest, readRecording } from "./replay/replay-corpus.ts";
 import type { Side } from "./replay/replay-judge.ts";
 import { Meter, renderReport, score } from "./replay/replay-report.ts";
-import { type SessionResult, replaySession } from "./replay/replay-session.ts";
+import { guardCall, type SessionResult, replaySession } from "./replay/replay-session.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_MANIFEST = join(HERE, "replay-manifest.json");
@@ -100,7 +100,8 @@ async function main(): Promise<number> {
 	const settings = existsSync(settingsPath) ? (JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>) : {};
 
 	const meter = new Meter();
-	const call = registry.streamSimple.bind(registry);
+	// No call can hang the run: a stalled or endless one fails its cut (see `guardCall`).
+	const call = guardCall(registry.streamSimple.bind(registry));
 	const prunedDir = mkdtempSync(join(tmpdir(), "pi-replay-pruned-"));
 	const startedAt = new Date();
 	const picked = manifest.sessions.slice(0, quick ? QUICK_SESSIONS : FULL_SESSIONS);
@@ -109,6 +110,24 @@ async function main(): Promise<number> {
 
 	let judged = 0;
 	const sessions: SessionResult[] = [];
+	const mode = quick ? "quick" : "full";
+	const stamp = startedAt.toISOString().replace(/[:.]/g, "-");
+	const reportPath = join(REPORTS, `${stamp}-${mode}.md`);
+	/** Write the report on what is done so far, over the last one: a run stopped short keeps what it paid for. */
+	const write = (unfinished?: string): string => {
+		const report = renderReport({ sessions, scored: score(sessions), meter, mode, startedAt, judge: judgeKey, unfinished });
+		mkdirSync(REPORTS, { recursive: true });
+		writeFileSync(reportPath, report);
+		writeFileSync(reportPath.replace(/\.md$/, ".json"), JSON.stringify({ startedAt, mode, judge: judgeKey, ...(unfinished ? { unfinished } : {}), sessions, spend: meter.rows() }, null, 2));
+		return report;
+	};
+	const stopped = () => `stopped after ${sessions.length} of ${picked.length} sessions`;
+	process.once("SIGINT", () => {
+		write(`${stopped()} (interrupted)`);
+		console.log(`\nInterrupted. Report so far (spend counted for finished calls only): ${reportPath}`);
+		rmSync(prunedDir, { recursive: true, force: true });
+		process.exit(130);
+	});
 	try {
 		for (const [i, entry] of picked.entries()) {
 			console.log(`[${i + 1}/${picked.length}] ${entry.name}…`);
@@ -131,24 +150,22 @@ async function main(): Promise<number> {
 			sessions.push(result);
 			await meter.settled();
 			if (result.skipped) console.log(`  skipped: ${result.skipped}`);
-			for (const cut of result.cuts) console.log(`  cut ${cut.depth} (${cut.kind}): ${cut.error ?? (cut.verdict ? "judged" : `not judged: ${cut.unjudged}`)}`);
+			for (const cut of result.cuts) {
+				const declined = cut.declinedWith ? ` (steered to Self-compact, the agent ${cut.declinedWith})` : "";
+				console.log(`  cut ${cut.depth} (${cut.kind}${declined}): ${cut.error ?? (cut.verdict ? "judged" : `not judged: ${cut.unjudged}`)}`);
+			}
 			console.log(`  spent so far: $${meter.total().toFixed(2)}`);
+			if (sessions.length < picked.length) write(stopped());
 		}
 	} finally {
 		rmSync(prunedDir, { recursive: true, force: true });
 	}
 
 	await meter.settled();
-	const scored = score(sessions);
-	const report = renderReport({ sessions, scored, meter, mode: quick ? "quick" : "full", startedAt, judge: judgeKey });
-	mkdirSync(REPORTS, { recursive: true });
-	const stamp = startedAt.toISOString().replace(/[:.]/g, "-");
-	const reportPath = join(REPORTS, `${stamp}-${quick ? "quick" : "full"}.md`);
-	writeFileSync(reportPath, report);
-	writeFileSync(reportPath.replace(/\.md$/, ".json"), JSON.stringify({ startedAt, mode: quick ? "quick" : "full", judge: judgeKey, sessions, spend: meter.rows() }, null, 2));
+	const report = write();
 	console.log(`\n${report}`);
 	console.log(`Report: ${reportPath}`);
-	return scored.pass ? 0 : 1;
+	return score(sessions).pass ? 0 : 1;
 }
 
 main().then(

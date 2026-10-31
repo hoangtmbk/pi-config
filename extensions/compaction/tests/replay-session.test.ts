@@ -16,14 +16,14 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { type Context, getCurrentTools, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import type { HandoffDetails } from "../handoff.ts";
 import { FORK_PREAMBLE } from "../instruction.ts";
 import { type CutKind, readRecording } from "../replay/replay-corpus.ts";
-import { type ReplayDeps, replaySession, type Spending } from "../replay/replay-session.ts";
+import { CALL_CAP_MS, CALL_STALL_MS, guardCall, type ReplayDeps, replaySession, type Spending } from "../replay/replay-session.ts";
 import { MODEL } from "./fake-pi.ts";
 import { recorder } from "./recordings.ts";
-import { type Reply, scriptModel } from "./scripted-model.ts";
+import { fakeClock, type Reply, scriptModel } from "./scripted-model.ts";
 
 const RULE = "Never touch the generated files under gen/";
 const NOTE = "Retries are wired in; next I run the tests.";
@@ -47,11 +47,15 @@ Carry on with the retries. "Add retries to the fetcher."
 <add>${RULE}</add>
 </ledger>`;
 
-/** A session with room for a chain of three cuts, and three user turns after the last. */
+/**
+ * A session with room for a chain of three cuts, and three user turns after
+ * the last. Recorded before the extension was loaded, as every real one in the
+ * corpus was, so it declares no `self_compact`.
+ */
 function session(): string {
 	const read = (path: string) => ({ name: "read", arguments: { path }, result: `contents of ${path}` });
 	return recorder("/work")
-		.system()
+		.system(undefined, ["read", "write", "edit", "bash"])
 		.user(`Add retries to the fetcher. ${RULE}.`, 150)
 		.turn([read("src/fetch.ts")], { tokens: 100 })
 		.turn([read("src/retry.ts")], { tokens: 100 })
@@ -92,6 +96,8 @@ interface Routed {
 	asked: string[];
 	/** What the agent was steered with, each time it was. */
 	steers: string[];
+	/** The tools each steered request declared. */
+	steeredTools: string[][];
 	deps: ReplayDeps;
 }
 
@@ -107,6 +113,7 @@ function verdict(oursIs: "A" | "B"): Reply {
 function routed(options: { selfCompacts?: boolean; reachable?: (provider: string, id: string) => boolean } = {}): Routed {
 	const asked: string[] = [];
 	const steers: string[] = [];
+	const steeredTools: string[][] = [];
 	let cut = 0;
 	const sessionModel = (model: Model<any>, context: Context, streamOptions?: SimpleStreamOptions) => {
 		const last = lastUser(context);
@@ -121,7 +128,11 @@ function routed(options: { selfCompacts?: boolean; reachable?: (provider: string
 		} else if (context.messages.at(-1)?.role === "user" && last.includes("Self-compact")) {
 			asked.push("steered");
 			steers.push(last);
-			reply = options.selfCompacts === false ? { text: "I'll finish this step first." } : { toolCall: { name: "self_compact", arguments: { note: NOTE } }, stopReason: "toolUse" };
+			const tools = getCurrentTools(context.messages).map((tool) => tool.name);
+			steeredTools.push(tools);
+			// A model can only call a tool its request declares.
+			const compacts = options.selfCompacts !== false && tools.includes("self_compact");
+			reply = compacts ? { toolCall: { name: "self_compact", arguments: { note: NOTE } }, stopReason: "toolUse" } : { text: "I'll finish this step first." };
 		} else {
 			asked.push("continuation");
 			reply = { text: "Carrying on with the task." };
@@ -142,7 +153,7 @@ function routed(options: { selfCompacts?: boolean; reachable?: (provider: string
 		oursSide: () => (blind++ % 2 === 0 ? "A" : "B"),
 		prunedDir: mkdtempSync(join(tmpdir(), "replay-pruned-")),
 	};
-	return { asked, steers, deps };
+	return { asked, steers, steeredTools, deps };
 }
 
 function recording() {
@@ -153,7 +164,7 @@ function recording() {
 
 describe("replaying a session", () => {
 	it("cuts it in a chain, each cut compacted by our extension and by pi, carried on from and judged", async () => {
-		const { asked, steers, deps } = routed();
+		const { asked, steers, steeredTools, deps } = routed();
 		const result = await replaySession(recording(), "fetcher", deps);
 		assert.equal(result.skipped, undefined);
 		assert.equal(result.model, "anthropic/fable-5");
@@ -169,6 +180,8 @@ describe("replaying a session", () => {
 		// Self-compaction answered the extension's own steer, and its note opens the Handoff.
 		assert.equal(steers.length, 1);
 		assert.match(steers[0]!, /Self-compact at your next natural break/);
+		// The recording predates the extension: its tool is declared to the agent as pi would, once the extension is loaded.
+		assert.deepEqual(steeredTools, [["read", "write", "edit", "bash", "self_compact"]]);
 		const [self, forced, beforeUser] = result.cuts;
 		const ours = self!.ours!.handoff.details as HandoffDetails;
 		assert.equal(ours.writer, "fork");
@@ -207,6 +220,7 @@ describe("replaying a session", () => {
 		assert.equal(first!.kind, "forced");
 		assert.equal(first!.requested, "self");
 		assert.equal(first!.declined, true);
+		assert.equal(first!.declinedWith, "replied in text");
 		assert.equal((first!.ours!.handoff.details as HandoffDetails).note, undefined);
 	});
 
@@ -219,5 +233,50 @@ describe("replaying a session", () => {
 		if ("problem" in short) throw new Error(short.problem);
 		const tooShort = await replaySession(short, "short", routed().deps);
 		assert.match(tooShort.skipped ?? "", /too short for a chain of two cuts/);
+	});
+});
+
+describe("a replay call", () => {
+	const ask = { messages: [{ role: "user" as const, content: "Go on.", timestamp: 0 }] } as Context;
+
+	it("is relayed as the provider streams it", async () => {
+		const clock = fakeClock();
+		const model = scriptModel({ text: "Carrying on." });
+		const reply = await guardCall(model.stream, clock)(MODEL, ask).result();
+		assert.equal(reply.stopReason, "stop");
+		assert.deepEqual(reply.content, [{ type: "text", text: "Carrying on." }]);
+		assert.ok(model.calls[0]!.options?.signal, "the provider is handed a signal to abort on");
+	});
+
+	it("fails, and aborts the provider, once nothing has streamed for a minute", async () => {
+		const clock = fakeClock();
+		const model = scriptModel({ stall: true });
+		const events = guardCall(model.stream, clock)(MODEL, ask);
+		clock.advance(CALL_STALL_MS - 1);
+		let settled = false;
+		void events.result().then(() => (settled = true));
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(settled, false, "a call still inside the stall timeout goes on");
+		clock.advance(1);
+		const reply = await events.result();
+		assert.equal(reply.stopReason, "error");
+		assert.match(reply.errorMessage ?? "", /streamed nothing for 60s/);
+		assert.equal(model.calls[0]!.options?.signal?.aborted, true);
+	});
+
+	it("fails once it has run ten minutes, however much it streams", async () => {
+		const clock = fakeClock();
+		const model = scriptModel({ text: "…", paced: true });
+		const events = guardCall(model.stream, clock)(MODEL, ask);
+		await new Promise((resolve) => setImmediate(resolve));
+		for (let ms = 0; ms < CALL_CAP_MS; ms += 30_000) {
+			model.chunk();
+			await new Promise((resolve) => setImmediate(resolve));
+			clock.advance(30_000);
+		}
+		const reply = await events.result();
+		assert.equal(reply.stopReason, "error");
+		assert.match(reply.errorMessage ?? "", /ran past 10 minutes/);
+		assert.equal(model.calls[0]!.options?.signal?.aborted, true);
 	});
 });
