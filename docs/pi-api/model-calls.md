@@ -28,12 +28,16 @@ interface StreamOptions {
 
 - **Auth** is resolved at request time (`dist/core/model-runtime.js:497-521`); no API key needed.
   The stream is lazy (`pi-ai/dist/api/lazy.js:45-66`): missing auth or an unknown provider arrives as
-  an `error` event with `stopReason: "error"`, not as a throw. (pi-ai's own `streamSimple`, called
-  directly, does throw synchronously.)
+  an `error` event with `stopReason: "error"`, not as a throw. (Unverified: that pi-ai's own
+  `streamSimple`, called directly, throws synchronously. It does for an `api` with no registered
+  provider, `pi-ai/dist/compat.js:163-169`; for missing auth it depends on whether the provider is
+  wrapped by `lazyStream`.)
 - **A virtual model** is routed first, and `maxTokens` capped to the routed model's.
 - **No extension hooks run**: see [limits.md](limits.md).
-- **Other members:** `find(provider, modelId)` (`model-registry.d.ts:29`), `complete(...)` (the
-  same call, awaited to an `AssistantMessage`), `getApiKeyAndHeaders(model)` →
+- **Other members:** `find(provider, modelId)` (`model-registry.d.ts:29`), `complete(...)`
+  (`stream(...)` awaited to an `AssistantMessage`, `model-runtime.js:494-496`: it takes the
+  provider-specific `ModelsApiStreamOptions`, not `streamSimple`'s options, and `ModelRegistry` has
+  no `completeSimple`; await `streamSimple(...).result()` instead), `getApiKeyAndHeaders(model)` →
   `{ ok: true, apiKey?, headers?, baseUrl?, env? } | { ok: false, error }` (`:33`).
 
 ### What the agent's own request carries
