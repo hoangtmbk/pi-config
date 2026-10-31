@@ -12,7 +12,8 @@
  * can hand it a clock of its own. Nothing else here touches the world.
  */
 
-import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { JsonAgentSessionEvent, RpcExtensionUIRequest } from "@earendil-works/pi-coding-agent";
+import { type PressureStatus, parseStatus, STATUS_KEY } from "../compaction/status.ts";
 
 /**
  * Where a Run is in its lifecycle.
@@ -125,6 +126,20 @@ export interface Run {
 	 * a moment too short to be worth a line that says nothing.
 	 */
 	activity?: string;
+	/**
+	 * How full the child's context is, as its compaction extension last said:
+	 * a Pressure level and its count, or that a compaction is under way. Absent
+	 * below notice, and once the Run is done or failed.
+	 *
+	 * Display data and nothing else. It is read by the widget, the picker and the
+	 * Inspector, and never by anything that writes into the parent conversation:
+	 * a parent agent spending its own context on how full a Run's is would be
+	 * paying for something only a human watching can act on.
+	 *
+	 * A Waiting Run keeps it. Its child is alive and holding that context, and
+	 * the answer lands in it.
+	 */
+	pressure?: PressureStatus;
 	/**
 	 * The child's last assistant message, once the Run is done. Absent when the
 	 * child settled without saying anything.
@@ -280,6 +295,16 @@ export class Supervisor {
 		const record = this.byName.get(name);
 		if (!record || hasStopped(record.run.state)) return undefined;
 
+		// Read before anything else, because it is not one of the events the type
+		// lists: pi in RPC mode writes a child's `setStatus` on the same stream as
+		// an `extension_ui_request`. A cleared status, or one that isn't the
+		// codec's, is a Run below notice.
+		const request = pressureRequest(event);
+		if (request) {
+			record.run.pressure = parseStatus(request.statusText);
+			return undefined;
+		}
+
 		if (event.type === "message_end") {
 			if (isResultBearing(event.message)) record.lastAssistant = event.message;
 			else if (event.message.role === "user" && record.asked) this.overrule(record);
@@ -318,6 +343,9 @@ export class Supervisor {
 		} else {
 			record.run.state = "done";
 			record.run.stoppedAt = this.now();
+			// A finished Run's context is going away with its child, so how full it
+			// was is history, and a level left showing would read as a Run still alive.
+			record.run.pressure = undefined;
 			record.run.result = record.lastAssistant && assistantText(record.lastAssistant);
 			// The slot this Run was holding is free, so whatever has been queued
 			// longest starts now rather than when the parent next asks for anything.
@@ -426,6 +454,8 @@ export class Supervisor {
 		record.asked = undefined;
 		record.lastAssistant = undefined;
 		record.run.question = undefined;
+		// Its child's context is gone, or about to be: see the same line for a Run that is done.
+		record.run.pressure = undefined;
 		record.run.state = "failed";
 		record.run.stoppedAt = this.now();
 		record.run.failure = failure;
@@ -776,6 +806,22 @@ function activityOf(toolName: string, args: unknown): string {
 		if (typeof subject === "string" && subject.trim()) return `${toolName} ${subject.trim()}`;
 	}
 	return toolName;
+}
+
+/** The one `extension_ui_request` the parent reads: a child's compaction extension setting its status. */
+type PressureRequest = Extract<RpcExtensionUIRequest, { method: "setStatus" }>;
+
+/**
+ * The event as the child's compaction status, when that is what it is.
+ *
+ * Narrowed by hand, because the stream is typed as session events and this is
+ * not one. Only the compaction extension's key counts: a status some other
+ * extension of the child's sets says nothing about its context.
+ */
+function pressureRequest(event: JsonAgentSessionEvent): PressureRequest | undefined {
+	const request = event as unknown as Partial<PressureRequest>;
+	if (request.type !== "extension_ui_request" || request.method !== "setStatus" || request.statusKey !== STATUS_KEY) return undefined;
+	return request as PressureRequest;
 }
 
 /**

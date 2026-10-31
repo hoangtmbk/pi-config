@@ -29,7 +29,22 @@ import { spawnRun } from "../child.ts";
 import { registerSubagents } from "../index.ts";
 import { ASK_QUESTION_TOOL, type QuestionDetails, RUN_SLOTS } from "../supervisor.ts";
 // `started` is aliased: this file already has a `started` of its own, the children it must reap.
-import { AGENT_END, AGENT_START, asked, heard, queued, said, SETTLED, started as toolStarted } from "./child-events.ts";
+import {
+	AGENT_END,
+	AGENT_START,
+	asked,
+	compacted,
+	compactionEnded,
+	heard,
+	nudged,
+	pruned,
+	queued,
+	said,
+	SETTLED,
+	status,
+	started as toolStarted,
+	toast,
+} from "./child-events.ts";
 import { pidFrom, reaped } from "./processes.ts";
 
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -259,8 +274,9 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>, cliP
 	const tools: RegisteredTool[] = [];
 	const sent: SentMessage[] = [];
 	const handlers = new Map<string, Handler[]>();
+	const commands: RegisteredCommand[] = [];
 	const parent: Parent = { streaming: false };
-	const pi = recorder(parent, tools, sent, handlers);
+	const pi = recorder(parent, tools, sent, handlers, commands);
 
 	const control = registerSubagents(pi as unknown as ExtensionAPI, {
 		roster,
@@ -277,6 +293,7 @@ function fakeSession(roster: Roster = ROSTER, env?: Record<string, string>, cliP
 		subagentWait: requireTool(tools, "subagent_wait"),
 		subagentAnswer: requireTool(tools, "subagent_answer"),
 		control,
+		commands,
 		tools,
 		sent,
 		parent,
@@ -1702,6 +1719,131 @@ describe("subagents widget", () => {
 	});
 });
 
+describe("a Run's Pressure level", () => {
+	/** A session with one running Run whose child is inside `bash`, and the widget's line for it. */
+	async function busyRun() {
+		const session = stubbedSession();
+		await session.startSession();
+		await call(session.subagent, { agent: "scout", task: "look around" });
+		session.spawned[0].emit(toolStarted("bash"));
+		return { ...session, row: () => session.widgets.at(-1)?.lines?.[1] ?? "" };
+	}
+
+	it("starts the Run's row with its level and count once its child reports notice", async () => {
+		const { spawned, row } = await busyRun();
+
+		spawned[0].emit(status("ctx notice · 131k"));
+
+		assert.match(row(), /scout {2}notice 131k · running · bash/);
+	});
+
+	it("reads compacting while the child compacts, and goes back to its level after", async () => {
+		const { spawned, row } = await busyRun();
+		spawned[0].emit(status("ctx warning · 152k"));
+		assert.match(row(), /scout {2}warning 152k · running · bash/);
+
+		spawned[0].emit(status("ctx compacting"));
+		assert.match(row(), /scout {2}compacting │$/);
+
+		spawned[0].emit(status("ctx notice · 124k"));
+		assert.match(row(), /scout {2}notice 124k · running · bash/);
+	});
+
+	it("drops the level once the child clears its status, back below notice", async () => {
+		const { spawned, row } = await busyRun();
+		spawned[0].emit(status("ctx notice · 131k"));
+
+		spawned[0].emit(status(undefined));
+
+		assert.match(row(), /scout {2}running · bash │$/);
+	});
+
+	it("reads the status through the colour a child in RPC mode sends it in", async () => {
+		const { spawned, row } = await busyRun();
+
+		spawned[0].emit(status("\x1b[38;5;178mctx warning · 152k\x1b[39m"));
+
+		assert.match(row(), /scout {2}warning 152k · running · bash/);
+	});
+
+	it("ignores a status another of the child's extensions sets", async () => {
+		const { spawned, row } = await busyRun();
+		spawned[0].emit(status("ctx notice · 131k"));
+
+		spawned[0].emit(status(undefined, "git"));
+		spawned[0].emit(status("ctx warning · 152k", "git"));
+
+		assert.match(row(), /scout {2}notice 131k · running · bash/);
+	});
+
+	it("keeps a Waiting Run's level, whose child is still holding that context", async () => {
+		const { spawned, row } = await busyRun();
+		spawned[0].emit(status("ctx notice · 131k"));
+
+		spawned[0].emit(asked("Which auth module do you mean?"));
+		spawned[0].emit(SETTLED);
+
+		assert.match(row(), /scout {2}notice 131k · waiting/);
+	});
+
+	it("raises no toast for a Run's crossings, whatever its child tries to say", async () => {
+		const { spawned, notifications } = await busyRun();
+
+		spawned[0].emit(status("ctx notice · 131k"));
+		spawned[0].emit(status("ctx warning · 152k"));
+		spawned[0].emit(toast("Context at 152k (warning). The agent has been told it's a good time to compact; forced at 170k."));
+		spawned[0].emit(status("ctx compacting"));
+		spawned[0].emit(toast("Compaction used pi's default summary; the Handoff may be thinner."));
+		spawned[0].emit(status(undefined));
+
+		assert.deepEqual(notifications, []);
+	});
+
+	it("never tells the parent agent: not in a Delivery, a Question, or what a join returns", async () => {
+		const { subagent, subagentWait, subagentAnswer, sent, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		await call(subagent, { agent: "worker", task: "fix it" });
+		spawned[0].emit(status("ctx warning · 152k"));
+		spawned[1].emit(status("ctx notice · 131k"));
+		spawned[1].emit(asked("Which auth module do you mean?"));
+		spawned[1].emit(SETTLED);
+		const answered = await call(subagentAnswer, { name: "worker", answer: "src/auth.ts" });
+		spawned[1].emit(status("ctx compacting"));
+
+		const joining = call(subagentWait, { names: ["scout", "worker"] });
+		spawned[0].emit(said("Found three call sites."));
+		spawned[0].emit(SETTLED);
+		spawned[1].emit(said("Fixed."));
+		spawned[1].emit(SETTLED);
+		const joined = await joining;
+
+		const told = [...sent.map((message) => message.content), answered, joined];
+		assert.ok(told.length >= 3, `expected the Question, the answer and the join, got ${JSON.stringify(told)}`);
+		assert.match(joined, /Found three call sites/);
+		for (const text of told) assert.doesNotMatch(text, /notice|warning|compacting|1[35][12]k/);
+		// Nor in what a message carries along with its text.
+		assert.doesNotMatch(JSON.stringify(sent.map((message) => message.details)), /pressure|notice|warning|compacting/);
+	});
+
+	it("carries a real child's status all the way through the RPC stream", async () => {
+		const events = [
+			AGENT_START,
+			status("ctx notice · 131k"),
+			asked("Which auth module do you mean?"),
+			AGENT_END,
+			SETTLED,
+		];
+		const session = fakeSession(ROSTER, { FAKE_RPC_TURNS: JSON.stringify([events]) });
+		await session.startSession();
+
+		await call(session.subagent, { agent: "scout", task: "look around" });
+		await messageAt(session.sent);
+
+		assert.match(session.widgets.at(-1)?.lines?.[1] ?? "", /scout {2}notice 131k · waiting/);
+		await session.shutdown();
+	});
+});
+
 /** A turn held open until the child is steered — a Run still working when the user types. */
 const AWAIT_STEER = { type: "fake:await_steer" } as unknown as JsonAgentSessionEvent;
 
@@ -1831,6 +1973,35 @@ describe("steering a running Run", () => {
 		spawned[0].emit(SETTLED);
 
 		assert.deepEqual(notifications, []);
+	});
+
+	it("never takes the compaction extension's own steers for a human Steer the Run did not read", async () => {
+		const { subagent, control, sent, spawned, notifications, startSession } = stubbedSession();
+		await startSession();
+		await call(subagent, { agent: "scout", task: "one" });
+		await call(subagent, { agent: "worker", task: "two" });
+		await flush();
+		spawned[0].onSteer = (text) => spawned[0].emit(queued(text));
+
+		// One Run steered by the user and nudged towards Self-compaction around
+		// it; the other only nudged. Both compact and finish.
+		await control.send("scout", "Only the auth module, please.");
+		spawned[0].emit(nudged("notice"));
+		spawned[0].emit(queued());
+		spawned[0].emit(heard("Only the auth module, please."));
+		spawned[0].emit(nudged("warning"));
+		spawned[0].emit(compacted("## Plan\nFix auth.", 172_000));
+		spawned[0].emit(said("Only the auth module: three call sites."));
+		spawned[0].emit(SETTLED);
+		spawned[1].emit(nudged("notice"));
+		spawned[1].emit(nudged("warning"));
+		spawned[1].emit(compactionEnded("## Plan\nFix it.", 98_000));
+		spawned[1].emit(said("Fixed."));
+		spawned[1].emit(SETTLED);
+
+		assert.deepEqual(notifications, []);
+		assert.deepEqual(sent.map((message) => message.customType), ["subagent-steer", "subagent-delivery", "subagent-delivery"]);
+		for (const message of sent) assert.doesNotMatch(message.content, /never reached it|Self-compact/);
 	});
 
 	it("says why it could not reach a child that refused the steer, and tells the parent nothing", async () => {
@@ -2532,6 +2703,83 @@ describe("the /subagents command", () => {
 		assert.match(sent[0]?.content ?? "", /killed by the user/);
 		assert.match(after, /scout · scout · failed/);
 		assert.match(after, /A finished run is read-only/);
+	});
+
+	it("heads the Inspector with the Run's Pressure level, and with compacting while its child compacts", async () => {
+		const { subagent, commands, spawned } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "look around" });
+		spawned[0].emit(status("ctx warning · 152k"));
+		const screen = terminal();
+
+		const running = requireCommand(commands, "subagents").handler("", screen.ctx);
+		(await screen.overlay(0)).handleInput("\r");
+		const inspector = await screen.overlay(1);
+		const warned = drawn(inspector);
+		spawned[0].emit(status("ctx compacting"));
+		const compacting = drawn(inspector);
+		await closeAll(screen, 1, running);
+
+		assert.match(warned, /scout · scout · running · \d\d:\d\d · warning 152k/);
+		assert.match(compacting, /scout · scout · running · \d\d:\d\d · compacting/);
+	});
+
+	it("shows no level for a Run that is done or failed, whatever its child last said", async () => {
+		const { subagent, commands, spawned, control } = stubbedSession();
+		await call(subagent, { agent: "scout", task: "one" });
+		await call(subagent, { agent: "worker", task: "two" });
+		spawned[0].emit(status("ctx notice · 131k"));
+		spawned[1].emit(status("ctx warning · 152k"));
+		spawned[0].emit(said("Found it."));
+		spawned[0].emit(SETTLED);
+		await control.kill("worker");
+		// A stopped Run's child going on talking changes nothing about it.
+		spawned[0].emit(status("ctx notice · 140k"));
+		const screen = terminal();
+
+		const running = requireCommand(commands, "subagents").handler("", screen.ctx);
+		const picker = await screen.overlay(0);
+		const listed = drawn(picker, 80);
+		picker.handleInput("\r");
+		const inspector = drawn(await screen.overlay(1));
+		await closeAll(screen, 1, running);
+
+		assert.match(listed, /worker\s+failed · killed by the user/);
+		assert.match(listed, /scout\s+done/);
+		assert.doesNotMatch(listed, /notice|warning|1\d\dk/);
+		assert.doesNotMatch(inspector.split("\n")[0] ?? "", /notice|warning|1\d\dk/);
+	});
+
+	it("draws pi's compaction card wherever a real child compacted, collapsed, with what came before kept", async () => {
+		const events = [
+			AGENT_START,
+			...task("look around"),
+			said("Read the whole tree."),
+			nudged("warning"),
+			pruned("e3", "[pruned: 400 lines of output]"),
+			compacted("## Plan\nFix the token refresh.", 172_000),
+			said("Carrying on with the refresh."),
+			compactionEnded("## Plan\nShip the fix.", 98_000),
+			said("Found three call sites."),
+			AGENT_END,
+			SETTLED,
+		];
+		const session = fakeSession(ROSTER, { FAKE_RPC_TURNS: JSON.stringify([events]) });
+		await call(session.subagent, { agent: "scout", task: "look around" });
+		await messageAt(session.sent);
+		const screen = terminal();
+
+		const running = requireCommand(session.commands, "subagents").handler("", screen.ctx);
+		(await screen.overlay(0)).handleInput("\r");
+		const inspector = drawn(await screen.overlay(1));
+		await closeAll(screen, 1, running);
+		await session.shutdown();
+
+		assert.match(
+			inspector,
+			/look around[\s\S]*Read the whole tree\.[\s\S]*\[compaction\][\s\S]*Compacted from 172,000 tokens[\s\S]*Carrying on with the refresh\.[\s\S]*\[compaction\][\s\S]*Compacted from 98,000 tokens[\s\S]*Found three call sites\./,
+		);
+		assert.doesNotMatch(inspector, /Fix the token refresh|Ship the fix/, "each Handoff is behind expand");
+		assert.doesNotMatch(inspector, /pruned|Self-compact/, "neither Pruning nor the extension's steer is drawn");
 	});
 
 	it("keeps a stopped Run's transcript as it stopped: a reply cut off shows as cut off, and later words are not recorded", async () => {

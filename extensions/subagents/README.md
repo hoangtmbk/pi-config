@@ -183,6 +183,14 @@ Question's *text* is never here: it is already being delivered into the conversa
 fixed-height block would only truncate it. The whole thing is `hasUI`-guarded, so a `-p` or
 JSON-mode session gets no widget rather than widget lines in its output.
 
+A Run whose child loads the `compaction` extension reports its **Pressure level** too. From notice
+up, the row starts with it, `notice 131k · running · bash`, and while the child compacts the row
+reads just `compacting`. The child's footer status (`ctx notice · 131k`) reaches the parent as an
+RPC `extension_ui_request`, and is read with the compaction extension's own status codec. A
+cleared status removes the level, a Waiting Run keeps its last one, and a done or failed Run shows
+none. A Run's crossings raise no toast, and the level is display only: it never reaches a
+Delivery, a Question or what the `subagent` tools return.
+
 ## `/subagents`: watching and steering a Run
 
 The widget says *that* a Run is busy; `/subagents` shows *what* it is doing, and lets you talk to
@@ -194,7 +202,17 @@ keyboard shortcut for it.
 
 Choosing a Run opens the **Inspector**: that Run's live transcript, rendered the way the main chat
 renders — the same message components, and pi's own renderers for the built-in tools — with a
-header of `name · agent · state · elapsed` and an editor along the bottom.
+header of `name · agent · state · elapsed` (then `· warning 152k` from notice up, or
+`· compacting` while one runs) and an editor along the bottom.
+
+Where a Run compacted, the transcript shows pi's compaction card at that point, collapsed, with the
+Handoff behind ctrl+o, and keeps everything above it: unlike the main chat, which redraws itself
+from what the compaction kept, the Inspector is the record of what the Run did. The card comes from
+the child's `entry_appended` for a compaction drafted at a turn boundary, or its `compaction_end`
+for one on pi's hook paths (`/compact`, pi's threshold, overflow recovery). Pruning is not shown,
+and nor is the compaction extension's steer towards Self-compaction, which is a hidden custom
+message: it never enters the child's steering queue, so it is never mistaken for a Steer of yours
+that the Run did not read.
 
 | Where | Key | Does |
 |---|---|---|
@@ -204,7 +222,7 @@ header of `name · agent · state · elapsed` and an editor along the bottom.
 | Inspector | Enter | Send what is in the editor |
 | Inspector | Shift+Enter | New line |
 | Inspector | PgUp / PgDn | Scroll the transcript; at the bottom it follows the tail |
-| Inspector | ctrl+o | Expand or collapse tool output (collapsed by default) |
+| Inspector | ctrl+o | Expand or collapse tool output and compaction cards (collapsed by default) |
 | Inspector | ctrl+t | Show or hide thinking blocks |
 | Inspector | ctrl+x | Kill this Run, after a y/n confirmation |
 | Inspector | Esc | Back to the picker |

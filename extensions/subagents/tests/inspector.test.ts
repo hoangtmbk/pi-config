@@ -40,6 +40,7 @@ import {
 } from "../inspector.ts";
 import type { Run } from "../supervisor.ts";
 import { Transcripts } from "../transcript.ts";
+import { compacted, compactionEnded, pruned } from "./child-events.ts";
 
 // pi's message components draw with pi's global theme, which pi itself sets up
 // before any extension runs. Here nothing has, so it is set up once, by hand.
@@ -248,6 +249,14 @@ describe("what the Inspector says about a Run", () => {
 
 	it("heads the Inspector with the Run's name, Agent, state and age", () => {
 		assert.equal(inspectorHeader(run("scout-2", "running", 75, { agent: "scout" }), 0), "scout-2 · scout · running · 01:15");
+	});
+
+	it("ends the header with the Run's Pressure level from notice up, and with compacting while one runs", () => {
+		const warned = run("scout-2", "running", 75, { pressure: { level: "warning", tokens: 152_000 } });
+		const compacting = run("scout-2", "running", 75, { pressure: "compacting" });
+
+		assert.equal(inspectorHeader(warned, 0), "scout-2 · scout · running · 01:15 · warning 152k");
+		assert.equal(inspectorHeader(compacting, 0), "scout-2 · scout · running · 01:15 · compacting");
 	});
 });
 
@@ -523,6 +532,40 @@ describe("the Inspector, drawn", () => {
 		view.dispose();
 
 		assert.equal(lines.length, 36);
+	});
+
+	it("draws pi's compaction card where the Run compacted, collapsed, the history above it kept", () => {
+		const { view, emit, screen, press } = inspecting(undefined, { rows: 60 });
+		emit(
+			...settled(user("Find the auth module.")),
+			...settled(assistant([{ type: "text", text: "Read the whole tree." }])),
+			pruned("e3", "[pruned: 400 lines of output]"),
+			compacted("## Plan\nFix the token refresh in src/auth.ts.", 172_000),
+			...settled(assistant([{ type: "text", text: "Carrying on with the refresh." }])),
+		);
+
+		const collapsed = text(screen());
+		press(KEY.ctrlO);
+		const expanded = text(screen());
+		view.dispose();
+
+		assert.match(collapsed, /Find the auth module\.[\s\S]*Read the whole tree\.[\s\S]*\[compaction\][\s\S]*Carrying on with the refresh\./);
+		assert.match(collapsed, /Compacted from 172,000 tokens \(.* to expand\)/);
+		assert.doesNotMatch(collapsed, /token refresh in src\/auth\.ts/, "the Handoff is behind expand");
+		assert.match(expanded, /Compacted from 172,000 tokens/);
+		assert.doesNotMatch(expanded, /to expand/);
+		assert.match(expanded, /Fix the token refresh in src\/auth\.ts\./);
+		assert.doesNotMatch(expanded, /pruned/, "Pruning is not shown");
+	});
+
+	it("draws a compaction on pi's hook paths the same way", () => {
+		const { view, emit, screen } = inspecting();
+		emit(...settled(assistant([{ type: "text", text: "Read the whole tree." }])), compactionEnded("## Plan\nFix auth.", 98_000, "manual"));
+
+		const drawn = text(screen());
+		view.dispose();
+
+		assert.match(drawn, /Read the whole tree\.[\s\S]*\[compaction\][\s\S]*Compacted from 98,000 tokens/);
 	});
 
 	it("hides thinking and expands tool output on their keys", () => {

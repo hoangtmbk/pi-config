@@ -10,7 +10,9 @@
  * Not a `.test.ts` file, so `npm test` never runs it directly.
  */
 
-import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { JsonAgentSessionEvent, RpcExtensionUIRequest } from "@earendil-works/pi-coding-agent";
+import { STEER_TYPE } from "../../compaction/index.ts";
+import { STATUS_KEY } from "../../compaction/status.ts";
 import { ASK_QUESTION_TOOL, type QuestionDetails } from "../supervisor.ts";
 
 /** An assistant `message_end`, the event a result is read from. */
@@ -59,6 +61,94 @@ export function failed(toolName: string, message: string): JsonAgentSessionEvent
  */
 export function queued(...steering: string[]): JsonAgentSessionEvent {
 	return { type: "queue_update", steering, followUp: [] } as JsonAgentSessionEvent;
+}
+
+/**
+ * The child's compaction extension setting its footer status, as pi in RPC mode
+ * forwards it: an `extension_ui_request`, which is not one of the events
+ * `JsonAgentSessionEvent` lists but arrives on the same stream all the same.
+ * `undefined` is a cleared status: Context pressure back under notice.
+ *
+ * `key` is for a status some other extension of the child's set.
+ */
+export function status(text: string | undefined, key: string = STATUS_KEY): JsonAgentSessionEvent {
+	const request: RpcExtensionUIRequest = { type: "extension_ui_request", id: `status-${text}`, method: "setStatus", statusKey: key, statusText: text };
+	return request as unknown as JsonAgentSessionEvent;
+}
+
+/** The child's extension raising a toast, which pi in RPC mode forwards the same way. */
+export function toast(message: string, type: "info" | "warning" | "error" = "warning"): JsonAgentSessionEvent {
+	const request: RpcExtensionUIRequest = { type: "extension_ui_request", id: `notify-${message}`, method: "notify", message, notifyType: type };
+	return request as unknown as JsonAgentSessionEvent;
+}
+
+/**
+ * The child's compaction extension steering it towards Self-compaction: a
+ * custom message pi hands the agent as a steer, which comes back over the
+ * stream as a custom `message_end` and never as a `queue_update`.
+ */
+export function nudged(level: "notice" | "warning"): JsonAgentSessionEvent {
+	return {
+		type: "message_end",
+		message: { role: "custom", customType: STEER_TYPE, content: `Self-compact (${level}).`, display: false, details: { level }, timestamp: 0 },
+	} as unknown as JsonAgentSessionEvent;
+}
+
+/**
+ * A compaction drafted at a turn boundary, as pi commits it: the entry
+ * appended to the child's session, and nothing else — no `compaction_end`.
+ */
+export function compacted(summary: string, tokensBefore: number): JsonAgentSessionEvent {
+	return {
+		type: "entry_appended",
+		entry: {
+			type: "compaction",
+			id: `compaction-${tokensBefore}`,
+			parentId: "e1",
+			timestamp: "2026-10-31T00:00:00.000Z",
+			summary,
+			firstKeptEntryId: "e1",
+			tokensBefore,
+			details: { version: 1 },
+			fromHook: true,
+		},
+	} as unknown as JsonAgentSessionEvent;
+}
+
+/**
+ * A compaction on one of pi's hook paths — `/compact`, its threshold, its
+ * overflow recovery — which pi appends itself and reports only as the end of
+ * the compaction, with no `entry_appended`. `aborted` is one cancelled before
+ * it left anything behind.
+ */
+export function compactionEnded(
+	summary: string,
+	tokensBefore: number,
+	reason: "manual" | "threshold" | "overflow" = "threshold",
+	aborted = false,
+): JsonAgentSessionEvent {
+	return {
+		type: "compaction_end",
+		reason,
+		result: aborted ? undefined : { summary, firstKeptEntryId: "e1", tokensBefore, details: { version: 1 } },
+		aborted,
+		willRetry: reason === "overflow",
+	} as unknown as JsonAgentSessionEvent;
+}
+
+/** Pruning at a turn boundary: a `context_edit` entry pi commits the way it commits a compaction. */
+export function pruned(targetId: string, text: string): JsonAgentSessionEvent {
+	return {
+		type: "entry_appended",
+		entry: {
+			type: "context_edit",
+			id: `edit-${targetId}`,
+			parentId: "e1",
+			timestamp: "2026-10-31T00:00:00.000Z",
+			targetId,
+			replacement: { content: [{ type: "text", text }] },
+		},
+	} as unknown as JsonAgentSessionEvent;
 }
 
 function toolExecutionEnd(toolName: string, result: unknown, isError: boolean): JsonAgentSessionEvent {

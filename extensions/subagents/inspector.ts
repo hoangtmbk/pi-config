@@ -29,6 +29,7 @@
 
 import {
 	AssistantMessageComponent,
+	CompactionSummaryMessageComponent,
 	createBashToolDefinition,
 	createEditToolDefinition,
 	createFindToolDefinition,
@@ -59,7 +60,7 @@ import {
 import type { RunControl, SendOutcome } from "./control.ts";
 import type { Run } from "./supervisor.ts";
 import type { AgentMessage, AssistantMessage, ToolExecution, Transcripts, TranscriptSnapshot } from "./transcript.ts";
-import { age, clip, oneLine, runRows } from "./widget.ts";
+import { age, clip, oneLine, pressureLabel, runRows } from "./widget.ts";
 
 /** What the picker and the Inspector read, and act through. */
 export interface InspectorSession {
@@ -332,9 +333,17 @@ export function packHints(hints: readonly string[], width: number): string[] {
 	return lines;
 }
 
-/** The Inspector's header: which Run, of which Agent, where it is, and for how long. */
+/**
+ * The Inspector's header: which Run, of which Agent, where it is, for how long,
+ * and, from notice up, how full its context is.
+ *
+ * The level goes last, after the parts every Run has, so a header without one
+ * reads exactly as it always did.
+ */
 export function inspectorHeader(run: Run, now: number): string {
-	return [oneLine(run.name), run.agent, run.state, age(run, now)].join(DOT);
+	const parts = [oneLine(run.name), run.agent, run.state, age(run, now)];
+	if (run.pressure) parts.push(pressureLabel(run.pressure));
+	return parts.join(DOT);
 }
 
 /**
@@ -440,7 +449,7 @@ interface DrawnTool {
  * component from first token to last rather than being rebuilt per token. What
  * is drawn follows pi's chat exactly — a user message, an assistant message
  * followed by a component per tool call, a tool's result shown inside its call
- * rather than as a message of its own.
+ * rather than as a message of its own, a compaction as pi's compaction card.
  */
 class TranscriptView {
 	readonly root = new Container();
@@ -450,7 +459,8 @@ class TranscriptView {
 	private drawn = 0;
 	private streaming?: AssistantMessageComponent;
 	private readonly assistants: AssistantMessageComponent[] = [];
-	private readonly customs: CustomMessageComponent[] = [];
+	/** Everything drawn collapsed behind the expand key that is not a tool: custom messages and compaction cards. */
+	private readonly expandables: (CustomMessageComponent | CompactionSummaryMessageComponent)[] = [];
 	private readonly tools = new Map<string, DrawnTool>();
 	private readonly renderers = new Map<string, ToolRenderer>();
 	private expanded = false;
@@ -512,7 +522,7 @@ class TranscriptView {
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
 		for (const tool of this.tools.values()) tool.component.setExpanded(expanded);
-		for (const custom of this.customs) custom.setExpanded(expanded);
+		for (const expandable of this.expandables) expandable.setExpanded(expanded);
 	}
 
 	/** Hide or show every thinking block, and every one drawn from here on. */
@@ -528,7 +538,7 @@ class TranscriptView {
 		this.drawn = 0;
 		this.streaming = undefined;
 		this.assistants.length = 0;
-		this.customs.length = 0;
+		this.expandables.length = 0;
 		this.tools.clear();
 	}
 
@@ -555,15 +565,27 @@ class TranscriptView {
 				if (!message.display) return;
 				const component = new CustomMessageComponent(message, undefined, getMarkdownTheme());
 				component.setExpanded(this.expanded);
-				this.customs.push(component);
+				this.expandables.push(component);
+				this.root.addChild(component);
+				return;
+			}
+			case "compactionSummary": {
+				// pi's compaction card, with the Handoff behind the same key as tool
+				// output, as in pi's chat. Drawn below what came before rather than in
+				// place of it: pi's chat redraws itself from the compacted context, but
+				// a Run's transcript is the record of what it did.
+				if (!this.isEmpty()) this.root.addChild(new Spacer(1));
+				const component = new CompactionSummaryMessageComponent(message, getMarkdownTheme());
+				component.setExpanded(this.expanded);
+				this.expandables.push(component);
 				this.root.addChild(component);
 				return;
 			}
 			default:
 				// A tool result is drawn inside its call, from `tools`, the way pi's own
 				// chat draws it. The other kinds are pi's bookkeeping around a
-				// conversation — a `!` command, a summary — rather than anything a Run's
-				// child is asked or says.
+				// conversation — a `!` command, a branch summary — rather than anything a
+				// Run's child is asked or says.
 				return;
 		}
 	}
