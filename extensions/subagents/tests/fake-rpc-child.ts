@@ -40,6 +40,12 @@
  * still working when it is steered; without the marker, every steer lands on a
  * child that has already settled, which is the race a steer can lose.
  *
+ * A turn script can also hold a turn open with `{ "type": "fake:await_release" }`,
+ * until the process is sent SIGUSR2 (its pid is in `FAKE_RPC_PID_OUT`). That is a
+ * Run still working for as long as the test needs: without it, a turn settles
+ * the moment its prompt is acknowledged, so a `subagent_wait` placed next races
+ * the Run's own Delivery.
+ *
  * Not a `.test.ts` file, so `npm test` never runs it directly.
  */
 
