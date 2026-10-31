@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A new push supersedes a PR's run; every commit on main keeps its own result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          # pi 1.4 requires node >=22.19.0; @types/node is pinned to 22.
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # The same three steps as `npm run check`, split so a failure names its step.
+      - run: npm run typecheck
+      - run: npm run check:imports
+      - run: npm test
