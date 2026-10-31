@@ -17,7 +17,9 @@
     "themes": ["./themes"]
   },
   "scripts": {
-    "test": "tsx --test extensions/*/tests/*.test.ts",
+    "check": "npm run typecheck && npm run check:imports && npm test",
+    "check:imports": "tsx scripts/check-imports.ts",
+    "test": "tsx --test extensions/*/tests/*.test.ts scripts/tests/*.test.ts",
     "typecheck": "tsc --noEmit",
     "live:subagents": "tsx extensions/subagents/test.ts",
     "live:web-fetch": "tsx extensions/web-fetch/test.ts",
