@@ -307,11 +307,14 @@ async function laneCut(session: SessionManager, recording: Recording, cut: Plann
 	return { handoff, fileState: fileStateDiff(handoff, removed), retention: recurringDetailRetention(handoff, { removed, tail, after }), continuation };
 }
 
-/** The recording after the cut, up to and including the user turns a cut needs after it. */
+/** User turns after a cut the judge is shown, where the recording has them: more than a cut needs, so that a re-ask further on still shows. */
+const JUDGED_USER_TURNS = 3;
+
+/** The recording after the cut, up to and including its third user turn, or to its end. */
 function futureFor(recording: Recording, end: number): AgentMessage[] {
 	const future = seenIn(recording.branch.slice(end + 1));
 	let users = 0;
-	const upTo = future.findIndex((message) => message.role === "user" && ++users === USER_TURNS_AFTER);
+	const upTo = future.findIndex((message) => message.role === "user" && ++users === JUDGED_USER_TURNS);
 	return upTo < 0 ? future : future.slice(0, upTo + 1);
 }
 
@@ -352,7 +355,7 @@ export async function replaySession(recording: Recording, name: string, deps: Re
 	const settings = { ...deps.settings, compaction: { ...compaction, enabled: true, keepRecentTokens: keep, reserveTokens: reserve } };
 
 	const plan = planCuts(boundaries, { kinds: deps.kinds, gap: keep });
-	if (plan.length === 0) return { name, model: key(sessionModel), skipped: `it is too short for a chain of two cuts, ${keep} tokens apart, with ${USER_TURNS_AFTER} user turns after the last`, cuts: [] };
+	if (plan.length === 0) return { name, model: key(sessionModel), skipped: `it is too short for a chain of two cuts, ${keep} tokens apart, with ${USER_TURNS_AFTER === 1 ? "a user turn" : `${USER_TURNS_AFTER} user turns`} after the last`, cuts: [] };
 	const unreachable = plan.map((cut) => cut.boundary.model).find((model) => !deps.findModel(model.provider, model.id));
 	if (unreachable) return { name, model: key(unreachable), skipped: `its model ${key(unreachable)} can't be reached`, cuts: [] };
 

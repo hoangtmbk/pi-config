@@ -99,8 +99,8 @@ describe("planning a chain of cuts", () => {
 		]);
 	});
 
-	it("leaves a removed span of at least the gap before each cut, and three user turns after it", () => {
-		const boundaries = [at("mid-run", 1_500), at("mid-run", 2_200), at("mid-run", 2_900), at("mid-run", 3_300), at("mid-run", 4_400), at("mid-run", 9_000, 2)];
+	it("leaves a removed span of at least the gap before each cut, and a user turn after it", () => {
+		const boundaries = [at("mid-run", 1_500), at("mid-run", 2_200), at("mid-run", 2_900), at("mid-run", 3_300), at("mid-run", 4_400), at("mid-run", 9_000, 0)];
 		assert.deepEqual(plan(boundaries, ["forced", "forced", "forced"]), [
 			{ tokens: 2_200, kind: "forced", requested: "forced" },
 			{ tokens: 3_300, kind: "forced", requested: "forced" },

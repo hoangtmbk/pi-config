@@ -399,7 +399,7 @@ to, so that transcripts never reach the repo:
   really had: mid-run, as Self-compaction after the extension's real steer (the agent's own
   `self_compact` note goes to the Handoff; an agent that doesn't compact when steered is compacted as
   forced, and the report says so) or as forced; and just before a user message, as `/compact`. The
-  kinds rotate across sessions, every cut has at least three recorded user turns after it, and each
+  kinds rotate across sessions, every cut has at least one recorded user turn after it (the judge sees up to three), and each
   removes at least `keepRecentTokens`.
 - **Two lanes** (`replay-session.ts`): the extension, through the same fake pi the offline suite
   drives, and pi's own `compact`, with no extension, chained on its own summaries. Both run on the
