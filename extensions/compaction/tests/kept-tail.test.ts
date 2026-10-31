@@ -1,8 +1,10 @@
 /**
- * Kept-tail Pruning: at a compaction, superseded reads in the tail it keeps
- * are replaced with the same one-line marker the notice batch writes, with no
- * minimum gain — the cache is cold after a compaction anyway. The rest of the
- * tail stays verbatim.
+ * Kept-tail Pruning: at a compaction on the boundary path (forced and
+ * Self-compaction), superseded reads in the tail it keeps are replaced with
+ * the same one-line marker the notice batch writes, with no minimum gain — the
+ * cache is cold after a compaction anyway. The rest of the tail stays verbatim.
+ * A compaction through `session_before_compact` (`/compact`, pi's backstop)
+ * prunes nothing in the tail and stores nothing for later (#43).
  *
  * Driven only through the recording fake pi, with the model call scripted and
  * the pruned-copy folder a temp dir: a test builds a session out of turns,
@@ -159,6 +161,36 @@ describe("at a forced compaction", () => {
 		assert.ok(compaction && !kept(pi, compaction.firstKeptEntryId!, removed), "the old read is in the removed span");
 		assert.deepEqual(drafts.map((draft) => draft.type), ["compaction"]);
 	});
+});
+
+describe("at a compaction through `session_before_compact`", () => {
+	/** A tool result's text as the session's projection hands it to the model. */
+	function seen(pi: Pi, id: string): string | undefined {
+		const message = pi.session.buildSessionProjection().entries.find((e) => e.sourceEntry.id === id)?.messages[0];
+		return message?.role === "toolResult" && message.content[0]?.type === "text" ? message.content[0].text : undefined;
+	}
+
+	for (const reason of ["manual", "threshold"] as const) {
+		it(`(${reason === "manual" ? "/compact" : "pi's backstop"}) leaves the kept tail as it is, and prunes none of it at the next turn_end`, async () => {
+			const pi = compacting();
+			await asks(pi);
+			// The superseded read the boundary path prunes at a forced compaction.
+			const first = await turn(pi, "read", { path: "src/a.ts" }, output(2_000, "a.ts v1"));
+			await turn(pi, "read", { path: "src/a.ts" }, output(2_000, "a.ts v2"));
+
+			const done = await pi.compact({ reason });
+			assert.ok(done?.entryId, "pi took our compaction");
+			assert.ok(kept(pi, done.preparation.firstKeptEntryId, first), "the first read is in the kept tail");
+			assert.equal(seen(pi, first), output(2_000, "a.ts v1"));
+			assert.deepEqual(readdirSync(pi.dir), []);
+
+			// Below notice, where no notice batch runs: nothing stored is drafted now.
+			assert.deepEqual(await pi.turnEnd({ tokens: 50_000 }), []);
+			assert.equal(seen(pi, first), output(2_000, "a.ts v1"));
+			assert.deepEqual(readdirSync(pi.dir), []);
+			assert.deepEqual(pi.errors, []);
+		});
+	}
 });
 
 describe("the drafts", () => {

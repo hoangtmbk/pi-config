@@ -12,8 +12,7 @@ without summarizing it, and the **Handoff** is what stands in for the span a com
 > **Work in progress.** What is here today is the Pressure levels, the footer status, the
 > steers, the notice Pruning batch, forced compaction and Self-compaction at the turn boundary
 > with kept-tail Pruning, and our Handoff on every compaction, with its Constraint ledger, written
-> by the forked call, serialized mode or pi's summarizer. Kept-tail Pruning on the hook path is
-> still to come. The extension is not in the package's
+> by the forked call, serialized mode or pi's summarizer. The extension is not in the package's
 > `pi.extensions` until the Handoff has passed its replay check; until then load it by hand:
 >
 > ```bash
@@ -209,8 +208,12 @@ straight after, its next request built from the Handoff and the kept tail.
   pruned too, with no minimum gain: superseded reads only, with the same rules, marker, saved copy
   and edit checks as the notice batch. The rest of the tail stays verbatim — old bulk included —
   and nothing in the removed span is edited. Copies are saved only once the Handoff is written.
-  The notice batch never runs at a boundary where a compaction lands. On the hook path pi takes no
-  drafts from `session_before_compact`, so the kept tail is not pruned there (#43).
+  The notice batch never runs at a boundary where a compaction lands. This is boundary-path only
+  (forced and Self-compaction): `/compact` and pi's backstop do no kept-tail Pruning and store
+  nothing for later ([#43](https://github.com/hoangtmbk/pi-config/issues/43)). pi takes no drafts
+  from `session_before_compact`, and deferring the edits to the next `turn_end` would cost a cache
+  miss of its own, since the first request after the compaction has already rebuilt the cache.
+  That tail is pruned at the next notice batch or the next boundary compaction.
 - **A sunk compaction is re-drafted once.** pi drops every draft at a boundary when any one of them
   won't replay, so another extension's bad draft sinks ours with it. The next boundary sees that no
   compaction landed (ours carries its `compactionNo`, so our previous one doesn't pass for it) and
