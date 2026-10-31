@@ -84,7 +84,7 @@ export interface Turn {
 	 * model, or a model with no window). Leave it out to keep the last reading.
 	 */
 	tokens?: number | null;
-	/** The turn's assistant message. Defaults to one that called a tool, so the run goes on. */
+	/** The turn's assistant message. Defaults to one that called a tool, so the prompt goes on. */
 	message?: AssistantMessage;
 	/**
 	 * The turn's tool results. Defaults to what pi would record: a call to a
@@ -112,6 +112,8 @@ export interface FakeSetup {
 	session?: SessionManager;
 	/** Defaults to "medium". */
 	thinkingLevel?: ExtensionContext["thinkingLevel"];
+	/** `ctx.cwd`, the project pi runs in. Defaults to "/work". */
+	cwd?: string;
 }
 
 /** How a compaction reaches `session_before_compact`: `/compact`, or pi's own backstop. */
@@ -173,13 +175,13 @@ export function assistant(content: AssistantMessage["content"], stopReason: Stop
 	};
 }
 
-/** A turn that called a tool: the run goes on after its boundary. */
+/** A turn that called a tool: the prompt goes on after its boundary. */
 export function calling(name = "bash", args: Record<string, unknown> = { command: "ls" }): AssistantMessage {
 	const call: ToolCall = { type: "toolCall", id: `call-${++calls}`, name, arguments: args as ToolCall["arguments"] };
 	return assistant([call], "toolUse");
 }
 
-/** A turn that answered in text and called nothing: the boundary that ends the run. */
+/** A turn that answered in text and called nothing: the boundary that ends the prompt. */
 export function said(text = "Done."): AssistantMessage {
 	return assistant([{ type: "text", text }], "stop");
 }
@@ -231,14 +233,15 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 	/** What each `turn_end` came back with after the whole chain, oldest first. */
 	const boundaries: SessionBoundaryDraft[][] = [];
 
-	const session = setup.session ?? SessionManager.inMemory("/work");
+	const cwd = setup.cwd ?? "/work";
+	const session = setup.session ?? SessionManager.inMemory(cwd);
 	const state = {
 		settings: setup.settings ?? {},
 		model: setup.model ?? MODEL,
 		mode: setup.mode ?? "tui",
 		/** What `ctx.getContextUsage()` returns next. */
 		usage: undefined as ContextUsage | undefined,
-		/** The run in progress: its signal is `ctx.signal`, and Escape aborts it. */
+		/** The prompt in progress: its signal is `ctx.signal`, and Escape aborts it. */
 		run: new AbortController(),
 		/** The hook compaction in progress: its signal is `session_before_compact`'s, and Escape aborts it. */
 		compacting: undefined as AbortController | undefined,
@@ -291,7 +294,7 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 			ui,
 			mode: state.mode,
 			hasUI: state.mode === "tui" || state.mode === "rpc",
-			cwd: "/work",
+			cwd,
 			sessionManager: session,
 			model: state.model,
 			thinkingLevel: state.thinkingLevel,
@@ -331,8 +334,8 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 	}
 
 	/**
-	 * One tool call, run the way pi's agent loop runs it: while the run streams,
-	 * with the run's signal, a throw recorded as an errored result.
+	 * One tool call, run the way pi's agent loop runs it: while the prompt streams,
+	 * with the prompt's signal, a throw recorded as an errored result.
 	 */
 	async function execute(call: ToolCall): Promise<ToolResultMessage> {
 		const tool = tools.find((t) => t.name === call.name);
@@ -486,7 +489,7 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 		});
 		if (!preparation) return undefined;
 		const reason = how.reason ?? "manual";
-		// `/compact` aborts the run before the hook; the backstop runs between turns.
+		// `/compact` aborts the prompt before the hook; the backstop runs between turns.
 		if (reason === "manual") state.run.abort();
 		state.compacting = new AbortController();
 		const event = {
@@ -543,11 +546,11 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 		},
 		/** Set what pi will report as Context pressure from now on. */
 		pressure: setTokens,
-		/** Escape: abort the run in progress. Its next boundary is an aborted one. */
+		/** Escape: abort the prompt in progress. Its next boundary is an aborted one. */
 		escape(): void {
 			state.run.abort();
 		},
-		/** Start a new run, with a signal of its own, the way a new prompt does. */
+		/** Start a new prompt, with a signal of its own, as the user's next message does. */
 		async startRun(): Promise<void> {
 			state.run = new AbortController();
 			state.turnIndex = 0;

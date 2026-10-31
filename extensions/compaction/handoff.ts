@@ -346,7 +346,7 @@ export interface HandoffRequest {
 	focus?: string;
 	/** The agent's own note, on Self-compaction. */
 	note?: string;
-	/** The path's own abort signal. On the hook path that is the event's, not the run's. */
+	/** The path's own abort signal. On the hook path that is the event's, not the prompt's. */
 	signal: AbortSignal | undefined;
 }
 

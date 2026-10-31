@@ -25,7 +25,7 @@
  * steer, and asks the session's model what it does next; if it calls
  * `self_compact`, its own note goes to the Handoff, and if it doesn't, the cut
  * compacts as forced and says so. A cut before a user message is `/compact`,
- * through pi's hook, once the run has ended. The recording is only ever read:
+ * through pi's hook, once the prompt has ended. The recording is only ever read:
  * every session here is in memory.
  */
 
@@ -164,7 +164,7 @@ interface Lanes {
 
 /**
  * Replay the recorded entries in `[from, to)` into both lanes. In ours, a
- * user's message starts a run, as a prompt does, and each recorded turn is its
+ * user's message starts a prompt, as in pi, and each recorded turn is its
  * `turn_end`, with pressure under notice, its drafts committed as pi would.
  */
 async function replay(lanes: Lanes, branch: readonly SessionEntry[], from: number, to: number): Promise<void> {

@@ -8,8 +8,8 @@
  * - A recording is one session file read into its active branch, without
  *   touching the file: pi's in-memory `SessionManager`, never one that persists.
  * - A cut sits at a turn boundary the recording really had: mid-run, after a
- *   turn whose tool calls the run went on from, or just before a user message,
- *   after the turn that ended a run. Each cut needs at least three user turns
+ *   turn whose tool calls the prompt went on from, or just before a user message,
+ *   after the turn that ended a prompt. Each cut needs at least three user turns
  *   recorded after it, so that there is a future to compare with; a session
  *   is cut two or three times in a chain.
  *
@@ -161,9 +161,9 @@ function messageOf(entry: SessionEntry | undefined): AgentMessage | undefined {
  * Every turn boundary in the recording a cut could sit at, oldest first.
  *
  * - Mid-run: after a turn that called tools, every call answered, where the
- *   run went on — the next message is the agent's again, not the user's.
+ *   prompt went on — the next message is the agent's again, not the user's.
  * - Before a user message: after a turn that answered in text and ended the
- *   run, where the user spoke next.
+ *   prompt, where the user spoke next.
  *
  * A turn cut short or failed is no boundary, and nor is anything at or before
  * the newest compaction the recording has: a replayed chain is the

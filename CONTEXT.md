@@ -28,7 +28,8 @@ _Avoid_: local agents, repo agents, workspace scope
 
 **Run**:
 One execution of an agent: a single child pi process carrying out one delegated task, with its
-own identity, lifecycle and transcript. Many runs can share one agent.
+own identity, lifecycle and transcript. Many runs can share one agent. Not pi's own run of one
+prompt's turns, up to the agent settling: call that a *prompt* ("disarmed until the next prompt").
 _Avoid_: subagent (when you mean the execution), job, task, invocation
 
 **Supervisor**:

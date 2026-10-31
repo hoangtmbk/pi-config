@@ -173,14 +173,14 @@ function read(text: string) {
 const READ = { name: "read", arguments: { path: "src/a.ts" } };
 
 describe("the turn boundaries a recording offers", () => {
-	it("are mid-run after a turn the run went on from, and before a user message after the turn that ended a run", () => {
+	it("are mid-run after a turn the prompt went on from, and before a user message after the turn that ended a prompt", () => {
 		const recording = read(
 			recorder()
 				.system()
 				.user("Add retries.")
-				.turn([READ]) // 2, 3: the run goes on
-				.turn([READ, READ]) // 4, 5, 6: the run goes on
-				.say("Done.") // 7: the run ends, and the user speaks next
+				.turn([READ]) // 2, 3: the prompt goes on
+				.turn([READ, READ]) // 4, 5, 6: the prompt goes on
+				.say("Done.") // 7: the prompt ends, and the user speaks next
 				.user("Now the tests.")
 				.say("Which ones?") // 9
 				.user("The unit tests.")

@@ -456,7 +456,7 @@ describe("on the boundary path", () => {
 		pi.session.appendMessage(user(RULES));
 		await pi.turnEnd({ message: said("On it.") });
 		await compact(pi, "the retry path");
-		// `/compact` ended the run; the next prompt starts one.
+		// `/compact` ended the prompt; the next message starts another.
 		await pi.startRun();
 		pi.session.appendMessage(user("Go on."));
 		// Well under warning after the first compaction, so that forcing isn't paused.

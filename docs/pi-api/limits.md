@@ -7,7 +7,7 @@ can't be met as written.
 
 ## Settings edits don't reach a running session
 
-*Parked #34.* `pi.getSettings()` returns `structuredClone(this.settings)`
+*Decided in #34: applies after `/reload` or a restart.* `pi.getSettings()` returns `structuredClone(this.settings)`
 (`dist/core/settings-manager.js:329-331`), and `this.settings` is rebuilt only in the constructor, on
 a trust change (`:341-361`), in `reload()` (`:362-387`) and by pi's own setters. Nothing watches the
 file. `reload()` runs from `/reload` (`AgentSession.reload`, `dist/core/agent-session.js:2998-3010`),
@@ -20,7 +20,7 @@ still come from pi's stale copy, so the two can disagree.
 
 ## Outside a boundary, an extension can't append context edits or compactions
 
-*Parked #43.* Only the actionable boundaries, `turn_end` and `agent_before_settle`, accept drafts
+*Decided in #43: no kept-tail Pruning on `/compact` or pi's backstop.* Only the actionable boundaries, `turn_end` and `agent_before_settle`, accept drafts
 (`custom`, `custom_message`, `context_edit`, `compaction`; see [events.md](events.md#drafts)).
 Everywhere else:
 
@@ -40,7 +40,7 @@ from the next `turn_end`, re-checked against the branch then.
 
 ## An extension's working-row text never shows during a pi compaction
 
-*Parked #35.* `ctx.ui.setWorkingMessage` changes the live indicator only while it is the `"working"`
+*Decided in #35: working-row text on the boundary path only.* `ctx.ui.setWorkingMessage` changes the live indicator only while it is the `"working"`
 kind (`dist/modes/interactive/interactive-mode.js:2059-2064`). On `compaction_start`, which fires
 before `session_before_compact` on `/compact`, threshold and overflow alike, pi swaps in its own
 `CompactionStatusIndicator` (`interactive-mode.js:2930-2945`) with fixed text: `Compacting

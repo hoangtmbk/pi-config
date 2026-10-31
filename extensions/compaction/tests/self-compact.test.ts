@@ -1,6 +1,6 @@
 /**
  * Self-compaction: the `self_compact` tool, with which the agent compacts at a
- * natural break, from notice up, and carries on in the same run.
+ * natural break, from notice up, and carries on in the same prompt.
  *
  * Driven only through the recording fake pi, with the model call scripted: a
  * test builds a session out of turns, has the agent call `self_compact`, and
@@ -45,7 +45,7 @@ const HANDOFF = [
 ].join("\n");
 
 const COMPACTED = "Context compacted. The Handoff above carries the task; continue from its Next step.";
-const FAILED = "Compaction failed; carry on, and it will be retried at the forced level.";
+const FAILED = "Compaction failed; carry on with the task.";
 
 const NOTE ="Retries are wired into fetch.ts; next I run npm test and fix what fails.";
 
@@ -135,7 +135,7 @@ describe("the `self_compact` tool", () => {
 		assert.deepEqual(drafts, []);
 		assert.deepEqual(pi.notifications, [
 			{
-				message: "Compaction failed (Summarization failed: overloaded). Context will keep growing until the next run or pi's own compaction.",
+				message: "Compaction failed (Summarization failed: overloaded). Context will keep growing until your next message or pi's own compaction.",
 				type: "error",
 			},
 		]);
@@ -215,7 +215,7 @@ describe("the `self_compact` tool", () => {
 	});
 });
 
-describe("the run, after a Self-compaction", () => {
+describe("the prompt, after a Self-compaction", () => {
 	it("carries on from the Handoff and then the kept tail, which ends in its own self_compact call and result", async () => {
 		const { pi } = selfCompacting([{ text: HANDOFF }]);
 		await history(pi);
@@ -228,7 +228,7 @@ describe("the run, after a Self-compaction", () => {
 		assert.equal(answer.role, "toolResult");
 		assert.equal(answer.toolCallId, call.content[0]!.type === "toolCall" ? call.content[0]!.id : undefined);
 		assert.equal(answer.content[0].text, COMPACTED);
-		// The next boundary of the same run goes on as usual.
+		// The next boundary of the same prompt goes on as usual.
 		await pi.turnEnd({ tokens: 45_000 });
 		assert.equal(pi.status(), undefined);
 		assert.deepEqual(pi.errors, []);
@@ -306,7 +306,7 @@ describe("a Self-compaction its own boundary can't draft", () => {
 		assert.deepEqual(await pi.turnEnd({ tokens: 127_000 }), []);
 		assert.deepEqual(pi.notifications.filter((n) => n.type === "error"), [
 			{
-				message: "Compaction failed (pi dropped it, with another extension's invalid draft). Context will keep growing until the next run or pi's own compaction.",
+				message: "Compaction failed (pi dropped it, with another extension's invalid draft). Context will keep growing until your next message or pi's own compaction.",
 				type: "error",
 			},
 		]);

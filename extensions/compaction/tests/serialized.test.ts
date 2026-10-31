@@ -1,7 +1,7 @@
 /**
  * The serialized-mode writer: our instruction over a serialized transcript,
  * its reply parsed and checked, and every way it can fail falling through to
- * pi's summarizer without ever hanging the run.
+ * pi's summarizer without ever hanging the prompt.
  *
  * Driven only through the recording fake pi, with the model call scripted: a
  * test builds a session, compacts it the way pi would, and reads back the
@@ -394,7 +394,7 @@ describe("a stalled provider", () => {
 		assert.equal(done?.entryId, undefined);
 		assert.deepEqual(pi.notifications, [
 			{
-				message: "Compaction failed (the provider streamed nothing for 60s). Context will keep growing until the next run or pi's own compaction.",
+				message: "Compaction failed (the provider streamed nothing for 60s). Context will keep growing until your next message or pi's own compaction.",
 				type: "error",
 			},
 		]);
@@ -430,7 +430,7 @@ describe("on the boundary path", () => {
 		const [text] = request(model, 1).users as [string];
 		assert.match(text, /<conversation>\n\[User\]: Add retries to the fetcher\.[^]*\[User\]: Go ahead\.[^]*<\/conversation>/);
 		assert.match(text, /<kept-tail>\n\[Assistant\]: Wired it in\.\n<\/kept-tail>/);
-		// Writers stop on the run's own signal there.
+		// Writers stop on the prompt's own signal there.
 		assert.equal(model.calls[1]?.options?.signal?.aborted, false);
 	});
 
@@ -456,7 +456,7 @@ describe("when every writer fails", () => {
 		assert.deepEqual(pi.notifications, [
 			{
 				message:
-					"Compaction failed (Summarization failed: invalid_request_error: prompt is too long). Context will keep growing until the next run or pi's own compaction.",
+					"Compaction failed (Summarization failed: invalid_request_error: prompt is too long). Context will keep growing until your next message or pi's own compaction.",
 				type: "error",
 			},
 		]);

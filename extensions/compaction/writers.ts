@@ -100,7 +100,7 @@ export const SYSTEM_CLOCK: Clock = {
 export const STALL_MS = 60_000;
 
 /**
- * Run one writer's attempt so that a hung provider can't hang the run.
+ * Run one writer's attempt so that a hung provider can't hang the prompt.
  *
  * `work` makes its model calls through the `stream` it is handed. Every event
  * a call streams resets a 60s timer; if it fires, the call is aborted and the

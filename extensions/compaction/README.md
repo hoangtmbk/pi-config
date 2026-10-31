@@ -12,8 +12,7 @@ without summarizing it, and the **Handoff** is what stands in for the span a com
 > **Work in progress.** What is here today is the Pressure levels, the footer status, the
 > steers, the notice Pruning batch, forced compaction and Self-compaction at the turn boundary
 > with kept-tail Pruning, and our Handoff on every compaction, with its Constraint ledger, written
-> by the forked call, serialized mode or pi's summarizer. Kept-tail Pruning on the hook path is
-> still to come. The extension is not in the package's
+> by the forked call, serialized mode or pi's summarizer. The extension is not in the package's
 > `pi.extensions` until the Handoff has passed its replay check; until then load it by hand:
 >
 > ```bash
@@ -37,7 +36,7 @@ This builds on pi's compaction rather than replacing it
 |---|---|---|
 | notice | 120,000 | One Pruning batch, if it frees enough; then, unless that brought pressure back under notice, a muted footer status and one steer to the agent. |
 | warning | 150,000 | The status turns the warning colour, one steer to the agent, and one toast to the user. |
-| forced | 170,000 | Compaction at that turn boundary, without ending the run; see [Forced compaction](#forced-compaction). |
+| forced | 170,000 | Compaction at that turn boundary, without ending the prompt; see [Forced compaction](#forced-compaction). |
 
 The defaults can be changed, per model too, and shrink on a small window; see
 [Configuration](#configuration). Pressure is read at every `turn_end`, from `ctx.getContextUsage()`. Three rules decide what a
@@ -50,7 +49,7 @@ boundary does:
   past forced compacts, and gets no steer and no toast at all.
 - **A turn that didn't happen does nothing.** A turn the user aborted or the provider failed
   changes nothing and marks no level crossed — including the turn pi still ends as "completed"
-  when Escape lands while tools are running, which is caught by the run's abort signal rather
+  when Escape lands while tools are running, which is caught by the prompt's abort signal rather
   than the turn's outcome. A boundary with no reading (no model, or a compaction not yet answered)
   does nothing either.
 
@@ -95,9 +94,12 @@ read merged, with `pi.getSettings()`, at every `turn_end`:
   compaction will be forced. The extension has no on/off switch of its own.
 - **The kept tail** is pi's `compaction.keepRecentTokens`, resolved per model the way pi does, so
   `/compact`, pi's backstop and forced keep the same tail.
-- **When an edit takes effect.** pi reads `settings.json` into memory at startup and again on
-  `/reload`, not on every turn. The extension takes pi's settings as they stand at each turn, so a
-  change is what the next turn goes by once pi has it.
+- **When an edit takes effect.** An edit to `settings.json` mid-session applies after `/reload` or a
+  restart, not before. pi reads the file into memory only at startup and on `/reload`, and the
+  extension never reads the file itself: it takes pi's copy, through `pi.getSettings()`, at every
+  turn. So a change pi has taken in (at startup, on `/reload`, or through pi's own setters) is what
+  the next turn goes by, and the levels always come from the same copy as pi's own
+  `compaction.*`.
 
 The extension never writes pi's settings and adds nothing under `compaction.*`. Nothing is set per
 Agent or per Run.
@@ -147,10 +149,10 @@ They are deliberately calm: no token counts, nothing about running out or a limi
 forced, because pressure that reads as a deadline makes a model cut corners.
 
 A steer goes out with `deliverAs: "steer"`, so the agent takes it at its next turn boundary. The
-one exception is the boundary that ends the run: a steer queued there would make pi run one more
-turn just to answer it, so it is held with `deliverAs: "nextTurn"` and arrives with the user's next
-prompt. A steer that Escape clears from pi's queue unread is not sent again; the level still counts
-as crossed.
+one exception is the boundary that ends the prompt: a steer queued there would make pi run one
+more turn just to answer it, so it is held with `deliverAs: "nextTurn"` and arrives with the user's
+next prompt. A steer that Escape clears from pi's queue unread is not sent again; the level still
+counts as crossed.
 
 ## Pruning at notice
 
@@ -193,9 +195,9 @@ bulky tool output and superseded reads with a one-line marker pointing at a save
 
 ## Forced compaction
 
-At the first `turn_end` at or above forced — the turn that ends a run included, with no grace
+At the first `turn_end` at or above forced — the turn that ends a prompt included, with no grace
 period — the extension compacts at that boundary from `turn_end` (the **boundary path**). pi has
-already run and persisted every tool of the turn, so nothing is in flight, and the run goes on
+already run and persisted every tool of the turn, so nothing is in flight, and the prompt goes on
 straight after, its next request built from the Handoff and the kept tail.
 
 - **The cut** is pi's exported `findCutPoint` with pi's `keepRecentTokens`, fed the session's
@@ -209,8 +211,13 @@ straight after, its next request built from the Handoff and the kept tail.
   pruned too, with no minimum gain: superseded reads only, with the same rules, marker, saved copy
   and edit checks as the notice batch. The rest of the tail stays verbatim — old bulk included —
   and nothing in the removed span is edited. Copies are saved only once the Handoff is written.
-  The notice batch never runs at a boundary where a compaction lands. On the hook path pi takes no
-  drafts from `session_before_compact`, so the kept tail is not pruned there (#43).
+  The notice batch never runs at a boundary where a compaction lands. This is boundary-path only
+  (forced and Self-compaction): `/compact` and pi's backstop do no kept-tail Pruning and store
+  nothing for later ([#43](https://github.com/hoangtmbk/pi-config/issues/43)). pi takes no drafts
+  from `session_before_compact`, and deferring the edits to the next `turn_end` would cost a cache
+  miss of its own, since the first request after the compaction has already rebuilt the cache.
+  That tail is pruned at the next notice batch that clears its minimum, or the next boundary
+  compaction.
 - **A sunk compaction is re-drafted once.** pi drops every draft at a boundary when any one of them
   won't replay, so another extension's bad draft sinks ours with it. The next boundary sees that no
   compaction landed (ours carries its `compactionNo`, so our previous one doesn't pass for it) and
@@ -223,7 +230,7 @@ straight after, its next request built from the Handoff and the kept tail.
   guard** — once a compaction, on either path, leaves pressure at or above warning, a toast says
   so ("Compaction left context at 158k, still above warning. Forced compaction is paused until it
   drops.") and forcing waits until pressure is below warning; and every writer failing, which
-  disarms it for the rest of the run (an error toast says why) and re-arms it at the next run.
+  disarms it for the rest of the prompt (an error toast says why) and re-arms it at the next prompt.
   Escape during the writer chain stops it with no compaction and no toast, and leaves forced
   armed.
 - **What the user sees:** pi's working row reads `Compacting at 172k (forced) · pruning old tool
@@ -236,10 +243,10 @@ straight after, its next request built from the Handoff and the kept tail.
 ## Self-compaction
 
 The `self_compact` tool (exported as `SELF_COMPACT_TOOL`) lets the agent compact at a natural
-break, from notice up, and carry on in the same run with no user prompt. It is always declared, so
-the tool list never changes and the prompt cache holds. Its one required parameter is `note`:
-what the agent is doing and will do next, in its own words. There is no focus parameter, and the
-description says nothing about running out or a limit.
+break, from notice up, and carry on in the same prompt, with nothing from the user. It is always
+declared, so the tool list never changes and the prompt cache holds. Its one required parameter is
+`note`: what the agent is doing and will do next, in its own words. There is no focus parameter,
+and the description says nothing about running out or a limit.
 
 - **Below notice it refuses**, saying the context isn't large enough yet for a compaction to help.
 - **From notice up, `execute` compacts.** A tool can't append to the session, so it runs the same
@@ -255,9 +262,11 @@ description says nothing about running out or a limit.
   at the first that can; if pi drops it there, it is handled as every writer failing. One that
   someone else's compaction overtakes in the meantime is let go: the context was compacted.
 - **It returns one plain line**, with no token counts: "Context compacted. The Handoff above
-  carries the task; continue from its Next step." on success, and "Compaction failed; carry on,
-  and it will be retried at the forced level." when every writer fails (with the same error toast
-  and disarming as on any path) or when Escape stops it mid-write (no toast, forced still armed).
+  carries the task; continue from its Next step." on success, and "Compaction failed; carry on
+  with the task." when every writer fails (with the same error toast, and forced disarmed for the
+  rest of the prompt, as on any path) or when Escape stops it mid-write (no toast, forced still
+  armed). It promises no retry: after every writer failing, forced won't try again until the next
+  prompt.
 - **The note** opens the Handoff's Next step verbatim, labelled `Agent's note (verbatim)`, and the
   writer's instruction restates it and asks for the rest of Next step to agree with it, or say why
   it can't be followed. It lasts for that compaction only: it is not merged forward, and the next
@@ -323,7 +332,7 @@ with instructions, which supersedes it. The writer can't supersede it, and no ad
 
 The chain is the same on both paths. Writers are tried in order and the first to succeed writes the
 judgment part; each failed attempt goes into `details.attempts` with its reason. Writers stop on the
-run's signal on the boundary path and on the compaction's own on the hook path.
+prompt's signal on the boundary path and on the compaction's own on the hook path.
 
 - **The forked call** (`fork.ts`, ADR-0004) is the agent writing its own Handoff: a side request
   that sends the live conversation exactly as the next turn would, so it reads the warm prompt
@@ -356,9 +365,10 @@ run's signal on the boundary path and on the compaction's own on the hook path.
 
 Any writer's attempt fails after 60s with nothing streamed; there is no cap on a reply that keeps
 streaming, and no retry of our own. If every writer fails, nothing is compacted and an error toast
-reads "Compaction failed (<last error>). Context will keep growing until the next run or pi's own
-compaction." Escape stops the chain with no compaction and no toast. Only if our own code throws
-does pi fall back to its whole default.
+reads "Compaction failed (<last error>). Context will keep growing until your next message or pi's
+own compaction.", on every path, and forced is disarmed for the rest of the prompt. Escape stops
+the chain with no compaction and no toast. Only if our own code throws does pi fall back to its
+whole default.
 
 ## The replay check
 

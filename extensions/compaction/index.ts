@@ -9,7 +9,7 @@
  * stays on underneath as the backstop (ADR-0005).
  *
  * At forced, the extension compacts at that same boundary, without ending the
- * run: the boundary path. Self-compaction, the `self_compact` tool, takes the
+ * prompt: the boundary path. Self-compaction, the `self_compact` tool, takes the
  * same path at a break of the agent's choosing. Every compaction that reaches
  * `session_before_compact` — `/compact`, and pi's own threshold and overflow
  * backstop — is the hook path. Both get our Handoff instead of pi's summary (see `handoff.ts`).
@@ -84,7 +84,7 @@ const SelfCompactParams = Type.Object({
  */
 const SELF_COMPACT = {
 	compacted: "Context compacted. The Handoff above carries the task; continue from its Next step.",
-	failed: "Compaction failed; carry on, and it will be retried at the forced level.",
+	failed: "Compaction failed; carry on with the task.",
 	refused: "Not compacted: the context isn't large enough yet for a compaction to help. Carry on with the task; you'll be told when it's a good time.",
 };
 
@@ -168,10 +168,10 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 * Tell the agent, once. Escape may clear it from pi's queue unread; it is not
 	 * sent again, and the level stays crossed.
 	 *
-	 * A steer is taken at the next boundary — unless this boundary is the run's
-	 * last, where a queued steer would keep the run going for one more turn just
-	 * to answer it. There it waits for the next prompt instead: an agent that has
-	 * stopped is already at its natural break.
+	 * A steer is taken at the next boundary — unless this boundary is the
+	 * prompt's last, where a queued steer would keep the prompt going for one
+	 * more turn just to answer it. There it waits for the next prompt instead: an
+	 * agent that has stopped is already at its natural break.
 	 */
 	function steer(level: SteeredLevel, event: TurnEndEvent): void {
 		pi.sendMessage(
@@ -226,18 +226,18 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 
 	/**
 	 * Every writer failing, or what stands for it: nothing is compacted, the
-	 * user is told why, and forced is disarmed for the rest of the run.
+	 * user is told why, and forced is disarmed for the rest of the prompt.
 	 */
 	function giveUp(ctx: ExtensionContext, failure: Failure): void {
 		const why = typeof failure === "string" ? GIVE_UP[failure] : failure.lastError;
-		ctx.ui.notify(`Compaction failed (${why}). Context will keep growing until the next run or pi's own compaction.`, "error");
+		ctx.ui.notify(`Compaction failed (${why}). Context will keep growing until your next message or pi's own compaction.`, "error");
 		forced.disarm();
 	}
 
 	/**
 	 * What the user hears of a writer chain, on either path. Escape is silent.
 	 * Every writer failing is an error, and disarms forced for the rest of the
-	 * run, so that a chain that can't write isn't run again at every boundary;
+	 * prompt, so that a chain that can't write isn't run again at every boundary;
 	 * pi's own trigger stays as the backstop. Pi's summarizer having written
 	 * the judgment part is a warning: that Handoff may be thinner. Returns
 	 * whether there is a Handoff to compact with.
@@ -258,7 +258,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 * The cut is pi's own, so the tail kept is the same as pi's would be. The
 	 * removed span is what pi prepared — including, on a cut inside a turn, that
 	 * turn's start. Writers stop on the event's signal: `/compact` has already
-	 * aborted the run, and Escape here aborts the compaction, not the run.
+	 * aborted the prompt, and Escape here aborts the compaction, not the prompt.
 	 *
 	 * The forked call sends the branch as the model sees it, which is what the
 	 * next request would send — except on overflow, where that is exactly what
@@ -357,10 +357,10 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 * in the removed span would do nothing. Pruned copies are saved only once
 	 * there is a compaction for them to go out with.
 	 *
-	 * The run goes on streaming through it, so pi's working row is up, and says
-	 * what is happening until the chain is done. Writers stop on the run's own
-	 * signal — or the signal pi hands `self_compact`, which is the run's: Escape
-	 * here stops the run, and the compaction with it.
+	 * The prompt goes on streaming through it, so pi's working row is up, and
+	 * says what is happening until the chain is done. Writers stop on the
+	 * prompt's own signal — or the signal pi hands `self_compact`, which is the
+	 * prompt's: Escape here stops the prompt, and the compaction with it.
 	 *
 	 * `transcript` is what the forked call sends: the live context, as the
 	 * next request would. At a boundary that is the context pi previews there.
@@ -415,7 +415,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 
 	/**
 	 * Self-compaction: the agent compacts at a natural break, and carries on in
-	 * the same run. Always declared, so the tool list never changes and the
+	 * the same prompt. Always declared, so the tool list never changes and the
 	 * prompt cache holds; below notice it refuses, since a compaction there
 	 * gains little.
 	 *
@@ -425,7 +425,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 * happened. Escape mid-write is a failure, as is every writer failing, and
 	 * forced compaction tries again: after Escape at the next boundary at forced,
 	 * after every writer failing (which disarms it, as on any path) from the
-	 * next run.
+	 * next prompt.
 	 */
 	pi.registerTool({
 		name: SELF_COMPACT_TOOL,
@@ -465,7 +465,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		// as Escape lets go of one being written. The outcome alone misses half
 		// of an Escape: one that lands while tools run ends that turn as
 		// "completed", since the model had finished streaming, and only the turn
-		// after it comes back "aborted". The run's signal says it for both. A
+		// after it comes back "aborted". The prompt's signal says it for both. A
 		// Self-compaction already written still lands, though: the agent has been
 		// told it did, and a sibling call cut short doesn't make that untrue. On
 		// a turn that didn't complete at all, it is held for the next that does.
