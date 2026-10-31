@@ -112,6 +112,8 @@ export interface FakeSetup {
 	session?: SessionManager;
 	/** Defaults to "medium". */
 	thinkingLevel?: ExtensionContext["thinkingLevel"];
+	/** `ctx.cwd`, the project pi runs in. Defaults to "/work". */
+	cwd?: string;
 }
 
 /** How a compaction reaches `session_before_compact`: `/compact`, or pi's own backstop. */
@@ -231,7 +233,8 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 	/** What each `turn_end` came back with after the whole chain, oldest first. */
 	const boundaries: SessionBoundaryDraft[][] = [];
 
-	const session = setup.session ?? SessionManager.inMemory("/work");
+	const cwd = setup.cwd ?? "/work";
+	const session = setup.session ?? SessionManager.inMemory(cwd);
 	const state = {
 		settings: setup.settings ?? {},
 		model: setup.model ?? MODEL,
@@ -291,7 +294,7 @@ export function fakePi(setup: FakeSetup = {}, register: (pi: ExtensionAPI) => vo
 			ui,
 			mode: state.mode,
 			hasUI: state.mode === "tui" || state.mode === "rpc",
-			cwd: "/work",
+			cwd,
 			sessionManager: session,
 			model: state.model,
 			thinkingLevel: state.thinkingLevel,

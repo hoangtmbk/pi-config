@@ -94,9 +94,12 @@ read merged, with `pi.getSettings()`, at every `turn_end`:
   compaction will be forced. The extension has no on/off switch of its own.
 - **The kept tail** is pi's `compaction.keepRecentTokens`, resolved per model the way pi does, so
   `/compact`, pi's backstop and forced keep the same tail.
-- **When an edit takes effect.** pi reads `settings.json` into memory at startup and again on
-  `/reload`, not on every turn. The extension takes pi's settings as they stand at each turn, so a
-  change is what the next turn goes by once pi has it.
+- **When an edit takes effect.** An edit to `settings.json` mid-session applies after `/reload` or a
+  restart, not before. pi reads the file into memory only at startup and on `/reload`, and the
+  extension never reads the file itself: it takes pi's copy, through `pi.getSettings()`, at every
+  turn. So a change pi has taken in (at startup, on `/reload`, or through pi's own setters) is what
+  the next turn goes by, and the levels always come from the same copy as pi's own
+  `compaction.*`.
 
 The extension never writes pi's settings and adds nothing under `compaction.*`. Nothing is set per
 Agent or per Run.
