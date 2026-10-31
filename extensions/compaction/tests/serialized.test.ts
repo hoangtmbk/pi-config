@@ -394,7 +394,7 @@ describe("a stalled provider", () => {
 		assert.equal(done?.entryId, undefined);
 		assert.deepEqual(pi.notifications, [
 			{
-				message: "Compaction failed (the provider streamed nothing for 60s). Context will keep growing until the next run or pi's own compaction.",
+				message: "Compaction failed (the provider streamed nothing for 60s). Context will keep growing until your next message or pi's own compaction.",
 				type: "error",
 			},
 		]);
@@ -456,7 +456,7 @@ describe("when every writer fails", () => {
 		assert.deepEqual(pi.notifications, [
 			{
 				message:
-					"Compaction failed (Summarization failed: invalid_request_error: prompt is too long). Context will keep growing until the next run or pi's own compaction.",
+					"Compaction failed (Summarization failed: invalid_request_error: prompt is too long). Context will keep growing until your next message or pi's own compaction.",
 				type: "error",
 			},
 		]);

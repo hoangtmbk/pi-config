@@ -280,7 +280,7 @@ describe("the warning-pause guard", () => {
 });
 
 describe("when every writer fails", () => {
-	const FAILED = "Compaction failed (Summarization failed: overloaded). Context will keep growing until the next run or pi's own compaction.";
+	const FAILED = "Compaction failed (Summarization failed: overloaded). Context will keep growing until your next message or pi's own compaction.";
 
 	it("compacts nothing, says why, and disarms forced for the rest of the run", async () => {
 		const { pi, model } = forcing([{ errorMessage: "overloaded" }, { text: PI_SUMMARY }]);

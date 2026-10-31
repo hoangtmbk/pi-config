@@ -64,6 +64,37 @@ describe("the hook path", () => {
 		assert.match(done.result.compaction.summary, /Add retries to the fetcher\.\n\n## Progress\n- Wrote the wrapper\./);
 		assert.deepEqual(pi.errors, []);
 	});
+
+	it("leaves pi its whole default only when our own code throws", async () => {
+		const { pi } = compacting([{ text: PI_SUMMARY }]);
+		pi.session.appendMessage(user("Add retries to the fetcher."));
+		await pi.turnEnd({ message: said("Started.") });
+		const kept = pi.session.appendMessage(user("Go on."));
+		// A record of ours that our merge can't read: the ledger isn't a list.
+		pi.session.appendCompaction("(earlier Handoff)", kept, 50_000, {
+			kind: "handoff",
+			version: 1,
+			compactionNo: 1,
+			writer: "pi-default",
+			attempts: [],
+			userMessages: ["Add retries to the fetcher."],
+			droppedUserMessages: 0,
+			ledger: 5,
+			fileState: {},
+			sections: { piDefault: PI_SUMMARY },
+			log: [],
+		});
+		pi.session.appendMessage(user("Keep going."));
+		await pi.turnEnd({ message: said("Done.") });
+
+		const done = await pi.compact();
+		assert.equal(done?.result, undefined, "no answer, so pi runs its own default");
+		assert.equal(done?.entryId, undefined);
+		assert.deepEqual(
+			pi.errors.map((e) => e.event),
+			["session_before_compact"],
+		);
+	});
 });
 
 describe("the user's words", () => {
@@ -346,6 +377,18 @@ describe("what the user sees", () => {
 		assert.equal(pi.sent.length, sentBefore);
 	});
 
+	it("leaves pi's working row alone on /compact, threshold and overflow, whether the Handoff is written or not", async () => {
+		for (const reason of ["manual", "threshold", "overflow"] as const) {
+			for (const reply of [{ text: PI_SUMMARY }, { errorMessage: "overloaded" }]) {
+				const { pi } = compacting([reply], SMALL_TAIL, reason === "overflow");
+				pi.session.appendMessage(user("Add retries to the fetcher."));
+				await pi.turnEnd({ tokens: 152_000, message: said("Done.") });
+				await pi.compact({ reason });
+				assert.deepEqual(pi.working, [], `${reason}, ${reply.text ? "written" : "failed"}`);
+			}
+		}
+	});
+
 	it("clears the footer status while compacting, and leaves it for the next reading to restore", async () => {
 		let during: string | undefined = "unread";
 		const { pi } = await underPressure([{ text: PI_SUMMARY, during: () => (during = pi.status()) }]);
@@ -387,7 +430,7 @@ describe("when the Handoff can't be written", () => {
 		assert.deepEqual(pi.notifications, [
 			{
 				message:
-					"Compaction failed (Summarization failed: invalid_request_error: prompt is too long). Context will keep growing until the next run or pi's own compaction.",
+					"Compaction failed (Summarization failed: invalid_request_error: prompt is too long). Context will keep growing until your next message or pi's own compaction.",
 				type: "error",
 			},
 		]);

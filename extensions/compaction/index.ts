@@ -84,7 +84,7 @@ const SelfCompactParams = Type.Object({
  */
 const SELF_COMPACT = {
 	compacted: "Context compacted. The Handoff above carries the task; continue from its Next step.",
-	failed: "Compaction failed; carry on, and it will be retried at the forced level.",
+	failed: "Compaction failed; carry on with the task.",
 	refused: "Not compacted: the context isn't large enough yet for a compaction to help. Carry on with the task; you'll be told when it's a good time.",
 };
 
@@ -226,18 +226,18 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 
 	/**
 	 * Every writer failing, or what stands for it: nothing is compacted, the
-	 * user is told why, and forced is disarmed for the rest of the run.
+	 * user is told why, and forced is disarmed for the rest of the prompt.
 	 */
 	function giveUp(ctx: ExtensionContext, failure: Failure): void {
 		const why = typeof failure === "string" ? GIVE_UP[failure] : failure.lastError;
-		ctx.ui.notify(`Compaction failed (${why}). Context will keep growing until the next run or pi's own compaction.`, "error");
+		ctx.ui.notify(`Compaction failed (${why}). Context will keep growing until your next message or pi's own compaction.`, "error");
 		forced.disarm();
 	}
 
 	/**
 	 * What the user hears of a writer chain, on either path. Escape is silent.
 	 * Every writer failing is an error, and disarms forced for the rest of the
-	 * run, so that a chain that can't write isn't run again at every boundary;
+	 * prompt, so that a chain that can't write isn't run again at every boundary;
 	 * pi's own trigger stays as the backstop. Pi's summarizer having written
 	 * the judgment part is a warning: that Handoff may be thinner. Returns
 	 * whether there is a Handoff to compact with.
@@ -425,7 +425,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 * happened. Escape mid-write is a failure, as is every writer failing, and
 	 * forced compaction tries again: after Escape at the next boundary at forced,
 	 * after every writer failing (which disarms it, as on any path) from the
-	 * next run.
+	 * next prompt.
 	 */
 	pi.registerTool({
 		name: SELF_COMPACT_TOOL,

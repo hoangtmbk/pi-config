@@ -45,7 +45,7 @@ const HANDOFF = [
 ].join("\n");
 
 const COMPACTED = "Context compacted. The Handoff above carries the task; continue from its Next step.";
-const FAILED = "Compaction failed; carry on, and it will be retried at the forced level.";
+const FAILED = "Compaction failed; carry on with the task.";
 
 const NOTE ="Retries are wired into fetch.ts; next I run npm test and fix what fails.";
 
@@ -135,7 +135,7 @@ describe("the `self_compact` tool", () => {
 		assert.deepEqual(drafts, []);
 		assert.deepEqual(pi.notifications, [
 			{
-				message: "Compaction failed (Summarization failed: overloaded). Context will keep growing until the next run or pi's own compaction.",
+				message: "Compaction failed (Summarization failed: overloaded). Context will keep growing until your next message or pi's own compaction.",
 				type: "error",
 			},
 		]);
@@ -306,7 +306,7 @@ describe("a Self-compaction its own boundary can't draft", () => {
 		assert.deepEqual(await pi.turnEnd({ tokens: 127_000 }), []);
 		assert.deepEqual(pi.notifications.filter((n) => n.type === "error"), [
 			{
-				message: "Compaction failed (pi dropped it, with another extension's invalid draft). Context will keep growing until the next run or pi's own compaction.",
+				message: "Compaction failed (pi dropped it, with another extension's invalid draft). Context will keep growing until your next message or pi's own compaction.",
 				type: "error",
 			},
 		]);

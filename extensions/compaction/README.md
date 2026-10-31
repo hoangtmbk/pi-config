@@ -223,7 +223,7 @@ straight after, its next request built from the Handoff and the kept tail.
   guard** — once a compaction, on either path, leaves pressure at or above warning, a toast says
   so ("Compaction left context at 158k, still above warning. Forced compaction is paused until it
   drops.") and forcing waits until pressure is below warning; and every writer failing, which
-  disarms it for the rest of the run (an error toast says why) and re-arms it at the next run.
+  disarms it for the rest of the prompt (an error toast says why) and re-arms it at the next prompt.
   Escape during the writer chain stops it with no compaction and no toast, and leaves forced
   armed.
 - **What the user sees:** pi's working row reads `Compacting at 172k (forced) · pruning old tool
@@ -255,9 +255,11 @@ description says nothing about running out or a limit.
   at the first that can; if pi drops it there, it is handled as every writer failing. One that
   someone else's compaction overtakes in the meantime is let go: the context was compacted.
 - **It returns one plain line**, with no token counts: "Context compacted. The Handoff above
-  carries the task; continue from its Next step." on success, and "Compaction failed; carry on,
-  and it will be retried at the forced level." when every writer fails (with the same error toast
-  and disarming as on any path) or when Escape stops it mid-write (no toast, forced still armed).
+  carries the task; continue from its Next step." on success, and "Compaction failed; carry on
+  with the task." when every writer fails (with the same error toast, and forced disarmed for the
+  rest of the prompt, as on any path) or when Escape stops it mid-write (no toast, forced still
+  armed). It promises no retry: after every writer failing, forced won't try again until the next
+  prompt.
 - **The note** opens the Handoff's Next step verbatim, labelled `Agent's note (verbatim)`, and the
   writer's instruction restates it and asks for the rest of Next step to agree with it, or say why
   it can't be followed. It lasts for that compaction only: it is not merged forward, and the next
@@ -356,9 +358,10 @@ run's signal on the boundary path and on the compaction's own on the hook path.
 
 Any writer's attempt fails after 60s with nothing streamed; there is no cap on a reply that keeps
 streaming, and no retry of our own. If every writer fails, nothing is compacted and an error toast
-reads "Compaction failed (<last error>). Context will keep growing until the next run or pi's own
-compaction." Escape stops the chain with no compaction and no toast. Only if our own code throws
-does pi fall back to its whole default.
+reads "Compaction failed (<last error>). Context will keep growing until your next message or pi's
+own compaction.", on every path, and forced is disarmed for the rest of the prompt. Escape stops
+the chain with no compaction and no toast. Only if our own code throws does pi fall back to its
+whole default.
 
 ## The replay check
 

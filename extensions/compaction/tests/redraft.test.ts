@@ -31,9 +31,9 @@ const SETUP: FakeSetup = { settings: { compaction: { keepRecentTokens: KEEP }, r
 const BAD: SessionBoundaryDraft = { type: "context_edit", targetId: "no-such-entry", replacement: { content: [{ type: "text", text: "x" }] } };
 
 const FAILED_TWICE =
-	"Compaction failed (pi dropped it twice, with another extension's invalid draft). Context will keep growing until the next run or pi's own compaction.";
+	"Compaction failed (pi dropped it twice, with another extension's invalid draft). Context will keep growing until your next message or pi's own compaction.";
 const CUT_GONE =
-	"Compaction failed (its kept tail is no longer on the branch). Context will keep growing until the next run or pi's own compaction.";
+	"Compaction failed (its kept tail is no longer on the branch). Context will keep growing until your next message or pi's own compaction.";
 
 /**
  * A fake pi with the extension on it, and pi's summarizer scripted to answer
