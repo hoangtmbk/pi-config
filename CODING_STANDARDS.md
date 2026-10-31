@@ -2,7 +2,8 @@
 
 The judgement calls a reviewer checks a change against. Each rule names where the repo already
 follows it; when a change breaks one, cite the rule and the evidence. Rules a script can check
-(what may import what) belong in a script, not here.
+(what may import what) belong in a script, not here. `npm run check:imports` checks the import
+rules.
 
 ## Tests go through the seams, with fakes at the edge
 
