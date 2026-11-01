@@ -408,6 +408,12 @@ to, so that transcripts never reach the repo:
 { "sessions": ["~/.pi/agent/sessions/<project>/<session>.jsonl", { "path": "…", "name": "the refactor" }] }
 ```
 
+`--rejudge <report.json>` runs only the judge again, on a saved report's Handoffs and continuations
+(about $1.30 for a full report): each saved cut is found in its recording by the recorded actions
+its continuation was compared with, and everything is checked before anything is spent.
+`--only "<session>#<depth>"` picks cuts; the rest keep their saved verdicts. It is how a change to
+the judge is calibrated against the hand labels.
+
 - **Cuts** (`replay-corpus.ts`): two or three per session, chained, at turn boundaries the recording
   really had: mid-run, as Self-compaction after the extension's real steer (the agent's own
   `self_compact` note goes to the Handoff; an agent that doesn't compact when steered is compacted as
@@ -415,7 +421,7 @@ to, so that transcripts never reach the repo:
   kinds rotate across sessions, every cut has at least one recorded user turn after it (the judge sees up to three), and each
   removes at least `keepRecentTokens`. A session pi already compacted is skipped: with the
   extension loaded from the start pi never compacts first, and the rules before pi's compaction
-  live on only in its summary.
+  live on only in its summary. (A saved report's cuts in such a session can still be re-judged.)
 - **Two lanes** (`replay-session.ts`): the extension, through the same fake pi the offline suite
   drives, and pi's own `compact`, with no extension, chained on its own summaries. Both run on the
   session's recorded model; a session whose model can't be reached is skipped.
@@ -425,7 +431,9 @@ to, so that transcripts never reach the repo:
 - **The judge** (`replay-judge.ts`), GPT 6.1 Sol (`openai-codex/gpt-6.1-sol`) by default: the one
   checked against hand labels (#48) and passed with (#50), so that a re-run judges the same way.
   It sees both Handoffs blind, as A and B in alternating order, and scores ledger recall,
-  violations, re-asks and redone work (re-reads allowed). Every verdict must cite its evidence and every rule must be the user's own words.
+  violations, re-asks and redone work. A rule counts as carried only as the instruction itself, not
+  as a record that it was once followed; re-reads, and what a rule the continuation's own Handoff
+  carries calls for, are not redone work. Every verdict must cite its evidence and every rule must be the user's own words.
 - **The report** (`replay-report.ts`): each pass bar for ours and pi's default — ledger recall ≥95%
   at every depth with no decline, 0 violations, ≤1/30 re-asks, ≤3/30 redone, exact file state, no
   worse than pi's default — then retention and the collapse guard (reported, not gated), the actual

@@ -53,10 +53,10 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { kindsFor, parseManifest, readRecording } from "./replay/replay-corpus.ts";
+import { kindsFor, type ManifestSession, parseManifest, type Recording, readRecording } from "./replay/replay-corpus.ts";
 import type { Side } from "./replay/replay-judge.ts";
 import { Meter, renderReport, score } from "./replay/replay-report.ts";
-import { guardCall, rejudgeSession, type SessionResult, replaySession } from "./replay/replay-session.ts";
+import { type CutResult, guardCall, rejudgeProblem, rejudgeSession, type SessionResult, replaySession } from "./replay/replay-session.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_MANIFEST = join(HERE, "replay-manifest.json");
@@ -83,6 +83,45 @@ function fail(message: string): never {
 	process.exit(1);
 }
 
+/** One saved session to judge again: its recording, where the manifest has it, and which of its cuts. */
+interface Rejudge {
+	saved: SessionResult;
+	/** Absent for a session no `--only` picks: it is reported as saved. */
+	recording?: Recording;
+	picked: (cut: CutResult) => boolean;
+}
+
+/**
+ * The saved sessions to judge again, every one checked before anything is
+ * spent: named in the manifest, readable, and cut where the report cut it;
+ * and every `--only` naming a cut the report has.
+ */
+function rejudgePlan(saved: SessionResult[], entries: readonly ManifestSession[]): Rejudge[] {
+	const only = flags("--only");
+	const problems = only
+		.filter((at) => !saved.some((s) => s.cuts.some((cut) => `${s.name}#${cut.depth}` === at && cut.ours && cut.pi)))
+		.map((at) => `--only "${at}": the report has no cut by that name and depth with both Handoffs (write it as "<session name>#<depth>")`);
+	const plan = saved.map((result): Rejudge => {
+		const picked = (cut: CutResult) => only.length === 0 || only.includes(`${result.name}#${cut.depth}`);
+		const entry = entries.find((named) => named.name === result.name);
+		if (result.skipped || !result.cuts.some(picked)) return { saved: result, picked };
+		if (!entry) {
+			problems.push(`${result.name}: the manifest doesn't name it; pass --manifest with the one the report was run from`);
+			return { saved: result, picked };
+		}
+		const recording = readRecording(readFileSync(entry.path, "utf8"), "judging");
+		if ("problem" in recording) {
+			problems.push(`${result.name}: ${recording.problem}`);
+			return { saved: result, picked };
+		}
+		const problem = rejudgeProblem(recording, result);
+		if (problem) problems.push(`${result.name}: ${problem}`);
+		return { saved: result, recording, picked };
+	});
+	if (problems.length) fail(["Nothing was judged:", ...problems.map((p) => `  - ${p}`)].join("\n"));
+	return plan;
+}
+
 async function main(): Promise<number> {
 	const quick = process.argv.includes("--quick");
 	const manifestPath = flag("--manifest") ?? DEFAULT_MANIFEST;
@@ -105,7 +144,9 @@ async function main(): Promise<number> {
 		return model && registry.hasConfiguredAuth(model) ? model : undefined;
 	};
 	const rejudging = flag("--rejudge");
-	const saved = rejudging ? (JSON.parse(readFileSync(rejudging, "utf8")) as { judge?: string; sessions: SessionResult[] }) : undefined;
+	const saved = rejudging ? (JSON.parse(readFileSync(rejudging, "utf8")) as { judge?: string; sessions?: SessionResult[] }) : undefined;
+	if (saved && !Array.isArray(saved.sessions)) fail(`${rejudging} is not a replay report: it has no sessions.`);
+	if (saved && quick) fail("--quick replays; --rejudge only judges a saved report again. Pick one.");
 	const judgeKey = flag("--judge") ?? saved?.judge ?? DEFAULT_JUDGE;
 	const [judgeProvider, ...judgeId] = judgeKey.split("/");
 	const judgeModel = reachable(judgeProvider ?? "", judgeId.join("/"));
@@ -113,6 +154,7 @@ async function main(): Promise<number> {
 
 	const settingsPath = join(agentDir, "settings.json");
 	const settings = existsSync(settingsPath) ? (JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>) : {};
+	const rejudge = saved ? rejudgePlan(saved.sessions!, manifest.sessions) : [];
 
 	const meter = new Meter();
 	// No call can hang the run: a stalled or endless one fails its cut (see `guardCall`).
@@ -120,8 +162,8 @@ async function main(): Promise<number> {
 	const prunedDir = mkdtempSync(join(tmpdir(), "pi-replay-pruned-"));
 	const startedAt = new Date();
 	const picked = manifest.sessions.slice(0, quick ? QUICK_SESSIONS : FULL_SESSIONS);
-	if (!quick && manifest.sessions.length < FULL_SESSIONS) console.log(`The manifest names ${manifest.sessions.length} sessions; a full run is set for ${FULL_SESSIONS}.`);
-	if (manifest.sessions.length > picked.length) console.log(`Replaying the first ${picked.length} of ${manifest.sessions.length} sessions.`);
+	if (!saved && !quick && manifest.sessions.length < FULL_SESSIONS) console.log(`The manifest names ${manifest.sessions.length} sessions; a full run is set for ${FULL_SESSIONS}.`);
+	if (!saved && manifest.sessions.length > picked.length) console.log(`Replaying the first ${picked.length} of ${manifest.sessions.length} sessions.`);
 
 	let judged = 0;
 	// Our Handoff is "A" on every other cut, so that the judge can't learn which is which.
@@ -139,42 +181,26 @@ async function main(): Promise<number> {
 		writeFileSync(reportPath.replace(/\.md$/, ".json"), JSON.stringify({ startedAt, mode, judge: judgeKey, ...of, ...(unfinished ? { unfinished } : {}), sessions, spend: meter.rows() }, null, 2));
 		return report;
 	};
-	const stopped = () => `stopped after ${sessions.length} of ${picked.length} sessions`;
+	const stopped = () => `stopped after ${sessions.length} of ${saved ? rejudge.length : picked.length} sessions`;
 	process.once("SIGINT", () => {
 		write(`${stopped()} (interrupted)`);
 		console.log(`\nInterrupted. Report so far (spend counted for finished calls only): ${reportPath}`);
 		rmSync(prunedDir, { recursive: true, force: true });
 		process.exit(130);
 	});
-	if (saved) {
-		const only = flags("--only");
-		const pick = (name: string) => (cut: { depth: number }) => only.length === 0 || only.includes(`${name}#${cut.depth}`);
-		for (const result of saved.sessions) {
-			// A session none of `--only` picks is reported as saved, so the bars still score the whole run.
-			if (only.length > 0 && !only.some((at) => at.startsWith(`${result.name}#`))) {
+	try {
+		for (const { saved: result, recording, picked: pick } of rejudge) {
+			if (!recording) {
+				// Not judged again (skipped, or picked by no `--only`): reported as saved, so the bars still score the whole run.
 				sessions.push(result);
 				continue;
 			}
-			const at = manifest.sessions.findIndex((entry) => entry.name === result.name);
-			const recording = at === -1 ? undefined : readRecording(readFileSync(manifest.sessions[at]!.path, "utf8"), "judging");
-			if (!recording || "problem" in recording) {
-				sessions.push({ name: result.name, skipped: recording ? recording.problem : "the manifest doesn't name it", cuts: [] });
-				continue;
-			}
 			console.log(`${result.name}…`);
-			const deps = { settings, kinds: kindsFor(at), findModel: reachable, judge: { model: judgeModel, stream: meter.metered("judge", call) }, oursSide };
-			sessions.push(await rejudgeSession(recording, result, deps, pick(result.name)));
+			sessions.push(await rejudgeSession(recording, result, { judge: { model: judgeModel, stream: meter.metered("judge", call) }, oursSide }, pick));
 			await meter.settled();
 			console.log(`  spent so far: $${meter.total().toFixed(2)}`);
 		}
-		const report = write();
-		console.log(`\n${report}`);
-		console.log(`Report: ${reportPath}`);
-		rmSync(prunedDir, { recursive: true, force: true });
-		return 0;
-	}
-	try {
-		for (const [i, entry] of picked.entries()) {
+		for (const [i, entry] of saved ? [] : picked.entries()) {
 			console.log(`[${i + 1}/${picked.length}] ${entry.name}…`);
 			const recording = readRecording(readFileSync(entry.path, "utf8"));
 			if ("problem" in recording) {

@@ -65,7 +65,8 @@ describe("the judge's request", () => {
 		assert.match(constraints, /the instruction itself/, "carrying a rule means carrying the instruction");
 		assert.match(constraints, /once followed/, "a record of having followed it once is not carrying it");
 		const redone = systemPrompt.slice(systemPrompt.indexOf("4. Redone work."));
-		assert.match(redone, /carries in step 1/, "the rules found carried are what exempts an action");
+		assert.match(redone, /the Handoff this continuation carried on from carries that constraint in step 1/, "the rules found carried are what exempts an action");
+		assert.match(redone, /only the other Handoff carries exempts nothing/);
 		assert.match(redone, /is never redone work/);
 		assert.match(redone, /quote the rule/i, "an exemption cites the rule it rests on");
 	});
