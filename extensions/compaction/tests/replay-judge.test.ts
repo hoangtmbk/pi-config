@@ -65,11 +65,22 @@ describe("the judge's request", () => {
 		assert.match(constraints, /the instruction itself/, "carrying a rule means carrying the instruction");
 		assert.match(constraints, /once followed/, "a record of having followed it once is not carrying a standing rule");
 		assert.match(constraints, /one-time instruction the history shows was already carried out .* is carried by a record that it was done/, "a done one-off step is carried by its record");
+		assert.match(constraints, /several parts is carried when the Handoff keeps what it mainly asks/, "a missing qualifier doesn't drop a rule");
 		const redone = systemPrompt.slice(systemPrompt.indexOf("4. Redone work."));
 		assert.match(redone, /the Handoff this continuation carried on from carries that constraint in step 1/, "the rules found carried are what exempts an action");
 		assert.match(redone, /only the other Handoff carries exempts nothing/);
 		assert.match(redone, /is never redone work/);
 		assert.match(redone, /quote the rule/i, "an exemption cites the rule it rests on");
+	});
+
+	it("gives the judge the rules to score when they are already listed, and has it list them otherwise", () => {
+		const listing = judgeRequest(judgeCase());
+		assert.match(listing.systemPrompt, /List every rule/);
+		assert.doesNotMatch(listing.prompt, /<rules>/);
+		const given = judgeRequest({ ...judgeCase(), rules: [RULE, "Use vitest."] });
+		assert.match(given.systemPrompt, /listed in <rules>.*Score each of them and no others/);
+		assert.doesNotMatch(given.systemPrompt, /List every rule/);
+		assert.ok(given.prompt.includes(`<rules>\n[1] ${RULE}\n[2] Use vitest.\n</rules>`));
 	});
 });
 
@@ -99,6 +110,15 @@ describe("the judge's verdict", () => {
 		assert.deepEqual(verdict.constraints, []);
 		assert.deepEqual(verdict.A.violations, []);
 		assert.deepEqual(verdict.dropped, ['constraint "always use tabs": the user never said it', 'A violation of "always use tabs": the user never said it']);
+	});
+
+	it("scores each rule given and only those: another is dropped, and a missing one is refused", () => {
+		const users = judgeCase().userMessages;
+		const verdict = parseVerdict(reply(), users, [RULE]);
+		assert.ok(!("problem" in verdict));
+		assert.deepEqual(verdict.constraints.map((c) => c.quote), [RULE]);
+		assert.deepEqual(verdict.dropped, ['constraint "Use   vitest.": not one of the rules given']);
+		assert.match((parseVerdict(reply(), users, [RULE, "Fix the flaky test"]) as { problem: string }).problem, /rule \[2\] in <rules> is not scored/);
 	});
 
 	it("is refused when it isn't JSON of the asked shape, or a verdict cites nothing", () => {

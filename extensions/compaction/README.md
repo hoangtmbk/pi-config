@@ -411,8 +411,9 @@ to, so that transcripts never reach the repo:
 `--rejudge <report.json>` runs only the judge again, on a saved report's Handoffs and continuations
 (about $1.30 for a full report): each saved cut is found in its recording by the recorded actions
 its continuation was compared with, and everything is checked before anything is spent.
-`--only "<session>#<depth>"` picks cuts; the rest keep their saved verdicts. It is how a change to
-the judge is calibrated against the hand labels.
+`--only "<session>#<depth>"` picks cuts; the rest keep their saved verdicts. The judge is given
+the rules each saved verdict listed, so verdicts compare rule by rule. It is how a change to the
+judge is calibrated against the hand labels.
 
 - **Cuts** (`replay-corpus.ts`): two or three per session, chained, at turn boundaries the recording
   really had: mid-run, as Self-compaction after the extension's real steer (the agent's own
@@ -433,8 +434,8 @@ the judge is calibrated against the hand labels.
   It sees both Handoffs blind, as A and B in alternating order, and scores ledger recall,
   violations, re-asks and redone work. A standing rule counts as carried only as the instruction
   itself, not as a record that it was once followed (a one-time step already done is carried by its
-  record); re-reads, and what a rule the continuation's own Handoff
-  carries calls for, are not redone work. Every verdict must cite its evidence and every rule must be the user's own words.
+  record), and a rule of several parts counts as carried when what it mainly asks is; re-reads, and
+  what a rule the continuation's own Handoff carries calls for, are not redone work. Every verdict must cite its evidence and every rule must be the user's own words.
 - **The report** (`replay-report.ts`): each pass bar for ours and pi's default — ledger recall ≥95%
   at every depth with no decline, 0 violations, ≤1/30 re-asks, ≤3/30 redone, exact file state, no
   worse than pi's default — then retention and the collapse guard (reported, not gated), the actual

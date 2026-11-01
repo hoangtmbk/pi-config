@@ -417,7 +417,7 @@ type Judged = Pick<LaneCut, "handoff" | "continuation">;
 type JudgeDeps = Pick<ReplayDeps, "judge" | "oursSide">;
 
 /** The judge's verdict on a cut, with the sides named again, or why there is none. */
-async function judged(recording: Recording, end: number, ours: Judged, pi: Judged, deps: JudgeDeps): Promise<CutVerdict | { problem: string }> {
+async function judged(recording: Recording, end: number, ours: Judged, pi: Judged, deps: JudgeDeps, rules?: readonly string[]): Promise<CutVerdict | { problem: string }> {
 	const history = seenIn(recording.branch.slice(0, end + 1));
 	const oursIs = deps.oursSide();
 	const piIs: Side = oursIs === "A" ? "B" : "A";
@@ -427,6 +427,7 @@ async function judged(recording: Recording, end: number, ours: Judged, pi: Judge
 		handoffs: { [oursIs]: ours.handoff.summary, [piIs]: pi.handoff.summary } as Record<Side, string>,
 		continuations: { [oursIs]: ours.continuation, [piIs]: pi.continuation } as Record<Side, Continuation>,
 		future: futureFor(recording, end),
+		rules,
 	});
 	if ("problem" in verdict) return verdict;
 	return {
@@ -533,9 +534,9 @@ export function rejudgeProblem(recording: Recording, saved: SessionResult): stri
 /**
  * A saved session's cuts judged again, and nothing else replayed: the
  * Handoffs and continuations are the saved ones, and the history and what
- * happened next are the recording's, cut where the replay cut it. For checking
- * a change to the judge without paying for the writers and continuations
- * again. Throws, before any call, when a cut can't be found in the recording
+ * happened next are the recording's, cut where the replay cut it, and the
+ * rules to score are the ones the saved verdict listed. For checking a change
+ * to the judge without paying for the writers and continuations again. Throws, before any call, when a cut can't be found in the recording
  * (see `rejudgeProblem`).
  */
 export async function rejudgeSession(
@@ -555,7 +556,8 @@ export async function rejudgeSession(
 			cuts.push(cut);
 			continue;
 		}
-		const verdict = await judged(recording, savedEnd(recording, boundaries, cut)!, cut.ours, cut.pi, deps);
+		const rules = cut.verdict?.constraints.map((constraint) => constraint.quote);
+		const verdict = await judged(recording, savedEnd(recording, boundaries, cut)!, cut.ours, cut.pi, deps, rules);
 		cuts.push("problem" in verdict ? { ...rest, unjudged: verdict.problem } : { ...rest, verdict });
 	}
 	return { ...saved, cuts };

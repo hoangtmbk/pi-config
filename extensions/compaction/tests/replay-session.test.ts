@@ -251,6 +251,7 @@ describe("re-judging a saved session", () => {
 
 		const result = await rejudgeSession(recorded, saved, deps);
 		assert.deepEqual(asked, ["judge", "judge", "judge"], "no writer and no continuation is called again");
+		assert.ok(prompts.every((prompt) => !prompt.includes("<rules>")), "a cut saved without a verdict has its rules listed afresh");
 		assert.equal(result.cuts.length, 3);
 		for (const [i, cut] of result.cuts.entries()) {
 			assert.deepEqual(cut.verdict!.constraints.map((c) => [c.quote, c.ours.verdict, c.pi.verdict]), [[RULE, true, false]]);
@@ -264,8 +265,15 @@ describe("re-judging a saved session", () => {
 		const recorded = recording();
 		const saved = JSON.parse(JSON.stringify(await replaySession(recorded, "fetcher", routed().deps))) as SessionResult;
 		const { asked, deps } = routed();
+		const prompts: string[] = [];
+		const judge = deps.judge.stream;
+		deps.judge.stream = (model, context, options) => {
+			prompts.push(lastUser(context));
+			return judge(model, context, options);
+		};
 		const result = await rejudgeSession(recorded, saved, deps, (cut) => cut.depth === 2);
 		assert.deepEqual(asked, ["judge"]);
+		assert.ok(prompts[0]!.includes(`<rules>\n[1] ${RULE}\n</rules>`), "the judge scores the rules the saved verdict listed");
 		assert.deepEqual(result.cuts[0], saved.cuts[0]);
 		assert.deepEqual(result.cuts[2], saved.cuts[2]);
 	});
