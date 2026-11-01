@@ -149,19 +149,19 @@ describe("recurring-detail retention", () => {
 		pi.session.appendMessage(user("Add retries to fetchJson in src/fetch.ts, behind the --max-attempts flag."));
 		await tool(pi, "edit", { path: "src/fetch.ts", oldText: "a", newText: "b" });
 		const run = calling("bash", { command: "npm test -- --grep retryWithBackoff" });
-		await pi.turnEnd({ message: run, toolResults: [result(run, "FAIL retryWithBackoff: ECONNRESET on port 8080", true)] });
+		await pi.turnEnd({ message: run, toolResults: [result(run, "FAIL retryWithBackoff: ECONNRESET from undici 6.21.0", true)] });
 		await pi.turnEnd({ message: said("The retry test fails.") });
 		pi.session.appendMessage(user("Thanks."));
 		await pi.compact();
 
 		const { handoff, removed, tail } = cutAt(pi);
-		const after = [user("Try port 8080 again: is retryWithBackoff still failing with ECONNRESET?"), calling("read", { path: "src/fetch.ts" })];
+		const after = [user("Is retryWithBackoff still failing with ECONNRESET on undici 6.21.0?"), calling("read", { path: "src/fetch.ts" })];
 		const retention = recurringDetailRetention(handoff, { removed, tail, after });
 		// fetchJson, --max-attempts and the rest never come up again, so they are not counted.
-		assert.deepEqual(retention.recurring, ["src/fetch.ts", "retryWithBackoff", "ECONNRESET", "8080"]);
-		// The path survives in the parts code writes, the rest in the writer's; the port survives nowhere.
+		assert.deepEqual(retention.recurring, ["src/fetch.ts", "retryWithBackoff", "ECONNRESET", "6.21.0"]);
+		// The path survives in the parts code writes, the rest in the writer's; the version survives nowhere.
 		assert.deepEqual(retention.retained, ["src/fetch.ts", "retryWithBackoff", "ECONNRESET"]);
-		assert.deepEqual(retention.lost, ["8080"]);
+		assert.deepEqual(retention.lost, ["6.21.0"]);
 		assert.equal(retention.share, 0.75);
 		assert.equal(retention.handoffChars, handoff.summary.length);
 	});
@@ -180,6 +180,36 @@ describe("recurring-detail retention", () => {
 		const retention = recurringDetailRetention(handoff, { removed, tail, after });
 		assert.deepEqual(retention.recurring, []);
 		assert.equal(retention.share, undefined);
+	});
+
+	it("counts a detail only when someone names it after the cut before a tool result shows it again", async () => {
+		const pi = session();
+		pi.session.appendMessage(user("Fix parseRetryAfter in src/retry-after.ts; it calls toSeconds."));
+		await tool(pi, "write", { path: "src/retry-after.ts", content: "export {}" });
+		await pi.turnEnd({ message: said("Written.") });
+		pi.session.appendMessage(user("Thanks."));
+		await pi.compact();
+
+		const { handoff, removed, tail } = cutAt(pi);
+		const read = calling("read", { path: "src/retry-after.ts" });
+		const after = [read, result(read, "export function parseRetryAfter() { return toSeconds(); }"), said("parseRetryAfter calls toSeconds."), user("Rename toSeconds?")];
+		const retention = recurringDetailRetention(handoff, { removed, tail, after });
+		// The agent names the path in its call; the file's text then shows the two names again, found without the Handoff's help.
+		assert.deepEqual(retention.recurring, ["src/retry-after.ts"]);
+	});
+
+	it("counts versions and codes, but not capitals that are plain English or bare numbers", async () => {
+		const pi = session();
+		pi.session.appendMessage(user("NEVER bump undici past 6.21.0, see section 4.11 and line 1234, and catch ECONNRESET. Never."));
+		await tool(pi, "write", { path: "src/retry.ts", content: "export {}" });
+		await pi.turnEnd({ message: said("Written.") });
+		pi.session.appendMessage(user("Thanks."));
+		await pi.compact();
+
+		const { handoff, removed, tail } = cutAt(pi);
+		const after = [user("Did you keep NEVER, 6.21.0, 4.11, 1234 and ECONNRESET in mind?")];
+		const retention = recurringDetailRetention(handoff, { removed, tail, after });
+		assert.deepEqual(retention.recurring, ["6.21.0", "ECONNRESET"]);
 	});
 
 	it("scores pi's own summary the same way", async () => {

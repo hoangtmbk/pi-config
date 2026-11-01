@@ -388,7 +388,7 @@ async function laneCut(session: SessionManager, recording: Recording, cut: Plann
 	const kept = branch.findIndex((entry) => entry.id === handoff.firstKeptEntryId);
 	const removed = messagesOf(branch.slice(0, kept));
 	const tail = seenIn(branch.slice(kept, branch.indexOf(handoff)));
-	// What really happened next, up to the next cut: the details that come up again there are this Handoff's to carry.
+	// What really happened next, up to the next cut: the details named again there are this Handoff's to carry.
 	const after = seenIn(recording.branch.slice(cut.boundary.end + 1, next ? next.boundary.end + 1 : undefined));
 	const continuation = await continueFrom(
 		buildSessionProjection(branch).messages,
