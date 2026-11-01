@@ -7,7 +7,7 @@ every machine, in one repo that pi can install and update itself.
 
 | Path | What |
 |---|---|
-| `extensions/compaction/` | `self_compact` tool — earlier, calmer compaction on top of pi's own: Pressure levels (a quiet footer status, one calm steer, a forced compaction before pi's would fire), Pruning of old tool output, Self-compaction at a natural break, and a Handoff that keeps the user's words, rules and file state on every compaction. Not enabled by default until it passes its replay check (`pi -e` it). See its [README](extensions/compaction/README.md). |
+| `extensions/compaction/` | `self_compact` tool — earlier, calmer compaction on top of pi's own: Pressure levels (a quiet footer status, one calm steer, a forced compaction before pi's would fire), Pruning of old tool output, Self-compaction at a natural break, and a Handoff that keeps the user's words, rules and file state on every compaction. On by default, in main sessions and in every Run. See its [README](extensions/compaction/README.md). |
 | `extensions/subagents/` | `subagent`, `subagent_wait`, `subagent_answer` — delegate a task to a child pi session, keep working, answer its questions. See its [README](extensions/subagents/README.md). |
 | `extensions/web-fetch/` | `web_fetch` tool — fetches a URL and returns clean, context-lean markdown. See its [README](extensions/web-fetch/README.md). |
 | `extensions/web-search/` | `web_search` tool — turns a query into ranked Brave results with snippets to triage. Needs a Brave API key. See its [README](extensions/web-search/README.md). |
@@ -56,7 +56,7 @@ registers every tool twice. `pi list` shows installed packages, but not auto-dis
 To remove copies left by an older manual deployment while keeping this package installed:
 
 ```bash
-rm -rf ~/.pi/agent/extensions/{subagents,web-fetch,web-search}
+rm -rf ~/.pi/agent/extensions/{compaction,subagents,web-fetch,web-search}
 pi list
 ```
 

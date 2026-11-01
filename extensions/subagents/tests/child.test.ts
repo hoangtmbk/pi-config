@@ -17,11 +17,13 @@ import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { Agent } from "../agents.ts";
 import { type ChildExit, type RunChild, RUN_NAME_ENV, runPreamble, spawnRun } from "../child.ts";
 import { ASK_QUESTION_TOOL } from "../supervisor.ts";
+import { SELF_COMPACT_TOOL } from "../../compaction/index.ts";
 import { reaped } from "./processes.ts";
 
 const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CHILD = join(TESTS_DIR, "fake-rpc-child.ts");
 const EXTENSION = join(TESTS_DIR, "..", "index.ts");
+const COMPACTION = join(TESTS_DIR, "..", "..", "compaction", "index.ts");
 
 const SCOUT: Agent = {
 	name: "scout",
@@ -91,6 +93,11 @@ async function spawnAndReadArgv(options: Parameters<typeof spawnFake>[0] = {}): 
 	return JSON.parse(readFileSync(argvPath, "utf-8")) as string[];
 }
 
+/** Every value the child was given for `flag`, in order. */
+function flagValues(argv: string[], flag: string): string[] {
+	return argv.flatMap((arg, index) => (arg === flag ? [argv[index + 1]!] : []));
+}
+
 /** The value the child was given for `flag`. */
 function flagValue(argv: string[], flag: string): string | undefined {
 	const index = argv.indexOf(flag);
@@ -113,16 +120,29 @@ describe("spawnRun", () => {
 		assert.ok(argv.indexOf("--no-extensions") < argv.indexOf("-e"), "the -e must come after --no-extensions");
 	});
 
-	it("passes the Agent's exact tool allowlist, plus the one tool every Run has", async () => {
+	it("adds the compaction extension with a second -e, so every Run gets compaction", async () => {
 		const argv = await spawnAndReadArgv();
 
-		assert.equal(flagValue(argv, "--tools"), `read,grep,${ASK_QUESTION_TOOL}`);
+		assert.deepEqual(flagValues(argv, "-e"), [EXTENSION, COMPACTION]);
+		assert.ok(argv.indexOf("--no-extensions") < argv.lastIndexOf("-e"), "both -e must come after --no-extensions");
 	});
 
-	it("lists ask_question once, however the Agent spelled its own allowlist", async () => {
-		const argv = await spawnAndReadArgv({ agent: { ...SCOUT, tools: ["read", ASK_QUESTION_TOOL] } });
+	it("passes the Agent's exact tool allowlist, plus the two tools every Run has", async () => {
+		const argv = await spawnAndReadArgv();
 
-		assert.equal(flagValue(argv, "--tools"), `read,${ASK_QUESTION_TOOL}`);
+		assert.equal(flagValue(argv, "--tools"), `read,grep,${ASK_QUESTION_TOOL},${SELF_COMPACT_TOOL}`);
+	});
+
+	it("lists ask_question and self_compact once, however the Agent spelled its own allowlist", async () => {
+		const argv = await spawnAndReadArgv({ agent: { ...SCOUT, tools: ["read", SELF_COMPACT_TOOL, ASK_QUESTION_TOOL] } });
+
+		assert.equal(flagValue(argv, "--tools"), `read,${SELF_COMPACT_TOOL},${ASK_QUESTION_TOOL}`);
+	});
+
+	it("keeps the parent's settings, so a Run resolves the Pressure levels for its own model", async () => {
+		const argv = await spawnAndReadArgv();
+
+		assert.ok(!argv.includes("--no-settings"), `expected no --no-settings in ${argv.join(" ")}`);
 	});
 
 	it("tells the child which Run it is, which is how the child knows to register ask_question", async () => {
