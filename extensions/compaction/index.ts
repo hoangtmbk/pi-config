@@ -86,6 +86,7 @@ const SELF_COMPACT = {
 	compacted: "Context compacted. The Handoff above carries the task; continue from its Next step.",
 	failed: "Compaction failed; carry on with the task.",
 	refused: "Not compacted: the context isn't large enough yet for a compaction to help. Carry on with the task; you'll be told when it's a good time.",
+	nothingToRemove: "Not compacted: the older part of the conversation is too small to replace yet. Carry on with the task.",
 };
 
 /** The custom message type our steers go out as. */
@@ -346,6 +347,11 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		return checkPrunes(planPrunes(kept, { scope: "kept-tail", cwd: ctx.cwd, dir }), ctx.sessionManager);
 	}
 
+	/** pi's own cut for the session as it stands, with the kept tail its `keepRecentTokens`; `undefined` when it would remove nothing. */
+	function piCut(ctx: ExtensionContext) {
+		return cutFor(ctx.sessionManager.buildSessionProjection(), piCompactionTokens(settings(), ctx.model, "keepRecentTokens"));
+	}
+
 	/**
 	 * A compaction at this boundary, drafted: our Handoff over pi's cut, then the
 	 * kept tail's Pruning, with `trigger` saying why on pi's working row.
@@ -379,8 +385,7 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 		trigger: Trigger,
 		asked: { note: string; signal: AbortSignal | undefined } | undefined = undefined,
 	): Promise<Compacting | undefined> {
-		const keep = piCompactionTokens(settings(), ctx.model, "keepRecentTokens");
-		const cut = cutFor(ctx.sessionManager.buildSessionProjection(), keep);
+		const cut = piCut(ctx);
 		if (!cut) return undefined;
 		const branch = ctx.sessionManager.getBranch();
 		const dir = prunedDirOf(ctx);
@@ -417,7 +422,8 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 	 * Self-compaction: the agent compacts at a natural break, and carries on in
 	 * the same prompt. Always declared, so the tool list never changes and the
 	 * prompt cache holds; below notice it refuses, since a compaction there
-	 * gains little.
+	 * gains little, and it says so, rather than that it failed, when pi's cut
+	 * has nothing to remove.
 	 *
 	 * A tool can't append to the session, so `execute` runs the writer chain
 	 * itself and keeps the compaction for this turn's `turn_end`, which pi fires
@@ -443,6 +449,9 @@ export function registerCompaction(pi: ExtensionAPI, options: CompactionOptions 
 			if (!note) throw new Error("A note cannot be empty. Say what you're doing and what you'll do next.");
 			const tokens = pressureOf(ctx);
 			if (tokens === undefined || tokens < levelsFor(ctx).notice) return line(SELF_COMPACT.refused);
+			// Near notice with a large kept tail, pi's cut can still remove nothing:
+			// nothing was tried, so nothing failed.
+			if (!piCut(ctx)) return line(SELF_COMPACT.nothingToRemove);
 			const projection = ctx.sessionManager.buildSessionProjection();
 			const compacting = await compactAtBoundary(projection.entries, convertToLlm(projection.messages), ctx, "self", { note, signal });
 			if (!compacting) return line(SELF_COMPACT.failed);

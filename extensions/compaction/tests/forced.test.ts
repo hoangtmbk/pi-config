@@ -304,6 +304,19 @@ describe("when every writer fails", () => {
 	});
 });
 
+describe("when pi's cut has nothing to remove", () => {
+	it("compacts nothing, says nothing, and stays armed for the next boundary in the same prompt", async () => {
+		const { pi, model } = forcing([{ text: PI_SUMMARY }], { settings: { compaction: { keepRecentTokens: 20_000 }, retry: { enabled: false } } });
+		await history(pi);
+		assert.deepEqual(await pi.turnEnd({ tokens: 172_000 }), []);
+		assert.deepEqual(pi.notifications, []);
+		assert.equal(model.calls.length, 0);
+		pi.session.appendMessage(user(words(25_000, "ask 5")));
+		assert.ok(compactionIn(await pi.turnEnd({ tokens: 174_000 })));
+		assert.equal(model.calls.length, 3);
+	});
+});
+
 describe("Escape during the writer chain", () => {
 	it("compacts nothing, says nothing, and leaves forced armed for the next prompt", async () => {
 		const { pi, model } = forcing([{ text: PI_SUMMARY, during: () => pi.escape() }, { text: PI_SUMMARY }]);
