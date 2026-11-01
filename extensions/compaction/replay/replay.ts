@@ -6,8 +6,8 @@
  * - The file-state diff compares the compaction's file state with the true
  *   one at the cut. "Exact" is the pass bar.
  * - Recurring-detail retention is the share of identifiers from the removed
- *   span that come up again after the cut and survive in the compaction's
- *   summary. It is reported, not gated; below 70% is the trigger to add an
+ *   span that the user or the agent names again after the cut, before a tool
+ *   shows them, and that survive in the compaction's summary. It is reported, not gated; below 70% is the trigger to add an
  *   identifier dump.
  * - The collapse guard flags a chained compaction that has lost content
  *   compared with the one before it.
@@ -111,6 +111,7 @@ function detailsIn(text: string, prose: string): string[] {
 	return [...found];
 }
 
+/** Whether `text` has `word` in another case. `word` is a `CAPITALS` match, so it needs no escaping. */
 function inOtherCase(word: string, text: string): boolean {
 	return [...text.matchAll(new RegExp(`\\b${word}\\b`, "gi"))].some((match) => match[0] !== word);
 }
@@ -125,41 +126,49 @@ function stringsIn(value: unknown): string[] {
 
 /**
  * What the model read and wrote in one message. The user's words, the agent's
- * replies and its tool calls `name` a detail; a tool's result and the output
- * of the user's own `!` command only `show` it. Thinking is left out, and so
+ * replies and its tool calls are `named`; a tool's result and the output of
+ * the user's own `!` command are only `shown`. Thinking is left out, and so
  * are custom messages, which are the extensions' words, not the work's.
  */
-function partsOf(message: AgentMessage): { name: string[]; show: string[] } {
+function partsOf(message: AgentMessage): { named: string[]; shown: string[] } {
 	const texts = (content: string | readonly { type: string; text?: string }[]) =>
 		typeof content === "string" ? [content] : content.flatMap((part) => (part.type === "text" && part.text !== undefined ? [part.text] : []));
 	switch (message.role) {
 		case "user":
-			return { name: texts(message.content), show: [] };
+			return { named: texts(message.content), shown: [] };
 		case "toolResult":
-			return { name: [], show: texts(message.content) };
+			return { named: [], shown: texts(message.content) };
 		case "assistant":
 			return {
-				name: message.content.flatMap((part) => (part.type === "text" ? [part.text] : part.type === "toolCall" ? stringsIn(part.arguments) : [])),
-				show: [],
+				named: message.content.flatMap((part) => {
+					if (part.type === "text") return [part.text];
+					return part.type === "toolCall" ? stringsIn(part.arguments) : [];
+				}),
+				shown: [],
 			};
 		case "bashExecution":
-			return { name: [message.command], show: [message.output] };
+			return { named: [message.command], shown: [message.output] };
 		default:
-			return { name: [], show: [] };
+			return { named: [], shown: [] };
 	}
 }
 
 /** Everything the model read and wrote in `messages` (see `partsOf`). */
 function textOf(messages: readonly AgentMessage[]): string {
-	return messages.flatMap((message) => Object.values(partsOf(message)).flat()).join("\n");
+	return messages
+		.flatMap((message) => {
+			const { named, shown } = partsOf(message);
+			return [...named, ...shown];
+		})
+		.join("\n");
 }
 
 /** Whether someone in `messages` names `detail` before a tool's result shows it. */
 function namedFirst(detail: string, messages: readonly AgentMessage[]): boolean {
 	for (const message of messages) {
-		const { name, show } = partsOf(message);
-		if (name.some((text) => text.includes(detail))) return true;
-		if (show.some((text) => text.includes(detail))) return false;
+		const { named, shown } = partsOf(message);
+		if (named.some((text) => text.includes(detail))) return true;
+		if (shown.some((text) => text.includes(detail))) return false;
 	}
 	return false;
 }
