@@ -69,6 +69,8 @@ describe("the judge's request", () => {
 		const redone = systemPrompt.slice(systemPrompt.indexOf("4. Redone work."));
 		assert.match(redone, /the Handoff this continuation carried on from carries that constraint in step 1/, "the rules found carried are what exempts an action");
 		assert.match(redone, /only the other Handoff carries exempts nothing/);
+		assert.match(redone, /a standing constraint calls for/, "only a rule that applies again exempts an action");
+		assert.match(redone, /nor does a one-time step already done, or a part of a constraint this Handoff left out/);
 		assert.match(redone, /is never redone work/);
 		assert.match(redone, /quote the rule/i, "an exemption cites the rule it rests on");
 	});

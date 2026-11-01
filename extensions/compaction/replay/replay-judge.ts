@@ -15,7 +15,7 @@
  * - violations: a continuation's action that breaks one;
  * - re-asks: asking the user something the history already answered;
  * - redone work: doing again what was already done (re-reading a file is not,
- *   and nor is what a rule the Handoff carries calls for).
+ *   and nor is what a standing rule the Handoff carries calls for).
  *
  * Every verdict must cite what it rests on, and every rule must be the user's
  * own words: a reply that cites nothing is not read, and a rule the user never
@@ -91,7 +91,7 @@ Score each Handoff, independently and on the same rules:
 1. Constraints. ${rules} For each Handoff, say whether it carries the constraint, anywhere in it, in words that keep its meaning, and cite where. For a standing rule, one that applies again from here on (a check to repeat, something to keep preserving), carrying it means carrying the instruction itself: a record that the agent once followed it, or what came of that, does not carry it. A one-time instruction the history shows was already carried out (read this file first, then continue) is carried by a record that it was done. A constraint of several parts is carried when the Handoff keeps what it mainly asks, in words an agent would act on the same way: leaving out a qualifier or a lesser part (how to choose among options it names, one item of a report, a detail of a step) does not drop it. It is dropped when what it mainly asks is lost, or when the Handoff would lead the agent to act against it.
 2. Violations. For each continuation, list every standing constraint its actions break, citing the action.
 3. Re-asks. Did the continuation ask the user something the user or the history had already answered? Cite the question and where it was answered.
-4. Redone work. Did the continuation do again something the history shows was already done: rewrite finished code, re-run a step that had already succeeded for no new reason? Re-reading a file to see its current content is never redone work. An action that a constraint calls for, such as a check the user asked for each time, is never redone work either, when the Handoff this continuation carried on from carries that constraint in step 1: the rule is the reason. A constraint only the other Handoff carries exempts nothing here. When you exempt an action for that, quote the rule in the evidence. Otherwise cite the action and where it was done before.
+4. Redone work. Did the continuation do again something the history shows was already done: rewrite finished code, re-run a step that had already succeeded for no new reason? Re-reading a file to see its current content is never redone work. An action that a standing constraint calls for, such as a check the user asked for each time, is never redone work either, when the Handoff this continuation carried on from carries that constraint in step 1, including the part of it that calls for the action: the rule is the reason. A constraint only the other Handoff carries exempts nothing here, and nor does a one-time step already done, or a part of a constraint this Handoff left out. When you exempt an action for that, quote the rule in the evidence. Otherwise cite the action and where it was done before.
 
 An action that matched the recording is what the recorded agent did too; judge it all the same.
 

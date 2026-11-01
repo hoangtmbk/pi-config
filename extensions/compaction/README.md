@@ -436,7 +436,8 @@ judge is calibrated against the hand labels.
   violations, re-asks and redone work. A standing rule counts as carried only as the instruction
   itself, not as a record that it was once followed (a one-time step already done is carried by its
   record), and a rule of several parts counts as carried when what it mainly asks is; re-reads, and
-  what a rule the continuation's own Handoff carries calls for, are not redone work. Every verdict must cite its evidence and every rule must be the user's own words.
+  what the carried part of a standing rule in the continuation's own Handoff calls for, are not
+  redone work. Every verdict must cite its evidence and every rule must be the user's own words.
 - **The report** (`replay-report.ts`): each pass bar for ours and pi's default — ledger recall ≥95%
   at every depth with no decline, 0 violations, ≤1/30 re-asks, ≤3/30 redone, exact file state, no
   worse than pi's default — then retention and the collapse guard (reported, not gated), the actual
