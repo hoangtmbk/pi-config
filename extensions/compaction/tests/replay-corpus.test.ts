@@ -86,6 +86,13 @@ describe("a recording", () => {
 			problem: "pi compacted it before the extension could, so the rules given before that compaction survive only in pi's summary",
 		});
 	});
+
+	it("is read for judging again even when pi compacted it, since a saved report's cuts are already made", () => {
+		const compacted = recorder().system().user("Old work.").say("Done.").user("Add retries.").compaction("Summary of the old work.", 1).say("Done.").user("Thanks.").text();
+		const read = readRecording(compacted, "judging");
+		assert.ok("branch" in read, "problem" in read ? read.problem : "");
+		assert.ok(read.branch.some((entry) => entry.type === "compaction"));
+	});
 });
 
 describe("planning a chain of cuts", () => {

@@ -114,9 +114,11 @@ export interface Recording {
  * Refused too when pi compacted it: with the extension loaded from the start,
  * every compaction is the extension's, so one of pi's means the extension came
  * in partway, and the rules given before it live on only in pi's summary,
- * where no Handoff could copy them word for word.
+ * where no Handoff could copy them word for word. Not when it is read for
+ * `judging` a saved report again: its cuts were made, and the judge reads
+ * only its messages.
  */
-export function readRecording(text: string): Recording | { problem: string } {
+export function readRecording(text: string, purpose: "replay" | "judging" = "replay"): Recording | { problem: string } {
 	const entries = parseSessionEntries(text);
 	const header = entries.find((entry): entry is SessionHeader => entry.type === "session");
 	if (!header) return { problem: "it is not a pi session file" };
@@ -125,7 +127,7 @@ export function readRecording(text: string): Recording | { problem: string } {
 	if (!branch.some((entry) => entry.type === "message" && entry.message.role === "system")) {
 		return { problem: "it records no system message, so its prompt and tools can't be replayed (recorded before pi kept them in the transcript)" };
 	}
-	if (branch.some((entry) => entry.type === "compaction")) {
+	if (purpose === "replay" && branch.some((entry) => entry.type === "compaction")) {
 		return { problem: "pi compacted it before the extension could, so the rules given before that compaction survive only in pi's summary" };
 	}
 	return { header, branch };

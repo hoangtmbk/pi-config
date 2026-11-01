@@ -13,6 +13,13 @@
  *   npm run live:compaction -- --quick          # the first session only, about $5
  *   npm run live:compaction -- --manifest <path>
  *   npm run live:compaction -- --judge <provider>/<model>   # default openai-codex/gpt-6.1-sol
+ *   npm run live:compaction -- --rejudge <report.json> [--only "<session>#<depth>"]...
+ *
+ * `--rejudge` runs only the judge again, on a saved report's Handoffs and
+ * continuations: a change to the judge is checked against the hand labels
+ * for about $1.30 a full report, not $45. Use the manifest the report was run
+ * from, and the report's own judge unless `--judge` says otherwise. `--only`
+ * picks cuts to judge again; the rest keep their saved verdicts.
  *
  * When it must pass: before the extension is enabled by default, and after any
  * change to the writer's instruction, the Handoff's sections or the Pruning
@@ -49,7 +56,7 @@ import { getAgentDir, ModelRegistry, ModelRuntime } from "@earendil-works/pi-cod
 import { kindsFor, parseManifest, readRecording } from "./replay/replay-corpus.ts";
 import type { Side } from "./replay/replay-judge.ts";
 import { Meter, renderReport, score } from "./replay/replay-report.ts";
-import { guardCall, type SessionResult, replaySession } from "./replay/replay-session.ts";
+import { guardCall, rejudgeSession, type SessionResult, replaySession } from "./replay/replay-session.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_MANIFEST = join(HERE, "replay-manifest.json");
@@ -64,6 +71,11 @@ const DEFAULT_JUDGE = "openai-codex/gpt-6.1-sol";
 function flag(name: string): string | undefined {
 	const at = process.argv.indexOf(name);
 	return at === -1 ? undefined : process.argv[at + 1];
+}
+
+/** Every value given for a flag that can repeat. */
+function flags(name: string): string[] {
+	return process.argv.flatMap((arg, i) => (arg === name && process.argv[i + 1] !== undefined ? [process.argv[i + 1]!] : []));
 }
 
 function fail(message: string): never {
@@ -92,7 +104,9 @@ async function main(): Promise<number> {
 		const model = registry.find(provider, id);
 		return model && registry.hasConfiguredAuth(model) ? model : undefined;
 	};
-	const judgeKey = flag("--judge") ?? DEFAULT_JUDGE;
+	const rejudging = flag("--rejudge");
+	const saved = rejudging ? (JSON.parse(readFileSync(rejudging, "utf8")) as { judge?: string; sessions: SessionResult[] }) : undefined;
+	const judgeKey = flag("--judge") ?? saved?.judge ?? DEFAULT_JUDGE;
 	const [judgeProvider, ...judgeId] = judgeKey.split("/");
 	const judgeModel = reachable(judgeProvider ?? "", judgeId.join("/"));
 	if (!judgeModel) fail(`The judge, ${judgeKey}, can't be reached: pi knows no such model, or has no credentials for it. Log in with pi first.`);
@@ -110,8 +124,10 @@ async function main(): Promise<number> {
 	if (manifest.sessions.length > picked.length) console.log(`Replaying the first ${picked.length} of ${manifest.sessions.length} sessions.`);
 
 	let judged = 0;
+	// Our Handoff is "A" on every other cut, so that the judge can't learn which is which.
+	const oursSide = (): Side => (judged++ % 2 === 0 ? "A" : "B");
 	const sessions: SessionResult[] = [];
-	const mode = quick ? "quick" : "full";
+	const mode = saved ? "rejudge" : quick ? "quick" : "full";
 	const stamp = startedAt.toISOString().replace(/[:.]/g, "-");
 	const reportPath = join(REPORTS, `${stamp}-${mode}.md`);
 	/** Write the report on what is done so far, over the last one: a run stopped short keeps what it paid for. */
@@ -119,7 +135,8 @@ async function main(): Promise<number> {
 		const report = renderReport({ sessions, scored: score(sessions), meter, mode, startedAt, judge: judgeKey, unfinished });
 		mkdirSync(REPORTS, { recursive: true });
 		writeFileSync(reportPath, report);
-		writeFileSync(reportPath.replace(/\.md$/, ".json"), JSON.stringify({ startedAt, mode, judge: judgeKey, ...(unfinished ? { unfinished } : {}), sessions, spend: meter.rows() }, null, 2));
+		const of = rejudging ? { rejudged: rejudging } : {};
+		writeFileSync(reportPath.replace(/\.md$/, ".json"), JSON.stringify({ startedAt, mode, judge: judgeKey, ...of, ...(unfinished ? { unfinished } : {}), sessions, spend: meter.rows() }, null, 2));
 		return report;
 	};
 	const stopped = () => `stopped after ${sessions.length} of ${picked.length} sessions`;
@@ -129,6 +146,33 @@ async function main(): Promise<number> {
 		rmSync(prunedDir, { recursive: true, force: true });
 		process.exit(130);
 	});
+	if (saved) {
+		const only = flags("--only");
+		const pick = (name: string) => (cut: { depth: number }) => only.length === 0 || only.includes(`${name}#${cut.depth}`);
+		for (const result of saved.sessions) {
+			// A session none of `--only` picks is reported as saved, so the bars still score the whole run.
+			if (only.length > 0 && !only.some((at) => at.startsWith(`${result.name}#`))) {
+				sessions.push(result);
+				continue;
+			}
+			const at = manifest.sessions.findIndex((entry) => entry.name === result.name);
+			const recording = at === -1 ? undefined : readRecording(readFileSync(manifest.sessions[at]!.path, "utf8"), "judging");
+			if (!recording || "problem" in recording) {
+				sessions.push({ name: result.name, skipped: recording ? recording.problem : "the manifest doesn't name it", cuts: [] });
+				continue;
+			}
+			console.log(`${result.name}…`);
+			const deps = { settings, kinds: kindsFor(at), findModel: reachable, judge: { model: judgeModel, stream: meter.metered("judge", call) }, oursSide };
+			sessions.push(await rejudgeSession(recording, result, deps, pick(result.name)));
+			await meter.settled();
+			console.log(`  spent so far: $${meter.total().toFixed(2)}`);
+		}
+		const report = write();
+		console.log(`\n${report}`);
+		console.log(`Report: ${reportPath}`);
+		rmSync(prunedDir, { recursive: true, force: true });
+		return 0;
+	}
 	try {
 		for (const [i, entry] of picked.entries()) {
 			console.log(`[${i + 1}/${picked.length}] ${entry.name}…`);
@@ -144,8 +188,7 @@ async function main(): Promise<number> {
 				findModel: reachable,
 				stream: (spending) => meter.metered(spending, call),
 				judge: { model: judgeModel, stream: meter.metered("judge", call) },
-				// Our Handoff is "A" on every other cut, so that the judge can't learn which is which.
-				oursSide: (): Side => (judged++ % 2 === 0 ? "A" : "B"),
+				oursSide,
 				prunedDir,
 			});
 			sessions.push(result);

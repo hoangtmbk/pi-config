@@ -410,8 +410,14 @@ function futureFor(recording: Recording, end: number): AgentMessage[] {
 	return upTo < 0 ? future : future.slice(0, upTo + 1);
 }
 
+/** What the judge reads of a lane's cut. */
+type Judged = Pick<LaneCut, "handoff" | "continuation">;
+
+/** What judging needs of the replay's dependencies. */
+type JudgeDeps = Pick<ReplayDeps, "judge" | "oursSide">;
+
 /** The judge's verdict on a cut, with the sides named again, or why there is none. */
-async function judged(recording: Recording, cut: PlannedCut, ours: LaneCut, pi: LaneCut, deps: ReplayDeps): Promise<CutVerdict | { problem: string }> {
+async function judged(recording: Recording, cut: PlannedCut, ours: Judged, pi: Judged, deps: JudgeDeps): Promise<CutVerdict | { problem: string }> {
 	const history = seenIn(recording.branch.slice(0, cut.boundary.end + 1));
 	const oursIs = deps.oursSide();
 	const piIs: Side = oursIs === "A" ? "B" : "A";
@@ -431,8 +437,16 @@ async function judged(recording: Recording, cut: PlannedCut, ours: LaneCut, pi: 
 	};
 }
 
-/** Replay one recorded session (see the module's comment). */
-export async function replaySession(recording: Recording, name: string, deps: ReplayDeps): Promise<SessionResult> {
+/** Where a session is cut, and on what settings; or the session skipped, and why. */
+interface Chain {
+	plan: PlannedCut[];
+	sessionModel: Model<any>;
+	settings: SettingsLike;
+	keep: number;
+	reserve: number;
+}
+
+function chainFor(recording: Recording, name: string, deps: Pick<ReplayDeps, "settings" | "kinds" | "findModel">): Chain | SessionResult {
 	const boundaries = boundariesOf(recording);
 	const last = boundaries.at(-1)?.model;
 	const sessionModel = last ? deps.findModel(last.provider, last.id) : undefined;
@@ -450,6 +464,14 @@ export async function replaySession(recording: Recording, name: string, deps: Re
 	if (plan.length === 0) return { name, model: key(sessionModel), skipped: `it is too short for a chain of two cuts, ${keep} tokens apart, with ${USER_TURNS_AFTER === 1 ? "a user turn" : `${USER_TURNS_AFTER} user turns`} after the last`, cuts: [] };
 	const unreachable = plan.map((cut) => cut.boundary.model).find((model) => !deps.findModel(model.provider, model.id));
 	if (unreachable) return { name, model: key(unreachable), skipped: `its model ${key(unreachable)} can't be reached`, cuts: [] };
+	return { plan, sessionModel, settings, keep, reserve };
+}
+
+/** Replay one recorded session (see the module's comment). */
+export async function replaySession(recording: Recording, name: string, deps: ReplayDeps): Promise<SessionResult> {
+	const planned = chainFor(recording, name, deps);
+	if (!("plan" in planned)) return planned;
+	const { plan, sessionModel, settings, keep, reserve } = planned;
 
 	const first = plan[0]!;
 	const seed = [recording.header, ...recording.branch.slice(0, first.boundary.at)];
@@ -492,4 +514,37 @@ export async function replaySession(recording: Recording, name: string, deps: Re
 
 	const chain = (lane: "ours" | "pi") => cuts.flatMap((cut) => (cut[lane] ? [cut[lane]!.handoff] : []));
 	return { name, model: key(sessionModel), cuts, collapse: { ours: collapseGuard(chain("ours")), pi: collapseGuard(chain("pi")) } };
+}
+
+/**
+ * A saved session's cuts judged again, and nothing else replayed: the
+ * Handoffs and continuations are the saved ones, and the history and what
+ * happened next are the recording's, cut where the replay cut it. For checking
+ * a change to the judge without paying for the writers and continuations
+ * again. A session whose recording no longer cuts where the report did is
+ * skipped, with the reason.
+ */
+export async function rejudgeSession(
+	recording: Recording,
+	saved: SessionResult,
+	deps: Pick<ReplayDeps, "settings" | "kinds" | "findModel"> & JudgeDeps,
+	/** Which cuts to judge again; the rest keep their saved verdict. */
+	picked: (cut: CutResult) => boolean = () => true,
+): Promise<SessionResult> {
+	if (saved.skipped) return saved;
+	const chain = chainFor(recording, saved.name, deps);
+	if (!("plan" in chain)) return chain;
+	const { plan } = chain;
+	if (saved.cuts.some((cut, i) => plan[i]?.requested !== cut.requested)) return { ...saved, skipped: "its cuts differ from the saved report's", cuts: [] };
+	const cuts: CutResult[] = [];
+	for (const [i, cut] of saved.cuts.entries()) {
+		const { verdict: _verdict, unjudged: _unjudged, ...rest } = cut;
+		if (!cut.ours || !cut.pi || !picked(cut)) {
+			cuts.push(cut);
+			continue;
+		}
+		const verdict = await judged(recording, plan[i]!, cut.ours, cut.pi, deps);
+		cuts.push("problem" in verdict ? { ...rest, unjudged: verdict.problem } : { ...rest, verdict });
+	}
+	return { ...saved, cuts };
 }

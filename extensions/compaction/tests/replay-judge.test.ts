@@ -58,6 +58,17 @@ describe("the judge's request", () => {
 		assert.ok(prompt.indexOf("<handoff-b>") < prompt.indexOf("The user wants the test fixed."));
 		assert.doesNotMatch(prompt + systemPrompt, /pi's default|our Handoff|baseline/i, "nothing says which Handoff is which");
 	});
+
+	it("counts a rule as carried only for the instruction itself, and doesn't count as redone what a carried rule calls for", () => {
+		const { systemPrompt } = judgeRequest(judgeCase());
+		const constraints = systemPrompt.slice(systemPrompt.indexOf("1. Constraints."), systemPrompt.indexOf("2. Violations."));
+		assert.match(constraints, /the instruction itself/, "carrying a rule means carrying the instruction");
+		assert.match(constraints, /once followed/, "a record of having followed it once is not carrying it");
+		const redone = systemPrompt.slice(systemPrompt.indexOf("4. Redone work."));
+		assert.match(redone, /carries in step 1/, "the rules found carried are what exempts an action");
+		assert.match(redone, /is never redone work/);
+		assert.match(redone, /quote the rule/i, "an exemption cites the rule it rests on");
+	});
 });
 
 describe("the judge's verdict", () => {

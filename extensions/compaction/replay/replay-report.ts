@@ -211,7 +211,8 @@ export interface Run {
 	sessions: readonly SessionResult[];
 	scored: Scorecard;
 	meter: Meter;
-	mode: "full" | "quick";
+	/** "rejudge" when only the judge ran again, on a saved report's Handoffs and continuations. */
+	mode: "full" | "quick" | "rejudge";
 	startedAt: Date;
 	/** `provider/id` of the judge. */
 	judge: string;
