@@ -536,8 +536,9 @@ export function rejudgeProblem(recording: Recording, saved: SessionResult): stri
  * Handoffs and continuations are the saved ones, and the history and what
  * happened next are the recording's, cut where the replay cut it, and the
  * rules to score are the ones the saved verdict listed. For checking a change
- * to the judge without paying for the writers and continuations again. Throws, before any call, when a cut can't be found in the recording
- * (see `rejudgeProblem`).
+ * to the judge without paying for the writers and continuations again.
+ * Throws, before any call, when a cut can't be found in the recording (see
+ * `rejudgeProblem`).
  */
 export async function rejudgeSession(
 	recording: Recording,

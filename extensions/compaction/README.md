@@ -409,8 +409,9 @@ to, so that transcripts never reach the repo:
 ```
 
 `--rejudge <report.json>` runs only the judge again, on a saved report's Handoffs and continuations
-(about $1.30 for a full report): each saved cut is found in its recording by the recorded actions
-its continuation was compared with, and everything is checked before anything is spent.
+(about $1.50 for a full report, measured on #67's runs): each saved cut is found in its recording by
+the recorded actions its continuation was compared with, and everything is checked before anything
+is spent.
 `--only "<session>#<depth>"` picks cuts; the rest keep their saved verdicts. The judge is given
 the rules each saved verdict listed, so verdicts compare rule by rule. It is how a change to the
 judge is calibrated against the hand labels.

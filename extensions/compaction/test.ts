@@ -17,7 +17,7 @@
  *
  * `--rejudge` runs only the judge again, on a saved report's Handoffs and
  * continuations: a change to the judge is checked against the hand labels
- * for about $1.30 a full report, not $45. Use the manifest the report was run
+ * for about $1.50 a full report (#67's runs), not $45. Use the manifest the report was run
  * from, and the report's own judge unless `--judge` says otherwise. `--only`
  * picks cuts to judge again; the rest keep their saved verdicts.
  *
@@ -147,6 +147,7 @@ async function main(): Promise<number> {
 	const saved = rejudging ? (JSON.parse(readFileSync(rejudging, "utf8")) as { judge?: string; sessions?: SessionResult[] }) : undefined;
 	if (saved && !Array.isArray(saved.sessions)) fail(`${rejudging} is not a replay report: it has no sessions.`);
 	if (saved && quick) fail("--quick replays; --rejudge only judges a saved report again. Pick one.");
+	if (!saved && flags("--only").length > 0) fail("--only picks cuts of a saved report to judge again: pass it with --rejudge <report.json>.");
 	const judgeKey = flag("--judge") ?? saved?.judge ?? DEFAULT_JUDGE;
 	const [judgeProvider, ...judgeId] = judgeKey.split("/");
 	const judgeModel = reachable(judgeProvider ?? "", judgeId.join("/"));
