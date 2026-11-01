@@ -107,10 +107,11 @@ Also seen: an interactive `auto`-mode session showed `Teach auto mode about your
 | Interactive launch in a new folder | `Accessing workspace: … Quick safety check: Is this a project you created or one you trust? ❯ No, exit / Yes, I trust this folder`. No hook fired before it. |
 | Writing `.projects["<abs path>"].hasTrustDialogAccepted = true` into `~/.claude.json` (jq, atomic replace) before launch | **No dialog.** `SessionStart` fired at once. |
 | A plain subfolder (`work/sub`, not a git repo) of a trusted folder | No dialog, although its own entry read `hasTrustDialogAccepted: false`. Trust is inherited. |
-| A subfolder that is its own git repo (`work/repo`) | **Not inherited.** `--bg` failed until the repo's own path was trusted. |
+| A subfolder that is its own git repository (`work/repo`, made with `git init`) | **Not inherited.** `--bg` failed until the repo's own path was trusted. |
+| Git worktrees of a trusted repo (only `work/repo` trusted): one at `repo/.claude/worktrees/team-e1`, one outside it at `work/sibling-wt` | **Both trusted.** `--bg` started in each with no error. A worktree takes trust from its main repository, wherever it lives. |
 | `claude --bg …` in an untrusted folder | Exits at once: `Workspace not trusted. Run claude in <path> once and accept the trust prompt, then retry.` No dialog, no session. |
 
-**Answer:** yes. Trust can be granted ahead of time by writing `hasTrustDialogAccepted: true` for the folder in `~/.claude.json`. It covers plain subfolders but not a nested git repo, so each worktree or repo a Teammate starts in needs its own entry. `~/.claude.json` is also rewritten by running sessions, so the write has to be a quick read-modify-replace.
+**Answer:** yes. Trust can be granted ahead of time by writing `hasTrustDialogAccepted: true` for the folder in `~/.claude.json`. It covers plain subfolders and every git worktree of a trusted repository, in or outside the repo, but not a separate repository nested inside a trusted folder. `~/.claude.json` is also rewritten by running sessions, so the write has to be a quick read-modify-replace.
 
 ## 8. Long-held permission hooks, and ExitPlanMode
 
