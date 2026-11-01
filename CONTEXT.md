@@ -104,3 +104,36 @@ The part of a Handoff that lists the user's rules, preferences and exclusions as
 of what they said. It only grows across compactions; an entry leaves it only when a later quote
 from the user supersedes it.
 _Avoid_: rules list, constraints summary, memory
+
+### Teams
+
+**Lead**:
+The pi session that works with the human first, until it understands what they want, then
+directs a Team's Teammates toward it. The human's single point of contact for the effort.
+_Avoid_: orchestrator, manager, supervisor (that is the subagents extension's)
+
+**Team**:
+A named definition: the set of Roles that together cover one kind of work, such as a software
+team or a marketing team. A description, not a running thing.
+_Avoid_: crew, squad, workforce
+
+**Role**:
+One position on a Team, such as architect, dev or QA: what that position is for and how a
+Teammate filling it is set up. A definition, as an Agent is.
+_Avoid_: persona, specialist, agent (that is the subagents extension's)
+
+**Teammate**:
+One running Claude Code session filling a Role, in a terminal the human can attach to and type
+into. Many Teammates may fill the same Role.
+_Avoid_: worker, terminal, run (that is a pi child process), subagent
+
+**Playbook**:
+A Team's standing guidance on how the Lead runs it: who does what, in what order, what counts as
+done, and when to come back to the human. Agreed with the human in Team setup and revised only
+with them. Reused across efforts.
+_Avoid_: pipeline, workflow, process, SOP
+
+**Brief**:
+What the human wants from one effort, agreed with the Lead at intake. No Teammate starts until
+the human has approved it.
+_Avoid_: spec, requirements, ticket, task
