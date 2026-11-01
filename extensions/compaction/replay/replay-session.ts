@@ -410,9 +410,15 @@ function futureFor(recording: Recording, end: number): AgentMessage[] {
 	return upTo < 0 ? future : future.slice(0, upTo + 1);
 }
 
+/** What the judge reads of a lane's cut. */
+type Judged = Pick<LaneCut, "handoff" | "continuation">;
+
+/** What judging needs of the replay's dependencies. */
+type JudgeDeps = Pick<ReplayDeps, "judge" | "oursSide">;
+
 /** The judge's verdict on a cut, with the sides named again, or why there is none. */
-async function judged(recording: Recording, cut: PlannedCut, ours: LaneCut, pi: LaneCut, deps: ReplayDeps): Promise<CutVerdict | { problem: string }> {
-	const history = seenIn(recording.branch.slice(0, cut.boundary.end + 1));
+async function judged(recording: Recording, end: number, ours: Judged, pi: Judged, deps: JudgeDeps, rules?: readonly string[]): Promise<CutVerdict | { problem: string }> {
+	const history = seenIn(recording.branch.slice(0, end + 1));
 	const oursIs = deps.oursSide();
 	const piIs: Side = oursIs === "A" ? "B" : "A";
 	const verdict = await judgeCut(deps.judge.stream, deps.judge.model, {
@@ -420,7 +426,8 @@ async function judged(recording: Recording, cut: PlannedCut, ours: LaneCut, pi: 
 		history,
 		handoffs: { [oursIs]: ours.handoff.summary, [piIs]: pi.handoff.summary } as Record<Side, string>,
 		continuations: { [oursIs]: ours.continuation, [piIs]: pi.continuation } as Record<Side, Continuation>,
-		future: futureFor(recording, cut.boundary.end),
+		future: futureFor(recording, end),
+		rules,
 	});
 	if ("problem" in verdict) return verdict;
 	return {
@@ -480,7 +487,7 @@ export async function replaySession(recording: Recording, name: string, deps: Re
 			await compactPi(lanes, recording.branch, cut, context);
 			result.ours = await laneCut(lanes.ours.session, recording, cut, plan[i + 1], context);
 			result.pi = await laneCut(lanes.pi, recording, cut, plan[i + 1], context);
-			const verdict = await judged(recording, cut, result.ours, result.pi, deps);
+			const verdict = await judged(recording, cut.boundary.end, result.ours, result.pi, deps);
 			if ("problem" in verdict) result.unjudged = verdict.problem;
 			else result.verdict = verdict;
 		} catch (error) {
@@ -492,4 +499,67 @@ export async function replaySession(recording: Recording, name: string, deps: Re
 
 	const chain = (lane: "ours" | "pi") => cuts.flatMap((cut) => (cut[lane] ? [cut[lane]!.handoff] : []));
 	return { name, model: key(sessionModel), cuts, collapse: { ours: collapseGuard(chain("ours")), pi: collapseGuard(chain("pi")) } };
+}
+
+/** The tools an action calls, in order. */
+const callsIn = (action: AssistantMessage) => action.content.flatMap((part) => (part.type === "toolCall" ? [part.name] : [])).join(",");
+
+/**
+ * Where a saved cut was made: the end of the recording's turn boundary that
+ * its saved continuation's recorded actions follow. Found from the saved
+ * cut, not planned again, so that a grown recording, other settings or a
+ * change to how cuts are planned can't move it; `undefined` unless exactly one
+ * boundary fits.
+ */
+function savedEnd(recording: Recording, boundaries: readonly Boundary[], cut: CutResult): number | undefined {
+	const lane = cut.ours ?? cut.pi;
+	if (!lane) return undefined;
+	const { matched, differed } = lane.continuation;
+	const fits = boundaries.filter((boundary) => {
+		const steps = futureAfter(recording.branch, boundary.end).steps;
+		if (!differed) return steps.length >= matched.length && matched.every((action, i) => callsIn(action) === callsIn(steps[i]!.action));
+		// The recorded action the first difference was shown beside, or the recording's end.
+		return differed.recorded ? JSON.stringify(steps[matched.length]?.action) === JSON.stringify(differed.recorded) : steps.length === matched.length;
+	});
+	return fits.length === 1 ? fits[0]!.end : undefined;
+}
+
+/** Why `saved` can't be judged again from `recording`, if it can't. */
+export function rejudgeProblem(recording: Recording, saved: SessionResult): string | undefined {
+	const boundaries = boundariesOf(recording);
+	const lost = saved.cuts.find((cut) => cut.ours && cut.pi && savedEnd(recording, boundaries, cut) === undefined);
+	return lost && `its cut ${lost.depth} matches no one turn of the recording: re-judge it from the recording the report was run on`;
+}
+
+/**
+ * A saved session's cuts judged again, and nothing else replayed: the
+ * Handoffs and continuations are the saved ones, and the history and what
+ * happened next are the recording's, cut where the replay cut it, and the
+ * rules to score are the ones the saved verdict listed. For checking a change
+ * to the judge without paying for the writers and continuations again.
+ * Throws, before any call, when a cut can't be found in the recording (see
+ * `rejudgeProblem`).
+ */
+export async function rejudgeSession(
+	recording: Recording,
+	saved: SessionResult,
+	deps: JudgeDeps,
+	/** Which cuts to judge again; the rest keep their saved verdict. */
+	picked: (cut: CutResult) => boolean = () => true,
+): Promise<SessionResult> {
+	const problem = rejudgeProblem(recording, saved);
+	if (problem) throw new Error(`${saved.name}: ${problem}`);
+	const boundaries = boundariesOf(recording);
+	const cuts: CutResult[] = [];
+	for (const cut of saved.cuts) {
+		const { verdict: _verdict, unjudged: _unjudged, ...rest } = cut;
+		if (!cut.ours || !cut.pi || !picked(cut)) {
+			cuts.push(cut);
+			continue;
+		}
+		const rules = cut.verdict?.constraints.map((constraint) => constraint.quote);
+		const verdict = await judged(recording, savedEnd(recording, boundaries, cut)!, cut.ours, cut.pi, deps, rules);
+		cuts.push("problem" in verdict ? { ...rest, unjudged: verdict.problem } : { ...rest, verdict });
+	}
+	return { ...saved, cuts };
 }

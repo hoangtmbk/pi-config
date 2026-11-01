@@ -13,6 +13,13 @@
  *   npm run live:compaction -- --quick          # the first session only, about $5
  *   npm run live:compaction -- --manifest <path>
  *   npm run live:compaction -- --judge <provider>/<model>   # default openai-codex/gpt-6.1-sol
+ *   npm run live:compaction -- --rejudge <report.json> [--only "<session>#<depth>"]...
+ *
+ * `--rejudge` runs only the judge again, on a saved report's Handoffs and
+ * continuations: a change to the judge is checked against the hand labels
+ * for about $1.50 a full report (#67's runs), not $45. Use the manifest the report was run
+ * from, and the report's own judge unless `--judge` says otherwise. `--only`
+ * picks cuts to judge again; the rest keep their saved verdicts.
  *
  * When it must pass: before the extension is enabled by default, and after any
  * change to the writer's instruction, the Handoff's sections or the Pruning
@@ -46,10 +53,10 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { kindsFor, parseManifest, readRecording } from "./replay/replay-corpus.ts";
+import { kindsFor, type ManifestSession, parseManifest, type Recording, readRecording } from "./replay/replay-corpus.ts";
 import type { Side } from "./replay/replay-judge.ts";
 import { Meter, renderReport, score } from "./replay/replay-report.ts";
-import { guardCall, type SessionResult, replaySession } from "./replay/replay-session.ts";
+import { type CutResult, guardCall, rejudgeProblem, rejudgeSession, type SessionResult, replaySession } from "./replay/replay-session.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_MANIFEST = join(HERE, "replay-manifest.json");
@@ -66,9 +73,53 @@ function flag(name: string): string | undefined {
 	return at === -1 ? undefined : process.argv[at + 1];
 }
 
+/** Every value given for a flag that can repeat. */
+function flags(name: string): string[] {
+	return process.argv.flatMap((arg, i) => (arg === name && process.argv[i + 1] !== undefined ? [process.argv[i + 1]!] : []));
+}
+
 function fail(message: string): never {
 	console.error(message);
 	process.exit(1);
+}
+
+/** One saved session to judge again: its recording, where the manifest has it, and which of its cuts. */
+interface Rejudge {
+	saved: SessionResult;
+	/** Absent for a session no `--only` picks: it is reported as saved. */
+	recording?: Recording;
+	picked: (cut: CutResult) => boolean;
+}
+
+/**
+ * The saved sessions to judge again, every one checked before anything is
+ * spent: named in the manifest, readable, and cut where the report cut it;
+ * and every `--only` naming a cut the report has.
+ */
+function rejudgePlan(saved: SessionResult[], entries: readonly ManifestSession[]): Rejudge[] {
+	const only = flags("--only");
+	const problems = only
+		.filter((at) => !saved.some((s) => s.cuts.some((cut) => `${s.name}#${cut.depth}` === at && cut.ours && cut.pi)))
+		.map((at) => `--only "${at}": the report has no cut by that name and depth with both Handoffs (write it as "<session name>#<depth>")`);
+	const plan = saved.map((result): Rejudge => {
+		const picked = (cut: CutResult) => only.length === 0 || only.includes(`${result.name}#${cut.depth}`);
+		const entry = entries.find((named) => named.name === result.name);
+		if (result.skipped || !result.cuts.some(picked)) return { saved: result, picked };
+		if (!entry) {
+			problems.push(`${result.name}: the manifest doesn't name it; pass --manifest with the one the report was run from`);
+			return { saved: result, picked };
+		}
+		const recording = readRecording(readFileSync(entry.path, "utf8"), "judging");
+		if ("problem" in recording) {
+			problems.push(`${result.name}: ${recording.problem}`);
+			return { saved: result, picked };
+		}
+		const problem = rejudgeProblem(recording, result);
+		if (problem) problems.push(`${result.name}: ${problem}`);
+		return { saved: result, recording, picked };
+	});
+	if (problems.length) fail(["Nothing was judged:", ...problems.map((p) => `  - ${p}`)].join("\n"));
+	return plan;
 }
 
 async function main(): Promise<number> {
@@ -92,13 +143,19 @@ async function main(): Promise<number> {
 		const model = registry.find(provider, id);
 		return model && registry.hasConfiguredAuth(model) ? model : undefined;
 	};
-	const judgeKey = flag("--judge") ?? DEFAULT_JUDGE;
+	const rejudging = flag("--rejudge");
+	const saved = rejudging ? (JSON.parse(readFileSync(rejudging, "utf8")) as { judge?: string; sessions?: SessionResult[] }) : undefined;
+	if (saved && !Array.isArray(saved.sessions)) fail(`${rejudging} is not a replay report: it has no sessions.`);
+	if (saved && quick) fail("--quick replays; --rejudge only judges a saved report again. Pick one.");
+	if (!saved && flags("--only").length > 0) fail("--only picks cuts of a saved report to judge again: pass it with --rejudge <report.json>.");
+	const judgeKey = flag("--judge") ?? saved?.judge ?? DEFAULT_JUDGE;
 	const [judgeProvider, ...judgeId] = judgeKey.split("/");
 	const judgeModel = reachable(judgeProvider ?? "", judgeId.join("/"));
 	if (!judgeModel) fail(`The judge, ${judgeKey}, can't be reached: pi knows no such model, or has no credentials for it. Log in with pi first.`);
 
 	const settingsPath = join(agentDir, "settings.json");
 	const settings = existsSync(settingsPath) ? (JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>) : {};
+	const rejudge = saved ? rejudgePlan(saved.sessions!, manifest.sessions) : [];
 
 	const meter = new Meter();
 	// No call can hang the run: a stalled or endless one fails its cut (see `guardCall`).
@@ -106,12 +163,14 @@ async function main(): Promise<number> {
 	const prunedDir = mkdtempSync(join(tmpdir(), "pi-replay-pruned-"));
 	const startedAt = new Date();
 	const picked = manifest.sessions.slice(0, quick ? QUICK_SESSIONS : FULL_SESSIONS);
-	if (!quick && manifest.sessions.length < FULL_SESSIONS) console.log(`The manifest names ${manifest.sessions.length} sessions; a full run is set for ${FULL_SESSIONS}.`);
-	if (manifest.sessions.length > picked.length) console.log(`Replaying the first ${picked.length} of ${manifest.sessions.length} sessions.`);
+	if (!saved && !quick && manifest.sessions.length < FULL_SESSIONS) console.log(`The manifest names ${manifest.sessions.length} sessions; a full run is set for ${FULL_SESSIONS}.`);
+	if (!saved && manifest.sessions.length > picked.length) console.log(`Replaying the first ${picked.length} of ${manifest.sessions.length} sessions.`);
 
 	let judged = 0;
+	// Our Handoff is "A" on every other cut, so that the judge can't learn which is which.
+	const oursSide = (): Side => (judged++ % 2 === 0 ? "A" : "B");
 	const sessions: SessionResult[] = [];
-	const mode = quick ? "quick" : "full";
+	const mode = saved ? "rejudge" : quick ? "quick" : "full";
 	const stamp = startedAt.toISOString().replace(/[:.]/g, "-");
 	const reportPath = join(REPORTS, `${stamp}-${mode}.md`);
 	/** Write the report on what is done so far, over the last one: a run stopped short keeps what it paid for. */
@@ -119,10 +178,11 @@ async function main(): Promise<number> {
 		const report = renderReport({ sessions, scored: score(sessions), meter, mode, startedAt, judge: judgeKey, unfinished });
 		mkdirSync(REPORTS, { recursive: true });
 		writeFileSync(reportPath, report);
-		writeFileSync(reportPath.replace(/\.md$/, ".json"), JSON.stringify({ startedAt, mode, judge: judgeKey, ...(unfinished ? { unfinished } : {}), sessions, spend: meter.rows() }, null, 2));
+		const of = rejudging ? { rejudged: rejudging } : {};
+		writeFileSync(reportPath.replace(/\.md$/, ".json"), JSON.stringify({ startedAt, mode, judge: judgeKey, ...of, ...(unfinished ? { unfinished } : {}), sessions, spend: meter.rows() }, null, 2));
 		return report;
 	};
-	const stopped = () => `stopped after ${sessions.length} of ${picked.length} sessions`;
+	const stopped = () => `stopped after ${sessions.length} of ${saved ? rejudge.length : picked.length} sessions`;
 	process.once("SIGINT", () => {
 		write(`${stopped()} (interrupted)`);
 		console.log(`\nInterrupted. Report so far (spend counted for finished calls only): ${reportPath}`);
@@ -130,7 +190,18 @@ async function main(): Promise<number> {
 		process.exit(130);
 	});
 	try {
-		for (const [i, entry] of picked.entries()) {
+		for (const { saved: result, recording, picked: pick } of rejudge) {
+			if (!recording) {
+				// Not judged again (skipped, or picked by no `--only`): reported as saved, so the bars still score the whole run.
+				sessions.push(result);
+				continue;
+			}
+			console.log(`${result.name}…`);
+			sessions.push(await rejudgeSession(recording, result, { judge: { model: judgeModel, stream: meter.metered("judge", call) }, oursSide }, pick));
+			await meter.settled();
+			console.log(`  spent so far: $${meter.total().toFixed(2)}`);
+		}
+		for (const [i, entry] of saved ? [] : picked.entries()) {
 			console.log(`[${i + 1}/${picked.length}] ${entry.name}…`);
 			const recording = readRecording(readFileSync(entry.path, "utf8"));
 			if ("problem" in recording) {
@@ -144,8 +215,7 @@ async function main(): Promise<number> {
 				findModel: reachable,
 				stream: (spending) => meter.metered(spending, call),
 				judge: { model: judgeModel, stream: meter.metered("judge", call) },
-				// Our Handoff is "A" on every other cut, so that the judge can't learn which is which.
-				oursSide: (): Side => (judged++ % 2 === 0 ? "A" : "B"),
+				oursSide,
 				prunedDir,
 			});
 			sessions.push(result);

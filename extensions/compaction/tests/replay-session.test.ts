@@ -20,7 +20,7 @@ import { type Context, getCurrentTools, type Model, type SimpleStreamOptions } f
 import type { HandoffDetails } from "../handoff.ts";
 import { FORK_PREAMBLE } from "../instruction.ts";
 import { type CutKind, readRecording } from "../replay/replay-corpus.ts";
-import { CALL_CAP_MS, CALL_STALL_MS, guardCall, type ReplayDeps, replaySession, type Spending } from "../replay/replay-session.ts";
+import { CALL_CAP_MS, CALL_STALL_MS, guardCall, type ReplayDeps, rejudgeProblem, rejudgeSession, replaySession, type SessionResult, type Spending } from "../replay/replay-session.ts";
 import { MODEL } from "./fake-pi.ts";
 import { recorder } from "./recordings.ts";
 import { fakeClock, type Reply, scriptModel } from "./scripted-model.ts";
@@ -233,6 +233,62 @@ describe("replaying a session", () => {
 		if ("problem" in short) throw new Error(short.problem);
 		const tooShort = await replaySession(short, "short", routed().deps);
 		assert.match(tooShort.skipped ?? "", /too short for a chain of two cuts/);
+	});
+});
+
+describe("re-judging a saved session", () => {
+	it("runs only the judge, on the saved Handoffs and continuations, with the history and future cut where the replay cut them", async () => {
+		const recorded = recording();
+		const saved = JSON.parse(JSON.stringify(await replaySession(recorded, "fetcher", routed().deps))) as SessionResult;
+		for (const cut of saved.cuts) cut.verdict = undefined;
+		const { asked, deps } = routed();
+		const prompts: string[] = [];
+		const judge = deps.judge.stream;
+		deps.judge.stream = (model, context, options) => {
+			prompts.push(lastUser(context));
+			return judge(model, context, options);
+		};
+
+		const result = await rejudgeSession(recorded, saved, deps);
+		assert.deepEqual(asked, ["judge", "judge", "judge"], "no writer and no continuation is called again");
+		assert.ok(prompts.every((prompt) => !prompt.includes("<rules>")), "a cut saved without a verdict has its rules listed afresh");
+		assert.equal(result.cuts.length, 3);
+		for (const [i, cut] of result.cuts.entries()) {
+			assert.deepEqual(cut.verdict!.constraints.map((c) => [c.quote, c.ours.verdict, c.pi.verdict]), [[RULE, true, false]]);
+			assert.ok(prompts[i]!.includes(saved.cuts[i]!.ours!.handoff.summary), "the saved Handoff is what is judged");
+			assert.ok(prompts[i]!.includes(saved.cuts[i]!.pi!.handoff.summary));
+			assert.deepEqual(cut.ours, saved.cuts[i]!.ours, "everything else is as saved");
+		}
+	});
+
+	it("judges again only the cuts picked, and keeps the saved verdict on the rest", async () => {
+		const recorded = recording();
+		const saved = JSON.parse(JSON.stringify(await replaySession(recorded, "fetcher", routed().deps))) as SessionResult;
+		const { asked, deps } = routed();
+		const prompts: string[] = [];
+		const judge = deps.judge.stream;
+		deps.judge.stream = (model, context, options) => {
+			prompts.push(lastUser(context));
+			return judge(model, context, options);
+		};
+		const result = await rejudgeSession(recorded, saved, deps, (cut) => cut.depth === 2);
+		assert.deepEqual(asked, ["judge"]);
+		assert.ok(prompts[0]!.includes(`<rules>\n[1] ${RULE}\n</rules>`), "the judge scores the rules the saved verdict listed");
+		assert.deepEqual(result.cuts[0], saved.cuts[0]);
+		assert.deepEqual(result.cuts[2], saved.cuts[2]);
+	});
+
+	it("finds each saved cut in the recording, and refuses, before any call, one it can't find", async () => {
+		const recorded = recording();
+		const saved = JSON.parse(JSON.stringify(await replaySession(recorded, "fetcher", routed().deps))) as SessionResult;
+		const { asked, deps } = routed();
+		assert.equal(rejudgeProblem(recorded, saved), undefined);
+		// A cut whose continuation was compared with an action the recording doesn't have.
+		const lost = structuredClone(saved);
+		lost.cuts[1]!.ours!.continuation.differed!.recorded!.responseId = "another";
+		assert.match(rejudgeProblem(recorded, lost) ?? "", /its cut 2 matches no one turn of the recording/);
+		await assert.rejects(rejudgeSession(recorded, lost, deps), /fetcher: its cut 2 matches no one turn/);
+		assert.deepEqual(asked, []);
 	});
 });
 
