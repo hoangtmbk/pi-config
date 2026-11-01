@@ -394,7 +394,7 @@ compaction entry, ours or pi's.
 | Check | What it reports |
 |---|---|
 | `fileStateDiff(handoff, removed)` | the Handoff's file state against the true one, read from every message it stands in for with the Handoff's own mapping; `exact` is the pass bar. pi's own compaction can say only read or modified, so a created or deleted file is wrong there. |
-| `recurringDetailRetention(handoff, { removed, tail, after })` | of the identifiers in the removed span (paths, names, flags, error codes, hashes, numbers…) that the kept tail doesn't show and that come up again after the cut, the share found word for word in the Handoff, beside its size. Reported, not gated; below 70% is the trigger to add an identifier dump. |
+| `recurringDetailRetention(handoff, { removed, tail, after })` | of the identifiers in the removed span (paths, names, flags, error codes, hashes, versions…) that the kept tail doesn't show and that the user or the agent names again after the cut before any tool result shows them, the share found word for word in the Handoff, beside its size. Capitals that are plain English (`NEVER` beside `never`) and bare numbers don't count. Reported, not gated; below 70% is the trigger to add an identifier dump. |
 | `collapseGuard(chain)` | each Handoff in a chain counted — judgment size, ledger entries, files, user messages (dropped ones included), open items — and a flag for every count that fell from one Handoff to the next. |
 
 They are tested offline on small fixture sessions written for the purpose, never real transcripts.

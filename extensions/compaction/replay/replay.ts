@@ -68,9 +68,10 @@ export function fileStateDiff(record: CompactionRecord, removed: readonly AgentM
  * What looks like an identifier rather than prose, in the order tried at each
  * position: URLs, backticked code, paths and file names, `--flags`, commit
  * hashes, snake_case, camelCase and PascalCase names, ALL-CAPS codes such as
- * `ENOENT`, `#123` references, and versions and numbers of three digits or
- * more. A path needs a dot in its last part, a leading `/`, `./` or `~/`, or
- * two slashes, so that "and/or" is not one.
+ * `ENOENT`, `#123` references, and versions of three parts or with a `v`. A
+ * path needs a dot in its last part, a leading `/`, `./` or `~/`, or two
+ * slashes, so that "and/or" is not one. A bare number, or one like a section's
+ * `4.11`, is not a detail.
  */
 const DETAIL = new RegExp(
 	[
@@ -85,22 +86,33 @@ const DETAIL = new RegExp(
 		/\b[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*\b/,
 		/\b[A-Z][A-Z0-9]{3,}\b/,
 		/#\d+\b/,
-		/\b\d+(?:\.\d+)+\b|\b\d{3,}\b/,
+		/\bv?\d+(?:\.\d+){2,}\b|\bv\d+(?:\.\d+)*\b/,
 	]
 		.map((pattern) => pattern.source)
 		.join("|"),
 	"g",
 );
 
-/** The identifiers in `text`, each once, in the order they first appear. */
-function detailsIn(text: string): string[] {
+/** A word in capitals, such as `NEVER` or `ENOENT`. */
+const CAPITALS = /^[A-Z][A-Z0-9]{3,}$/;
+
+/**
+ * The identifiers in `text`, each once, in the order they first appear. A word
+ * in capitals is prose, not a code, when `prose` also has it in another case:
+ * "NEVER" beside "never", but not "ECONNRESET".
+ */
+function detailsIn(text: string, prose: string): string[] {
 	const found = new Set<string>();
 	for (const match of text.matchAll(DETAIL)) {
 		// A path or name that ends a sentence keeps its full stop out.
 		const detail = (match[1] ?? match[0]).replace(/[.,:;]+$/, "");
-		if (detail) found.add(detail);
+		if (detail && !(CAPITALS.test(detail) && inOtherCase(detail, prose))) found.add(detail);
 	}
 	return [...found];
+}
+
+function inOtherCase(word: string, text: string): boolean {
+	return [...text.matchAll(new RegExp(`\\b${word}\\b`, "gi"))].some((match) => match[0] !== word);
 }
 
 /** Every string inside a tool call's arguments. */
@@ -112,27 +124,44 @@ function stringsIn(value: unknown): string[] {
 }
 
 /**
- * What the model read and wrote in `messages`: the user's words, the agent's
- * replies and tool calls, the tools' results, and the user's own `!` commands.
- * Thinking is left out, and so are custom messages, which are the extensions'
- * words, not the work's.
+ * What the model read and wrote in one message. The user's words, the agent's
+ * replies and its tool calls `name` a detail; a tool's result and the output
+ * of the user's own `!` command only `show` it. Thinking is left out, and so
+ * are custom messages, which are the extensions' words, not the work's.
  */
-function textOf(messages: readonly AgentMessage[]): string {
-	const parts: string[] = [];
-	for (const message of messages) {
-		if (message.role === "user" || message.role === "toolResult") {
-			if (typeof message.content === "string") parts.push(message.content);
-			else for (const part of message.content) if (part.type === "text") parts.push(part.text);
-		} else if (message.role === "assistant") {
-			for (const part of message.content) {
-				if (part.type === "text") parts.push(part.text);
-				else if (part.type === "toolCall") parts.push(...stringsIn(part.arguments));
-			}
-		} else if (message.role === "bashExecution") {
-			parts.push(message.command, message.output);
-		}
+function partsOf(message: AgentMessage): { name: string[]; show: string[] } {
+	const texts = (content: string | readonly { type: string; text?: string }[]) =>
+		typeof content === "string" ? [content] : content.flatMap((part) => (part.type === "text" && part.text !== undefined ? [part.text] : []));
+	switch (message.role) {
+		case "user":
+			return { name: texts(message.content), show: [] };
+		case "toolResult":
+			return { name: [], show: texts(message.content) };
+		case "assistant":
+			return {
+				name: message.content.flatMap((part) => (part.type === "text" ? [part.text] : part.type === "toolCall" ? stringsIn(part.arguments) : [])),
+				show: [],
+			};
+		case "bashExecution":
+			return { name: [message.command], show: [message.output] };
+		default:
+			return { name: [], show: [] };
 	}
-	return parts.join("\n");
+}
+
+/** Everything the model read and wrote in `messages` (see `partsOf`). */
+function textOf(messages: readonly AgentMessage[]): string {
+	return messages.flatMap((message) => Object.values(partsOf(message)).flat()).join("\n");
+}
+
+/** Whether someone in `messages` names `detail` before a tool's result shows it. */
+function namedFirst(detail: string, messages: readonly AgentMessage[]): boolean {
+	for (const message of messages) {
+		const { name, show } = partsOf(message);
+		if (name.some((text) => text.includes(detail))) return true;
+		if (show.some((text) => text.includes(detail))) return false;
+	}
+	return false;
 }
 
 /** One cut of a recorded session. */
@@ -146,7 +175,7 @@ export interface Cut {
 }
 
 export interface Retention {
-	/** Identifiers from the removed span, not in the kept tail, that come up again after the cut, in the order first seen. */
+	/** Identifiers from the removed span, not in the kept tail, that are named again after the cut, in the order first seen. */
 	recurring: string[];
 	/** Those the Handoff carries, word for word. */
 	retained: string[];
@@ -161,15 +190,18 @@ export interface Retention {
 /**
  * How many of the details that matter after the cut the Handoff kept.
  *
- * A detail is an identifier (see `DETAIL`) from the removed span that comes up
- * again in what really happened next. One the kept tail already shows is not
- * the Handoff's to carry, so it is not counted. Each is looked up as an exact
- * substring: in what happened next, and in the Handoff's text.
+ * A detail is an identifier (see `DETAIL`) from the removed span that the user
+ * or the agent names again in what really happened next, before any tool's
+ * result shows it: one a re-read file or a rerun command shows first was found
+ * again without the Handoff's help. One the kept tail already shows is not the
+ * Handoff's to carry, so it is not counted either. Each is looked up as an
+ * exact substring: in what happened next, and in the Handoff's text.
  */
 export function recurringDetailRetention(record: CompactionRecord, cut: Cut): Retention {
+	const removed = textOf(cut.removed);
 	const tail = textOf(cut.tail);
-	const after = textOf(cut.after);
-	const recurring = detailsIn(textOf(cut.removed)).filter((detail) => !tail.includes(detail) && after.includes(detail));
+	const prose = [removed, tail, textOf(cut.after)].join("\n");
+	const recurring = detailsIn(removed, prose).filter((detail) => !tail.includes(detail) && namedFirst(detail, cut.after));
 	const retained = recurring.filter((detail) => record.summary.includes(detail));
 	return {
 		recurring,
