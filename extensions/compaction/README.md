@@ -431,8 +431,9 @@ the judge is calibrated against the hand labels.
 - **The judge** (`replay-judge.ts`), GPT 6.1 Sol (`openai-codex/gpt-6.1-sol`) by default: the one
   checked against hand labels (#48) and passed with (#50), so that a re-run judges the same way.
   It sees both Handoffs blind, as A and B in alternating order, and scores ledger recall,
-  violations, re-asks and redone work. A rule counts as carried only as the instruction itself, not
-  as a record that it was once followed; re-reads, and what a rule the continuation's own Handoff
+  violations, re-asks and redone work. A standing rule counts as carried only as the instruction
+  itself, not as a record that it was once followed (a one-time step already done is carried by its
+  record); re-reads, and what a rule the continuation's own Handoff
   carries calls for, are not redone work. Every verdict must cite its evidence and every rule must be the user's own words.
 - **The report** (`replay-report.ts`): each pass bar for ours and pi's default — ledger recall ≥95%
   at every depth with no decline, 0 violations, ≤1/30 re-asks, ≤3/30 redone, exact file state, no

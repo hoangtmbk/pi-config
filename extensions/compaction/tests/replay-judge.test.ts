@@ -59,11 +59,12 @@ describe("the judge's request", () => {
 		assert.doesNotMatch(prompt + systemPrompt, /pi's default|our Handoff|baseline/i, "nothing says which Handoff is which");
 	});
 
-	it("counts a rule as carried only for the instruction itself, and doesn't count as redone what a carried rule calls for", () => {
+	it("counts a standing rule as carried only for the instruction itself, and doesn't count as redone what a carried rule calls for", () => {
 		const { systemPrompt } = judgeRequest(judgeCase());
 		const constraints = systemPrompt.slice(systemPrompt.indexOf("1. Constraints."), systemPrompt.indexOf("2. Violations."));
 		assert.match(constraints, /the instruction itself/, "carrying a rule means carrying the instruction");
-		assert.match(constraints, /once followed/, "a record of having followed it once is not carrying it");
+		assert.match(constraints, /once followed/, "a record of having followed it once is not carrying a standing rule");
+		assert.match(constraints, /one-time instruction the history shows was already carried out .* is carried by a record that it was done/, "a done one-off step is carried by its record");
 		const redone = systemPrompt.slice(systemPrompt.indexOf("4. Redone work."));
 		assert.match(redone, /the Handoff this continuation carried on from carries that constraint in step 1/, "the rules found carried are what exempts an action");
 		assert.match(redone, /only the other Handoff carries exempts nothing/);
