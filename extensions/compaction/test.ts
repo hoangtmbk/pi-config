@@ -12,7 +12,7 @@
  *   npm run live:compaction                     # the full run: up to 10 sessions × 3 cuts, about $45
  *   npm run live:compaction -- --quick          # the first session only, about $5
  *   npm run live:compaction -- --manifest <path>
- *   npm run live:compaction -- --judge <provider>/<model>   # default anthropic/claude-fable-5
+ *   npm run live:compaction -- --judge <provider>/<model>   # default openai-codex/gpt-6.1-sol
  *
  * When it must pass: before the extension is enabled by default, and after any
  * change to the writer's instruction, the Handoff's sections or the Pruning
@@ -58,7 +58,8 @@ const REPORTS = join(HERE, "replay-reports");
 /** A full run's corpus: ten sessions, cut three times each, as the pass bar is set for. */
 const FULL_SESSIONS = 10;
 const QUICK_SESSIONS = 1;
-const DEFAULT_JUDGE = "anthropic/claude-fable-5";
+/** The judge #48 checked against hand labels and #50 passed with; a re-run must use the same one. */
+const DEFAULT_JUDGE = "openai-codex/gpt-6.1-sol";
 
 function flag(name: string): string | undefined {
 	const at = process.argv.indexOf(name);

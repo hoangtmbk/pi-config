@@ -25,5 +25,9 @@ messages and not from `getSystemPrompt`, `cacheRetention` stays unset, and on An
 extension that rewrites requests (a `context` handler, `before_provider_request`, hidden tool
 declarations) makes the fork miss without warning, so misses are detected afterwards from
 `usage.cacheRead` and logged, not prevented. A miss costs money; it doesn't make the Handoff
-wrong. The Codex cache hit was confirmed live; the Anthropic one only from pi's code and
-Anthropic's docs ([Can a forked call hit the provider cache?](https://github.com/hoangtmbk/pi-config/issues/27)).
+wrong. The Codex cache hit was confirmed live
+([#49](https://github.com/hoangtmbk/pi-config/issues/49)), though one fork in three missed
+([#60](https://github.com/hoangtmbk/pi-config/issues/60)). The Anthropic hit is unconfirmed: it
+rests on pi's code and Anthropic's docs alone
+([Can a forked call hit the provider cache?](https://github.com/hoangtmbk/pi-config/issues/27)),
+and no live check has been run on an Anthropic model.

@@ -422,9 +422,10 @@ to, so that transcripts never reach the repo:
 - **The continuation** (`replay-continuation.ts`): from each lane's Handoff and kept tail, the model
   proposes actions; while each matches the recorded one, the recorded result is fed back, for at
   most three actions. The first that differs is judged. Nothing is executed.
-- **The judge** (`replay-judge.ts`), Claude Fable 5 by default: both Handoffs blind, as A and B in
-  alternating order, scored for ledger recall, violations, re-asks and redone work (re-reads
-  allowed). Every verdict must cite its evidence and every rule must be the user's own words.
+- **The judge** (`replay-judge.ts`), GPT 6.1 Sol (`openai-codex/gpt-6.1-sol`) by default: the one
+  checked against hand labels (#48) and passed with (#50), so that a re-run judges the same way.
+  It sees both Handoffs blind, as A and B in alternating order, and scores ledger recall,
+  violations, re-asks and redone work (re-reads allowed). Every verdict must cite its evidence and every rule must be the user's own words.
 - **The report** (`replay-report.ts`): each pass bar for ours and pi's default — ledger recall ≥95%
   at every depth with no decline, 0 violations, ≤1/30 re-asks, ≤3/30 redone, exact file state, no
   worse than pi's default — then retention and the collapse guard (reported, not gated), the actual
