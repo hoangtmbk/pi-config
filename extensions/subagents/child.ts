@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type JsonAgentSessionEvent, RpcClient } from "@earendil-works/pi-coding-agent";
+import { COMPACTION_EXTENSION_PATH, SELF_COMPACT_TOOL } from "../compaction/index.ts";
 import type { Agent } from "./agents.ts";
 import { ASK_QUESTION_TOOL } from "./supervisor.ts";
 
@@ -152,13 +153,17 @@ export function runPreamble(name: string): string {
  * The arguments a Run's child is spawned with, after `--mode rpc`.
  *
  * Tool access is a strict allowlist with no default, and `--no-extensions`
- * before `-e` is what makes this extension the one deliberate exception to it.
- * The allowlist filters extension tools too, so `ask_question` has to be in it
- * for a Run to be able to escalate at all.
+ * before `-e` is what makes this extension, and the compaction extension, the
+ * two deliberate exceptions to it. The allowlist filters extension tools too,
+ * so `ask_question` has to be in it for a Run to be able to escalate at all,
+ * and `self_compact` for it to Self-compact. Every Run loads compaction,
+ * whatever pi's package filter says for the parent, and resolves its Pressure
+ * levels from the same settings, since it runs in the parent's cwd without
+ * `--no-settings`.
  */
 function childArgs(spec: { tools: string[]; model?: string; systemPromptPath: string }): string[] {
-	const tools = [...new Set([...spec.tools, ASK_QUESTION_TOOL])];
-	const args = ["--no-session", "--no-extensions", "-e", EXTENSION_PATH, "--tools", tools.join(",")];
+	const tools = [...new Set([...spec.tools, ASK_QUESTION_TOOL, SELF_COMPACT_TOOL])];
+	const args = ["--no-session", "--no-extensions", "-e", EXTENSION_PATH, "-e", COMPACTION_EXTENSION_PATH, "--tools", tools.join(",")];
 	if (spec.model) args.push("--model", spec.model);
 	args.push("--append-system-prompt", spec.systemPromptPath);
 	return args;

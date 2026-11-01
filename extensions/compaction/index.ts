@@ -15,6 +15,7 @@
  * backstop — is the hook path. Both get our Handoff instead of pi's summary (see `handoff.ts`).
  */
 
+import { fileURLToPath } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
 import {
 	buildSessionProjection,
@@ -73,6 +74,9 @@ export interface CompactionOptions {
 }
 
 export { SELF_COMPACT_TOOL } from "./tools.ts";
+
+/** This extension's own path, for the subagents extension, which loads it into every Run. */
+export const COMPACTION_EXTENSION_PATH = fileURLToPath(import.meta.url);
 
 const SelfCompactParams = Type.Object({
 	note: Type.String({ description: "What you're doing and what you'll do next, in your own words." }),

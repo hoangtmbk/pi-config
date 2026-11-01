@@ -87,9 +87,13 @@ Answer in this shape:
 Two rules are worth stating out loud:
 
 - **The tool list is a strict allowlist with no default.** A Run is spawned `--no-extensions --tools
-  <exactly this list>`. `ask_question` is the one deliberate exception: this extension re-adds itself
-  to the child with `-e` *and* puts the tool in the allowlist, because the allowlist filters
-  extension tools too. An Agent naming no `tools` is a config error, not an Agent with an empty set.
+  <exactly this list>`. `ask_question` and `self_compact` are the two deliberate exceptions: this
+  extension re-adds itself to the child with `-e`, adds the
+  [compaction extension](../compaction/README.md) with a second `-e`, *and* puts both tools in the
+  allowlist, because the allowlist filters extension tools too. So every Run gets compaction,
+  whatever pi's package filter says for the parent, and resolves its Pressure levels from the same
+  settings files, for its own model. An Agent naming no `tools` is a config error, not an Agent with
+  an empty set.
 - **The body carries the output contract.** A Run's result is its **last assistant message** — there
   is no `report` tool — so an Agent that does not say what its final message should look like gets
   whatever the model felt like ending on. Both bundled Agents end with an "answer in this shape"
@@ -183,7 +187,7 @@ Question's *text* is never here: it is already being delivered into the conversa
 fixed-height block would only truncate it. The whole thing is `hasUI`-guarded, so a `-p` or
 JSON-mode session gets no widget rather than widget lines in its output.
 
-A Run whose child loads the `compaction` extension reports its **Pressure level** too. From notice
+Every Run's child loads the `compaction` extension, so a Run reports its **Pressure level** too. From notice
 up, the row starts with it, `notice 131k · running · bash`, and while the child compacts the row
 reads just `compacting`. The child's footer status (`ctx notice · 131k`) reaches the parent as an
 RPC `extension_ui_request`, and is read with the compaction extension's own status codec. A
@@ -345,4 +349,6 @@ a matter of feeding event sequences instead of an exercise in mocking. `child.ts
 that knows a Run is a subprocess, and it is the seam the tests replace.
 
 No new runtime dependencies. The root `package.json` carries `./extensions/subagents/index.ts` in
-`pi.extensions` and the `live:subagents` script.
+`pi.extensions` and the `live:subagents` script. `child.ts` imports the compaction extension's path
+and `SELF_COMPACT_TOOL` from its entry point, and the Runs display reads that extension's
+`status.ts`.

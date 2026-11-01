@@ -9,15 +9,7 @@ how full the context is in raw tokens, a **Pressure level** is one of the three 
 **Self-compaction** is a compaction the agent starts at a natural break, **Pruning** shrinks context
 without summarizing it, and the **Handoff** is what stands in for the span a compaction removed.
 
-> **Work in progress.** What is here today is the Pressure levels, the footer status, the
-> steers, the notice Pruning batch, forced compaction and Self-compaction at the turn boundary
-> with kept-tail Pruning, and our Handoff on every compaction, with its Constraint ledger, written
-> by the forked call, serialized mode or pi's summarizer. The extension is not in the package's
-> `pi.extensions` until the Handoff has passed its replay check; until then load it by hand:
->
-> ```bash
-> pi -e ./extensions/compaction/index.ts
-> ```
+It is on by default, in main sessions and in Runs: see [Loading](#loading).
 
 ## Why
 
@@ -29,6 +21,23 @@ the raw count, whatever the window holds.
 This builds on pi's compaction rather than replacing it
 ([ADR-0005](../../docs/adr/0005-build-on-pis-compaction.md)): pi's trigger, overflow recovery and
 `/compact` all stay on as the backstop for whatever the levels miss.
+
+## Loading
+
+- **Main sessions.** The extension is in the package's `pi.extensions`, beside `subagents`,
+  `web-fetch` and `web-search`, so pi loads it with the package. It has no on/off switch of its
+  own; pi's package filter unloads it, as it would any other of the package's extensions:
+
+  ```json
+  { "packages": [{ "source": "git:github.com/hoangtmbk/pi-config", "extensions": ["!extensions/compaction/index.ts"] }] }
+  ```
+
+- **Runs.** Every Run loads it, whatever the filter says. A Run is spawned with
+  `--no-extensions`, and the subagents extension adds this one with a second `-e` and puts
+  `self_compact` in the Run's tool allowlist, whatever its Agent's own `tools` say, as it does for
+  `ask_question`. A Run reads the same settings files as its parent (it runs in the parent's cwd
+  without `--no-settings`), so it resolves the levels for its own model. Nothing is set per Agent or
+  per Run.
 
 ## Pressure levels
 

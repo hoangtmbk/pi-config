@@ -7,9 +7,9 @@
  * `examples/extensions/subagent/agents.ts`, with three deliberate departures:
  *
  *  - **Tools are a strict allowlist with no default.** A run is spawned with
- *    `--no-extensions --tools <this list, plus `ask_question`>`, so an Agent
- *    naming no tools would be a session that can only ask questions — never a
- *    full set. That is always a mistake, so it is reported as a config error
+ *    `--no-extensions --tools <this list, plus `ask_question` and `self_compact`>`,
+ *    so an Agent naming no tools would be a session that can only ask questions
+ *    and compact — never a full set. That is always a mistake, so it is reported as a config error
  *    naming the file rather than quietly dropped.
  *  - **Every rejection is reported.** pi's example `continue`s past a bad file;
  *    a file that looks like an Agent and is silently absent from the roster is
