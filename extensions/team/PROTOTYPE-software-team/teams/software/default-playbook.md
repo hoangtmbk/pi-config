@@ -15,21 +15,21 @@ checkpoints:
       A Task's result changes CI config, release or publish scripts, or anything that runs
       outside this checkout. Before the Lead accepts that Task.
 permissions:
-  grants:
-    - id: read-public-docs
-      allow: >-
-        Fetch public web pages and package-registry metadata to read documentation. GET only:
-        no logins, no form posts, no uploads.
+  grants: []                   # none by default; e.g. {id: push-effort-branch, allow: push team/<effort-id> to origin, never with force}
   escalate:
     - id: history-rewrite
       when: >-
         Any git reset --hard, git clean, branch deletion, rebase or force-push, even on the
         Effort's own branch.
-  roles:
-    "*":
-      deny: ["Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git push origin main:*)"]
-    qa:
-      deny: ["Bash(git push:*)"]
+      ask:                     # forces a prompt so the request reaches the Lead; best effort, literal match
+        - "Bash(git reset --hard:*)"
+        - "Bash(git clean:*)"
+        - "Bash(git branch -D:*)"
+        - "Bash(git branch -d:*)"
+        - "Bash(git rebase:*)"
+        - "Bash(git push --force:*)"
+        - "Bash(git push -f:*)"
+  roles: {}                    # no per-Role mode or rules; Roles run in auto
 ---
 
 # Software Team: default Playbook

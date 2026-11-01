@@ -7,8 +7,8 @@ overrides:
     reason: >-
       The output header change is spelled out under Constraints below, so I've already seen the
       only interface change. The architect still designs; I just don't need to approve it.
-  - rule: read-public-docs
-    change: also allow fetching https://httpbin.org/*, including non-GET requests
+  - rule: httpbin-checks
+    change: "add grant: send test requests (any method) to https://httpbin.org"
     reason: QA needs to check the cache against real status codes and redirects.
 ---
 
