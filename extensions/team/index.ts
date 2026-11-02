@@ -1257,16 +1257,22 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	}
 
 	/** Carry out a step's actions in order, then append its lines: records are written before the line that claims them. */
-	async function carryOut(held: HeldEffort, result: Extract<Step, { ok: true }>, launch: (action: Extract<EffortAction, { kind: "launch-teammate" }>) => Promise<void>): Promise<void> {
+	async function carryOut(held: HeldEffort, result: Extract<Step, { ok: true }>, launch: (action: Extract<EffortAction, { kind: "launch-teammate" }>) => Promise<void>): Promise<string[]> {
+		const notes: string[] = [];
 		for (const action of result.actions) {
 			if (action.kind === "write-plan") writePlan(held.paths, result.state);
 			else if (action.kind === "launch-teammate") await launch(action);
 			else if (action.kind === "stop-teammate") {
 				const stopped = await stopTeammate(result.state, action);
 				if (stopped) throw new Error(`Teammate \`${action.teammate}\` couldn't be stopped with \`claude stop ${action.shortId}\` (${stopped.error}), so nothing was re-planned. Stop and tell the human.`);
+			} else if (action.kind === "remove-task-workspace" && result.state.workspace) {
+				// Not forced, and from the Workspace so `branch -d` weighs the Effort branch: uncommitted or unmerged work stays.
+				const left = removeTaskWorkspace(result.state.workspace.path, action);
+				if (left) notes.push(`Task \`${action.slug}\`'s worktree \`${action.path}\` or branch \`${action.branch}\` is left in place, since git refused to remove it: ${left} Tell the human, who can merge or delete it.`);
 			}
 		}
 		appendLines(held.paths, result.append);
+		return notes;
 	}
 
 	/**
@@ -2045,11 +2051,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			const criteria = briefCriteria(brief);
 			const result = step(state, { kind: "plan", tasks: params.tasks, criteria, roles: roles.map((role) => role.name), reason: params.reason, at: now().toISOString() });
 			if (!result.ok) throw new Error(result.refusal);
-			await carryOut(held, result, async () => {});
+			const left = await carryOut(held, result, async () => {});
 			// A Teammate stopped with its dropped Task makes room for a queued one.
 			const started = result.actions.some((action) => action.kind === "stop-teammate") ? await startQueued(held, result.state, ctx) : [];
 			paintBlock();
-			return { content: [{ type: "text", text: [result.reply ?? "", ...started].join(" ") }], details: undefined };
+			return { content: [{ type: "text", text: [result.reply ?? "", ...left, ...started].join(" ") }], details: undefined };
 		},
 	});
 

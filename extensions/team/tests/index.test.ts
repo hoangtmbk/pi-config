@@ -3917,6 +3917,30 @@ describe("an isolated Task in a worktree of its own", () => {
 		assert.ok(pi.claude.calls().some((argv) => argv[0] === "stop"), "its Teammate is stopped");
 	});
 
+	it("removes a dropped isolated Task's worktree and branch once its Teammate is stopped, when nothing of it is unmerged", async () => {
+		const { pi, repo } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true });
+		const task = crewTask(repo, "001");
+		assert.ok(existsSync(task.path));
+
+		const reply = await pi.call("team_plan", { tasks: [{ ...CREW_PLAN[0], slug: "rename-key-everywhere" }, { ...CREW_PLAN[1], dependsOn: ["rename-key-everywhere"] }, CREW_PLAN[2]] });
+
+		assert.match(reply, /Dropped Task `rename-key`, and stopped `builder-1`/);
+		assert.equal(existsSync(task.path), false);
+		assert.equal(git(repo, "branch", "--list", task.branch), "");
+	});
+
+	it("keeps a dropped isolated Task's branch when it has commits the Effort branch lacks, telling the Lead", async () => {
+		const { pi, repo, task } = await isolatedReported();
+
+		const reply = await pi.call("team_plan", { tasks: [{ ...CREW_PLAN[0], slug: "rename-key-everywhere" }, { ...CREW_PLAN[1], dependsOn: ["rename-key-everywhere"] }, CREW_PLAN[2]] });
+
+		assert.match(reply, /Dropped Task `rename-key`/);
+		assert.match(reply, /`team\/crew-2026-11-02-task-001`.*left in place/);
+		assert.ok(gitOk(repo, "rev-parse", "--verify", task.branch), "the unmerged branch is kept");
+	});
+
 	it("refuses to accept while the Effort's Workspace has uncommitted changes, leaving the Task in review and its branch intact", async () => {
 		const { pi, dir, workspace, task } = await isolatedReported();
 		const head = git(workspace, "rev-parse", "HEAD");

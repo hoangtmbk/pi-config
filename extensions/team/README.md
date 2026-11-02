@@ -155,6 +155,11 @@ stopped, and its worktree and branch removed. The merge is refused, with a `merg
 while the Workspace or the Task's worktree has uncommitted changes, or when it would conflict
 (the merge is aborted): nothing is merged, and the Task stays in review with its branch intact.
 
+A re-plan that drops an isolated Task stops its Teammate, then removes its worktree and deletes
+its branch without forcing either: a worktree with uncommitted changes, or a branch with commits
+the Effort branch lacks, is left in place and the Lead is told. Cancelling the Effort ends it, so
+its worktrees go as at any end (below).
+
 ### Clearing between Tasks
 
 A Teammate is cleared exactly when it is handed a different Task from the one in its context:

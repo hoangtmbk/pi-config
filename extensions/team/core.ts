@@ -2176,6 +2176,8 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 			append.push({ type: "teammate-ended", teammate: teammate.id, how: "stopped", at: input.at });
 			actions.push({ kind: "stop-teammate", teammate: teammate.id, shortId: teammate.shortId ?? teammate.name });
 		}
+		// Its worktree goes once its Teammate is stopped; the shell keeps one with uncommitted changes or unmerged commits.
+		if (handed?.worktree) actions.push({ kind: "remove-task-workspace", slug, ...handed.worktree });
 		const stopped = live ? `, and stopped \`${teammate.id}\` with \`claude stop\`, which keeps its conversation` : "";
 		notes.push(
 			replanned
