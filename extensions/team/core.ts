@@ -2725,7 +2725,9 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 		case "PostToolUse":
 		case "PostToolUseFailure": {
 			// A call a held request asked for ran: the human answered it in the terminal first.
-			// A hook killed by the terminal looks like a deny until the call runs.
+			// A hook killed by the terminal looks like a deny until the call runs, and a call
+			// that ran and failed (PostToolUseFailure) was allowed all the same, so the No
+			// that started no Takeover yet is known for the Yes it was.
 			const tool = text(payload.tool_name);
 			const toolUseId = text(payload.tool_use_id);
 			const open = new Set<HeldRequest["state"]>(["held", "expired", "denied-in-terminal"]);

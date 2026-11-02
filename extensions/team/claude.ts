@@ -442,7 +442,13 @@ function usageReply(reply: Record<string, unknown>, at: string): UsageReading {
 	return given<UsageReading>({ source: "get-usage", at, rateLimits: limits !== undefined && reply.rate_limits_available !== false, fiveHour: window("five_hour"), sevenDay: window("seven_day") });
 }
 
-/** The hook events a Teammate reports, each to {@link HOOK_SCRIPT}. */
+/**
+ * The hook events a Teammate reports, each to {@link HOOK_SCRIPT}. Beyond the
+ * spec's list, `PostToolUseFailure` is here too: a call that ran and then
+ * failed was still allowed, so it settles a held request as answered in the
+ * terminal, as `PostToolUse` does, and a killed hook that looked like a No
+ * is known for the Yes it was rather than starting a Takeover.
+ */
 const HOOK_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure", "PermissionRequest", "PermissionDenied", "Notification", "PostToolUse", "PostToolUseFailure", "PreToolUse"];
 
 /** A `PermissionRequest` holds the request open while the Lead or the human answers it. */

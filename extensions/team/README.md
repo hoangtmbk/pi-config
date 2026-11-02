@@ -207,8 +207,9 @@ Teammate's terminal meanwhile, and the first answer wins. Nothing is allowed by 
   may add a session `rule` for the same tool, such as `Bash(npm test:*)`, and name the `grant` it
   relies on. An `AskUserQuestion` is answered with `answers`, keyed by each question's exact text.
 - The human answering in the terminal kills the hook, journalled as denied in the terminal; a
-  `PostToolUse` for the call after it shows it was allowed. Either way the Lead's answer is then
-  refused as already answered.
+  `PostToolUse` for the call after it shows it was allowed, and so does a `PostToolUseFailure`:
+  a call that ran and failed was still allowed, so a No in the terminal that was really a Yes
+  doesn't start a Takeover. Either way the Lead's answer is then refused as already answered.
 - A hook that holds 3570 s without an answer gives the prompt back to the terminal. It waits in
   `/team pending` as an item that attaches to the Teammate, and in the Report's Waiting on you.
 
