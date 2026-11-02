@@ -170,6 +170,49 @@ export function sendToInbox(inbox: Inbox, content: string): Promise<{ error: str
 	});
 }
 
+/** What `claude agents --json` says of one live background session. */
+export interface AgentStatus {
+	status?: string;
+	state?: string;
+	waitingFor?: string;
+}
+
+/** Long enough for `claude agents --json` to list the background sessions. */
+const AGENTS_TIMEOUT_MS = 10_000;
+
+/**
+ * The live background sessions, from `claude agents --json`, by `--name`: a
+ * session missing from it was stopped, idle or not. Its shape is read
+ * leniently, as a list of sessions or an object holding one, since Claude
+ * Code doesn't document it; a session without a name is left out.
+ */
+export function agentsList(claudePath: string): Promise<Map<string, AgentStatus> | { error: string }> {
+	return new Promise((resolve) => {
+		execFile(claudePath, ["agents", "--json"], { timeout: AGENTS_TIMEOUT_MS, encoding: "utf8" }, (error, stdout, stderr) => {
+			if (error) return resolve({ error: (stderr.trim() || error.message).split("\n")[0] });
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(stdout);
+			} catch {
+				return resolve({ error: "`claude agents --json` printed something that isn't JSON" });
+			}
+			const holder = isObject(parsed) ? parsed : {};
+			const list = Array.isArray(parsed) ? parsed : [holder.agents, holder.sessions].find(Array.isArray);
+			const agents = new Map<string, AgentStatus>();
+			for (const entry of (list ?? []) as unknown[]) {
+				if (!isObject(entry) || typeof entry.name !== "string") continue;
+				const status: AgentStatus = {};
+				for (const key of ["status", "state", "waitingFor"] as const) {
+					const value = entry[key];
+					if (typeof value === "string") status[key] = value;
+				}
+				agents.set(entry.name, status);
+			}
+			resolve(agents);
+		});
+	});
+}
+
 /**
  * The command that attaches a terminal to a Teammate's session, as the human
  * types it: `claude attach <short id>`, the executable quoted only when it

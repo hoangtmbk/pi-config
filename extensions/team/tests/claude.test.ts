@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { existsSync, lstatSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { BUNDLED_MOD, CLEAR_MARKER, installMod, MIN_CLAUDE_VERSION, trustFolder, versionWarning } from "../claude.ts";
+import { agentsList, BUNDLED_MOD, CLEAR_MARKER, installMod, launchBackground, MIN_CLAUDE_VERSION, stopBackground, trustFolder, versionWarning } from "../claude.ts";
 import { fakeClaude, tempRoots, writeFiles } from "./harness.ts";
 
 describe("the claude version check", () => {
@@ -72,6 +72,36 @@ describe("folder trust in Claude Code's config", () => {
 
 		assert.match(trustFolder(roots.claudeConfigPath, "/repo")?.error ?? "", /`projects`/);
 		assert.equal(readFileSync(roots.claudeConfigPath, "utf8"), '{"projects":[]}');
+	});
+});
+
+describe("background sessions in `claude agents --json`", () => {
+	it("lists each live session by its `--name`, with its status, state and what it waits for", async () => {
+		const roots = tempRoots();
+		const claude = fakeClaude(roots);
+		assert.equal(await launchBackground(claude.path, roots.scratch, ["--bg", "--name", "team-e-dev-1", "go"]), undefined);
+		claude.setAgent("team-e-dev-1", { state: "waiting", waitingFor: "permission" });
+
+		const listed = await agentsList(claude.path);
+		assert.ok(!("error" in listed), "error" in listed ? listed.error : "");
+		assert.deepEqual(listed.get("team-e-dev-1"), { status: "running", state: "waiting", waitingFor: "permission" });
+
+		claude.idleStop("team-e-dev-1");
+		const after = await agentsList(claude.path);
+		assert.ok(!("error" in after));
+		assert.equal(after.get("team-e-dev-1"), undefined, "an idle-stopped session is missing");
+	});
+
+	it("stops a session by its short id with `claude stop`", async () => {
+		const roots = tempRoots();
+		const claude = fakeClaude(roots);
+		await launchBackground(claude.path, roots.scratch, ["--bg", "--name", "team-e-dev-1", "go"]);
+		const [agent] = claude.agents();
+
+		assert.equal(await stopBackground(claude.path, agent.id.slice(0, 8)), undefined);
+		assert.deepEqual(claude.calls().at(-1), ["stop", agent.id.slice(0, 8)]);
+		assert.equal(claude.agents()[0].live, false);
+		assert.match((await stopBackground(claude.path, "00000000"))?.error ?? "", /no running session/);
 	});
 });
 
