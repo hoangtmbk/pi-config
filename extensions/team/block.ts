@@ -74,8 +74,22 @@ export interface QueuedTask {
 export interface PauseRow {
 	by: PauseSetter;
 	reason?: string;
+	/** For the usage pause: the limit that set it. */
+	kind?: "session" | "weekly";
+	/** For the usage pause: when it lifts, as an ISO time, when Claude Code said. */
+	reset?: string;
 	/** When it started, as an ISO time. */
 	since: string;
+}
+
+/** A model family's limit, or a usage-credit confirm, holding the Roles on that family while other Roles go on. */
+export interface HoldRow {
+	kind: "opus" | "sonnet" | "consent";
+	roles: string[];
+	/** When it lifts, as an ISO time; absent for a usage-credit confirm. */
+	reset?: string;
+	/** For a usage-credit confirm: the Teammate whose terminal it waits in. */
+	teammate?: string;
 }
 
 /** What the Team block shows, and what `team_status` returns. */
@@ -96,6 +110,8 @@ export interface TeamBlockData {
 	reports: number;
 	/** The pauses that hold, the human's first; absent while the Effort runs. No new Task starts while any holds. */
 	pauses?: PauseRow[];
+	/** The model-family holds; absent while none holds. A held Role's Tasks queue until it lifts. */
+	holds?: HoldRow[];
 }
 
 /** How the block is drawn. */
@@ -128,16 +144,38 @@ export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockD
 		// A Teammate stopped to make room, or that ended (stopped with its dropped Task, or crashed), is gone for this Effort.
 		teammates: state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined).map((teammate) => teammateRow(state, teammate)),
 		queued: state.queue.map((queued) => ({ task: queued.folder, role: queued.role, why: queued.why })),
-		waitingOnYou: state.pending.length + waitingInTerminal(state).length + extras.adoptionsPending,
+		waitingOnYou: state.pending.length + waitingInTerminal(state).length + extras.adoptionsPending + (state.usageItems?.length ?? 0),
 		reports: state.reports,
 		...pauseRows(state),
+		...holdRows(state),
 	};
 }
 
 function pauseRows(state: EffortState): { pauses?: PauseRow[] } {
 	const held = heldPauses(state);
 	if (held.length === 0) return {};
-	return { pauses: held.map((pause) => ({ by: pause.by, ...(pause.reason === undefined ? {} : { reason: pause.reason }), since: pause.at })) };
+	return {
+		pauses: held.map((pause) => ({
+			by: pause.by,
+			...(pause.reason === undefined ? {} : { reason: pause.reason }),
+			...(pause.kind === undefined ? {} : { kind: pause.kind }),
+			...(pause.reset === undefined ? {} : { reset: pause.reset }),
+			since: pause.at,
+		})),
+	};
+}
+
+function holdRows(state: EffortState): { holds?: HoldRow[] } {
+	const holds = Object.values(state.holds ?? {}).filter((hold) => hold !== undefined);
+	if (holds.length === 0) return {};
+	return {
+		holds: holds.map((hold) => ({
+			kind: hold.kind,
+			roles: hold.roles,
+			...(hold.reset === undefined ? {} : { reset: hold.reset }),
+			...(hold.teammate === undefined ? {} : { teammate: hold.teammate }),
+		})),
+	};
 }
 
 function teammateRow(state: EffortState, teammate: Teammate): TeammateRow {
@@ -160,7 +198,7 @@ function teammateRow(state: EffortState, teammate: Teammate): TeammateRow {
 type Section = (data: TeamBlockData, now: number, options: BlockOptions, width: number) => string[];
 
 /** The block's body, top to bottom. */
-const SECTIONS: Section[] = [statusLine, pauseLines, teammateRows, queuedLines, footerLine];
+const SECTIONS: Section[] = [statusLine, pauseLines, holdLines, teammateRows, queuedLines, footerLine];
 
 /** The framed Team block. */
 export function renderTeamBlock(data: TeamBlockData, now: number, options: BlockOptions): string[] {
@@ -188,13 +226,32 @@ function statusLine(data: TeamBlockData): string[] {
 const SETTERS: Record<PauseSetter, string> = { human: "you", lead: "the Lead", usage: "a usage limit" };
 
 /** A line per pause under the status line: who set it, since when and why; the human's says how to lift it. */
-function pauseLines(data: TeamBlockData): string[] {
+function pauseLines(data: TeamBlockData, now: number): string[] {
 	return (data.pauses ?? []).map((pause) => {
-		const why = pause.reason === undefined ? "" : `: ${oneLine(pause.reason)}`;
+		const resets = pause.reset === undefined ? "" : `, resets ${clockAt(pause.reset, now)}`;
+		const why = pause.reason === undefined ? "" : `: ${oneLine(pause.reason)}${resets}`;
 		const lift = pause.by === "human" ? "   /team resume" : "";
 		// The block repaints on events, not on a timer, so it shows a clock time rather than an age.
 		return `  by ${SETTERS[pause.by]} since ${pause.since.slice(11, 16)} UTC${why}${lift}`;
 	});
+}
+
+/** What holds each model family's Roles, as the human reads it. */
+const HOLDS: Record<HoldRow["kind"], string> = { opus: "an Opus limit", sonnet: "a Sonnet limit", consent: "a usage-credit confirm" };
+
+/** A line per model hold: the Roles it holds, on what, and until when, or where the confirm waits. */
+function holdLines(data: TeamBlockData, now: number): string[] {
+	return (data.holds ?? []).map((hold) => {
+		const until = hold.reset === undefined ? "" : ` until ${clockAt(hold.reset, now)}`;
+		const where = hold.teammate === undefined ? "" : ` in ${oneLine(hold.teammate)}'s terminal`;
+		return `held  ${oneLine(hold.roles.join(", "))} on ${HOLDS[hold.kind]}${until}${where}`;
+	});
+}
+
+/** A time as the block shows it: the UTC clock time, with its date when that is not today's. */
+function clockAt(at: string, now: number): string {
+	const day = at.slice(0, 10) === new Date(now).toISOString().slice(0, 10) ? "" : `${at.slice(0, 10)} `;
+	return `${day}${at.slice(11, 16)} UTC`;
 }
 
 /**

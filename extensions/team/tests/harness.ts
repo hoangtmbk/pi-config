@@ -126,7 +126,10 @@ export interface FakeClaudeOptions {
  * and event name filled in), write the result its handoff pointer asks for,
  * or edit a file in its working directory, committing it when a message is given.
  */
-export type FakeHookStep = { event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string };
+export type FakeHookStep = ({ event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string }) & {
+	/** Play the step only for a pointer that includes this text. */
+	when?: string;
+};
 
 /**
  * A hook command a fake session started without waiting on, as Claude Code
