@@ -27,6 +27,20 @@ export function sendBackPointer(slug: string, taskDir: string, round: number): s
 	].join(" ");
 }
 
+/**
+ * The pointer that hands a sent-back Task to a new Teammate, after the one
+ * working it has ended: it names the Task, every earlier round's result and
+ * feedback, and the next round's result, and carries none of their text.
+ */
+export function restaffPointer(slug: string, taskDir: string, round: number): string {
+	const rounds = Array.from({ length: round }, (_, index) => [`result-${index + 1}.md`, `feedback-${index + 1}.md`]).flat();
+	return [
+		`Task \`${slug}\` is yours now: the Teammate working it has ended, after round ${round} was sent back.`,
+		`Read ${join(taskDir, "task.md")}, then the rounds so far (${rounds.map((file) => join(taskDir, file)).join(", ")}), and do what ${join(taskDir, `feedback-${round}.md`)} asks.`,
+		`When it is done, write your result to ${join(taskDir, `result-${round + 1}.md`)}.`,
+	].join(" ");
+}
+
 /** Who the preamble is for, and where the files it points at are. */
 export interface PreambleFor {
 	teammateId: string;

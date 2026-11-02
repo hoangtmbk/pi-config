@@ -1878,6 +1878,8 @@ async function until(condition: () => boolean, what: string): Promise<void> {
 /** A Teammate that takes its pointer, writes the result it asks for and stops: at launch, and for each message in its inbox. */
 const WORKS: FakeHookStep[] = [{ event: "UserPromptSubmit" }, { write: "result" }, { event: "Stop", payload: { last_assistant_message: "Done." } }];
 const RENAME_DIR = join("tasks", "001-builder-rename-key");
+/** `builder-1`'s `--name`, which `claude agents --json` knows it by. */
+const BUILDER_1 = "team-crew-2026-11-02-builder-1";
 
 /** An approved crew Effort whose `rename-key` Task is handed off to `builder-1`, who has written round 1's result. */
 async function renameReported(options: { hooks?: FakeHookStep[]; replies?: FakeHookStep[] } = {}) {
@@ -2144,10 +2146,23 @@ describe("reviewing: team_review", () => {
 		assert.equal(effortLines(dir).filter((line) => line.type === "task-sent-back").length, 0);
 	});
 
-	it("tells the Lead when the pointer can't reach the Teammate's inbox", async () => {
+	it("resumes the Teammate's session with the pointer when its inbox refuses the send, and works round 2 there", async () => {
 		const { pi, dir } = await renameReported();
 		const [session] = effortLines(dir).filter((line) => line.type === "teammate-session");
-		unlinkSync((session.inbox as { socket: string }).socket);
+		pi.claude.refuseSends(BUILDER_1);
+
+		await pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Redo it." });
+
+		const resume = pi.claude.calls().find((argv) => argv.includes("--resume")) ?? [];
+		assert.deepEqual(resume.slice(0, 3), ["--bg", "--resume", session.sessionId]);
+		assert.ok(resume[3]?.includes(join(dir, RENAME_DIR, "feedback-1.md")), resume.join(" "));
+		await until(() => teammateWakes(pi.sent).length === 2, "the Lead is woken on round 2's result");
+		assert.ok(existsSync(join(dir, RENAME_DIR, "result-2.md")));
+	});
+
+	it("tells the Lead to stop and tell the human when the pointer can't reach the Teammate and its session can't be resumed", async () => {
+		const { pi, dir } = await renameReported();
+		pi.claude.forget(BUILDER_1);
 
 		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Redo it." }), (error: Error) => {
 			assert.match(error.message, /couldn't reach `builder-1`/);
@@ -2155,6 +2170,113 @@ describe("reviewing: team_review", () => {
 			return true;
 		});
 		assert.match(readFileSync(join(dir, RENAME_DIR, "feedback-1.md"), "utf8"), /Redo it\./);
+	});
+});
+
+describe("a Teammate's lifecycle", () => {
+	it("leaves an idle-stopped Teammate stopped until a send, which resumes its session with the pointer; the next send goes to its new socket", async () => {
+		const { pi, dir } = await renameReported();
+		const [session] = effortLines(dir).filter((line) => line.type === "teammate-session");
+		pi.claude.idleStop(BUILDER_1);
+
+		await pi.call("team_status", {});
+		assert.ok(!pi.claude.calls().some((argv) => argv.includes("--resume")), "only a send wakes a Teammate");
+
+		const reply = await pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Also the docs." });
+
+		assert.match(reply, /Sent Task `rename-key` back to `builder-1`/);
+		const resume = pi.claude.calls().find((argv) => argv.includes("--resume")) ?? [];
+		assert.deepEqual(resume.slice(0, 3), ["--bg", "--resume", session.sessionId]);
+		assert.ok(resume[3]?.includes(join(dir, RENAME_DIR, "result-2.md")), resume.join(" "));
+		assert.deepEqual(pi.claude.inbox(), [], "the pointer went with the resume");
+		assert.equal(pi.claude.launches().length, 1, "the same session works round 2");
+		await until(() => teammateWakes(pi.sent).length === 2, "the Lead is woken on round 2's result");
+		const resumed = effortLines(dir).filter((line) => line.type === "teammate-session" && line.source === "resume");
+		assert.equal(resumed.length, 1);
+		const inbox = resumed[0].inbox as { socket: string; token: string };
+		assert.notEqual(inbox.socket, (session.inbox as { socket: string }).socket);
+
+		await pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "And the changelog." });
+
+		await until(() => pi.claude.inbox().length === 1, "the pointer reached the new inbox");
+		assert.equal(pi.claude.inbox()[0].socket, inbox.socket);
+		assert.equal(pi.claude.inbox()[0].authorized, true);
+		await until(() => teammateWakes(pi.sent).length === 3, "the Lead is woken on round 3's result");
+		assert.equal(pi.claude.calls().filter((argv) => argv.includes("--resume")).length, 1);
+	});
+
+	it("wakes the Lead once when a Teammate's session crashes, and a send-back then starts another Teammate of the Role on the Task's folder", async () => {
+		const { pi, dir } = await renameReported({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }, ...WORKS, { event: "SessionEnd", payload: { reason: "other" } }] });
+		await until(() => teammateWakes(pi.sent).some((wake) => wake.content.includes("ended")), "the Lead is woken about the crash");
+		const crashes = (): SentMessage[] => teammateWakes(pi.sent).filter((wake) => /`builder-1`'s session ended/.test(wake.content));
+		assert.equal(crashes().length, 1);
+		assert.match(crashes()[0].content, /round 1 of Task `rename-key`/);
+		await pi.call("team_status", {});
+		assert.equal(crashes().length, 1, "the crash wakes the Lead once");
+
+		const reply = await pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Also the docs." });
+
+		assert.match(reply, /`builder-1` has ended, so this started `builder-2` on it/);
+		const [first, second, ...more] = pi.claude.launches();
+		assert.deepEqual(more, []);
+		assert.ok(first);
+		const name = second?.argv[second.argv.indexOf("--name") + 1];
+		assert.equal(name, "team-crew-2026-11-02-builder-2");
+		const pointer = second?.argv.at(-1) ?? "";
+		for (const file of ["task.md", "result-1.md", "feedback-1.md", "result-2.md"]) assert.ok(pointer.includes(join(dir, RENAME_DIR, file)), pointer);
+		await until(() => existsSync(join(dir, RENAME_DIR, "result-2.md")), "builder-2 writes round 2's result");
+		await until(() => teammateWakes(pi.sent).some((wake) => wake.content.includes(join(dir, RENAME_DIR, "result-2.md"))), "the Lead is woken on round 2's result");
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /- Status: sent back, with `builder-2`/);
+	});
+
+	it("drops a handed-off Task left out of a re-plan, stopping its Teammate with `claude stop` and listing it under Dropped in plan.md", async () => {
+		const { pi, dir } = await renameReported();
+		const [session] = effortLines(dir).filter((line) => line.type === "teammate-session");
+
+		const replan = [
+			{ slug: "rename-key-everywhere", role: "builder", goal: "Rename the key, docs too.", criteria: ["AC1"] },
+			{ ...CREW_PLAN[1], dependsOn: ["rename-key-everywhere"] },
+			CREW_PLAN[2],
+		];
+
+		const reply = await pi.call("team_plan", { tasks: replan });
+
+		assert.match(reply, /Dropped Task `rename-key`, and stopped `builder-1` with `claude stop`/);
+		assert.ok(pi.claude.calls().some((argv) => argv[0] === "stop" && argv[1] === session.shortId), JSON.stringify(pi.claude.calls()));
+		assert.equal(pi.claude.agents().find((agent) => agent.name === BUILDER_1)?.live, false);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## Dropped\n+- rename-key: was with `builder-1` \(tasks\/001-builder-rename-key\/\)/);
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /rename-key/);
+	});
+
+	it("starts a queued Task once a re-plan's drop stops the Teammate it waited for", async () => {
+		const { pi, dir } = await crewApproved({ settings: { maxTeammates: 1 }, hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		assert.match(await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" }), /^queued Task `survey`/);
+
+		const reply = await pi.call("team_plan", {
+			tasks: [{ slug: "rename-key-everywhere", role: "builder", goal: "Rename the key, docs too.", criteria: ["AC1"] }, { ...CREW_PLAN[1], dependsOn: ["rename-key-everywhere"] }, CREW_PLAN[2]],
+		});
+
+		assert.match(reply, /Dropped Task `rename-key`, and stopped `builder-1`/);
+		assert.match(reply, /Queued Task `survey` started scout-1 \(tasks\/002-scout-survey\/task\.md\)/);
+		assert.equal(pi.claude.launches().length, 2);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## survey\n[\s\S]*?- Status: running, with `scout-1`/);
+	});
+
+	it("gives each Teammate's status, state and what it waits for in `team_status`, as `claude agents --json` has them, and leaves out a Teammate that ended", async () => {
+		const { pi } = await renameReported();
+		pi.claude.setAgent(BUILDER_1, { state: "waiting", waitingFor: "permission" });
+		const rows = async () => (JSON.parse(await pi.call("team_status", {})) as { teammates: Record<string, unknown>[] }).teammates;
+
+		assert.deepEqual((await rows()).map((row) => row.agent), [{ status: "running", state: "waiting", waitingFor: "permission" }]);
+		pi.claude.idleStop(BUILDER_1);
+		assert.deepEqual((await rows()).map((row) => row.agent), ["missing"]);
+
+		await pi.call("team_plan", {
+			tasks: [{ slug: "rename-key-everywhere", role: "builder", goal: "Rename it, docs too.", criteria: ["AC1"] }, { ...CREW_PLAN[1], dependsOn: ["rename-key-everywhere"] }, CREW_PLAN[2]],
+		});
+		assert.deepEqual(await rows(), []);
 	});
 });
 
@@ -2314,7 +2436,18 @@ describe("the Team block", () => {
 			team: "crew",
 			phase: "working",
 			tasks: { accepted: 0, planned: 3 },
-			teammates: [{ id: "builder-1", role: "builder", shortId: "c0ffee12", activity: "busy", task: "001-builder-rename-key", mode: "auto", launchMode: "acceptEdits" }],
+			teammates: [
+				{
+					id: "builder-1",
+					role: "builder",
+					shortId: "c0ffee12",
+					activity: "busy",
+					task: "001-builder-rename-key",
+					mode: "auto",
+					launchMode: "acceptEdits",
+					agent: { status: "running", state: "idle" },
+				},
+			],
 			queued: [],
 			waitingOnYou: 0,
 			reports: 0,
