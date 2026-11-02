@@ -25,7 +25,7 @@
  */
 
 import { sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
-import { type EffortState, heldPauses, type PauseSetter, type Teammate } from "./core.ts";
+import { type EffortState, heldPauses, type PauseSetter, type Teammate, type UsageWindow, usageSource } from "./core.ts";
 
 /** The widest the frame may get, borders included. */
 export const MAX_WIDTH = 96;
@@ -78,6 +78,18 @@ export interface PauseRow {
 	since: string;
 }
 
+/** The account's usage, from the freshest reading. */
+export interface UsageRow {
+	/** The 5-hour window; absent when the reading doesn't give it. */
+	fiveHour?: UsageWindow;
+	/** The weekly window; absent when the reading doesn't give it. */
+	sevenDay?: UsageWindow;
+	/** Where the reading came from: a Teammate's status line, or `get_usage`. */
+	source: string;
+	/** When it was taken, ISO. */
+	at: string;
+}
+
 /** What the Team block shows, and what `team_status` returns. */
 export interface TeamBlockData {
 	effortId: string;
@@ -96,6 +108,8 @@ export interface TeamBlockData {
 	reports: number;
 	/** The pauses that hold, the human's first; absent while the Effort runs. No new Task starts while any holds. */
 	pauses?: PauseRow[];
+	/** The account's usage; absent until a first reading. */
+	usage?: UsageRow;
 }
 
 /** How the block is drawn. */
@@ -120,18 +134,28 @@ export interface StatusExtras {
  */
 export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockData {
 	const handed = Object.keys(state.tasks).length > 0 || state.queue.length > 0;
+	const teammates = state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined).map((teammate) => teammateRow(state, teammate));
 	return {
 		effortId: state.effortId,
 		team: state.team,
 		phase: !state.brief ? "intake" : handed ? "working" : "planning",
 		tasks: { accepted: Object.values(state.tasks).filter((task) => task.accepted !== undefined).length, planned: state.plan?.length ?? 0 },
 		// A Teammate stopped to make room, or that ended (stopped with its dropped Task, or crashed), is gone for this Effort.
-		teammates: state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined).map((teammate) => teammateRow(state, teammate)),
+		teammates,
 		queued: state.queue.map((queued) => ({ task: queued.folder, role: queued.role, why: queued.why })),
 		waitingOnYou: state.pending.length + extras.adoptionsPending,
 		reports: state.reports,
 		...pauseRows(state),
+		...usageRow(state, teammates.length),
 	};
+}
+
+/** The freshest reading; one `get_usage` took while no Teammate is live says so. */
+function usageRow(state: EffortState, live: number): { usage?: UsageRow } {
+	const reading = state.usage?.latest;
+	if (!reading) return {};
+	const source = reading.source === "get-usage" && live === 0 ? `${usageSource(reading)} (no Teammate live)` : usageSource(reading);
+	return { usage: { ...(reading.fiveHour ? { fiveHour: reading.fiveHour } : {}), ...(reading.sevenDay ? { sevenDay: reading.sevenDay } : {}), source, at: reading.at } };
 }
 
 function pauseRows(state: EffortState): { pauses?: PauseRow[] } {
@@ -143,6 +167,7 @@ function pauseRows(state: EffortState): { pauses?: PauseRow[] } {
 function teammateRow(state: EffortState, teammate: Teammate): TeammateRow {
 	const mode = teammate.observedMode ?? teammate.mode;
 	const drifted = teammate.observedMode !== undefined && teammate.mode !== undefined && teammate.observedMode !== teammate.mode;
+	const ctx = state.usage?.statusLines[teammate.id]?.ctx;
 	return {
 		id: teammate.id,
 		role: teammate.role,
@@ -151,6 +176,7 @@ function teammateRow(state: EffortState, teammate: Teammate): TeammateRow {
 		activity: teammate.activity ?? "starting",
 		task: state.tasks[teammate.task]?.folder ?? teammate.task,
 		...(teammate.activity === "idle" && teammate.doing !== undefined ? { doing: teammate.doing } : {}),
+		...(ctx === undefined ? {} : { ctx }),
 		...(mode === undefined ? {} : { mode }),
 		...(drifted ? { launchMode: teammate.mode } : {}),
 	};
@@ -160,7 +186,7 @@ function teammateRow(state: EffortState, teammate: Teammate): TeammateRow {
 type Section = (data: TeamBlockData, now: number, options: BlockOptions, width: number) => string[];
 
 /** The block's body, top to bottom. */
-const SECTIONS: Section[] = [statusLine, pauseLines, teammateRows, queuedLines, footerLine];
+const SECTIONS: Section[] = [statusLine, pauseLines, usageLine, teammateRows, queuedLines, footerLine];
 
 /** The framed Team block. */
 export function renderTeamBlock(data: TeamBlockData, now: number, options: BlockOptions): string[] {
@@ -195,6 +221,41 @@ function pauseLines(data: TeamBlockData): string[] {
 		// The block repaints on events, not on a timer, so it shows a clock time rather than an age.
 		return `  by ${SETTERS[pause.by]} since ${pause.since.slice(11, 16)} UTC${why}${lift}`;
 	});
+}
+
+/**
+ * The account's usage, shown whether or not a Teammate is live: each window,
+ * or `n/a` when the reading doesn't give it, and when it resets, as a time
+ * today or a weekday and time otherwise, in UTC like the pause lines; then
+ * where the reading came from and how old it is.
+ */
+function usageLine(data: TeamBlockData, now: number): string[] {
+	const usage = data.usage;
+	if (!usage) return [];
+	const windows = [usageWindow("5h", usage.fiveHour, now), usageWindow("week", usage.sevenDay, now)].join(" · ");
+	return [`${windows}  · ${oneLine(usage.source)}, ${age(now - Date.parse(usage.at))} ago`];
+}
+
+function usageWindow(label: string, window: UsageWindow | undefined, now: number): string {
+	if (!window) return `${label} n/a`;
+	const resets = window.resetsAt === undefined ? "" : ` ↻${resetClock(Date.parse(window.resetsAt), now)}`;
+	return `${label} ${Math.round(window.percent)}%${resets}`;
+}
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/** `HH:MM` UTC for a time today, `Ddd HH:MM` for another day. */
+function resetClock(at: number, now: number): string {
+	const date = new Date(at);
+	const time = date.toISOString().slice(11, 16);
+	return date.toISOString().slice(0, 10) === new Date(now).toISOString().slice(0, 10) ? time : `${WEEKDAYS[date.getUTCDay()]} ${time}`;
+}
+
+/** An age: seconds under a minute, minutes under an hour, then hours and minutes. */
+function age(ms: number): string {
+	if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))}s`;
+	if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+	return `${Math.floor(ms / 3_600_000)}h ${Math.round((ms % 3_600_000) / 60_000)}m`;
 }
 
 /**

@@ -12,7 +12,7 @@
  * human's real agent dir or Claude Code config.
  */
 
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
@@ -22,8 +22,8 @@ import { Type } from "typebox";
 import { attachTarget, chooseAttach, pickerLabel } from "./attach.ts";
 import { renderTeamBlock, teamStatus } from "./block.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
-import { agentsList, CLEAR_MARKER, installMod, launchBackground, sendToInbox, stopBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
-import { currentResult, DEFAULT_MAX_TEAMMATES, type EffortAction, type EffortState, fold, type Inbox, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace } from "./core.ts";
+import { agentsList, CLEAR_MARKER, getUsage, humanStatusLine, installMod, launchBackground, sendToInbox, statusLineReading, stopBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
+import { currentResult, DEFAULT_MAX_TEAMMATES, type EffortAction, type EffortState, fold, freshStatusLine, type Inbox, openEffort, type PendingApproval, refuseRequest, type Step, step, USAGE_FRESH_MS, type UsageReading, type Workspace } from "./core.ts";
 import { EVERY_ROLE, listTeams, loadTeam, type Playbook, readSnapshot, type Role, sha256, type Team, type TeamRoots } from "./definitions.ts";
 import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
 import { adoptable, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
@@ -152,12 +152,16 @@ export interface TeamDeps {
 	agentDir?: string;
 	/** Claude Code's config file, `~/.claude.json`. Injected by tests, and by nothing else. */
 	claudeConfigPath?: string;
+	/** Claude Code's folder, `~/.claude`, whose settings.json names the human's status line; only read. Injected by tests, and by nothing else. */
+	claudeDir?: string;
 	/** The `claude` executable. Injected by tests, and by nothing else. */
 	claudePath?: string;
 	/** The bundled Teams. Injected by tests, and by nothing else. */
 	bundledTeamsDir?: string;
 	/** The clock adoption times are read from. Injected by tests, and by nothing else. */
 	now?: () => Date;
+	/** Run `tick` every `ms` until the returned stop is called: the Team block's usage readings. Injected by tests, and by nothing else. */
+	every?: (ms: number, tick: () => Promise<void> | void) => () => void;
 	/** The pid this session leads an Effort as. Injected by tests standing in for another pi process, and by nothing else. */
 	pid?: number;
 	/** Waits out the stagger between Teammate starts. Injected by tests, and by nothing else. */
@@ -194,7 +198,16 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		claudeConfigPath: deps.claudeConfigPath ?? join(homedir(), ".claude.json"),
 		claudePath: deps.claudePath ?? "claude",
 	};
+	const claudeDir = deps.claudeDir ?? join(homedir(), ".claude");
 	const now = deps.now ?? (() => new Date());
+	const every =
+		deps.every ??
+		((ms: number, tick: () => Promise<void> | void) => {
+			const timer = setInterval(() => void tick(), ms);
+			// The block's readings never keep pi running.
+			timer.unref();
+			return () => clearInterval(timer);
+		});
 	const pid = deps.pid ?? process.pid;
 	const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 	const env = deps.env ?? process.env;
@@ -215,6 +228,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	// Where the Team block goes, when pi has a UI, and the lines it last showed.
 	let surface: ExtensionUIContext | undefined;
 	let shown: string[] | undefined;
+	// While the block shows: the timer that reads usage into it, the reading under way, and when `get_usage` was last asked.
+	let stopUsage: (() => void) | undefined;
+	let usageRun: Promise<void> | undefined;
+	let usageAsked: number | undefined;
 
 	function syncLeadTools(): void {
 		const others = pi.getActiveTools().filter((name) => !LEAD_TOOLS.includes(name));
@@ -233,9 +250,72 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	function paintBlock(): void {
 		if (!surface) return;
 		const lines = effort ? renderTeamBlock(teamStatus(effortState(effort), { adoptionsPending: pending.length }), now().getTime(), { maxTeammates: maxTeammates() }) : undefined;
+		if (lines && !stopUsage) stopUsage = every(USAGE_FRESH_MS, readUsage);
+		if (!lines) endUsage();
 		if (lines === shown || (lines && shown && lines.length === shown.length && lines.every((line, index) => line === shown?.[index]))) return;
 		shown = lines;
 		surface.setWidget(BLOCK_KEY, lines, { placement: "aboveEditor" });
+	}
+
+	function endUsage(): void {
+		stopUsage?.();
+		stopUsage = undefined;
+	}
+
+	/**
+	 * Each live Teammate's status line, read from its `statusline.json` on
+	 * demand (the wrapper never pushes it), recorded when newer than the last
+	 * one recorded. The file's modification time is when it was taken.
+	 */
+	function readStatusLines(held: HeldEffort): EffortState {
+		let state = effortState(held);
+		for (const teammate of state.teammates) {
+			if (teammate.retiredAt !== undefined || teammate.ended !== undefined) continue;
+			const file = join(held.paths.teammates, teammate.id, "statusline.json");
+			let reading: UsageReading | undefined;
+			try {
+				reading = statusLineReading(readFileSync(file, "utf8"), teammate.id, statSync(file).mtime.toISOString());
+			} catch {
+				// No status line yet: Claude Code runs it once the session's footer first draws.
+			}
+			if (reading) state = recordUsage(held, state, reading);
+		}
+		return state;
+	}
+
+	function recordUsage(held: HeldEffort, state: EffortState, reading: UsageReading): EffortState {
+		const result = step(state, { kind: "usage", reading });
+		if (!result.ok) return state;
+		appendLines(held.paths, result.append);
+		return result.state;
+	}
+
+	/**
+	 * The block's usage, once a minute while it shows: the status lines, and
+	 * only when none is under a minute old, the undocumented \`get_usage\`, asked
+	 * at most once a minute whatever came of the last ask. One that fails
+	 * leaves the last reading standing.
+	 */
+	function readUsage(): Promise<void> {
+		if (usageRun) return usageRun;
+		const run = async () => {
+			const held = effort;
+			if (!held || !shown) return;
+			const state = readStatusLines(held);
+			const at = now().getTime();
+			if (!freshStatusLine(state, at) && (usageAsked === undefined || at - usageAsked >= USAGE_FRESH_MS)) {
+				usageAsked = at;
+				const reading = await getUsage(paths.claudePath, new Date(at).toISOString());
+				if (!("error" in reading) && effort === held) recordUsage(held, effortState(held), reading);
+			}
+			paintBlock();
+		};
+		usageRun = run()
+			.catch(() => {})
+			.finally(() => {
+				usageRun = undefined;
+			});
+		return usageRun;
 	}
 
 	/** pi's `maxTeammates` setting, which reaches a running session only after `/reload`. */
@@ -383,6 +463,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		// The block shows only while this session holds the Effort.
 		if (shown) surface?.setWidget(BLOCK_KEY, undefined, { placement: "aboveEditor" });
 		shown = undefined;
+		endUsage();
 		const open = bridge;
 		bridge = undefined;
 		await open?.then(
@@ -707,6 +788,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				deny: [role.name, EVERY_ROLE].flatMap((key) => playbook.roles[key]?.deny ?? []),
 				ask: playbook.escalate.flatMap((entry) => entry.ask),
 				records: protectedRecords(held.paths),
+				humanStatusLine: humanStatusLine(effortState(held).workspace?.path ?? effortState(held).repo, claudeDir),
 			}),
 			prompt: teammatePrompt({ teammateId: teammate.id, role: role.name, brief: held.paths.brief, clarifications: held.paths.clarifications, tasks: held.paths.tasks }, role.prompt),
 			pointer,
@@ -1155,7 +1237,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		name: "team_status",
 		label: "Team status",
 		description: [
-			"The held Effort at a glance, as the human sees it in the Team block: the phase, Tasks accepted out of planned, each Teammate's state, Task, context use and permission mode (`acceptEdits≠auto` is drift from the mode it launched in), queued Tasks and why, each pause that holds (who set it, why and since when), and what waits on the human.",
+			"The held Effort at a glance, as the human sees it in the Team block: the phase, Tasks accepted out of planned, each Teammate's state, Task, context use and permission mode (`acceptEdits≠auto` is drift from the mode it launched in), queued Tasks and why, each pause that holds (who set it, why and since when), the account's usage from the freshest reading (where it came from and when), and what waits on the human.",
 			"Returns it as JSON. Changes nothing.",
 		].join(" "),
 		promptSnippet: "See the Effort's Teammates, Tasks and what waits on the human",
@@ -1230,15 +1312,17 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		promptSnippet: "Write a Report to the human: where the Effort stands and Brief coverage",
 		parameters: ReportParams,
 		defaultActive: false,
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!effort) throw new Error("No Effort is open in this session, so there is nothing to report on; the human opens one with `/team start <team>`.");
 			const held = effort;
-			const state = effortState(held);
+			// The Report's usage is as of now: each live Teammate's status line is read first.
+			const state = readStatusLines(held);
 			const criteria = state.brief ? briefCriteria(readFileSync(held.paths.brief, "utf8")) : [];
 			// The Role modes go only into the plan Report, and need the snapshot only then.
 			const snapshot = state.brief && state.reports === 0 ? snapshotOf(held) : undefined;
 			const modes = snapshot ? snapshot.roles.map((role) => ({ role: role.name, mode: modeInForce(snapshot.playbook, role) })) : [];
-			const result = step(state, { kind: "report", headline: params.headline, coverage: params.coverage, found: params.found, criteria, modes, at: now().toISOString() });
+			const leadCostUsd = leadCost(ctx.sessionManager.getEntries());
+			const result = step(state, { kind: "report", headline: params.headline, coverage: params.coverage, found: params.found, criteria, modes, leadCostUsd, at: now().toISOString() });
 			if (!result.ok) throw new Error(result.refusal);
 			let details: ReportDetails | undefined;
 			for (const action of result.actions) {
@@ -1326,4 +1410,23 @@ function bullets(lines: readonly string[]): string {
 
 export default function (pi: ExtensionAPI): void {
 	registerTeam(pi);
+}
+
+/**
+ * What the Lead's session has cost, as pi's own usage totals add it up: each
+ * entry's `usage.cost.total`, from assistant replies, tool results that made
+ * model calls, usage entries, and compaction and branch summaries. pi doesn't
+ * export the sum (`getUsageCostBreakdown`), so it is mirrored here.
+ */
+export function leadCost(entries: readonly unknown[]): number {
+	let total = 0;
+	for (const entry of entries) {
+		if (typeof entry !== "object" || entry === null) continue;
+		const { type, message, usage } = entry as { type?: unknown; message?: { role?: unknown; usage?: unknown }; usage?: unknown };
+		const counted =
+			type === "message" && (message?.role === "assistant" || message?.role === "toolResult") ? message.usage : type === "usage" || type === "compaction" || type === "branch_summary" ? usage : undefined;
+		const cost = (counted as { cost?: { total?: unknown } } | undefined)?.cost?.total;
+		if (typeof cost === "number" && Number.isFinite(cost)) total += cost;
+	}
+	return total;
 }

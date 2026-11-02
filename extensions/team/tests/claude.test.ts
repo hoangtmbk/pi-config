@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { existsSync, lstatSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { agentsList, BUNDLED_MOD, CLEAR_MARKER, installMod, launchBackground, MIN_CLAUDE_VERSION, stopBackground, trustFolder, versionWarning } from "../claude.ts";
+import { agentsList, BUNDLED_MOD, CLEAR_MARKER, getUsage, humanStatusLine, installMod, launchBackground, MIN_CLAUDE_VERSION, statusLineReading, stopBackground, trustFolder, versionWarning } from "../claude.ts";
 import { fakeClaude, tempRoots, writeFiles } from "./harness.ts";
 
 describe("the claude version check", () => {
@@ -148,5 +148,92 @@ describe("the Team's mod, loaded from a per-user copy", () => {
 
 		assert.ok(register.includes(CLEAR_MARKER), register);
 		assert.deepEqual(JSON.parse(readFileSync(join(BUNDLED_MOD, "hooks", "hooks.json"), "utf8")), { modules: ["./register.ts"] });
+	});
+});
+
+describe("the human's own status line command", () => {
+	const statusLine = (command: string) => JSON.stringify({ statusLine: { type: "command", command, padding: 0 } });
+
+	it("is the one Claude Code would run in the Workspace: local settings over project settings over the human's own", () => {
+		const roots = tempRoots();
+		const workspace = join(roots.scratch, "workspace");
+		writeFiles(roots.claudeDir, { "settings.json": statusLine("~/bin/user-status") });
+		assert.equal(humanStatusLine(workspace, roots.claudeDir), "~/bin/user-status");
+
+		writeFiles(workspace, { ".claude/settings.json": statusLine("./project-status.sh") });
+		assert.equal(humanStatusLine(workspace, roots.claudeDir), "./project-status.sh");
+
+		writeFiles(workspace, { ".claude/settings.local.json": statusLine("./local-status.sh") });
+		assert.equal(humanStatusLine(workspace, roots.claudeDir), "./local-status.sh");
+	});
+
+	it("is none when no settings file has a status line command, skipping files that aren't JSON", () => {
+		const roots = tempRoots();
+		const workspace = join(roots.scratch, "workspace");
+		assert.equal(humanStatusLine(workspace, roots.claudeDir), undefined);
+
+		writeFiles(workspace, { ".claude/settings.local.json": "{ not json", ".claude/settings.json": JSON.stringify({ statusLine: { type: "static" } }) });
+		writeFiles(roots.claudeDir, { "settings.json": JSON.stringify({ model: "opus" }) });
+		assert.equal(humanStatusLine(workspace, roots.claudeDir), undefined);
+	});
+});
+
+describe("usage readings", () => {
+	const AT = "2026-11-02T10:00:00.000Z";
+
+	it("reads a status line's JSON: the account's windows, the session's tokens, estimate and context", () => {
+		const json = JSON.stringify({
+			session_id: "sess-1",
+			context_window: { total_input_tokens: 41_000, total_output_tokens: 900, used_percentage: 21 },
+			rate_limits: { five_hour: { used_percentage: 12.4, resets_at: 1_793_617_200 }, seven_day: { used_percentage: 73, resets_at: 1_793_955_600 } },
+			cost: { total_cost_usd: 0.42 },
+		});
+
+		assert.deepEqual(statusLineReading(json, "dev-1", AT), {
+			source: "status-line",
+			at: AT,
+			teammate: "dev-1",
+			sessionId: "sess-1",
+			rateLimits: true,
+			fiveHour: { percent: 12.4, resetsAt: "2026-11-02T11:00:00.000Z" },
+			sevenDay: { percent: 73, resetsAt: "2026-11-06T09:00:00.000Z" },
+			tokens: 41_900,
+			costUsd: 0.42,
+			ctx: 21,
+		});
+	});
+
+	it("reads a status line without rate_limits, as an API key's, and leaves out what it doesn't say", () => {
+		const json = JSON.stringify({ session_id: "sess-2", context_window: { total_input_tokens: 10, total_output_tokens: 5, used_percentage: null }, cost: { total_cost_usd: 1.5 } });
+
+		assert.deepEqual(statusLineReading(json, "dev-2", AT), { source: "status-line", at: AT, teammate: "dev-2", sessionId: "sess-2", rateLimits: false, tokens: 15, costUsd: 1.5 });
+		assert.equal(statusLineReading("{ half", "dev-2", AT), undefined);
+		assert.equal(statusLineReading("[]", "dev-2", AT), undefined);
+	});
+
+	it("asks claude -p for get_usage over stream-json, with no prompt, and reads the account's windows", async () => {
+		const claude = fakeClaude(tempRoots(), {
+			usage: {
+				subscription_type: "max",
+				rate_limits_available: true,
+				rate_limits: { five_hour: { utilization: null, resets_at: null }, seven_day: { utilization: 73, resets_at: "2026-11-06T09:00:00.000Z" } },
+				session: { total_cost_usd: 0 },
+			},
+		});
+
+		assert.deepEqual(await getUsage(claude.path, AT), { source: "get-usage", at: AT, rateLimits: true, sevenDay: { percent: 73, resetsAt: "2026-11-06T09:00:00.000Z" } });
+		assert.deepEqual(claude.calls(), [["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]]);
+	});
+
+	it("reads no windows from an API key's get_usage, and an error from a failed or unanswered one", async () => {
+		const roots = tempRoots();
+		const apiKey = fakeClaude(roots, { usage: { subscription_type: null, rate_limits_available: false, rate_limits: null, session: { total_cost_usd: 0 } } });
+		assert.deepEqual(await getUsage(apiKey.path, AT), { source: "get-usage", at: AT, rateLimits: false });
+
+		const unscripted = await getUsage(fakeClaude(roots).path, AT);
+		assert.match("error" in unscripted ? unscripted.error : "", /get_usage/);
+
+		const missing = await getUsage(join(roots.scratch, "no-such-claude"), AT);
+		assert.match("error" in missing ? missing.error : "", /get_usage/);
 	});
 });

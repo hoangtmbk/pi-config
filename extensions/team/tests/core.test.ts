@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, heldPauses, type JournalLine, openEffort, type Step, step, taskStatus } from "../core.ts";
+import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, type Step, step, taskStatus, type UsageReading } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -1473,3 +1473,116 @@ describe("a Teammate's lifecycle", () => {
 	});
 });
 
+
+describe("usage readings", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "design", role: "architect", goal: "Design the rename.", criteria: ["AC2"] },
+			{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] },
+			{ slug: "docs", role: "dev", goal: "Document the key.", criteria: ["AC1"] },
+		],
+		criteria: ["AC1", "AC2"],
+		roles: ["architect", "dev"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+	const staffed = ["design", "rename", "docs"].reduce((lines, slug) => applied(lines, { kind: "handoff", slug, at: "2026-11-02T11:20:00.000Z" }), planned);
+
+	function statusLine(teammate: string, at: string, extra: Partial<UsageReading> = {}): EffortInput {
+		return { kind: "usage", reading: { source: "status-line", at, teammate, sessionId: `${teammate}-a`, rateLimits: true, ...extra } };
+	}
+
+	function report(lines: EffortLine[], at: string, extra: Partial<Extract<EffortInput, { kind: "report" }>> = {}): string[] | undefined {
+		const result = run(lines, { kind: "report", headline: "On track.", criteria: ["AC1", "AC2"], modes: [], at, ...extra });
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "write-report");
+		assert.ok(action?.kind === "write-report");
+		return action.report.sections.find((each) => each.title === "Usage")?.lines;
+	}
+
+	it("keeps a status line reading once, as the last reading with its source and time, and its Teammate's context", () => {
+		const reading = statusLine("dev-1", "2026-11-02T11:30:00.000Z", { sevenDay: { percent: 73, resetsAt: "2026-11-06T09:00:00.000Z" }, ctx: 21 });
+		const read = applied(staffed, reading);
+
+		assert.deepEqual(read.slice(staffed.length), [{ type: "usage-read", ...(reading as Extract<EffortInput, { kind: "usage" }>).reading }]);
+		assert.equal(fold(read).usage?.latest.source, "status-line");
+		assert.equal(fold(read).usage?.latest.at, "2026-11-02T11:30:00.000Z");
+		assert.equal(fold(read).usage?.statusLines["dev-1"]?.ctx, 21);
+		// The same file read again, or an older one, adds nothing.
+		const again = run(read, reading);
+		assert.ok(again.ok);
+		assert.deepEqual(again.append, []);
+		const older = run(read, statusLine("dev-1", "2026-11-02T11:29:00.000Z"));
+		assert.ok(older.ok);
+		assert.deepEqual(older.append, []);
+	});
+
+	it("leaves usage out of the Report until there is a reading, and out of what happened since the last Report", () => {
+		assert.equal(report(staffed, "2026-11-02T11:40:00.000Z"), undefined);
+		const read = applied(staffed, statusLine("dev-1", "2026-11-02T11:30:00.000Z", { sevenDay: { percent: 70 } }));
+		assert.ok(report(read, "2026-11-02T11:40:00.000Z"));
+		const result = run(read, { kind: "report", headline: "On track.", criteria: ["AC1", "AC2"], modes: [], at: "2026-11-02T11:40:00.000Z" });
+		assert.ok(result.ok);
+		const action = result.actions.find((each) => each.kind === "write-report");
+		assert.ok(action?.kind === "write-report");
+		assert.equal(action.report.sections.find((each) => each.title === "Since the last Report")?.lines.some((line) => line.includes("usage")), false);
+	});
+
+	it("gives the freshest account reading and its change since the Effort began, which includes the human's own use", () => {
+		const lines = [
+			statusLine("dev-1", "2026-11-02T11:30:00.000Z", { fiveHour: { percent: 10, resetsAt: "2026-11-02T14:00:00.000Z" }, sevenDay: { percent: 66, resetsAt: "2026-11-06T09:00:00.000Z" } }),
+			statusLine("architect-1", "2026-11-02T12:10:00.000Z", { fiveHour: { percent: 31, resetsAt: "2026-11-02T14:00:00.000Z" }, sevenDay: { percent: 73, resetsAt: "2026-11-06T09:00:00.000Z" } }),
+			// Older than the reading above, so not the freshest, though read later.
+			statusLine("dev-2", "2026-11-02T12:00:00.000Z", { fiveHour: { percent: 29, resetsAt: "2026-11-02T14:00:00.000Z" }, sevenDay: { percent: 72, resetsAt: "2026-11-06T09:00:00.000Z" } }),
+		].reduce(applied, staffed);
+
+		assert.deepEqual(report(lines, "2026-11-02T12:15:00.000Z")?.[0], "Account, from architect-1's status line at 12:10 UTC: 5h 31% (+21 since the Effort began) · week 73% (+7 since the Effort began). It includes your own use outside the Team.");
+	});
+
+	it("says n/a for a window no reading gives, and that a window reset rather than a change across its reset", () => {
+		const lines = [
+			statusLine("dev-1", "2026-11-02T11:30:00.000Z", { fiveHour: { percent: 80, resetsAt: "2026-11-02T12:00:00.000Z" } }),
+			{ kind: "usage", reading: { source: "get-usage", at: "2026-11-02T12:30:00.000Z", rateLimits: true, fiveHour: { percent: 4, resetsAt: "2026-11-02T17:00:00.000Z" } } } as EffortInput,
+		].reduce(applied, staffed);
+
+		assert.equal(report(lines, "2026-11-02T12:35:00.000Z")?.[0], "Account, from get_usage at 12:30 UTC: 5h 4% (reset since the Effort began) · week n/a. It includes your own use outside the Team.");
+	});
+
+	it("sums each Role's tokens and estimate across session ids, a value that drops counting as a reset, labelled as not the bill", () => {
+		const lines = [
+			statusLine("dev-1", "2026-11-02T11:30:00.000Z", { tokens: 40_000, costUsd: 0.5 }),
+			statusLine("dev-1", "2026-11-02T11:40:00.000Z", { tokens: 60_000, costUsd: 0.7 }),
+			// A clear: a new session id, counted from its own start.
+			statusLine("dev-1", "2026-11-02T11:50:00.000Z", { sessionId: "dev-1-b", tokens: 10_000, costUsd: 0.1 }),
+			// The first session's figure dropped: it reset, so what it had counts too.
+			statusLine("dev-1", "2026-11-02T12:00:00.000Z", { tokens: 5_000, costUsd: 0.05 }),
+			statusLine("dev-2", "2026-11-02T12:00:00.000Z", { tokens: 21_000, costUsd: 0.25 }),
+			statusLine("architect-1", "2026-11-02T12:00:00.000Z", { tokens: 412_000, costUsd: 3.1 }),
+		].reduce(applied, staffed);
+
+		assert.deepEqual(report(lines, "2026-11-02T12:05:00.000Z")?.slice(1), ["By Role: architect 412k tokens ≈ $3.10 · dev 96k tokens ≈ $1.10. *API-price equivalent, not your bill.*"]);
+	});
+
+	it("says the estimate is the nearest thing to a charge when no reading has rate_limits, as with an API key", () => {
+		const lines = [statusLine("dev-1", "2026-11-02T11:30:00.000Z", { rateLimits: false, tokens: 96_000, costUsd: 1.1 })].reduce(applied, staffed);
+
+		assert.deepEqual(report(lines, "2026-11-02T11:35:00.000Z"), [
+			"Account, from dev-1's status line at 11:30 UTC: 5h n/a · week n/a. It includes your own use outside the Team.",
+			"By Role: dev 96k tokens ≈ $1.10. No reading has `rate_limits`, as with an API key, so the estimate is the nearest thing to a charge.",
+		]);
+	});
+
+	it("gives the Lead's own cost as pi reports it", () => {
+		assert.deepEqual(report(staffed, "2026-11-02T11:35:00.000Z", { leadCostUsd: 0.4321 }), ["The Lead: $0.43, as pi reports it."]);
+		assert.equal(report(staffed, "2026-11-02T11:35:00.000Z", { leadCostUsd: 0 }), undefined);
+	});
+
+	it("tells whether a status line is under a minute old", () => {
+		const read = fold(applied(staffed, statusLine("dev-1", "2026-11-02T11:30:00.000Z")));
+
+		assert.equal(freshStatusLine(fold(staffed), Date.parse("2026-11-02T11:30:00.000Z")), false);
+		assert.equal(freshStatusLine(read, Date.parse("2026-11-02T11:30:59.000Z")), true);
+		assert.equal(freshStatusLine(read, Date.parse("2026-11-02T11:31:00.000Z")), false);
+	});
+});

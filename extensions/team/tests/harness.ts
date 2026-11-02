@@ -17,6 +17,8 @@ export interface TempRoots {
 	agentDir: string;
 	/** Stands in for `~/.claude.json`. Not created. */
 	claudeConfigPath: string;
+	/** Stands in for `~/.claude`, where the human's own settings.json lives. Not created. */
+	claudeDir: string;
 	/** A scratch folder for anything else the test needs on disk. */
 	scratch: string;
 }
@@ -27,7 +29,7 @@ export function tempRoots(): TempRoots {
 	const scratch = join(home, "scratch");
 	mkdirSync(agentDir, { recursive: true });
 	mkdirSync(scratch, { recursive: true });
-	return { agentDir, claudeConfigPath: join(home, ".claude.json"), scratch };
+	return { agentDir, claudeConfigPath: join(home, ".claude.json"), claudeDir: join(home, ".claude"), scratch };
 }
 
 /**
@@ -116,14 +118,18 @@ export interface FakeClaudeOptions {
 	replies?: FakeHookStep[];
 	/** The exit code of a `claude attach`; 0 when unset. */
 	attachExit?: number;
+	/** What the `get_usage` control request answers; an error response when unset. */
+	usage?: Record<string, unknown>;
 }
 
 /**
  * One step a fake background session plays: fire a hook event through the
  * hook commands of its `--settings` (the payload gets the session id, folder
- * and event name filled in), or write the result its handoff pointer asks for.
+ * and event name filled in), write the result its handoff pointer asks for, or
+ * update its status line, which runs the `statusLine.command` of its
+ * `--settings` with the payload (the session id and folder filled in).
  */
-export type FakeHookStep = { event: string; payload?: Record<string, unknown> } | { write: "result" };
+export type FakeHookStep = { event: string; payload?: Record<string, unknown> } | { write: "result" } | { statusLine: Record<string, unknown> };
 
 /** One `claude --bg` launch, as the fake saw it. */
 export interface FakeLaunch {
@@ -162,6 +168,10 @@ export interface FakeClaude {
 	forget(name: string): void;
 	/** Set what `agents --json` says of the session named `name`. */
 	setAgent(name: string, change: Partial<Pick<FakeAgent, "status" | "state" | "waitingFor">>): void;
+	/** Set what `get_usage` answers from now on; undefined makes it answer with an error. */
+	setUsage(usage: Record<string, unknown> | undefined): void;
+	/** How many times `get_usage` was asked for: each is one `claude -p`. */
+	usageCalls(): number;
 }
 
 /** A session in the fake's registry. */
@@ -219,6 +229,8 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 	const replies = join(dir, "replies.json");
 	if (options.hooks) writeFileSync(hooks, JSON.stringify(options.hooks));
 	if (options.replies) writeFileSync(replies, JSON.stringify(options.replies));
+	const usage = join(dir, "usage.json");
+	if (options.usage) writeFileSync(usage, JSON.stringify(options.usage));
 	// Its own short folder: a Unix socket path can't be much longer than 100 bytes.
 	const sockets = mkdtempSync(join(tmpdir(), "fcs-"));
 	const agents = join(dir, "agents");
@@ -246,6 +258,7 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 		FAKE_CLAUDE_ATTACH_OUT: attachOut,
 		FAKE_CLAUDE_AGENTS: agents,
 		FAKE_CLAUDE_ATTACH_EXIT: options.attachExit === undefined ? undefined : String(options.attachExit),
+		FAKE_CLAUDE_USAGE: usage,
 	};
 	const exports = Object.entries(env)
 		.filter((entry): entry is [string, string] => entry[1] !== undefined)
@@ -275,6 +288,8 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 			rmSync(file);
 		},
 		setAgent: (name, edit) => change(name, (agent) => ({ ...agent, ...edit })),
+		setUsage: (next) => (next === undefined ? rmSync(usage, { force: true }) : writeFileSync(usage, JSON.stringify(next))),
+		usageCalls: () => jsonLines<string[]>(argvOut).filter((args) => args[0] === "-p").length,
 	};
 }
 
