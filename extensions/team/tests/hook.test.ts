@@ -135,3 +135,121 @@ describe("the hook script", () => {
 		assert.equal(journal(dir, "builder-1").length, 1);
 	});
 });
+
+/**
+ * A fake Lead that answers held requests: every `held` line it is sent gets
+ * `answer(line)` written back on the same socket, unless that returns undefined.
+ */
+async function answeringLead(
+	answer: (held: { request: string }) => unknown,
+): Promise<{ server: Server; port: number; held: () => Record<string, unknown>[]; doorbells: () => Record<string, unknown>[] }> {
+	const held: Record<string, unknown>[] = [];
+	const doorbells: Record<string, unknown>[] = [];
+	const server = createServer((socket) => {
+		let buffered = "";
+		socket.setEncoding("utf8");
+		socket.on("error", () => socket.destroy());
+		socket.on("data", (chunk: string) => {
+			buffered += chunk;
+			const lines = buffered.split("\n");
+			buffered = lines.pop() ?? "";
+			for (const text of lines) {
+				const line = JSON.parse(text) as { type: string; request: string };
+				if (line.type === "doorbell") doorbells.push(line);
+				if (line.type !== "held") continue;
+				held.push(line);
+				const reply = answer(line);
+				if (reply !== undefined) socket.write(`${JSON.stringify(reply)}\n`);
+			}
+		});
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const address = server.address();
+	if (address === null || typeof address === "string") throw new Error("the fake Lead has no port");
+	return { server, port: address.port, held: () => held, doorbells: () => doorbells };
+}
+
+function writeLead(dir: string, port: number): void {
+	writeFileSync(join(dir, "lead.json"), JSON.stringify({ pid: process.pid, port, token: "t0ken", sessionFile: "/s.jsonl", startedAt: "2026-11-02T10:00:00.000Z" }));
+}
+
+const PERMISSION = {
+	session_id: STOP.session_id,
+	hook_event_name: "PermissionRequest",
+	tool_name: "Bash",
+	tool_input: { command: "npm publish", description: "Publish the package" },
+};
+
+describe("the hook script holding a PermissionRequest", () => {
+	it("journals the request with an id, holds it open on the Lead bridge and prints the Lead's decision", async () => {
+		const dir = effortDir();
+		const lead = await answeringLead(({ request }) => ({ type: "decision", request, decision: { behavior: "allow" } }));
+		writeLead(dir, lead.port);
+
+		const result = await runHook(dir, "builder-1", PERMISSION);
+		lead.server.close();
+
+		const [line] = journal(dir, "builder-1");
+		assert.equal(line.event, "PermissionRequest");
+		assert.match(String(line.request), /^req-[0-9a-f]{8}$/);
+		assert.deepEqual(lead.held(), [{ type: "held", token: "t0ken", teammate: "builder-1", request: line.request }]);
+		assert.equal(result.code, 0);
+		assert.deepEqual(JSON.parse(result.output), {
+			hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } },
+		});
+	});
+
+	it("journals 'denied in terminal' when Claude Code kills the held hook, as it does when the human answers in the terminal", async () => {
+		const dir = effortDir();
+		const lead = await answeringLead(() => undefined);
+		writeLead(dir, lead.port);
+
+		const child = spawn(process.execPath, [HOOK_SCRIPT, dir, "builder-1"]);
+		child.stdin.end(JSON.stringify(PERMISSION));
+		while (lead.held().length === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+		const closed = new Promise((resolve) => child.on("close", resolve));
+		child.kill("SIGTERM");
+		await closed;
+		lead.server.close();
+
+		const lines = journal(dir, "builder-1");
+		assert.deepEqual(
+			lines.map((line) => [line.event, line.request]),
+			[
+				["PermissionRequest", lead.held()[0].request],
+				["denied-in-terminal", lead.held()[0].request],
+			],
+		);
+	});
+
+	it("gives up holding after its hold time, journalling that, ringing the doorbell and printing nothing, so the prompt stays with the human", async () => {
+		const dir = effortDir();
+		const lead = await answeringLead(() => undefined);
+		writeLead(dir, lead.port);
+
+		const result = await runHook(dir, "builder-1", PERMISSION, { TEAM_HOOK_HOLD_MS: "200" });
+		lead.server.close();
+
+		assert.deepEqual(result, { code: 0, output: "" });
+		const lines = journal(dir, "builder-1");
+		assert.deepEqual(lines.map((line) => line.event), ["PermissionRequest", "hold-expired"]);
+		assert.equal(lines[1].request, lines[0].request);
+		assert.deepEqual(lead.doorbells(), [{ type: "doorbell", token: "t0ken", teammate: "builder-1" }]);
+	});
+
+	it("gives the request straight back to the terminal when no Lead is listening", async () => {
+		const missing = effortDir();
+		const closed = effortDir();
+		const lead = await answeringLead(() => undefined);
+		await new Promise((resolve) => lead.server.close(resolve));
+		writeLead(closed, lead.port);
+
+		const results = [await runHook(missing, "builder-1", PERMISSION), await runHook(closed, "builder-1", PERMISSION)];
+
+		assert.deepEqual(results, [
+			{ code: 0, output: "" },
+			{ code: 0, output: "" },
+		]);
+		for (const dir of [missing, closed]) assert.deepEqual(journal(dir, "builder-1").map((line) => line.event), ["PermissionRequest", "hold-expired"]);
+	});
+});

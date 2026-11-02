@@ -70,7 +70,7 @@ From then on the Effort reads only those copies, so editing your Team or Playboo
 in it; a copy whose sha no longer matches its approval is reported and never used. A Brief can't
 be approved once its Playbook has been adopted again: start a new Effort.
 
-`team_plan`, `team_handoff`, `team_review` and `team_report` are switched on with the Effort, and
+`team_plan`, `team_handoff`, `team_review`, `team_report` and `team_answer` are switched on with the Effort, and
 refuse until the Brief is approved.
 
 ### Planning and handing off
@@ -145,6 +145,24 @@ is also read when the Lead's run settles, so a lost doorbell loses nothing.
   wakes the Lead with the Teammate's last message.
 
 Wakes that come while the Lead is busy are sent together as one follow-up once its run settles.
+
+### Held requests
+
+A Teammate's permission prompt, an `AskUserQuestion` included, is held by its `PermissionRequest`
+hook: the hook journals it with a request id `req-<8 hex>`, keeps a socket open to the Lead
+bridge, and the Lead is woken with the tool and its input. The prompt stays live in the
+Teammate's terminal meanwhile, and the first answer wins. Nothing is allowed by default.
+
+- `team_answer` with `allow` or `deny` and a `reason` goes to the hook as its decision. An allow
+  may add a session `rule` for the same tool, such as `Bash(npm test:*)`, and name the `grant` it
+  relies on. An `AskUserQuestion` is answered with `answers`, keyed by each question's exact text.
+- The human answering in the terminal kills the hook, journalled as denied in the terminal; a
+  `PostToolUse` for the call after it shows it was allowed. Either way the Lead's answer is then
+  refused as already answered.
+- A hook that holds 3570 s without an answer gives the prompt back to the terminal. It waits in
+  `/team pending` as an item that attaches to the Teammate, and in the Report's Waiting on you.
+
+The next Report logs every answer, rule and grant under Decided for you, with the Task.
 
 ### Reviewing
 

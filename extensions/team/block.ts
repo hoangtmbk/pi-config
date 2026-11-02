@@ -25,7 +25,7 @@
  */
 
 import { sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
-import type { EffortState, Teammate } from "./core.ts";
+import { type EffortState, type Teammate, waitingInTerminal } from "./core.ts";
 
 /** The widest the frame may get, borders included. */
 export const MAX_WIDTH = 96;
@@ -117,7 +117,7 @@ export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockD
 		tasks: { accepted: Object.values(state.tasks).filter((task) => task.accepted !== undefined).length, planned: state.plan?.length ?? 0 },
 		teammates: state.teammates.filter((teammate) => teammate.retiredAt === undefined).map((teammate) => teammateRow(state, teammate)),
 		queued: state.queue.map((queued) => ({ task: queued.folder, role: queued.role, why: queued.why })),
-		waitingOnYou: state.pending.length + extras.adoptionsPending,
+		waitingOnYou: state.pending.length + waitingInTerminal(state).length + extras.adoptionsPending,
 		reports: state.reports,
 	};
 }

@@ -273,6 +273,17 @@ describe("team_status data", () => {
 		assert.equal(teamStatus(fold(through([REQUEST, APPROVE, PLAN, report("2026-11-02T10:20:00.000Z"), report("2026-11-02T10:25:00.000Z")])), { adoptionsPending: 0 }).reports, 2);
 	});
 
+	it("counts a request only the human can answer now, in a Teammate's terminal, as waiting on the human", () => {
+		const asked = (cursor: number, event: string, payload?: Record<string, unknown>): EffortInput => {
+			const base = hook("architect-1", cursor, event, payload);
+			return base.kind === "journal" ? { ...base, line: { ...base.line, request: "req-0000000a" } } : base;
+		};
+		const held = [REQUEST, APPROVE, PLAN, handoff("design"), asked(1, "PermissionRequest", { tool_name: "Bash", tool_input: { command: "npm publish" } })];
+
+		assert.equal(teamStatus(fold(through(held)), { adoptionsPending: 0 }).waitingOnYou, 0);
+		assert.equal(teamStatus(fold(through([...held, asked(2, "hold-expired")])), { adoptionsPending: 0 }).waitingOnYou, 1);
+	});
+
 	it("rows a Teammate whose new session gave it a new short id as new, until the human attaches to it through pi", () => {
 		const opened = through([REQUEST, APPROVE, PLAN, handoff("design"), hook("architect-1", 1, "SessionStart", { source: "startup", permission_mode: "auto" })]);
 		const relaunched: EffortLine[] = [
