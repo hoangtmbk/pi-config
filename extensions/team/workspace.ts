@@ -220,6 +220,56 @@ export function removeTaskWorkspace(repo: string, task: { path: string; branch: 
 	}
 }
 
+/** One of an Effort's worktrees: its Workspace or an isolated Task's, with whether it has uncommitted changes. */
+export interface EffortWorktree {
+	path: string;
+	branch: string;
+	dirty: boolean;
+}
+
+/**
+ * The worktrees Effort `effortId` has in `repo` now, as `git worktree list`
+ * knows them: the one on its branch `team/<effort-id>` and each on a Task
+ * branch `team/<effort-id>-task-<nnn>`.
+ */
+export function effortWorktrees(repo: string, effortId: string): EffortWorktree[] {
+	const { branch: own } = workspaceFor(repo, effortId);
+	const found: EffortWorktree[] = [];
+	for (const entry of git(repo, ["worktree", "list", "--porcelain", "-z"]).split("\0\0")) {
+		const fields = entry.split("\0");
+		const path = fields.find((field) => field.startsWith("worktree "))?.slice("worktree ".length);
+		const branch = fields.find((field) => field.startsWith("branch refs/heads/"))?.slice("branch refs/heads/".length);
+		if (path === undefined || branch === undefined || (branch !== own && !branch.startsWith(`${own}-task-`))) continue;
+		found.push({ path, branch, dirty: existsSync(path) && changed(path).length > 0 });
+	}
+	return found;
+}
+
+/**
+ * Remove Effort `effortId`'s clean worktrees at its end, sign-off or cancel,
+ * and keep every branch: the work stays in git for the human to merge or
+ * delete. A worktree with uncommitted changes is kept, never forced, and so is
+ * one git refuses to remove, with git's reason.
+ */
+export function endWorktrees(repo: string, effortId: string): { removed: EffortWorktree[]; kept: (EffortWorktree & { why: string })[] } {
+	const removed: EffortWorktree[] = [];
+	const kept: (EffortWorktree & { why: string })[] = [];
+	for (const worktree of effortWorktrees(repo, effortId)) {
+		if (worktree.dirty) {
+			kept.push({ ...worktree, why: `it has uncommitted changes (${listed(changed(worktree.path))})` });
+			continue;
+		}
+		try {
+			git(repo, ["worktree", "remove", worktree.path]);
+			removed.push(worktree);
+		} catch (error) {
+			if (!(error instanceof GitError)) throw error;
+			kept.push({ ...worktree, why: error.message });
+		}
+	}
+	return { removed, kept };
+}
+
 /** The paths `git status` shows as changed or untracked in the worktree at `dir`. */
 function changed(dir: string): string[] {
 	return git(dir, ["status", "--porcelain", "-z"])

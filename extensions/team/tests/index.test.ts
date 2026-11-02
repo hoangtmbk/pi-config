@@ -340,8 +340,8 @@ describe("/team", () => {
 		await pi.team("");
 
 		assert.deepEqual(pi.notifications, [
-			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "error" },
-			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "info" },
+			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`.", type: "error" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`.", type: "info" },
 		]);
 	});
 });
@@ -3140,8 +3140,8 @@ describe("/team attach [id]", () => {
 		await leading.team("attach qa-1");
 
 		assert.deepEqual(pi.notifications, [
-			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "info" },
-			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "info" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`.", type: "info" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`.", type: "info" },
 		]);
 		assert.deepEqual(leading.notifications, [{ message: "There is no Teammate `qa-1` with a session to attach to. Teammates with one: `builder-1`.", type: "error" }]);
 	});
@@ -3289,5 +3289,222 @@ describe("an isolated Task in a worktree of its own", () => {
 		await pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Also the docs." });
 
 		assert.equal(pi.claude.launches()[1]?.cwd, task.path);
+	});
+});
+
+/** The criteria of {@link crewBrief}, each with its evidence, as the final Report maps them. */
+const FINAL_COVERAGE = [
+	{ criterion: "AC1", note: "`rename-key` accepted: no file mentions `colour`." },
+	{ criterion: "AC2", note: "`check-old-configs` accepted: old configs load." },
+];
+
+/**
+ * A crew Effort at its end: two isolated Tasks with their Teammates running,
+ * `survey`'s worktree left with an uncommitted file, and the final Report
+ * written with `changes`, which asks the human to sign off.
+ */
+async function finalReported(changes?: Record<string, unknown>[]) {
+	const crew = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+	await crew.pi.call("team_plan", { tasks: CREW_PLAN });
+	await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true });
+	await crew.pi.call("team_handoff", { slug: "survey", body: "# Survey\n", isolated: true });
+	await until(() => effortLines(crew.dir).filter((line) => line.type === "teammate-session").length === 2, "both Teammates start");
+	const [clean, dirty] = [crewTask(crew.repo, "001"), crewTask(crew.repo, "002")];
+	writeFileSync(join(dirty.path, "notes.txt"), "not committed\n");
+	const reply = await crew.pi.call("team_report", { headline: "Both criteria are met.", coverage: FINAL_COVERAGE, final: true, ...(changes ? { changes } : {}) });
+	return { ...crew, clean, dirty, reply, report: join(crew.dir, "reports", "001.md") };
+}
+
+function approvals(dir: string): Record<string, unknown>[] {
+	return readFileSync(join(dir, "approvals.jsonl"), "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+const EFFORT_TOOL_NAMES = ["team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer"];
+
+describe("ending an Effort: the final Report and sign-off", () => {
+	it("writes the final Report mapping each criterion to its evidence, with the checkpoints and the worktrees, and asks the human to sign it off", async () => {
+		const { pi, reply, report, clean, dirty } = await finalReported();
+
+		assert.match(reply, /^The final Report 1 of Effort `crew-2026-11-02` is written as reports\/001\.md/);
+		assert.match(reply, /sign off .*`r2`/);
+		const written = readFileSync(report, "utf8");
+		for (const needed of [
+			"# Final Report 1 · Effort `crew-2026-11-02`",
+			"- AC1: `rename-key` accepted: no file mentions `colour`.",
+			"## Checkpoints",
+			"- Brief: `r1` approved at 10:00 UTC",
+			"## Found work",
+			"## Worktrees",
+			`- ${clean.path} (\`${clean.branch}\`): clean, removed at sign-off; the branch is kept`,
+			`- ${dirty.path} (\`${dirty.branch}\`): has uncommitted changes, so it is kept; the branch is kept`,
+		]) {
+			assert.ok(written.includes(needed), `reports/001.md doesn't say ${needed}:\n${written}`);
+		}
+		assert.match(teamBlock(pi)?.join("\n") ?? "", /pending/);
+	});
+
+	it("refuses a final Report that leaves a criterion without evidence, writing nothing", async () => {
+		const { pi, dir } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await assert.rejects(pi.call("team_report", { headline: "Done.", coverage: [FINAL_COVERAGE[0]], final: true }), /AC2/);
+		assert.equal(existsSync(join(dir, "reports")), false);
+	});
+
+	it("signing off records the act with the Report's sha, stops every Teammate, removes the clean worktrees, keeps the dirty one and every branch, and ends the Effort", async () => {
+		const { pi, dir, repo, report, workspace, clean, dirty } = await finalReported();
+		const shortIds = effortLines(dir)
+			.filter((line) => line.type === "teammate-session")
+			.map((line) => line.shortId);
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		assert.match(pi.dialogs.at(-1)?.title ?? "", /[Ss]ign off.*reports\/001\.md/s);
+		const signed = approvals(dir).at(-1);
+		assert.equal(signed?.act, "sign-off");
+		assert.equal(signed?.request, "r2");
+		assert.equal(signed?.report, sha(readFileSync(report)));
+		const stops = pi.claude.calls().filter((argv) => argv[0] === "stop").map((argv) => argv[1]);
+		assert.deepEqual(stops.sort(), [...shortIds].sort());
+		assert.deepEqual(effortLines(dir).at(-1), { type: "effort-ended", how: "signed-off", at: NOW.toISOString() });
+		assert.equal(existsSync(workspace), false);
+		assert.equal(existsSync(clean.path), false);
+		assert.ok(existsSync(join(dirty.path, "notes.txt")));
+		for (const branch of [`team/${CREW_EFFORT_ID}`, clean.branch, dirty.branch]) assert.ok(gitOk(repo, "rev-parse", "--verify", branch), `${branch} is kept`);
+		const said = pi.notifications.at(-1)?.message ?? "";
+		assert.match(said, /[Ss]igned off/);
+		assert.ok(said.includes(dirty.path), said);
+		assert.deepEqual(
+			pi.activeTools().filter((name) => EFFORT_TOOL_NAMES.includes(name)),
+			[],
+		);
+		assert.equal(teamBlock(pi), undefined);
+	});
+
+	it("leaves nothing waiting once signed off, and adopts nothing ended with `/team resume`", async () => {
+		const { pi } = await finalReported();
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		await pi.team("pending");
+		await pi.team("resume");
+
+		assert.equal(pi.notifications.at(-2)?.message, "Nothing is waiting on you.");
+		assert.match(pi.notifications.at(-1)?.message ?? "", /nothing to adopt/);
+	});
+
+	it("refuses to adopt a signed-off Effort by name, and a new session leading it doesn't take it back", async () => {
+		const { pi, roots, repo } = await finalReported();
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		await pi.team(`resume ${CREW_EFFORT_ID}`);
+		assert.match(pi.notifications.at(-1)?.message ?? "", /`crew-2026-11-02` was signed off, so there is nothing to adopt/);
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries() });
+		await again.emit("session_start", { reason: "startup" });
+		assert.deepEqual(
+			again.activeTools().filter((name) => EFFORT_TOOL_NAMES.includes(name)),
+			[],
+		);
+		assert.deepEqual(again.notifications, []);
+	});
+
+	it("a send-back of the final Report wakes the Lead with the note and leaves the Teammates running", async () => {
+		const { pi, dir } = await finalReported();
+		const woken = pi.sent.length;
+
+		pi.answer("Send back with a note", "AC2 needs a test.");
+		await pi.team("pending");
+
+		assert.equal(pi.claude.calls().filter((argv) => argv[0] === "stop").length, 0);
+		const wake = pi.sent.slice(woken).find((message) => message.customType === "team-pending");
+		assert.match(wake?.content ?? "", /sent back the final Report .*AC2 needs a test\..*still running/s);
+		assert.equal(effortLines(dir).some((line) => line.type === "effort-ended"), false);
+		assert.equal(approvals(dir).some((record) => record.act === "sign-off"), false);
+		assert.ok(pi.activeTools().includes("team_report"));
+		await pi.team("pending");
+		assert.equal(pi.notifications.at(-1)?.message, "Nothing is waiting on you.");
+	});
+
+	it("asks about each proposed Playbook change on its own: an adopted one changes the Team's adopted Playbook for the next Effort, never this Effort's snapshot", async () => {
+		const changes = [
+			{ id: "tiny-diffs", summary: "Diffs were still too big.", oldText: "keep each Task's diff small.", newText: "keep each Task's diff under 200 lines." },
+			{ id: "no-curl", summary: "Nobody needed curl.", oldText: "## Rules", newText: "## Rules\n\n- **no-curl**: never fetch with curl." },
+		];
+		const { pi, roots, dir } = await finalReported(changes);
+		const adopted = join(playbooksDir(roots), "crew.md");
+		const snapshot = readFileSync(join(dir, "playbook.md"), "utf8");
+		const asked = pi.dialogs.length;
+
+		pi.answer("Adopt for the next Effort", "Decline", "Approve");
+		await pi.team("pending");
+
+		const titles = pi.dialogs.slice(asked).map((dialog) => dialog.title);
+		assert.match(titles[0], /`tiny-diffs`.*under 200 lines/s);
+		assert.match(titles[1], /`no-curl`/);
+		assert.match(titles[2], /[Ss]ign off/);
+		const now = readFileSync(adopted, "utf8");
+		assert.ok(now.includes("keep each Task's diff under 200 lines."));
+		assert.ok(!now.includes("no-curl"));
+		assert.equal(readFileSync(join(dir, "playbook.md"), "utf8"), snapshot);
+		const record = approvals(dir).find((each) => each.act === "playbook-change");
+		assert.deepEqual(record && { request: record.request, change: record.change, playbook: record.playbook }, { request: "r3", change: "tiny-diffs", playbook: sha(Buffer.from(now)) });
+		const json = JSON.parse(readFileSync(join(playbooksDir(roots), "crew.adopted.json"), "utf8")) as { sha256: string };
+		assert.equal(json.sha256, sha(Buffer.from(now)));
+		assert.equal(effortLines(dir).at(-1)?.type, "effort-ended");
+	});
+
+	it("waits to sign off until each proposed change is answered", async () => {
+		const changes = [{ id: "tiny-diffs", summary: "Smaller.", oldText: "keep each Task's diff small.", newText: "keep each Task's diff tiny." }];
+		const { pi, dir } = await finalReported(changes);
+
+		pi.answer("Later", "Approve");
+		await pi.team("pending");
+
+		assert.match(pi.notifications.at(-1)?.message ?? "", /Adopt or decline each proposed Playbook change before signing off.*`tiny-diffs`/);
+		assert.equal(effortLines(dir).some((line) => line.type === "effort-ended"), false);
+	});
+
+	it("refuses a final Report whose Playbook change doesn't apply to the Effort's Playbook, writing nothing", async () => {
+		const { pi, dir } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await assert.rejects(
+			pi.call("team_report", { headline: "Done.", coverage: FINAL_COVERAGE, final: true, changes: [{ id: "nope", summary: "x", oldText: "not in it", newText: "y" }] }),
+			/`nope`: its `oldText` isn't in the Playbook/,
+		);
+		assert.equal(existsSync(join(dir, "reports")), false);
+	});
+
+	it("`/team cancel`, confirmed, stops every Teammate and ends the Effort without sign-off; declined, it changes nothing", async () => {
+		const { pi, dir, workspace, clean, dirty } = await finalReported();
+
+		pi.answer(false);
+		await pi.team("cancel");
+		assert.equal(pi.claude.calls().filter((argv) => argv[0] === "stop").length, 0);
+		assert.ok(pi.activeTools().includes("team_report"));
+
+		pi.answer(true);
+		await pi.team("cancel");
+
+		assert.match(pi.dialogs.at(-1)?.title ?? "", /Cancel Effort `crew-2026-11-02`\?/);
+		assert.equal(pi.claude.calls().filter((argv) => argv[0] === "stop").length, 2);
+		assert.deepEqual(effortLines(dir).at(-1), { type: "effort-ended", how: "cancelled", at: NOW.toISOString() });
+		assert.equal(approvals(dir).some((record) => record.act === "sign-off"), false);
+		assert.equal(existsSync(workspace), false);
+		assert.equal(existsSync(clean.path), false);
+		assert.ok(existsSync(dirty.path));
+		assert.match(pi.notifications.at(-1)?.message ?? "", /Cancelled Effort/);
+		assert.deepEqual(
+			pi.activeTools().filter((name) => EFFORT_TOOL_NAMES.includes(name)),
+			[],
+		);
+		assert.equal(teamBlock(pi), undefined);
+		await pi.team("cancel");
+		assert.match(pi.notifications.at(-1)?.message ?? "", /holds no Effort, so there is nothing to cancel/);
 	});
 });
