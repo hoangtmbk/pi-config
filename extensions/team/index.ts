@@ -206,7 +206,7 @@ const DECISIONS = ["allow", "deny"] as const;
 
 const AnswerParams = Type.Object({
 	request: Type.String({ description: "The held request's id, `req-<8 hex>`, from the message that woke you about it." }),
-	decision: Type.Optional(Type.String({ description: "For a permission request: `allow` or `deny`. Leave it out when answering an AskUserQuestion." })),
+	decision: Type.Optional(Type.Union([Type.Literal("allow"), Type.Literal("deny")], { description: "For a permission request: `allow` or `deny`. Leave it out when answering an AskUserQuestion." })),
 	reason: Type.Optional(Type.String({ description: "Why: the deny message the Teammate sees, and what the human reads in the next Report." })),
 	rule: Type.Optional(
 		Type.String({ description: "With `allow`: a session rule for the same tool, such as `Bash(npm test:*)`, so the Teammate isn't asked again this session." }),
@@ -264,7 +264,7 @@ const VERDICTS = ["accept", "send_back"] as const;
 
 const ReviewParams = Type.Object({
 	slug: Type.String({ description: "The handed-off Task whose newest result was reviewed." }),
-	verdict: Type.String({ description: "`accept` to accept the result, or `send_back` to send the Task back to its Teammate with `feedback`." }),
+	verdict: Type.Union([Type.Literal("accept"), Type.Literal("send_back")], { description: "`accept` to accept the result, or `send_back` to send the Task back to its Teammate with `feedback`." }),
 	feedback: Type.Optional(
 		Type.String({ description: "For `send_back`: what is wrong with the result and what would make it acceptable. It is written to the Task's `feedback-<n>.md`." }),
 	),
@@ -2078,6 +2078,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		defaultActive: false,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { held, state } = approvedEffort("team_review", ctx);
+			// pi checks the call against ReviewParams first; this stays loud for a caller that doesn't.
 			const verdict = VERDICTS.find((each) => each === params.verdict);
 			if (verdict === undefined) throw new Error(`\`verdict\` is \`accept\` or \`send_back\`, not \`${params.verdict}\`.`);
 			const due = state.tasks[params.slug];
@@ -2278,6 +2279,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!effort) throw new Error("No Effort is open in this session, so no request waits on you; the human opens one with `/team start <team>`.");
 			const held = effort;
+			// pi checks the call against AnswerParams first; this stays loud for a caller that doesn't.
 			const decision = params.decision === undefined ? undefined : DECISIONS.find((each) => each === params.decision);
 			if (params.decision !== undefined && decision === undefined) throw new Error(`\`decision\` is \`allow\` or \`deny\`, not \`${params.decision}\`.`);
 			// What the terminal did meanwhile counts first: the first answer wins.
