@@ -43,9 +43,15 @@ async function fakeLead(): Promise<{ server: Server; port: number; lines: () => 
 }
 
 /** Run the hook script for `teammate` with `payload` on stdin; resolves with its exit code and output. */
-function runHook(effortDir: string, teammate: string, payload: unknown, env: Record<string, string> = {}): Promise<{ code: number | null; output: string }> {
+function runHook(
+	effortDir: string,
+	teammate: string,
+	payload: unknown,
+	env: Record<string, string> = {},
+	args: string[] = [],
+): Promise<{ code: number | null; output: string }> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(process.execPath, [HOOK_SCRIPT, effortDir, teammate], { env: { ...process.env, ...env } });
+		const child = spawn(process.execPath, [HOOK_SCRIPT, effortDir, teammate, ...args], { env: { ...process.env, ...env } });
 		let output = "";
 		child.stdout.on("data", (chunk) => (output += chunk));
 		child.stderr.on("data", (chunk) => (output += chunk));
@@ -133,6 +139,57 @@ describe("the hook script", () => {
 			{ code: 0, output: "" },
 		]);
 		assert.equal(journal(dir, "builder-1").length, 1);
+	});
+});
+
+describe("the hook script as the PreToolUse floor hook", () => {
+	const WORKSPACE = "/work/effort";
+	const bash = (command: string, cwd = WORKSPACE) => ({
+		session_id: STOP.session_id,
+		hook_event_name: "PreToolUse",
+		cwd,
+		tool_name: "Bash",
+		tool_input: { command },
+		tool_use_id: "toolu_01",
+	});
+
+	it("returns `ask` for a floor command, naming the kind, so the human is prompted even in auto", async () => {
+		const dir = effortDir();
+
+		const push = await runHook(dir, "builder-1", bash("npm test && git -C . push origin main"), {}, [WORKSPACE]);
+
+		assert.equal(push.code, 0);
+		const output = JSON.parse(push.output) as { hookSpecificOutput: Record<string, string> };
+		assert.equal(output.hookSpecificOutput.hookEventName, "PreToolUse");
+		assert.equal(output.hookSpecificOutput.permissionDecision, "ask");
+		assert.match(output.hookSpecificOutput.permissionDecisionReason, /floor: push \(`git -C \. push origin main`\)/);
+		assert.equal(journal(dir, "builder-1")[0].event, "PreToolUse");
+	});
+
+	it("returns nothing for a command off the floor, or a tool that isn't Bash", async () => {
+		const dir = effortDir();
+
+		const results = [
+			await runHook(dir, "builder-1", bash("npm test"), {}, [WORKSPACE]),
+			await runHook(dir, "builder-1", bash("rm -rf build"), {}, [WORKSPACE]),
+			await runHook(dir, "builder-1", bash("curl https://example.com"), {}, [WORKSPACE]),
+			await runHook(dir, "builder-1", { ...bash("git push"), tool_name: "Edit", tool_input: { file_path: "a.ts" } }, {}, [WORKSPACE]),
+		];
+
+		assert.deepEqual(results, Array(4).fill({ code: 0, output: "" }));
+		assert.equal(journal(dir, "builder-1").length, 4);
+	});
+
+	it("judges a delete against the Workspace it is given, falling back to the session's cwd", async () => {
+		const dir = effortDir();
+
+		const outside = await runHook(dir, "builder-1", bash("rm -rf ../shared", `${WORKSPACE}/pkg`), {}, [`${WORKSPACE}/pkg`]);
+		const inside = await runHook(dir, "builder-1", bash("rm -rf ../shared", `${WORKSPACE}/pkg`), {}, [WORKSPACE]);
+		const fallback = await runHook(dir, "builder-1", bash("rm -rf /tmp/x"));
+
+		assert.match(outside.output, /"permissionDecision":"ask"/);
+		assert.deepEqual(inside, { code: 0, output: "" });
+		assert.match(fallback.output, /floor: delete/);
 	});
 });
 

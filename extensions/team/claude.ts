@@ -459,6 +459,12 @@ export interface SettingsFrom {
 	ask: readonly string[];
 	/** Absolute paths (a folder as `<folder>/**`) the Teammate may never edit: the Effort's records. */
 	records: readonly string[];
+	/**
+	 * The folder the Teammate works in (its isolated Task's worktree, else the
+	 * Effort's Workspace). The `PreToolUse` floor hook gets it as a third
+	 * argument and judges deletes against it.
+	 */
+	workspace?: string;
 	/** The human's own status line command ({@link humanStatusLine}), which the Teammate's status line runs first. */
 	humanStatusLine?: string;
 }
@@ -477,7 +483,8 @@ export function teammateSettings(from: SettingsFrom): Record<string, unknown> {
 	for (const event of HOOK_EVENTS) {
 		const hook = event === "PermissionRequest" ? { type: "command", command, timeout: PERMISSION_REQUEST_TIMEOUT_S } : { type: "command", command };
 		// The floor is about commands, so only `Bash` reaches the `PreToolUse` hook.
-		hooks[event] = [event === "PreToolUse" ? { matcher: "Bash", hooks: [hook] } : { hooks: [hook] }];
+		const floor = from.workspace === undefined ? hook : { type: "command", command: `${command} ${shellQuote(from.workspace)}` };
+		hooks[event] = [event === "PreToolUse" ? { matcher: "Bash", hooks: [floor] } : { hooks: [hook] }];
 	}
 	const unique = (rules: readonly string[]) => [...new Set(rules)];
 	return {

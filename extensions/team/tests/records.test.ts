@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { openEffort, type PendingApproval } from "../core.ts";
 import type { Playbook } from "../definitions.ts";
-import { appendLines, checkRecords, createEffort, promoteBrief, readLines, validateBrief } from "../records.ts";
+import { answerTerms, appendLines, checkRecords, createEffort, promoteBrief, readLines, validateBrief } from "../records.ts";
 import { goodTeam, tempRoots, writeFiles } from "./harness.ts";
 
 const SHA = "a".repeat(64);
@@ -164,6 +164,37 @@ function sha(content: string | Buffer): string {
 }
 
 const NOW = new Date("2026-11-02T10:00:00.000Z");
+
+describe("what an approved Brief lets the Lead allow", () => {
+	const ESCALATING: Playbook = { ...PLAYBOOK, escalate: [{ id: "history-rewrite", when: "rewriting history", ask: ["Bash(git rebase:*)"] }, { id: "lockfile", when: "the lockfile", ask: ["Edit(package-lock.json)"] }] };
+
+	it("cites the Playbook's grants, the grants the Brief's overrides add, and its Delivery, and keeps every escalate entry", () => {
+		const overrides = ["overrides:", "  - rule: open-pr", '    change: "add grant: open the PR the Delivery asks for"', "    reason: The human reviews a PR."];
+
+		assert.deepEqual(answerTerms(ESCALATING, brief({ frontmatter: [...FRONTMATTER, ...overrides] }), "/work/app-ws"), {
+			workspace: "/work/app-ws",
+			grants: [
+				{ id: "push-effort-branch", allow: "push the Effort's branch", from: "Playbook" },
+				{ id: "open-pr", allow: "open the PR the Delivery asks for", from: "Brief" },
+			],
+			delivery: "Commits on the Effort's branch.",
+			escalate: [
+				{ id: "history-rewrite", ask: ["Bash(git rebase:*)"] },
+				{ id: "lockfile", ask: ["Edit(package-lock.json)"] },
+			],
+		});
+	});
+
+	it("drops a grant or an escalate entry the Brief skips, and has no Delivery to cite when the section says nothing", () => {
+		const overrides = ["overrides:", "  - rule: push-effort-branch", "    change: skip", "    reason: Nothing leaves the machine.", "  - rule: lockfile", "    change: skip", "    reason: The lockfile is regenerated."];
+
+		const terms = answerTerms(ESCALATING, brief({ frontmatter: [...FRONTMATTER, ...overrides], sections: { Delivery: "## Delivery\n" } }), "/work/app-ws");
+
+		assert.deepEqual(terms.grants, []);
+		assert.equal(terms.delivery, undefined);
+		assert.deepEqual(terms.escalate, [{ id: "history-rewrite", ask: ["Bash(git rebase:*)"] }]);
+	});
+});
 
 describe("an Effort on disk", () => {
 	it("opens each Effort in its own directory, named by Team and day, numbered when the name is taken", () => {

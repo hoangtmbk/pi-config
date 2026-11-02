@@ -29,7 +29,10 @@
  *   its prompt stays live: the step after it plays at once, standing for
  *   whatever the human does in the terminal meanwhile. A step with `when` plays
  *   only for a pointer that includes that text, so one Task's Teammate can do
- *   what another's doesn't.
+ *   what another's doesn't. A `PreToolUse` hook that prints
+ *   `permissionDecision: "ask"` makes the call prompt, as in Claude Code: a
+ *   held `PermissionRequest` for the same tool call plays next, through the
+ *   settings' hooks.
  * - `FAKE_CLAUDE_HELD_OUT`: a file each held hook command appends one JSON
  *   line to: its process group, the event, and the files its stdout and exit
  *   code land in once it exits. Killing the group with SIGTERM is what Claude
@@ -403,6 +406,7 @@ function playSteps(steps: HookStep[], session: Session, pointer: string): void {
 		}
 		const prompt = step.event === "UserPromptSubmit" && step.payload === undefined ? { prompt: pointer } : {};
 		const payload: Record<string, unknown> = { session_id: session.id, cwd: session.cwd, hook_event_name: step.event, ...prompt, ...step.payload };
+		let ask = false;
 		for (const group of settings.hooks?.[step.event] ?? []) {
 			if (group.matcher !== undefined && group.matcher !== payload.tool_name) continue;
 			for (const hook of group.hooks) {
@@ -410,8 +414,14 @@ function playSteps(steps: HookStep[], session: Session, pointer: string): void {
 					holdHook(hook.command, payload, session.cwd, { ...process.env, ...inbox });
 					continue;
 				}
-				execFileSync("sh", ["-c", hook.command], { cwd: session.cwd, input: JSON.stringify(payload), env: { ...process.env, ...inbox }, stdio: ["pipe", "ignore", "inherit"] });
+				const out = execFileSync("sh", ["-c", hook.command], { cwd: session.cwd, input: JSON.stringify(payload), env: { ...process.env, ...inbox }, stdio: ["pipe", "pipe", "inherit"], encoding: "utf8" });
+				const decided = parsed(out.trim())?.hookSpecificOutput as { permissionDecision?: unknown } | undefined;
+				if (step.event === "PreToolUse" && decided?.permissionDecision === "ask") ask = true;
 			}
+		}
+		if (ask) {
+			const call = { tool_name: payload.tool_name, tool_input: payload.tool_input, ...(payload.tool_use_id === undefined ? {} : { tool_use_id: payload.tool_use_id }) };
+			playSteps([{ event: "PermissionRequest", payload: { session_id: payload.session_id, ...call }, hold: true }], session, pointer);
 		}
 		if (step.event === "SessionEnd" && payload.reason !== "clear" && payload.reason !== "resume") {
 			const agent = registry().find((each) => (each.sessionId ?? each.id) === session.id);
