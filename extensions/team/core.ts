@@ -16,11 +16,37 @@ import { askText, closedText, type HeldRequest, type HookDecision, isCallOf, typ
 /** The one checkpoint an Effort has before its Brief is approved. */
 export const BRIEF = "brief";
 
+/** The checkpoint that ends an Effort: the human signs off its final Report. */
+export const SIGN_OFF = "sign-off";
+
+/** A Playbook change the final Report proposes, which the human adopts or declines on its own. */
+export const PLAYBOOK_CHANGE = "playbook-change";
+
+/**
+ * A change the Lead proposes to the Team's Playbook in the final Report: the
+ * one passage `oldText` replaced by `newText`. Adopted, it applies to the
+ * Playbook the next Effort adopts; the running Effort keeps its snapshot.
+ */
+export interface PlaybookChange {
+	/** Kebab-case, unique in the Report; how the human and the record name it. */
+	id: string;
+	summary: string;
+	oldText: string;
+	newText: string;
+}
+
+/** What the human sees, and approves by its sha256, when a Playbook change is offered. */
+export function changeSnapshot(change: PlaybookChange): string {
+	return `Playbook change \`${change.id}\`: ${change.summary}\n\nReplace:\n${change.oldText}\n\nWith:\n${change.newText}\n`;
+}
+
 /** A request the human answers in `/team pending`, with what they would approve. */
 export interface PendingApproval {
 	/** Unique within the Effort: `r1`, `r2`, … */
 	id: string;
-	checkpoint: typeof BRIEF;
+	checkpoint: typeof BRIEF | typeof SIGN_OFF | typeof PLAYBOOK_CHANGE;
+	/** For a Playbook change, the change itself. */
+	change?: PlaybookChange;
 	/** The draft the snapshot was taken from. */
 	path: string;
 	/** Of `snapshot`'s UTF-8 bytes. */
@@ -170,7 +196,7 @@ export type EffortLine =
 	/** The Lead asked the human to approve a snapshot. */
 	| ({ type: "approval-requested" } & PendingApproval)
 	/** The human answered a request in `/team pending`. */
-	| { type: "approval-answered"; id: string; answer: "approved" | "sent-back"; note?: string; workspace?: Workspace; at: string }
+	| { type: "approval-answered"; id: string; answer: Answer; note?: string; workspace?: Workspace; at: string }
 	/** The Lead wrote its whole Task list, replacing any before it. */
 	| { type: "plan-written"; tasks: PlannedTask[]; reason?: string; at: string }
 	/** A Teammate was launched. */
@@ -218,7 +244,7 @@ export type EffortLine =
 	/** Work found outside the Brief (scope creep), kept for the final Report as a suggestion. */
 	| ({ type: "found-work" } & Logged)
 	/** Report `n` was written as `reports/<nnn>.md`; the next one covers what comes after this line. */
-	| { type: "report-written"; n: number; at: string }
+	| { type: "report-written"; n: number; final?: true; at: string }
 	/** `by` paused the Effort: no new Task starts until every pause is lifted. */
 	| ({ type: "paused" } & Pause)
 	/** `by` lifted its own pause. */
@@ -230,7 +256,30 @@ export type EffortLine =
 	/** The terminal settled a held request: answered there, denied there, or left there once the hook's hold ran out. */
 	| { type: "request-settled"; teammate: string; cursor: number; request: string; how: "answered-in-terminal" | "denied-in-terminal" | "expired"; at: string }
 	/** The Lead answered a held request through its hook, adding `rule` for the Teammate's session. Reads no journal line. */
-	| { type: "request-answered"; teammate: string; request: string; task?: string; decision: HookDecision; rule?: string; at: string };
+	| { type: "request-answered"; teammate: string; request: string; task?: string; decision: HookDecision; rule?: string; at: string }
+	/** The Effort is over: the human signed off its final Report, or cancelled it. Nothing more is taken. */
+	| { type: "effort-ended"; how: Ended["how"]; at: string };
+
+/** The human's answer to a pending item: a Playbook change is approved (adopted) or declined, the rest approved or sent back. */
+export type Answer = "approved" | "sent-back" | "declined";
+
+/** How an Effort ended. */
+export interface Ended {
+	how: "signed-off" | "cancelled";
+	at: string;
+}
+
+/** A request the human was asked, kept after it leaves `pending`, for the final Report's checkpoints. */
+export interface Asked {
+	id: string;
+	checkpoint: PendingApproval["checkpoint"];
+	sha256: string;
+	at: string;
+	/** The proposed change's id, for a Playbook change. */
+	change?: string;
+	/** How it left `pending`; absent while it waits. */
+	outcome?: { how: Answer | "replaced" | "dropped"; at: string; note?: string };
+}
 
 /** Who set a pause, the only one who lifts it: the human, the Lead, or a usage limit. */
 export type PauseSetter = "human" | "lead" | "usage";
@@ -268,6 +317,15 @@ export interface Report {
 	/** Brief coverage by criterion id, as the Lead tells it. */
 	coverage: { criterion: string; note: string }[];
 	sections: ReportSection[];
+	/** Set on the final Report, which the human signs off. */
+	final?: true;
+}
+
+/** What the shell gathers for the final Report: the Playbook snapshot's checkpoint ids, the proposed changes and the Effort's worktrees now. */
+export interface FinalFacts {
+	checkpoints: readonly string[];
+	changes: readonly PlaybookChange[];
+	worktrees: readonly { path: string; branch: string; dirty: boolean }[];
 }
 
 /** What an Effort's lines fold to. */
@@ -306,6 +364,12 @@ export interface EffortState {
 	pauses?: Partial<Record<PauseSetter, Pause>>;
 	/** Every request a Teammate's hook held for an answer, by request id, oldest first. */
 	teammateRequests: Record<string, HeldRequest>;
+	/** Every approval requested, oldest first, with how it was answered; absent before the first. */
+	asked?: Asked[];
+	/** The number of the last Report while it is the final one, which sign-off is asked for. */
+	finalReport?: number;
+	/** Set once the Effort is over; then nothing more is taken. */
+	ended?: Ended;
 }
 
 /** A new input to the core. */
@@ -313,7 +377,7 @@ export type EffortInput =
 	/** `team_request_approval`, with the draft already validated and snapshotted. */
 	| { kind: "request-approval"; checkpoint: string; path: string; sha256: string; snapshot: string; at: string }
 	/** The human's answer to a pending item, with the Workspace the shell added for an approved Brief. */
-	| { kind: "answer"; id: string; answer: "approved" | "sent-back"; note?: string; workspace?: Workspace; at: string }
+	| { kind: "answer"; id: string; answer: Answer; note?: string; workspace?: Workspace; at: string }
 	/** A Lead tool that would start a Teammate. */
 	| { kind: "start-teammate"; tool: "team_plan" | "team_handoff" | "team_review" }
 	/**
@@ -341,8 +405,18 @@ export type EffortInput =
 			found?: string[];
 			criteria: readonly string[];
 			modes: readonly { role: string; mode: string }[];
+			/** For the final Report, which maps every criterion to evidence: what the shell gathered. */
+			final?: FinalFacts;
 			at: string;
 	  }
+	/**
+	 * Ask the human to sign off the final Report just written, as the shell
+	 * rendered it (`snapshot`, with its sha256), and to adopt or decline each
+	 * change it proposes, each with the sha256 of its {@link changeSnapshot}.
+	 */
+	| { kind: "request-sign-off"; path: string; sha256: string; snapshot: string; changes: readonly { change: PlaybookChange; sha256: string }[]; at: string }
+	/** `/team cancel`, confirmed: the Effort ends without sign-off. */
+	| { kind: "cancel"; at: string }
 	/**
 	 * `team_handoff` of a planned Task, with the permission mode a Teammate
 	 * started for it launches in and the cap of live Teammates (pi's
@@ -424,7 +498,13 @@ export type EffortAction =
 	/** Write the Report as `reports/<nnn>.md`. */
 	| { kind: "write-report"; report: Report }
 	/** Send the decision to the hook holding `request`, which prints it for Claude Code. */
-	| { kind: "answer-hook"; request: string; teammate: string; decision: HookDecision };
+	| { kind: "answer-hook"; request: string; teammate: string; decision: HookDecision }
+	/** Check the final Report still has the sha256 signed off, and record the act in `approvals.jsonl`. */
+	| { kind: "record-sign-off"; approval: PendingApproval; at: string }
+	/** Apply the approved change to the Team's adopted Playbook, for the next Effort, and record the act. */
+	| { kind: "adopt-playbook-change"; approval: PendingApproval & { change: PlaybookChange }; at: string }
+	/** The Effort is over: clean up its worktrees, keep every branch, and let go of it in this session. */
+	| { kind: "end-effort"; how: Ended["how"] };
 
 export type Step =
 	| { ok: true; state: EffortState; append: EffortLine[]; actions: EffortAction[]; reply?: string }
@@ -441,7 +521,10 @@ const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "t
 /** Fold one line into the state, keeping what the next Report tells of. */
 function apply(state: EffortState, line: EffortLine): EffortState {
 	const next = applyLine(state, line);
-	if (line.type === "report-written") return { ...next, reports: line.n, sinceReport: [] };
+	if (line.type === "report-written") {
+		const { finalReport: _final, ...rest } = next;
+		return { ...rest, reports: line.n, sinceReport: [], ...(line.final ? { finalReport: line.n } : {}) };
+	}
 	return UNREPORTED.has(line.type) ? next : { ...next, sinceReport: [...next.sinceReport, line] };
 }
 
@@ -451,26 +534,39 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			throw new Error(`effort.jsonl opens Effort \`${state.effortId}\` a second time, as \`${line.effortId}\``);
 		case "approval-requested": {
 			const { type: _type, ...approval } = line;
-			// A newer request at the same checkpoint replaces one the human hasn't answered.
+			// A newer request at the same checkpoint replaces one the human hasn't answered; a new sign-off also replaces the changes the last final Report proposed.
+			const replaces = (item: PendingApproval) =>
+				approval.checkpoint === PLAYBOOK_CHANGE ? false : item.checkpoint === approval.checkpoint || (approval.checkpoint === SIGN_OFF && item.checkpoint === PLAYBOOK_CHANGE);
+			const replaced = state.pending.filter(replaces).map((item) => item.id);
 			return {
 				...state,
-				pending: [...state.pending.filter((item) => item.checkpoint !== approval.checkpoint), approval],
+				pending: [...state.pending.filter((item) => !replaces(item)), approval],
 				requests: state.requests + 1,
+				asked: [
+					...settle(state.asked ?? [], replaced, { how: "replaced", at: line.at }),
+					{ id: line.id, checkpoint: line.checkpoint, sha256: line.sha256, at: line.at, ...(line.change === undefined ? {} : { change: line.change.id }) },
+				],
 			};
 		}
 		case "approval-answered": {
 			const answered = state.pending.find((item) => item.id === line.id);
-			const pending = state.pending.filter((item) => item.id !== line.id);
+			// Sending back the final Report drops the changes it proposed: the next final Report proposes its own.
+			const dropped = answered?.checkpoint === SIGN_OFF && line.answer === "sent-back" ? state.pending.filter((item) => item.checkpoint === PLAYBOOK_CHANGE).map((item) => item.id) : [];
+			const pending = state.pending.filter((item) => item.id !== line.id && !dropped.includes(item.id));
+			const asked = settle(settle(state.asked ?? [], [line.id], { how: line.answer, at: line.at, ...(line.note === undefined ? {} : { note: line.note }) }), dropped, { how: "dropped", at: line.at });
 			if (line.answer === "approved" && answered?.checkpoint === BRIEF) {
 				return {
 					...state,
 					pending,
+					asked,
 					brief: { sha256: answered.sha256, approvedAt: line.at, request: answered.id },
 					...(line.workspace === undefined ? {} : { workspace: line.workspace }),
 				};
 			}
-			return { ...state, pending };
+			return { ...state, pending, asked };
 		}
+		case "effort-ended":
+			return { ...state, pending: [], ended: { how: line.how, at: line.at } };
 		case "plan-written":
 			return { ...state, plan: line.tasks };
 		case "teammate-started": {
@@ -586,6 +682,11 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 	}
 }
 
+/** The asked requests `ids` given `outcome`, once: an outcome is never rewritten. */
+function settle(asked: readonly Asked[], ids: readonly string[], outcome: NonNullable<Asked["outcome"]>): Asked[] {
+	return asked.map((each) => (ids.includes(each.id) && each.outcome === undefined ? { ...each, outcome } : each));
+}
+
 /** The state with handed-off Task `slug` changed by `change`. */
 function withTask(state: EffortState, slug: string, change: Partial<HandedTask>): EffortState {
 	const task = state.tasks[slug];
@@ -629,7 +730,16 @@ export function fold(lines: readonly EffortLine[]): EffortState {
 
 /** Take one input: the lines it appends and what the shell must do, or why it is refused. */
 export function step(state: EffortState, input: EffortInput): Step {
+	if (state.ended) {
+		// A Teammate's last journal lines can still arrive after the end; there is nothing left for them to change.
+		if (input.kind === "journal") return took(state, [], []);
+		return { ok: false, refusal: endedText(state, state.ended) };
+	}
 	switch (input.kind) {
+		case "request-sign-off":
+			return requestSignOff(state, input);
+		case "cancel":
+			return took(state, ending(state, "cancelled", input.at), [...stops(state), { kind: "end-effort", how: "cancelled" }], `Cancelled Effort \`${state.effortId}\` without sign-off: every Teammate is stopped.`);
 		case "start-teammate": {
 			const refusal = beforeBrief(state, input.tool);
 			if (refusal !== undefined) return { ok: false, refusal };
@@ -773,6 +883,10 @@ function took(state: EffortState, append: EffortLine[], actions: EffortAction[],
  * refused anyway is refused for the reason that matters.
  */
 export function refuseRequest(state: EffortState, checkpoint: string): string | undefined {
+	if (state.ended) return endedText(state, state.ended);
+	if (checkpoint === SIGN_OFF || checkpoint === PLAYBOOK_CHANGE) {
+		return `Sign-off of Effort \`${state.effortId}\` comes from the final Report: write it with \`team_report\` and \`final: true\`, which asks for sign-off and offers each proposed Playbook change.`;
+	}
 	if (checkpoint !== BRIEF) {
 		return `Effort \`${state.effortId}\` has no checkpoint \`${checkpoint}\` open; the one checkpoint before Teammates start is \`${BRIEF}\`.`;
 	}
@@ -808,6 +922,19 @@ function answer(state: EffortState, input: Extract<EffortInput, { kind: "answer"
 			refusal: `Effort \`${state.effortId}\` has no pending request \`${input.id}\`; ${open ? `the pending ones are ${open}` : "nothing is pending"}.`,
 		};
 	}
+	if (item.checkpoint === PLAYBOOK_CHANGE) {
+		if (input.answer === "sent-back") return { ok: false, refusal: `Request \`${item.id}\` is Playbook change \`${item.change?.id}\`, which is adopted or declined, not sent back.` };
+	} else if (input.answer === "declined") {
+		return { ok: false, refusal: `Only a Playbook change is declined; request \`${item.id}\` is approved or sent back.` };
+	}
+	if (item.checkpoint === SIGN_OFF) return answerSignOff(state, item, input);
+	if (item.checkpoint === PLAYBOOK_CHANGE && item.change !== undefined) {
+		const line: EffortLine = { type: "approval-answered", id: item.id, answer: input.answer, at: input.at };
+		const change = item.change;
+		return input.answer === "approved"
+			? took(state, [line], [{ kind: "adopt-playbook-change", approval: { ...item, change }, at: input.at }], `Adopted Playbook change \`${change.id}\` for the next Effort.`)
+			: took(state, [line], [], `Declined Playbook change \`${change.id}\`.`);
+	}
 	const line: EffortLine = {
 		type: "approval-answered",
 		id: input.id,
@@ -839,6 +966,96 @@ function answer(state: EffortState, input: Extract<EffortInput, { kind: "answer"
 			text: `The human sent back the Brief of Effort \`${state.effortId}\` (request \`${item.id}\`) with this note:\n\n${input.note ?? ""}\n\nRevise ${item.path} with them, then ask again with \`team_request_approval\` at checkpoint \`${BRIEF}\`.`,
 		},
 	]);
+}
+
+/**
+ * Sign-off of the final Report. Approving it ends the Effort: every live
+ * Teammate is stopped, which keeps its conversation, and nothing more is
+ * taken. It waits until each proposed Playbook change is answered, since the
+ * end drops whatever is still pending. A send-back wakes the Lead with the
+ * note and leaves the Teammates running.
+ */
+function answerSignOff(state: EffortState, item: PendingApproval, input: Extract<EffortInput, { kind: "answer" }>): Step {
+	const line: EffortLine = { type: "approval-answered", id: item.id, answer: input.answer, ...(input.note === undefined ? {} : { note: input.note }), at: input.at };
+	if (input.answer === "sent-back") {
+		const dropped = state.pending.filter((each) => each.checkpoint === PLAYBOOK_CHANGE);
+		return took(state, [line], [
+			{
+				kind: "wake-lead",
+				text: [
+					`The human sent back the final Report of Effort \`${state.effortId}\` (request \`${item.id}\`) with this note:\n\n${input.note ?? ""}\n\nThe Teammates are still running.`,
+					dropped.length > 0 ? `The Playbook changes it proposed (${quoted(dropped.map((each) => each.change?.id ?? each.id))}) are dropped; propose them again in the next final Report if they still apply.` : undefined,
+					"Re-plan with `team_plan` if the work needs more Tasks, then write a new final Report with `team_report` and `final: true`, which asks for sign-off again.",
+				]
+					.filter((part) => part !== undefined)
+					.join(" "),
+			},
+		]);
+	}
+	const unanswered = state.pending.filter((each) => each.checkpoint === PLAYBOOK_CHANGE);
+	if (unanswered.length > 0) {
+		return {
+			ok: false,
+			refusal: `Adopt or decline each proposed Playbook change before signing off Effort \`${state.effortId}\`: ${unanswered.map((each) => `\`${each.id}\` (\`${each.change?.id}\`)`).join(", ")} still wait${unanswered.length === 1 ? "s" : ""}.`,
+		};
+	}
+	return took(
+		state,
+		[line, ...ending(state, "signed-off", input.at)],
+		[{ kind: "record-sign-off", approval: item, at: input.at }, ...stops(state), { kind: "end-effort", how: "signed-off" }],
+		`Signed off Effort \`${state.effortId}\`: every Teammate is stopped.`,
+	);
+}
+
+/** The lines that end the Effort: each live Teammate stopped, then the end itself. */
+function ending(state: EffortState, how: Ended["how"], at: string): EffortLine[] {
+	return [...live(state).map((teammate): EffortLine => ({ type: "teammate-ended", teammate: teammate.id, how: "stopped", at })), { type: "effort-ended", how, at }];
+}
+
+/** `claude stop` for each live Teammate, by its short id, or its `--name` before it has one. */
+function stops(state: EffortState): EffortAction[] {
+	return live(state).map((teammate) => ({ kind: "stop-teammate", teammate: teammate.id, shortId: teammate.shortId ?? teammate.name }));
+}
+
+/** Why an ended Effort takes nothing more. */
+function endedText(state: EffortState, ended: Ended): string {
+	return `Effort \`${state.effortId}\` has ended: it was ${ended.how === "signed-off" ? "signed off" : "cancelled"} at ${clock(ended.at)} UTC, so it takes nothing more. Start the next one with \`/team start\`.`;
+}
+
+/**
+ * Ask for sign-off of the final Report just written, and offer each change it
+ * proposes as its own pending item, so each is adopted or declined on its own.
+ */
+function requestSignOff(state: EffortState, input: Extract<EffortInput, { kind: "request-sign-off" }>): Step {
+	if (state.finalReport === undefined || state.finalReport !== state.reports) {
+		return { ok: false, refusal: `Effort \`${state.effortId}\` has no final Report to sign off: write it with \`team_report\` and \`final: true\`.` };
+	}
+	const signOff: EffortLine = { type: "approval-requested", id: `r${state.requests + 1}`, checkpoint: SIGN_OFF, path: input.path, sha256: input.sha256, snapshot: input.snapshot, at: input.at };
+	const changes = input.changes.map(
+		({ change, sha256 }, index): EffortLine => ({
+			type: "approval-requested",
+			id: `r${state.requests + 2 + index}`,
+			checkpoint: PLAYBOOK_CHANGE,
+			change,
+			path: input.path,
+			sha256,
+			snapshot: changeSnapshot(change),
+			at: input.at,
+		}),
+	);
+	const offered = changes.flatMap((line) => (line.type === "approval-requested" && line.change ? [`\`${line.id}\` (\`${line.change.id}\`)`] : []));
+	return took(
+		state,
+		[signOff, ...changes],
+		[],
+		[
+			`Asked the human to sign off the final Report of Effort \`${state.effortId}\` as request \`${signOff.id}\`: ${input.path} (sha256 ${input.sha256}).`,
+			offered.length > 0 ? `Each proposed Playbook change is its own request: ${offered.join(", ")}.` : undefined,
+			"They answer in `/team pending`. Signing off stops every Teammate and ends the Effort; a send-back comes back to you with a note. Stop here and wait.",
+		]
+			.filter((part) => part !== undefined)
+			.join(" "),
+	);
 }
 
 /** Why `tool` can't start a Teammate yet, or undefined once the Brief is approved. */
@@ -1392,12 +1609,18 @@ function clock(at: string): string {
 }
 
 /** What a Report says of one line since the last Report, or undefined for a line its own section tells of. */
-function told(line: EffortLine): string | undefined {
+function told(line: EffortLine, state: EffortState): string | undefined {
 	switch (line.type) {
 		case "approval-requested":
+			if (line.checkpoint === SIGN_OFF) return `asked for your sign-off (\`${line.id}\`)`;
+			if (line.checkpoint === PLAYBOOK_CHANGE) return `proposed Playbook change \`${line.change?.id}\` (\`${line.id}\`)`;
 			return `asked you to approve the Brief (\`${line.id}\`)`;
-		case "approval-answered":
+		case "approval-answered": {
+			const asked = state.asked?.find((each) => each.id === line.id);
+			if (asked?.checkpoint === PLAYBOOK_CHANGE) return `you ${line.answer === "approved" ? "adopted" : "declined"} Playbook change \`${asked.change}\` (\`${line.id}\`)`;
+			if (asked?.checkpoint === SIGN_OFF) return line.answer === "approved" ? `you signed off (\`${line.id}\`)` : `you sent back the final Report (\`${line.id}\`): ${line.note ?? ""}`;
 			return line.answer === "approved" ? `you approved the Brief (\`${line.id}\`)` : `you sent back \`${line.id}\`: ${line.note ?? ""}`;
+		}
 		case "plan-written":
 			return `${line.reason === undefined ? "planned" : "re-planned"} ${line.tasks.length} Task${line.tasks.length === 1 ? "" : "s"}`;
 		case "task-handed-off":
@@ -1446,21 +1669,96 @@ function report(state: EffortState, input: Extract<EffortInput, { kind: "report"
 	for (const { criterion } of coverage) {
 		if (!input.criteria.includes(criterion)) problems.push(`coverage names \`${criterion}\`, which the Brief doesn't have; its criteria are ${quoted(input.criteria)}`);
 	}
+	if (input.final) problems.push(...finalProblems(coverage, input.criteria, input.final.changes));
 	if (problems.length > 0) {
 		return { ok: false, refusal: `The Report for Effort \`${state.effortId}\` can't be written until these are fixed:\n${problems.map((problem) => `- ${problem}`).join("\n")}` };
 	}
 	const found: EffortLine[] = (input.found ?? []).map((what) => what.trim()).filter((what) => what !== "").map((what) => ({ type: "found-work", what, at: input.at }));
 	const now = found.reduce(apply, state);
 	const n = state.reports + 1;
-	const sections = reportSections(now, n === 1 ? input.modes : undefined).filter((each) => each.lines.length > 0);
-	const written: Report = { n, at: input.at, headline, coverage, sections };
+	const logged = reportSections(now, n === 1 ? input.modes : undefined).filter((each) => each.lines.length > 0);
+	// The final Report tells all found work, not only what is new, so its own section replaces the logged one.
+	const sections = input.final ? [...logged.filter((each) => each.title !== "Found work"), ...finalSections(now, input.final)] : logged;
+	const written: Report = { n, at: input.at, headline, coverage, sections, ...(input.final ? { final: true as const } : {}) };
 	const file = `reports/${String(n).padStart(3, "0")}.md`;
 	return took(
 		state,
-		[...found, { type: "report-written", n, at: input.at }],
+		[...found, { type: "report-written", n, ...(input.final ? { final: true as const } : {}), at: input.at }],
 		[{ kind: "write-report", report: written }],
-		`Report ${n} of Effort \`${state.effortId}\` is written as ${file}. The human sees it in chat, so don't repeat it.`,
+		`${input.final ? "The final Report" : "Report"} ${n} of Effort \`${state.effortId}\` is written as ${file}. The human sees it in chat, so don't repeat it.`,
 	);
+}
+
+/** What keeps a final Report from being written: a criterion without evidence, or a proposed change that isn't well formed. */
+function finalProblems(coverage: readonly { criterion: string; note: string }[], criteria: readonly string[], changes: readonly PlaybookChange[]): string[] {
+	const problems: string[] = [];
+	for (const criterion of criteria) {
+		if (!coverage.some((each) => each.criterion === criterion && each.note.trim() !== "")) {
+			problems.push(`the final Report maps every criterion to evidence, and \`${criterion}\` has none; give it a \`coverage\` note saying what shows it is met`);
+		}
+	}
+	const seen = new Set<string>();
+	for (const change of changes) {
+		if (!KEBAB.test(change.id)) problems.push(`the Playbook change id \`${change.id}\` must be kebab-case, such as \`qa-before-dev\``);
+		if (seen.has(change.id)) problems.push(`the Playbook change \`${change.id}\` is proposed more than once; propose each change once`);
+		seen.add(change.id);
+		if (change.summary.trim() === "") problems.push(`the Playbook change \`${change.id}\` has no summary; say in a sentence what it changes and why`);
+		if (change.oldText.trim() === "") problems.push(`the Playbook change \`${change.id}\` has no \`oldText\`; quote the passage of the Playbook it replaces`);
+		else if (change.newText === change.oldText) problems.push(`the Playbook change \`${change.id}\` leaves its passage as it is; \`newText\` must differ from \`oldText\``);
+	}
+	return problems;
+}
+
+/** What each checkpoint is called in the final Report. */
+const CHECKPOINT_NAMES: Record<PendingApproval["checkpoint"], string> = { [BRIEF]: "Brief", [SIGN_OFF]: "Sign-off", [PLAYBOOK_CHANGE]: "Playbook change" };
+
+/** How an asked request ended, as the final Report tells it. */
+function outcomeText(asked: Asked): string {
+	const outcome = asked.outcome;
+	if (outcome === undefined) return `asked at ${clock(asked.at)} UTC, waiting`;
+	const how = { approved: "approved", "sent-back": "sent back", declined: "declined", replaced: "replaced by a newer request", dropped: "dropped" }[outcome.how];
+	return `${how} at ${clock(outcome.at)} UTC${outcome.note === undefined ? "" : `: ${outcome.note}`}`;
+}
+
+/**
+ * The final Report's own sections, always present so a gap shows: every
+ * checkpoint with its approval (a Playbook checkpoint never asked says so),
+ * all found work, each proposed Playbook change, and what happens to each
+ * worktree at sign-off.
+ */
+function finalSections(state: EffortState, final: FinalFacts): ReportSection[] {
+	const asked = (state.asked ?? []).filter((each) => each.checkpoint !== PLAYBOOK_CHANGE);
+	const askedAt = new Set<string>(asked.map((each) => each.checkpoint));
+	return [
+		{
+			title: "Checkpoints",
+			lines: [
+				`Playbook: adopted before the Effort opened (sha256 ${state.playbook})`,
+				...asked.map((each) => `${CHECKPOINT_NAMES[each.checkpoint]}: \`${each.id}\` ${outcomeText(each)} (sha256 ${each.sha256})`),
+				...final.checkpoints.filter((id) => !askedAt.has(id)).map((id) => `\`${id}\`: never asked`),
+			],
+		},
+		{ title: "Found work", lines: state.found.length === 0 ? ["none"] : state.found.map((each) => `${each.what}${each.task === undefined ? "" : ` (Task \`${each.task}\`)`}`) },
+		{
+			title: "Proposed Playbook changes",
+			lines:
+				final.changes.length === 0
+					? ["none"]
+					: [
+							...final.changes.map((change) => `\`${change.id}\`: ${change.summary}`),
+							"Each is adopted or declined on its own in `/team pending`. An adopted one is the Playbook of the next Effort; this Effort keeps its snapshot.",
+						],
+		},
+		{
+			title: "Worktrees",
+			lines:
+				final.worktrees.length === 0
+					? ["none"]
+					: final.worktrees.map(
+							(each) => `${each.path} (\`${each.branch}\`): ${each.dirty ? "has uncommitted changes, so it is kept" : "clean, removed at sign-off"}; the branch is kept`,
+						),
+		},
+	];
 }
 
 /** The logged sections, from `since` the last Report; the plan Report passes each Role's mode. */
@@ -1473,12 +1771,18 @@ function reportSections(state: EffortState, modes: readonly { role: string; mode
 	const newFound = of("found-work");
 	const launched = (id: string) => state.teammates.find((each) => each.id === id)?.mode;
 	return [
-		{ title: "Since the last Report", lines: since.flatMap((line) => { const text = told(line); return text === undefined || !("at" in line) ? [] : [`${clock(line.at)} ${text}`]; }) },
+		{ title: "Since the last Report", lines: since.flatMap((line) => { const text = told(line, state); return text === undefined || !("at" in line) ? [] : [`${clock(line.at)} ${text}`]; }) },
 		{ title: "Plan", lines: [...plan, ...reasons] },
 		{
 			title: "Waiting on you",
 			lines: [
-				...state.pending.map((item) => `\`${item.id}\`: approve the Brief, ${item.path} (sha256 ${item.sha256}), in \`/team pending\``),
+				...state.pending.map((item) =>
+					item.checkpoint === SIGN_OFF
+						? `\`${item.id}\`: sign off the final Report, ${item.path} (sha256 ${item.sha256}), in \`/team pending\``
+						: item.checkpoint === PLAYBOOK_CHANGE
+							? `\`${item.id}\`: adopt or decline Playbook change \`${item.change?.id}\`, in \`/team pending\``
+							: `\`${item.id}\`: approve the Brief, ${item.path} (sha256 ${item.sha256}), in \`/team pending\``,
+				),
 				...waitingInTerminal(state).map((held) => `\`${held.request}\`: ${terminalText(held)}`),
 			],
 		},
