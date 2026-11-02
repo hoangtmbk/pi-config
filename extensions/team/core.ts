@@ -275,6 +275,8 @@ export type EffortLine =
 	| { type: "resumed"; by: PauseSetter; at: string }
 	/** A Task queued while paused waits on, once the Effort runs, for this reason instead. */
 	| { type: "task-requeued"; slug: string; why: string; at: string }
+	/** A usage reading: a Teammate's status line, or `get_usage`. */
+	| ({ type: "usage-read" } & UsageReading)
 	/** A `PermissionRequest` the Teammate's hook holds open for the first answer, the Lead's or the human's in the terminal. */
 	| ({ type: "request-held"; cursor: number } & Omit<HeldRequest, "state">)
 	/** The terminal settled a held request: answered there, denied there, or left there once the hook's hold ran out. */
@@ -303,6 +305,61 @@ export interface Asked {
 	change?: string;
 	/** How it left `pending`; absent while it waits. */
 	outcome?: { how: Answer | "replaced" | "dropped"; at: string; note?: string };
+}
+
+/** One of the account's usage windows, as a reading gives it. */
+export interface UsageWindow {
+	/** How much of it is used, 0 to 100. */
+	percent: number;
+	/** When it resets, ISO; absent when the reading doesn't say. */
+	resetsAt?: string;
+}
+
+/**
+ * One usage reading: a Teammate's status line, or the `get_usage` control
+ * request when no status line is fresh. A window the reading doesn't give is
+ * absent, never 0.
+ */
+export interface UsageReading {
+	source: "status-line" | "get-usage";
+	/** When it was taken: the status line file's modification time, or when `get_usage` answered. */
+	at: string;
+	/** The Teammate whose status line it is. */
+	teammate?: string;
+	/** The Claude Code session the status line is of. */
+	sessionId?: string;
+	/** Whether it came with the account's rate limits: a subscription's does, an API key's never. */
+	rateLimits: boolean;
+	fiveHour?: UsageWindow;
+	sevenDay?: UsageWindow;
+	/** The session's input and output tokens so far. */
+	tokens?: number;
+	/** The session's estimate so far, at API prices, in USD. */
+	costUsd?: number;
+	/** How full the session's context window is, 0 to 100. */
+	ctx?: number;
+}
+
+/** What one session has spent: its latest figures, and what earlier figures it reset from had reached. */
+export interface SessionSpend {
+	tokens: number;
+	costUsd: number;
+	/** The sum of the figures a drop showed to be reset: they were spent too. */
+	banked: { tokens: number; costUsd: number };
+}
+
+/** What the usage readings fold to. */
+export interface UsageState {
+	/** The freshest account reading: the newest with rate limits, or the newest of all while none has them. */
+	latest: UsageReading;
+	/** Each window as the first reading that gave it had it, for the change since the Effort began. */
+	first: { fiveHour?: UsageWindow; sevenDay?: UsageWindow };
+	/** Whether any reading came with rate limits; never, with an API key. */
+	rateLimits: boolean;
+	/** Each Teammate's latest status line: when it was taken, and how full its context was. */
+	statusLines: Record<string, { at: string; ctx?: number }>;
+	/** What each Teammate spent, by session id. */
+	spend: Record<string, Record<string, SessionSpend>>;
 }
 
 /** Who set a pause, the only one who lifts it: the human, the Lead, or a usage limit. */
@@ -386,6 +443,8 @@ export interface EffortState {
 	found: Logged[];
 	/** The pauses that hold, by setter; absent before the first pause. */
 	pauses?: Partial<Record<PauseSetter, Pause>>;
+	/** What the usage readings say; absent before the first. */
+	usage?: UsageState;
 	/** Every request a Teammate's hook held for an answer, by request id, oldest first. */
 	teammateRequests: Record<string, HeldRequest>;
 	/** Every approval requested, oldest first, with how it was answered; absent before the first. */
@@ -431,6 +490,8 @@ export type EffortInput =
 			modes: readonly { role: string; mode: string }[];
 			/** For the final Report, which maps every criterion to evidence: what the shell gathered. */
 			final?: FinalFacts;
+			/** The Lead's own cost so far, in USD, as pi reports it, which the shell reads. */
+			leadCostUsd?: number;
 			at: string;
 	  }
 	/**
@@ -482,6 +543,8 @@ export type EffortInput =
 	| { kind: "pause"; by: "human" | "lead"; reason?: string; at: string }
 	/** `/team resume` from the human in a session holding the Effort, or `team_resume` from the Lead: each lifts only its own pause. */
 	| { kind: "resume"; by: "human" | "lead"; at: string }
+	/** A usage reading the shell took: a Teammate's `statusline.json`, or `get_usage`. */
+	| { kind: "usage"; reading: UsageReading }
 	/** `team_answer` of a held request. */
 	| ({ kind: "answer-request"; at: string } & RequestAnswer);
 
@@ -552,7 +615,7 @@ export function openEffort(opened: { effortId: string; team: string; repo: strin
 }
 
 /** Lines a Report doesn't tell of: they only carry what other lines say. */
-const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested", "request-held", "request-answered"]);
+const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested", "usage-read", "request-held", "request-answered"]);
 
 /** Fold one line into the state, keeping what the next Report tells of. */
 function apply(state: EffortState, line: EffortLine): EffortState {
@@ -699,6 +762,10 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			return { ...state, queue: state.queue.map((queued) => (queued.slug === line.slug ? { ...queued, why: line.why } : queued)) };
 		case "report-written":
 			return state;
+		case "usage-read": {
+			const { type: _type, ...reading } = line;
+			return { ...state, usage: withReading(state.usage, reading) };
+		}
 		case "request-held": {
 			const { type: _type, cursor: _cursor, ...held } = line;
 			return { ...withTeammate(state, line, {}), teammateRequests: { ...state.teammateRequests, [line.request]: { ...held, state: "held" } } };
@@ -725,6 +792,55 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 /** The asked requests `ids` given `outcome`, once: an outcome is never rewritten. */
 function settle(asked: readonly Asked[], ids: readonly string[], outcome: NonNullable<Asked["outcome"]>): Asked[] {
 	return asked.map((each) => (ids.includes(each.id) && each.outcome === undefined ? { ...each, outcome } : each));
+}
+
+/** The usage state with one more reading folded in. */
+function withReading(usage: UsageState | undefined, reading: UsageReading): UsageState {
+	const before = usage ?? { latest: reading, first: {}, rateLimits: false, statusLines: {}, spend: {} };
+	const latest = before.latest;
+	const fresher = usage === undefined || (reading.rateLimits ? !latest.rateLimits || reading.at >= latest.at : !latest.rateLimits && reading.at >= latest.at);
+	const next: UsageState = {
+		...before,
+		latest: fresher ? reading : latest,
+		first: { fiveHour: before.first.fiveHour ?? reading.fiveHour, sevenDay: before.first.sevenDay ?? reading.sevenDay },
+		rateLimits: before.rateLimits || reading.rateLimits,
+	};
+	if (next.first.fiveHour === undefined) delete next.first.fiveHour;
+	if (next.first.sevenDay === undefined) delete next.first.sevenDay;
+	const teammate = reading.teammate;
+	if (reading.source !== "status-line" || teammate === undefined) return next;
+	next.statusLines = { ...before.statusLines, [teammate]: { at: reading.at, ...(reading.ctx === undefined ? {} : { ctx: reading.ctx }) } };
+	if (reading.sessionId !== undefined && (reading.tokens !== undefined || reading.costUsd !== undefined)) {
+		const sessions = before.spend[teammate] ?? {};
+		const was = sessions[reading.sessionId] ?? { tokens: 0, costUsd: 0, banked: { tokens: 0, costUsd: 0 } };
+		const tokens = reading.tokens ?? was.tokens;
+		const costUsd = reading.costUsd ?? was.costUsd;
+		// A figure that drops was reset, so what it had reached was spent too.
+		const banked = { tokens: was.banked.tokens + (tokens < was.tokens ? was.tokens : 0), costUsd: was.banked.costUsd + (costUsd < was.costUsd ? was.costUsd : 0) };
+		next.spend = { ...before.spend, [teammate]: { ...sessions, [reading.sessionId]: { tokens, costUsd, banked } } };
+	}
+	return next;
+}
+
+/** Whether a Teammate's status line was read under a minute before `now`, in ms: then `get_usage` isn't needed. */
+export function freshStatusLine(state: EffortState, now: number): boolean {
+	return Object.values(state.usage?.statusLines ?? {}).some((each) => now - Date.parse(each.at) < USAGE_FRESH_MS);
+}
+
+/** A status line younger than this is fresh; `get_usage` is asked at most this often. */
+export const USAGE_FRESH_MS = 60_000;
+
+/**
+ * Take a usage reading. A status line no newer than the last one read of its
+ * Teammate adds nothing, so the same file read twice is kept once.
+ */
+function usage(state: EffortState, input: Extract<EffortInput, { kind: "usage" }>): Step {
+	const { reading } = input;
+	if (reading.source === "status-line") {
+		const last = reading.teammate === undefined ? undefined : state.usage?.statusLines[reading.teammate];
+		if (reading.teammate === undefined || (last !== undefined && reading.at <= last.at)) return took(state, [], []);
+	}
+	return took(state, [{ type: "usage-read", ...reading }], []);
 }
 
 /** The state with handed-off Task `slug` changed by `change`. */
@@ -817,6 +933,8 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return pause(state, input);
 		case "resume":
 			return resume(state, input);
+		case "usage":
+			return usage(state, input);
 		case "answer-request":
 			return answerRequest(state, input);
 	}
@@ -1821,7 +1939,7 @@ function report(state: EffortState, input: Extract<EffortInput, { kind: "report"
 	const found: EffortLine[] = (input.found ?? []).map((what) => what.trim()).filter((what) => what !== "").map((what) => ({ type: "found-work", what, at: input.at }));
 	const now = found.reduce(apply, state);
 	const n = state.reports + 1;
-	const logged = reportSections(now, n === 1 ? input.modes : undefined).filter((each) => each.lines.length > 0);
+	const logged = [...reportSections(now, n === 1 ? input.modes : undefined), { title: "Usage", lines: usageLines(now, input.leadCostUsd) }].filter((each) => each.lines.length > 0);
 	// The final Report tells all found work, not only what is new, so its own section replaces the logged one.
 	const sections = input.final ? [...logged.filter((each) => each.title !== "Found work"), ...finalSections(now, input.final)] : logged;
 	const written: Report = { n, at: input.at, headline, coverage, sections, ...(input.final ? { final: true as const } : {}) };
@@ -1904,6 +2022,60 @@ function finalSections(state: EffortState, final: FinalFacts): ReportSection[] {
 						),
 		},
 	];
+}
+
+/** `412k`, `1.2M`: a token count as a Report gives it. */
+function tokenCount(tokens: number): string {
+	if (tokens < 1000) return String(Math.round(tokens));
+	if (tokens < 1_000_000) return `${Math.round(tokens / 1000)}k`;
+	return `${(tokens / 1_000_000).toFixed(1)}M`;
+}
+
+function dollars(usd: number): string {
+	return `$${usd.toFixed(2)}`;
+}
+
+/** Where a reading came from, as the Report and the Team block name it. */
+export function usageSource(reading: UsageReading): string {
+	return reading.source === "status-line" ? `${reading.teammate}'s status line` : "get_usage";
+}
+
+/**
+ * The Report's usage: the freshest account reading with its change since the
+ * Effort began, each Role's tokens and estimate summed across its Teammates'
+ * sessions, and the Lead's own cost. Empty with no reading and no Lead cost.
+ */
+function usageLines(state: EffortState, leadCostUsd: number | undefined): string[] {
+	const lines: string[] = [];
+	const usage = state.usage;
+	if (usage !== undefined) {
+		const window = (label: string, now: UsageWindow | undefined, first: UsageWindow | undefined): string => {
+			if (now === undefined) return `${label} n/a`;
+			const reset = first?.resetsAt !== undefined && now.resetsAt !== undefined && first.resetsAt !== now.resetsAt;
+			const change = first === undefined ? "" : reset ? " (reset since the Effort began)" : ` (${now.percent - first.percent >= 0 ? "+" : ""}${Math.round(now.percent - first.percent)} since the Effort began)`;
+			return `${label} ${Math.round(now.percent)}%${change}`;
+		};
+		const { latest } = usage;
+		lines.push(`Account, from ${usageSource(latest)} at ${clock(latest.at)} UTC: ${window("5h", latest.fiveHour, usage.first.fiveHour)} · ${window("week", latest.sevenDay, usage.first.sevenDay)}. It includes your own use outside the Team.`);
+		const byRole = new Map<string, { tokens: number; costUsd: number }>();
+		for (const teammate of state.teammates) {
+			const sessions = Object.values(usage.spend[teammate.id] ?? {});
+			if (sessions.length === 0) continue;
+			const sum = byRole.get(teammate.role) ?? { tokens: 0, costUsd: 0 };
+			for (const each of sessions) {
+				sum.tokens += each.tokens + each.banked.tokens;
+				sum.costUsd += each.costUsd + each.banked.costUsd;
+			}
+			byRole.set(teammate.role, sum);
+		}
+		if (byRole.size > 0) {
+			const roles = [...byRole].sort(([a], [b]) => a.localeCompare(b)).map(([role, sum]) => `${role} ${tokenCount(sum.tokens)} tokens ≈ ${dollars(sum.costUsd)}`);
+			const label = usage.rateLimits ? "*API-price equivalent, not your bill.*" : "No reading has `rate_limits`, as with an API key, so the estimate is the nearest thing to a charge.";
+			lines.push(`By Role: ${roles.join(" · ")}. ${label}`);
+		}
+	}
+	if (leadCostUsd !== undefined && leadCostUsd > 0) lines.push(`The Lead: ${dollars(leadCostUsd)}, as pi reports it.`);
+	return lines;
 }
 
 /** The logged sections, from `since` the last Report; the plan Report passes each Role's mode. */

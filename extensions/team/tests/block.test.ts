@@ -138,6 +138,33 @@ describe("the Team block", () => {
 		]);
 	});
 
+	it("shows the account's usage under the status line: each window or n/a, when it resets, where the reading came from and how old it is", () => {
+		const lines = render(
+			data({
+				teammates: [mate("dev-1", { ctx: 21 })],
+				usage: { sevenDay: { percent: 73, resetsAt: "2026-11-05T09:00:00.000Z" }, source: "dev-1's status line", at: "2026-11-02T09:59:48.000Z" },
+			}),
+		);
+
+		assert.deepEqual(lines.slice(1, 3), [
+			"│ ● running  ·  working · 1/4 Tasks accepted                   │",
+			"│ 5h n/a · week 73% ↻Thu 09:00  · dev-1's status line, 12s ago │",
+		]);
+		assert.match(lines[3], /ctx 21%/);
+	});
+
+	it("shows the usage with no Teammate live, a reset later today as a bare time, and an old reading's age in minutes and hours", () => {
+		const today = render(
+			data({
+				usage: { fiveHour: { percent: 41.6, resetsAt: "2026-11-02T13:00:00.000Z" }, sevenDay: { percent: 100 }, source: "get_usage (no Teammate live)", at: "2026-11-02T09:57:00.000Z" },
+			}),
+		);
+		assert.equal(today[2], "│ 5h 42% ↻13:00 · week 100%  · get_usage (no Teammate live), 3m ago │");
+
+		const stale = render(data({ usage: { source: "get_usage", at: "2026-11-02T07:45:00.000Z" } }));
+		assert.match(stale[2], /^│ 5h n\/a · week n\/a  · get_usage, 2h 15m ago +│$/);
+	});
+
 	it("never gets wider than 96 columns, clipping every cell and flattening newlines, wide characters included, in plain lines RPC can take", () => {
 		const long = "deeply/nested/".repeat(12);
 		const lines = render(
@@ -307,6 +334,37 @@ describe("team_status data", () => {
 
 		assert.equal(teamStatus(fold(through([REQUEST, APPROVE, PLAN])), { adoptionsPending: 0 }).reports, 0);
 		assert.equal(teamStatus(fold(through([REQUEST, APPROVE, PLAN, report("2026-11-02T10:20:00.000Z"), report("2026-11-02T10:25:00.000Z")])), { adoptionsPending: 0 }).reports, 2);
+	});
+
+	it("gives the freshest usage reading with where it came from, and each Teammate's context from its status line", () => {
+		const usage = (reading: Record<string, unknown>): EffortInput => ({ kind: "usage", reading: { rateLimits: true, ...reading } }) as EffortInput;
+		const handedOff = [REQUEST, APPROVE, PLAN, handoff("design"), handoff("ttl")];
+		const read = fold(
+			through([
+				...handedOff,
+				usage({ source: "status-line", teammate: "dev-1", sessionId: "d4e5f6a7-0000", at: "2026-11-02T10:45:00.000Z", sevenDay: { percent: 73, resetsAt: "2026-11-05T09:00:00.000Z" }, ctx: 21 }),
+				usage({ source: "status-line", teammate: "architect-1", sessionId: "a1b2c3d4-0000", at: "2026-11-02T10:44:00.000Z", sevenDay: { percent: 72 } }),
+			]),
+		);
+		const status = teamStatus(read, { adoptionsPending: 0 });
+
+		assert.deepEqual(status.usage, { sevenDay: { percent: 73, resetsAt: "2026-11-05T09:00:00.000Z" }, source: "dev-1's status line", at: "2026-11-02T10:45:00.000Z" });
+		assert.deepEqual(
+			status.teammates.map((row) => [row.id, row.ctx]),
+			[
+				["architect-1", undefined],
+				["dev-1", 21],
+			],
+		);
+		assert.equal(teamStatus(fold(through(handedOff)), { adoptionsPending: 0 }).usage, undefined);
+		assert.ok(!("ctx" in status.teammates[0]));
+	});
+
+	it("says a get_usage reading was taken with no Teammate live, once none is", () => {
+		const reading: EffortInput = { kind: "usage", reading: { source: "get-usage", rateLimits: true, at: "2026-11-02T10:15:00.000Z", fiveHour: { percent: 10 } } };
+
+		assert.equal(teamStatus(fold(through([REQUEST, APPROVE, reading])), { adoptionsPending: 0 }).usage?.source, "get_usage (no Teammate live)");
+		assert.equal(teamStatus(fold(through([REQUEST, APPROVE, PLAN, handoff("design"), { ...reading, reading: { ...reading.reading, at: "2026-11-02T10:35:00.000Z" } } as EffortInput])), { adoptionsPending: 0 }).usage?.source, "get_usage");
 	});
 
 	it("counts a request only the human can answer now, in a Teammate's terminal, as waiting on the human", () => {

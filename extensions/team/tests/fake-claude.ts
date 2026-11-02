@@ -69,6 +69,15 @@
  *   socket is gone (the harness's `idleStop`), and a played `SessionEnd`
  *   step ends it, as a crash does.
  *
+ * - `FAKE_CLAUDE_USAGE`: a JSON file of what the `get_usage` control request
+ *   answers. `-p --input-format stream-json` reads control requests from
+ *   stdin until it ends and answers each `get_usage` with the file's contents,
+ *   or with an error response when there is no file. It is sent no prompt,
+ *   so it plays nothing else.
+ * - A `{ statusLine: payload }` step runs the `statusLine.command` of the
+ *   session's `--settings`, as Claude Code does on each update, with the
+ *   payload (the session id and folder filled in) as JSON on stdin.
+ *
  * Anything else it is asked to do exits 1 with a message saying so, so a test
  * that reaches further than the fake goes is loud about it.
  */
@@ -184,6 +193,11 @@ async function main(): Promise<void> {
 		process.exit(exit);
 	}
 
+	if (argv[0] === "-p" && argv.includes("--input-format") && argv[argv.indexOf("--input-format") + 1] === "stream-json") {
+		await answerControlRequests();
+		process.exit(0);
+	}
+
 	if (argv[0] === "attach") {
 		const attachOut = process.env.FAKE_CLAUDE_ATTACH_OUT;
 		const stdio = [0, 1, 2].map((fd) => {
@@ -196,6 +210,27 @@ async function main(): Promise<void> {
 
 	process.stderr.write(`fake claude: no scripted behaviour for ${JSON.stringify(argv)}\n`);
 	process.exit(1);
+}
+
+/** Answer each `get_usage` control request on stdin from `FAKE_CLAUDE_USAGE`, until stdin ends. */
+async function answerControlRequests(): Promise<void> {
+	const file = process.env.FAKE_CLAUDE_USAGE;
+	let buffered = "";
+	process.stdin.setEncoding("utf8");
+	for await (const chunk of process.stdin) {
+		buffered += chunk as string;
+		const lines = buffered.split("\n");
+		buffered = lines.pop() ?? "";
+		for (const line of lines) {
+			const message = parsed(line) as { type?: string; request_id?: string; request?: { subtype?: string } } | undefined;
+			if (message?.type !== "control_request" || message.request?.subtype !== "get_usage") continue;
+			const response =
+				file && existsSync(file)
+					? { subtype: "success", request_id: message.request_id, response: JSON.parse(readFileSync(file, "utf8")) as unknown }
+					: { subtype: "error", request_id: message.request_id, error: "fake claude: no get_usage scripted" };
+			process.stdout.write(`${JSON.stringify({ type: "control_response", response })}\n`);
+		}
+	}
 }
 
 /** Every session `FAKE_CLAUDE_AGENTS` holds, live or not. */
@@ -226,7 +261,7 @@ function fileOf(flag: string): string | undefined {
 }
 
 /** One scripted step of a started session. */
-type HookStep = { event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string };
+type HookStep = { event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string } | { statusLine: Record<string, unknown> };
 
 /** Start the session's inbox server, detached so it outlives this launch, and wait until it listens. */
 async function openInbox(session: Session): Promise<void> {
@@ -338,9 +373,15 @@ function play(script: string | undefined, session: Session, pointer: string): vo
 
 /** Play steps against the session's settings and pointer. */
 function playSteps(steps: HookStep[], session: Session, pointer: string): void {
-	const settings = JSON.parse(session.settings ?? "{}") as { hooks?: Record<string, { matcher?: string; hooks: { command: string }[] }[]> };
+	const settings = JSON.parse(session.settings ?? "{}") as { hooks?: Record<string, { matcher?: string; hooks: { command: string }[] }[]>; statusLine?: { command?: string } };
 	const inbox = { CLAUDE_CODE_MESSAGING_SOCKET: session.socket, CLAUDE_CODE_MESSAGING_TOKEN: session.token };
 	for (const step of steps) {
+		if ("statusLine" in step) {
+			const command = settings.statusLine?.command;
+			if (command === undefined) throw new Error("fake claude: the session's settings have no status line command");
+			execFileSync("sh", ["-c", command], { cwd: session.cwd, input: JSON.stringify({ session_id: session.id, cwd: session.cwd, ...step.statusLine }), stdio: ["pipe", "ignore", "inherit"] });
+			continue;
+		}
 		if ("edit" in step) {
 			const task = /write your result to (\S+)\/result-\d+\.md\./.exec(pointer)?.[1]?.split("/").at(-1) ?? "task";
 			const file = step.edit.replaceAll("{task}", task);
