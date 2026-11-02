@@ -443,7 +443,7 @@ function usageReply(reply: Record<string, unknown>, at: string): UsageReading {
 }
 
 /** The hook events a Teammate reports, each to {@link HOOK_SCRIPT}. */
-const HOOK_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure", "PermissionRequest", "PermissionDenied", "Notification", "PostToolUse", "PreToolUse"];
+const HOOK_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure", "PermissionRequest", "PermissionDenied", "Notification", "PostToolUse", "PostToolUseFailure", "PreToolUse"];
 
 /** A `PermissionRequest` holds the request open while the Lead or the human answers it. */
 const PERMISSION_REQUEST_TIMEOUT_S = 3600;
@@ -473,7 +473,7 @@ export interface SettingsFrom {
  * A Teammate's `--settings`. Claude Code adds these to the human's own
  * settings, merging `permissions` and `hooks`, so they hold only keys that
  * add: the hooks, the permission rules and `crossSessionInbound`, which lets
- * the Lead's messages in. The one key that replaces is `statusLine.command`
+ * the Lead's messages in, and `env`, which tells the mod how to journal. The one key that replaces is `statusLine.command`
  * (the rest of the human's `statusLine` still applies), and its command,
  * {@link STATUSLINE_SCRIPT}, runs the human's own and prints what it prints.
  */
@@ -500,6 +500,8 @@ export function teammateSettings(from: SettingsFrom): Record<string, unknown> {
 			type: "command",
 			command: [process.execPath, STATUSLINE_SCRIPT, from.effortDir, from.teammateId, ...(from.humanStatusLine === undefined ? [] : [from.humanStatusLine])].map(shellQuote).join(" "),
 		},
+		// The hook command's argv, which the mod runs to journal what the human does in the Teammate's terminal (a Takeover).
+		env: { TEAM_HOOK: JSON.stringify([process.execPath, HOOK_SCRIPT, from.effortDir, from.teammateId]) },
 	};
 }
 

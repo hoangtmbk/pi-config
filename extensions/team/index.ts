@@ -12,7 +12,7 @@
  * human's real agent dir or Claude Code config.
  */
 
-import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
@@ -30,6 +30,7 @@ import {
 	currentResult,
 	DEFAULT_MAX_TEAMMATES,
 	type EffortAction,
+	type EffortInput,
 	type EffortState,
 	type Escalation,
 	escalationText,
@@ -603,6 +604,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			if (only !== undefined && id !== only) continue;
 			// A Teammate being started afresh is read once its relaunch is on record, so its new session's lines go to its new Task.
 			if (relaunching.has(id)) continue;
+			const sent = sentTo(held, state, id);
 			for (const read of readJournal(held.paths, id, cursor ?? 0)) {
 				const due = currentResult(state, id);
 				const path = due ? join(held.paths.tasks, due.folder, `result-${due.round}.md`) : "";
@@ -615,6 +617,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 					result: { path, written: path !== "" && existsSync(path) },
 					tz,
 					...(models ? { models } : {}),
+					sent,
 				});
 				if (!result.ok) break;
 				appendLines(held.paths, result.append);
@@ -623,6 +626,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 					if (action.kind === "wake-lead") texts.push(action.text);
 					else if (action.kind === "send-pointer") sendPointer(held, action);
 				}
+				takeoverActions(held, result.actions);
 				// Claude Code's auto-resume fired: the others on that limit get `continue`, and what it held back starts.
 				if (result.actions.some((action) => action.kind === "send-continue") || result.append.some((line) => (line.type === "resumed" && line.by === "usage") || line.type === "model-released")) {
 					const usage = { ...result, actions: result.actions.filter((action) => action.kind === "send-continue") };
@@ -642,6 +646,80 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				`\`${teammate}\` cleared its context for Task \`${slug}\`, but the Task's pointer couldn't reach its inbox (${failed.error}), so it isn't working on it. Stop and tell the human.`,
 			]);
 		});
+	}
+
+	/** The prompts the Effort itself sends Teammate `id`: every round's pointer of its Tasks, and `continue`. */
+	function sentTo(held: HeldEffort, state: EffortState, id: string): string[] {
+		const sent = [CONTINUE];
+		for (const [slug, task] of Object.entries(state.tasks)) {
+			if (task.teammate !== id) continue;
+			const dir = join(held.paths.tasks, task.folder);
+			for (let round = 1; round <= task.round; round++) sent.push(handoffPointer(slug, dir, round), sendBackPointer(slug, dir, round), restaffPointer(slug, dir, round));
+		}
+		return sent;
+	}
+
+	/**
+	 * Carry out a Takeover's own actions: the hook's marker, written or removed,
+	 * and the clear before a held Task pointer at the hand-back, whose pointer
+	 * goes once the clear lands. A clear that doesn't get through wakes the Lead.
+	 */
+	function takeoverActions(held: HeldEffort, actions: readonly EffortAction[]): void {
+		for (const action of actions) {
+			if (action.kind === "mark-takeover") {
+				const dir = join(held.paths.teammates, action.teammate);
+				if (action.on) {
+					mkdirSync(dir, { recursive: true });
+					writeFileSync(join(dir, "takeover"), `${now().toISOString()}\n`);
+				} else rmSync(join(dir, "takeover"), { force: true });
+			} else if (action.kind === "clear-then-send") {
+				void sendToInbox(action.inbox, CLEAR_MARKER).then((failed) => {
+					if (!failed) return;
+					wakeAboutTeammates([
+						`\`${action.teammate}\` was handed back with Task \`${action.slug}\`'s pointer held, but the clear couldn't reach its inbox (${failed.error}), so it isn't working on it. Stop and tell the human.`,
+					]);
+				});
+			}
+		}
+	}
+
+	/**
+	 * `/team handback`, and the attach menu's "Hand back": confirm, then end
+	 * the human's Takeover of `teammate` from pi, with what it did reviewed by
+	 * the Lead.
+	 */
+	async function handBackFromPi(teammate: string, note: string | undefined, ctx: ExtensionCommandContext): Promise<void> {
+		const held = effort;
+		if (!held) {
+			ctx.ui.notify("This session holds no Effort, so there is no Teammate to hand back.", "error");
+			return;
+		}
+		wakeAboutTeammates(applyJournals(held));
+		const input = (): Extract<EffortInput, { kind: "handback" }> => {
+			const due = currentResult(effortState(held), teammate);
+			const path = due ? join(held.paths.tasks, due.folder, `result-${due.round}.md`) : "";
+			return { kind: "handback", teammate, ...(note === undefined ? {} : { note }), result: { path, written: path !== "" && existsSync(path) }, at: now().toISOString() };
+		};
+		const probe = step(effortState(held), input());
+		if (!probe.ok) {
+			ctx.ui.notify(probe.refusal, "error");
+			return;
+		}
+		const sure = await ctx.ui.confirm(
+			`Hand \`${teammate}\` back to the Lead?`,
+			"Any send held for it while you had it is dropped, and the Lead reviews what you did in its terminal like any result. The next new Task it gets starts with a clear of its context.",
+		);
+		if (!sure) return;
+		const result = step(effortState(held), input());
+		if (!result.ok) {
+			ctx.ui.notify(result.refusal, "error");
+			return;
+		}
+		appendLines(held.paths, result.append);
+		takeoverActions(held, result.actions);
+		wakeAboutTeammates(result.actions.flatMap((action) => (action.kind === "wake-lead" ? [action.text] : [])));
+		paintBlock();
+		ctx.ui.notify(result.reply ?? `Handed \`${teammate}\` back.`, "info");
 	}
 
 	/** Wake the Lead about its Teammates now, or with everything else once its run settles. */
@@ -1799,6 +1877,17 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				await attachTo(args[0], ctx);
 			},
 		},
+		handback: {
+			async run(args, ctx) {
+				const [teammate, ...note] = args;
+				if (teammate === undefined) {
+					const held = effort ? effortState(effort).teammates.filter((each) => each.takeover !== undefined).map((each) => `\`${each.id}\``) : [];
+					ctx.ui.notify(`Name the Teammate to hand back: \`/team handback <teammate> [note]\`. Taken over now: ${held.length === 0 ? "none" : held.join(", ")}.`, "error");
+					return;
+				}
+				await handBackFromPi(teammate, note.length === 0 ? undefined : note.join(" "), ctx);
+			},
+		},
 	};
 	const valid = Object.keys(subcommands)
 		.map((name) => `\`${name}\``)
@@ -2233,8 +2322,12 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		}
 		const target = row && attachTarget(row, paths.claudePath);
 		if (!target) return;
-		const run = await chooseAttach(target, { mode: ctx.mode, ui: ctx.ui, env, tmuxPath, copy });
-		if (!run) return;
+		const chosen = await chooseAttach(target, { mode: ctx.mode, ui: ctx.ui, env, tmuxPath, copy, handBack: (teammate) => handBackFromPi(teammate, undefined, ctx) });
+		if (!chosen) return;
+		if (!chosen.attaches) {
+			await chosen.run();
+			return;
+		}
 		const result = step(effortState(held), { kind: "attach", teammate: target.teammate, at: now().toISOString() });
 		if (!result.ok) {
 			ctx.ui.notify(result.refusal, "error");
@@ -2242,11 +2335,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		}
 		appendLines(held.paths, result.append);
 		paintBlock();
-		await run();
+		await chosen.run();
 	}
 
 	pi.registerCommand("team", {
-		description: "Run a Team on one Effort: /team start [team], /team setup <team>, /team pending, /team pause [reason], /team resume [effort], /team report, /team reports, /team cancel, /team attach [teammate] (or just /team)",
+		description: "Run a Team on one Effort: /team start [team], /team setup <team>, /team pending, /team pause [reason], /team resume [effort], /team report, /team reports, /team cancel, /team attach [teammate] (or just /team), /team handback <teammate> [note]",
 		async handler(args, ctx) {
 			// Bare `/team` is the attach picker: getting to a Teammate is what it is reached for most.
 			const [name = "attach", ...rest] = args.trim().split(/\s+/).filter(Boolean);

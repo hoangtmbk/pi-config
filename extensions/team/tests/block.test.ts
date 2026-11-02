@@ -188,6 +188,24 @@ describe("the Team block", () => {
 		assert.match(stale[2], /^│ 5h n\/a · week n\/a  · get_usage, 2h 15m ago +│$/);
 	});
 
+	it("shows a Teammate the human holds as ✋ YOURS with its age, what started the Takeover and how to hand it back", () => {
+		const lines = render(
+			data({
+				teammates: [
+					mate("architect-1", { task: "001-architect-design", ctx: 18, mode: "auto" }),
+					mate("dev-1", { shortId: "d4e5f6a7", task: "002-dev-ttl", ctx: 40, mode: "auto", takeover: { since: "2026-11-02T09:37:00.000Z", trigger: "you typed a prompt" } }),
+				],
+			}),
+		);
+
+		assert.deepEqual(lines.slice(2, 4), [
+			"│ architect-1  a1b2c3d4  idle          001-architect-design  ctx 18%  auto       │",
+			"│ dev-1        d4e5f6a7  ✋ YOURS 23m  you typed a prompt · /team handback dev-1 │",
+		]);
+		const narrow = renderTeamBlock(data({ teammates: [mate("dev-1", { takeover: { since: "2026-11-02T09:37:00.000Z", trigger: "you typed a prompt" } })] }), NOW, { maxTeammates: 3, width: 56 });
+		assert.equal(narrow[2], "│ dev-1  a1b2c3d4  ✋ YOURS 23m  …/team handback dev-1 │");
+	});
+
 	it("never gets wider than 96 columns, clipping every cell and flattening newlines, wide characters included, in plain lines RPC can take", () => {
 		const long = "deeply/nested/".repeat(12);
 		const lines = render(
@@ -433,6 +451,21 @@ describe("team_status data", () => {
 		const attached = step(fold(relaunched), { kind: "attach", teammate: "architect-1", at: "2026-11-02T11:10:00.000Z" });
 		assert.ok(attached.ok);
 		assert.equal(teamStatus(attached.state, { adoptionsPending: 0 }).teammates[0].newShortId, undefined);
+	});
+
+	it("rows a Teammate under a Takeover with when it started and what started it, as the human reads it", () => {
+		const opened = through([REQUEST, APPROVE, PLAN, handoff("design"), hook("architect-1", 1, "SessionStart", { source: "startup", permission_mode: "auto" })]);
+		const trigger = (kind: string, more: Record<string, unknown> = {}): EffortLine[] => [
+			...opened,
+			{ type: "takeover-started", teammate: "architect-1", cursor: 2, trigger: { kind, ...more }, at: "2026-11-02T10:50:00.000Z" } as EffortLine,
+		];
+
+		assert.deepEqual(teamStatus(fold(trigger("prompt")), { adoptionsPending: 0 }).teammates[0].takeover, { since: "2026-11-02T10:50:00.000Z", trigger: "you typed a prompt" });
+		assert.deepEqual(
+			[trigger("command", { command: "/compact" }), trigger("interrupt"), trigger("deny", { request: "req-1" })].map((lines) => teamStatus(fold(lines), { adoptionsPending: 0 }).teammates[0].takeover?.trigger),
+			["you ran /compact", "you interrupted a turn", "you said No to its prompt"],
+		);
+		assert.equal(teamStatus(fold(opened), { adoptionsPending: 0 }).teammates[0].takeover, undefined);
 	});
 
 	it("carries the usage pause's limit and reset and the model holds, and counts the usage items waiting on the human", () => {
