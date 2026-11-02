@@ -11,7 +11,9 @@ export type StartOutcome =
 	/** Show the human a toast. */
 	| { kind: "notify"; level: "info" | "error"; text: string }
 	/** Ask the Lead to propose a Team, starting a turn. */
-	| { kind: "ask-lead"; text: string };
+	| { kind: "ask-lead"; text: string }
+	/** Tell the human, then run Team setup first: the Team has no adopted Playbook to run on. */
+	| { kind: "setup"; team: Team; text: string };
 
 function names(teams: readonly Team[]): string {
 	return teams.map((team) => `\`${team.name}\``).join(", ");
@@ -21,31 +23,54 @@ function problemLines(problems: readonly ConfigError[]): string {
 	return problems.map((problem) => `- ${problem.filePath}: ${problem.reason}`).join("\n");
 }
 
-function adoptionText(team: Team): string {
-	switch (team.adoption.state) {
-		case "adopted":
-			return `adopted ${team.adoption.adoptedAt} (${team.adoption.playbook.filePath}).`;
-		case "edited":
-			return `${team.adoption.filePath} was edited after it was adopted, so it counts as not adopted until it is adopted again.`;
-		case "not-adopted":
-			return team.defaultPlaybook
-				? "not adopted yet, so the Team's default Playbook is what setup would start from."
-				: "not adopted yet, and the Team ships no default Playbook.";
-	}
+/** "Teams: …" for an error that must say which Teams would have worked. */
+export function availableTeams(teams: readonly Team[]): string {
+	return teams.length > 0 ? `Teams: ${names(teams)}.` : "There are no Teams.";
 }
 
-/** `/team start <name>`: the named Team, if it exists and every file of it is right. */
-export function pickTeam(teams: readonly Team[], name: string): StartOutcome {
+/**
+ * The named Team, or why it can't be used: it doesn't exist, or a file of it
+ * has a config error that `excused` doesn't let through.
+ */
+export function findTeam(
+	teams: readonly Team[],
+	name: string,
+	action: string,
+	excused: (problem: ConfigError) => boolean = () => false,
+): { team: Team } | { error: string } {
 	const team = teams.find((candidate) => candidate.name === name);
-	if (!team) {
-		const available = teams.length > 0 ? `Teams: ${names(teams)}.` : "There are no Teams.";
-		return { kind: "notify", level: "error", text: `Unknown Team \`${name}\`. ${available}` };
+	if (!team) return { error: `Unknown Team \`${name}\`. ${availableTeams(teams)}` };
+	const problems = team.problems.filter((problem) => !excused(problem));
+	if (problems.length > 0) return { error: `Team \`${name}\` can't ${action} until its config errors are fixed:\n${problemLines(problems)}` };
+	return { team };
+}
+
+/**
+ * `/team start <name>`: the named Team, if it exists and every file of it is
+ * right. A Team with no adopted Playbook goes through Team setup first, and so
+ * does one whose adopted Playbook was edited by hand, since that edit was never
+ * agreed. A broken adoption record is a config error like any other here.
+ */
+export function pickTeam(teams: readonly Team[], name: string): StartOutcome {
+	const found = findTeam(teams, name, "start");
+	if ("error" in found) return { kind: "notify", level: "error", text: found.error };
+	const { team } = found;
+	const then = "Agree it with the Lead and adopt it from `/team pending`; the Team starts once it is adopted.";
+	switch (team.adoption.state) {
+		case "not-adopted":
+			return { kind: "setup", team, text: `Team \`${name}\` has no adopted Playbook, so Team setup runs first. ${then}` };
+		case "edited":
+			return {
+				kind: "setup",
+				team,
+				text: `Team \`${name}\`'s Playbook ${team.adoption.filePath} was edited after it was adopted, so Team setup runs first. ${then}`,
+			};
+		case "adopted": {
+			const roles = team.roles.map((role) => `\`${role.name}\``).join(", ");
+			const playbook = `adopted ${team.adoption.adoptedAt} (${team.adoption.playbook.filePath}).`;
+			return { kind: "notify", level: "info", text: `Team \`${name}\` picked: Roles ${roles}. Playbook: ${playbook}` };
+		}
 	}
-	if (team.problems.length > 0) {
-		return { kind: "notify", level: "error", text: `Team \`${name}\` can't start until its config errors are fixed:\n${problemLines(team.problems)}` };
-	}
-	const roles = team.roles.map((role) => `\`${role.name}\``).join(", ");
-	return { kind: "notify", level: "info", text: `Team \`${name}\` picked: Roles ${roles}. Playbook: ${adoptionText(team)}` };
 }
 
 /**

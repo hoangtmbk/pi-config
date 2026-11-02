@@ -161,14 +161,21 @@ export interface TeamRoots {
 }
 
 /** The files that hold a Team's adopted Playbook. */
+/** Where a Team's Playbook lives under the agent dir, once adopted and while drafted. */
 export interface PlaybookPaths {
+	/** The folder holding every Team's Playbook files. */
+	dir: string;
+	/** The adopted Playbook. */
 	adopted: string;
+	/** `{ sha256, adoptedAt }`: what was adopted, and when. */
 	adoptedJson: string;
+	/** The draft the Lead edits during Team setup. */
+	draft: string;
 }
 
 export function playbookPaths(agentDir: string, team: string): PlaybookPaths {
 	const dir = join(agentDir, "team", "playbooks");
-	return { adopted: join(dir, `${team}.md`), adoptedJson: join(dir, `${team}.adopted.json`) };
+	return { dir, adopted: join(dir, `${team}.md`), adoptedJson: join(dir, `${team}.adopted.json`), draft: join(dir, `${team}.draft.md`) };
 }
 
 /** The sha256 a Playbook is adopted by, in hex. */
@@ -303,11 +310,11 @@ class FileCheck {
 	}
 }
 
-/** Read and split a markdown file, or report why it can't be. */
-function readMarkdown(check: FileCheck): { fields: Fields; body: string; raw: Buffer } | undefined {
+/** Read and split a markdown file, or the bytes already read from it, or report why it can't be. */
+function readMarkdown(check: FileCheck, bytes?: Buffer): { fields: Fields; body: string; raw: Buffer } | undefined {
 	let raw: Buffer;
 	try {
-		raw = readFileSync(check.filePath);
+		raw = bytes ?? readFileSync(check.filePath);
 	} catch (error) {
 		check.fail(`could not be read: ${errorText(error)}`);
 		return undefined;
@@ -399,7 +406,8 @@ export interface PlaybookContext {
 }
 
 /**
- * Parse and validate a Playbook file.
+ * Parse and validate a Playbook file, or `bytes` already read from it, so
+ * what is validated is exactly what a snapshot holds.
  *
  * Only `sendBackLimit`, `checkpoints` and `permissions` mean anything to the
  * extension, and a misspelt key would be a rule that silently does nothing, so
@@ -407,9 +415,9 @@ export interface PlaybookContext {
  * share one id namespace, because a Brief override names an id and must mean
  * exactly one thing.
  */
-export function parsePlaybook(filePath: string, context: PlaybookContext): { playbook?: Playbook; problems: ConfigError[] } {
+export function parsePlaybook(filePath: string, context: PlaybookContext, bytes?: Buffer): { playbook?: Playbook; problems: ConfigError[] } {
 	const check = new FileCheck(filePath);
-	const file = readMarkdown(check);
+	const file = readMarkdown(check, bytes);
 	if (!file) return { problems: check.problems };
 	const { fields, body, raw } = file;
 

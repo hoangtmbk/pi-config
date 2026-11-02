@@ -5,17 +5,43 @@ the repo's, defined in the Teams section of [`CONTEXT.md`](../../CONTEXT.md): a 
 folder of markdown, a **Role** is one position on it, a **Playbook** is the Team's standing rules,
 and a **Workspace** is where its Teammates work.
 
-So far the extension knows its Teams and `/team start` gets as far as picking one.
+So far the extension knows its Teams, runs Team setup to adopt a Playbook, and `/team start` gets
+as far as picking a Team.
 
 ## Usage
 
 ```
-/team start <team>   pick a Team; refused, naming each file and reason, if any file of it is wrong
+/team start <team>   pick a Team; refused, naming each file and reason, if any file of it is wrong.
+                     A Team with no adopted Playbook goes through Team setup first, then is picked
 /team start          the Lead proposes a Team from each Team's description
+/team setup <team>   Team setup: agree the Team's Playbook with the Lead, then adopt it
+/team pending        answer what waits on you: approve, send back with a note, or later
 ```
 
 `/team start` warns when `claude --version` is older than 2.1.316, the version this extension was
-tried on. The warning never stops it.
+tried on. The warning never stops it. Every `/team` command runs while the Lead is streaming.
+
+## Team setup
+
+`/team setup <team>` seeds a draft at `~/.pi/agent/team/playbooks/<team>.draft.md` and wakes the
+Lead to walk you through it. The draft starts from, in order: a draft an earlier setup left
+unadopted, the adopted Playbook, the Team's `default-playbook.md`, or nothing, in which case the
+Lead grills you and writes one. The Lead edits the draft with pi's own file tools.
+
+When you're happy, the Lead calls `team_request_approval` with checkpoint `adopt-playbook` and the
+draft's path. That validates the draft (refusing it with its config errors), snapshots its bytes
+with their sha256 and adds a pending item. Nothing you say in chat adopts it: in `/team pending`
+you see the path and sha and approve, send it back with a note (which wakes the Lead), or leave it
+for later. Approving writes the snapshot, not whatever the draft holds by then, as
+`<team>.md` with `<team>.adopted.json` and removes the draft.
+
+The request and the dialog warn of what won't protect you: a `roles.<role>.allow` rule that auto
+mode drops on entry (any-command Bash, interpreter wildcards, package-manager run commands,
+`Agent`, `Monitor`) for a Role that runs in `auto`, and an `escalate` entry with no `ask:` list.
+
+The Lead's tools (`team_request_approval`) are registered at load but switched off; Team setup
+switches them on, and adoption switches them off again. Setup and pending items live in the pi
+session's memory for now.
 
 ## Defining a Team
 
@@ -78,6 +104,7 @@ through a recording fake pi in `tests/index.test.ts`.
 index.ts         wiring: the /team command and its subcommand table
 definitions.ts   Teams, Roles and Playbooks: discovery, validation, adoption state
 start.ts         what /team start says, and what it asks the Lead (pure)
+setup.ts         Team setup: seeding the draft, validating and adopting it, its warnings
 claude.ts        the only module that runs claude (version check)
 teams/software/  the bundled software Team: architect, dev and qa, and its default Playbook
 tests/           offline suite, fake claude, temp-root harness
