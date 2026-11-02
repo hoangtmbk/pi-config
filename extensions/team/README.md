@@ -116,7 +116,8 @@ Task with no judgment from the Lead, down a ladder:
 3. **Swap**: at the cap, stop (`claude stop`) an idle Teammate whose Task is accepted and whose
    Role has no queued Task, and start one in its place.
 4. **Queue** the Task, saying why (`cap 3 reached; waits for 001, 002 and 003`). `team_review`
-   starts queued Tasks, in handoff order, when an acceptance frees a Teammate.
+   starts queued Tasks, in handoff order, when an acceptance frees a Teammate; a Teammate's crash
+   frees room under the cap the same way.
 
 Every live Teammate counts toward the cap, working or idle. `maxTeammates` is a pi setting
 (default 3), read after `/reload`. Starts are at least 5 s apart. The reply says which Teammate

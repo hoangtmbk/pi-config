@@ -899,7 +899,9 @@ export type EffortAction =
 	/** Remove `feedback-<round>.md` from the Task's folder: the send-back that wrote it never launched its Teammate. */
 	| { kind: "discard-feedback"; slug: string; folder: string; round: number }
 	/** Write (`on`) or remove the Teammate's `takeover` marker, which its hook reads to leave permission prompts to the human. */
-	| { kind: "mark-takeover"; teammate: string; on: boolean };
+	| { kind: "mark-takeover"; teammate: string; on: boolean }
+	/** Room opened for queued Tasks: a usage pause or a model hold lifted, or a Teammate crashed. Drain the queue. */
+	| { kind: "start-queued" };
 
 export type Step =
 	| { ok: true; state: EffortState; append: EffortLine[]; actions: EffortAction[]; reply?: string }
@@ -1368,6 +1370,17 @@ export function fold(lines: readonly EffortLine[]): EffortState {
 
 /** Take one input: the lines it appends and what the shell must do, or why it is refused. */
 export function step(state: EffortState, input: EffortInput): Step {
+	const result = stepOnce(state, input);
+	if (result.ok && result.append.some(freesRoom)) return { ...result, actions: [...result.actions, { kind: "start-queued" }] };
+	return result;
+}
+
+/** A line after which a queued Task may start: a usage pause or a model hold lifted, or a Teammate crashed, freeing room under the cap. */
+function freesRoom(line: EffortLine): boolean {
+	return (line.type === "resumed" && line.by === "usage") || line.type === "model-released" || line.type === "teammate-crashed";
+}
+
+function stepOnce(state: EffortState, input: EffortInput): Step {
 	if (state.ended) {
 		// A Teammate's last journal lines can still arrive after the end; there is nothing left for them to change.
 		if (input.kind === "journal") return took(state, [], []);

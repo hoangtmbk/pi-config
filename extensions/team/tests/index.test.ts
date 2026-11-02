@@ -2644,6 +2644,19 @@ describe("a Teammate's lifecycle", () => {
 		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: sent back, with `builder-2`/);
 	});
 
+	it("starts a Task queued at `maxTeammates` once a Teammate's crash frees room under the cap", async () => {
+		const { pi } = await crewApproved({ settings: { maxTeammates: 1 }, hooks: [{ event: "SessionStart", payload: { source: "startup" } }, { event: "UserPromptSubmit" }], replies: WORKS });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		assert.match(await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" }), /started builder-1/);
+		assert.match(await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" }), /queued/);
+		assert.equal(pi.claude.launches().length, 1);
+
+		await pi.claude.terminal(BUILDER_1, [{ event: "SessionEnd", payload: { reason: "other" } }]);
+
+		await until(() => pi.claude.launches().length === 2, "the queued Task starts once the crash frees room");
+		await until(() => teammateWakes(pi.sent).some((wake) => /Queued Task `survey` started scout-1/.test(wake.content)), "the Lead hears the queued Task started");
+	});
+
 	it("drops a handed-off Task left out of a re-plan, stopping its Teammate with `claude stop` and listing it under Dropped in plan.md", async () => {
 		const { pi, dir } = await renameReported();
 		const [session] = effortLines(dir).filter((line) => line.type === "teammate-session");

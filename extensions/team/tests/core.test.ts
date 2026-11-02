@@ -1974,8 +1974,7 @@ describe("a Teammate's lifecycle", () => {
 
 		assert.ok(crash.ok, crash.ok ? "" : crash.refusal);
 		assert.deepEqual(crash.append, [{ type: "teammate-crashed", teammate: "dev-1", cursor: 2, reason: "other", at: "2026-11-02T12:02:00.000Z" }]);
-		assert.equal(crash.actions.length, 1);
-		assert.equal(crash.actions[0].kind, "wake-lead");
+		assert.deepEqual(crash.actions.map((action) => action.kind), ["wake-lead", "start-queued"], "the crash frees room under the cap, so the queue drains");
 		assert.match(crash.actions[0].kind === "wake-lead" ? crash.actions[0].text : "", /`dev-1`'s session ended \(other\).*Task `rename`.*send-back/s);
 		assert.deepEqual(crash.state.teammates[0].ended, { how: "crashed", at: "2026-11-02T12:02:00.000Z" });
 
@@ -2576,6 +2575,7 @@ describe("usage limits", () => {
 		const lifted = tick(queued, RESET);
 		assert.deepEqual(lifted.append.map((line) => line.type), ["model-released"]);
 		assert.deepEqual(lifted.ok && lifted.state.holds, {});
+		assert.ok(lifted.ok && lifted.actions.some((action) => action.kind === "start-queued"), "the lifted hold drains the queue");
 		const drained = run([...queued, ...lifted.append], { kind: "drain", at: RESET });
 		assert.match(drained.ok ? (drained.reply ?? "") : "", /^Queued Task `review` started architect-2/);
 	});

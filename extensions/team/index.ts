@@ -705,7 +705,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 	/**
 	 * Carry out what a usage step asks once its lines are on record: send
-	 * `continue`, start the queued Tasks a lifted pause or hold lets go, and
+	 * `continue`, start the queued Tasks a lifted pause or hold, or a crash, lets go, and
 	 * return what the Lead must hear, a failed send among it.
 	 */
 	async function afterUsage(held: HeldEffort, result: Extract<Step, { ok: true }>): Promise<string[]> {
@@ -717,8 +717,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				if (failed) texts.push(`\`${action.teammate}\`'s usage limit reset, but \`continue\` couldn't reach it (${failed.error}), so it is still stopped. Stop and tell the human.`);
 			}
 		}
-		const lifted = result.append.some((line) => (line.type === "resumed" && line.by === "usage") || line.type === "model-released");
-		if (lifted && leadCtx) texts.push(...(await startQueued(held, effortState(held), leadCtx)));
+		if (result.actions.some((action) => action.kind === "start-queued") && leadCtx) texts.push(...(await startQueued(held, effortState(held), leadCtx)));
 		paintBlock();
 		return texts;
 	}
@@ -775,10 +774,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 					}
 				}
 				takeoverActions(held, result.actions);
-				// Claude Code's auto-resume fired: the others on that limit get `continue`, and what it held back starts.
-				if (result.actions.some((action) => action.kind === "send-continue") || result.append.some((line) => (line.type === "resumed" && line.by === "usage") || line.type === "model-released")) {
-					const usage = { ...result, actions: result.actions.filter((action) => action.kind === "send-continue") };
-					void afterUsage(held, usage).then(wakeAboutTeammates, (error: unknown) => wakeAboutTeammates([`A usage limit lifted, but what it held back didn't restart: ${error instanceof Error ? error.message : String(error)}`]));
+				// Claude Code's auto-resume fired, or a Teammate crashed: the others on that limit get `continue`, and the queued Tasks it lets go start.
+				if (result.actions.some((action) => action.kind === "send-continue" || action.kind === "start-queued")) {
+					const usage = { ...result, actions: result.actions.filter((action) => action.kind === "send-continue" || action.kind === "start-queued") };
+					void afterUsage(held, usage).then(wakeAboutTeammates, (error: unknown) => wakeAboutTeammates([`What a lifted limit or a crash let go didn't start: ${error instanceof Error ? error.message : String(error)}`]));
 				}
 			}
 		}
