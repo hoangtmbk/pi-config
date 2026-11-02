@@ -189,7 +189,7 @@ function droppedInAuto(rule: string): boolean {
 }
 
 /** The mode a Role runs in under this Playbook: its own entry, then `*`, then its Role file, then `auto`. */
-function modeInForce(playbook: Playbook, role: Role): PermissionMode {
+export function modeInForce(playbook: Playbook, role: Role): PermissionMode {
 	return playbook.roles[role.name]?.mode ?? playbook.roles[EVERY_ROLE]?.mode ?? role.permissionMode ?? "auto";
 }
 

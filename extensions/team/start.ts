@@ -4,7 +4,7 @@
  * is handed.
  */
 
-import type { ConfigError, Team } from "./definitions.ts";
+import type { ConfigError, Playbook, Team } from "./definitions.ts";
 
 /** What `/team start` says back, by how it lands in pi. */
 export type StartOutcome =
@@ -13,7 +13,9 @@ export type StartOutcome =
 	/** Ask the Lead to propose a Team, starting a turn. */
 	| { kind: "ask-lead"; text: string }
 	/** Tell the human, then run Team setup first: the Team has no adopted Playbook to run on. */
-	| { kind: "setup"; team: Team; text: string };
+	| { kind: "setup"; team: Team; text: string }
+	/** Open an Effort on the Team and its adopted Playbook, and tell the human `text` with where it is. */
+	| { kind: "intake"; team: Team; playbook: Playbook; text: string };
 
 function names(teams: readonly Team[]): string {
 	return teams.map((team) => `\`${team.name}\``).join(", ");
@@ -47,9 +49,9 @@ export function findTeam(
 
 /**
  * `/team start <name>`: the named Team, if it exists and every file of it is
- * right. A Team with no adopted Playbook goes through Team setup first, and so
- * does one whose adopted Playbook was edited by hand, since that edit was never
- * agreed. A broken adoption record is a config error like any other here.
+ * right, goes on to intake on its adopted Playbook. A Team with no adopted
+ * Playbook goes through Team setup first, and so does one whose adopted
+ * Playbook was edited by hand, since that edit was never agreed. A broken adoption record is a config error like any other here.
  */
 export function pickTeam(teams: readonly Team[], name: string): StartOutcome {
 	const found = findTeam(teams, name, "start");
@@ -68,7 +70,7 @@ export function pickTeam(teams: readonly Team[], name: string): StartOutcome {
 		case "adopted": {
 			const roles = team.roles.map((role) => `\`${role.name}\``).join(", ");
 			const playbook = `adopted ${team.adoption.adoptedAt} (${team.adoption.playbook.filePath}).`;
-			return { kind: "notify", level: "info", text: `Team \`${name}\` picked: Roles ${roles}. Playbook: ${playbook}` };
+			return { kind: "intake", team, playbook: team.adoption.playbook, text: `Team \`${name}\` picked: Roles ${roles}. Playbook: ${playbook}` };
 		}
 	}
 }

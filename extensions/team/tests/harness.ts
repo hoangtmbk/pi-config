@@ -5,7 +5,8 @@
  * Nothing here is a test of its own; `npm test` only runs `*.test.ts`.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,6 +28,14 @@ export function tempRoots(): TempRoots {
 	mkdirSync(agentDir, { recursive: true });
 	mkdirSync(scratch, { recursive: true });
 	return { agentDir, claudeConfigPath: join(home, ".claude.json"), scratch };
+}
+
+/** An empty git repo under the scratch folder, by its real path, as `git` reports a repo's root. */
+export function gitRepo(roots: TempRoots, name = "repo"): string {
+	const dir = join(roots.scratch, name);
+	mkdirSync(dir, { recursive: true });
+	execFileSync("git", ["init", "-q", dir]);
+	return realpathSync(dir);
 }
 
 /** A Team folder's files, by path relative to the folder. */
