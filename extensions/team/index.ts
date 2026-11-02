@@ -56,6 +56,7 @@ import {
 	USAGE_FRESH_MS,
 	type UsageReading,
 	type Workspace,
+	waitingConfirm,
 	waitingInTerminal,
 	workdir,
 } from "./core.ts";
@@ -1834,7 +1835,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				const terminal = state ? waitingInTerminal(state) : [];
 				const escalated = state ? openEscalations(state) : [];
 				const usage = state?.usageItems ?? [];
-				if (pending.length === 0 && briefs.length === 0 && terminal.length === 0 && escalated.length === 0 && usage.length === 0) {
+				const confirm = state ? waitingConfirm(state) : undefined;
+				if (pending.length === 0 && briefs.length === 0 && terminal.length === 0 && escalated.length === 0 && usage.length === 0 && !confirm) {
 					ctx.ui.notify("Nothing is waiting on you.", "info");
 					return;
 				}
@@ -1845,6 +1847,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 					const attach = `Attach to ${item.teammate}`;
 					const answer = await ctx.ui.select(`\`${item.request}\` waited past its hook's hold: ${terminalText(item)}`, [attach, LATER]);
 					if (answer === attach) await attachTo(item.teammate, ctx);
+				}
+				if (confirm) {
+					const attach = `Attach to ${confirm.teammate}`;
+					const answer = await ctx.ui.select(`\`${confirm.teammate}\` waits for a usage-credit confirm in its terminal, which only you answer; new Tasks for ${confirm.roles.map((role) => `\`${role}\``).join(", ")} wait on it`, [attach, LATER]);
+					if (answer === attach) await attachTo(confirm.teammate, ctx);
 				}
 				// An answer before it can end the Effort, which leaves nothing to answer.
 				for (const item of usage) if (held && effort === held) await answerUsage(held, item, ctx);

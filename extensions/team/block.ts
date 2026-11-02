@@ -25,7 +25,7 @@
  */
 
 import { sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
-import { type EffortState, heldPauses, openEscalations, type PauseSetter, type TakeoverTrigger, type Teammate, type UsageWindow, usageSource, waitingInTerminal } from "./core.ts";
+import { type EffortState, heldPauses, openEscalations, type PauseSetter, type TakeoverTrigger, type Teammate, type UsageWindow, usageSource, waitingConfirm, waitingInTerminal } from "./core.ts";
 
 /** The widest the frame may get, borders included. */
 export const MAX_WIDTH = 96;
@@ -167,7 +167,7 @@ export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockD
 		// A Teammate stopped to make room, or that ended (stopped with its dropped Task, or crashed), is gone for this Effort.
 		teammates,
 		queued: state.queue.map((queued) => ({ task: queued.folder, role: queued.role, why: queued.why })),
-		waitingOnYou: state.pending.length + waitingInTerminal(state).length + openEscalations(state).length + extras.adoptionsPending + (state.usageItems?.length ?? 0),
+		waitingOnYou: state.pending.length + waitingInTerminal(state).length + openEscalations(state).length + extras.adoptionsPending + (state.usageItems?.length ?? 0) + (waitingConfirm(state) ? 1 : 0),
 		reports: state.reports,
 		...pauseRows(state),
 		...usageRow(state, teammates.length),

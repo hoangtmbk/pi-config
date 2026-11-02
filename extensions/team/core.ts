@@ -1358,6 +1358,12 @@ export function waitingInTerminal(state: EffortState): HeldRequest[] {
 	return Object.values(state.teammateRequests).filter((held) => held.state === "expired");
 }
 
+/** The usage-credit confirm waiting in a Teammate's terminal, which only the human answers there; undefined when none waits. */
+export function waitingConfirm(state: EffortState): (ModelHold & { teammate: string }) | undefined {
+	const hold = state.holds?.[CONSENT_FAMILY];
+	return hold?.kind === "consent" && hold.teammate !== undefined ? { ...hold, teammate: hold.teammate } : undefined;
+}
+
 /** The state an Effort's lines fold to. The first line must open the Effort. */
 export function fold(lines: readonly EffortLine[]): EffortState {
 	const [first, ...rest] = lines;
@@ -3700,6 +3706,7 @@ function reportSections(state: EffortState, modes: readonly { role: string; mode
 								: `\`${item.id}\`: approve ${requestName(item)}, ${item.path} (sha256 ${item.sha256})${item.affects && item.affects.length > 0 ? `, holding ${quoted(item.affects)}` : ""}, in \`/team pending\``,
 				),
 				...waitingInTerminal(state).map((held) => `\`${held.request}\`: ${terminalText(held)}`),
+				...[waitingConfirm(state)].flatMap((hold) => (hold ? [`\`${hold.teammate}\`: a usage-credit confirm waits in its terminal, which only you answer: attach to it from \`/team pending\` or \`/team\``] : [])),
 				...openEscalations(state).map((escalation) => `\`${escalation.id}\`: ${escalationText(escalation, state)}, escalated: ${escalation.summary} Answer it in \`/team pending\``),
 				...(state.usageItems ?? []).map((item) => `\`${item.id}\`: ${usageText(item, state.teammates)}, in \`/team pending\``),
 			],

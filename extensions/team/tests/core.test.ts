@@ -2728,6 +2728,11 @@ describe("usage limits", () => {
 		const woken = consent.actions.find((action) => action.kind === "wake-lead");
 		assert.match(woken?.kind === "wake-lead" ? woken.text : "", /Only the human confirms usage credits.*Never confirm them yourself/s);
 		const held = [...lines, ...consent.append];
+		const reported = run(held, { kind: "report", headline: "Held.", criteria: ["AC1"], modes: [], at: "2026-11-02T12:14:00.000Z" });
+		const written = reported.ok ? reported.actions.find((each) => each.kind === "write-report") : undefined;
+		assert.deepEqual(written?.kind === "write-report" ? written.report.sections.find((each) => each.title === "Waiting on you")?.lines : undefined, [
+			"`dev-1`: a usage-credit confirm waits in its terminal, which only you answer: attach to it from `/team pending` or `/team`",
+		]);
 		const docs = run(held, { kind: "handoff", slug: "docs", at: "2026-11-02T12:15:00.000Z" });
 		assert.equal(docs.ok && docs.state.queue[0]?.why, "held: usage-credit confirm");
 		// The human answered it in dev-1's terminal: its turn goes on, and the hold lifts.

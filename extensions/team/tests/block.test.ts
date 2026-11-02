@@ -515,4 +515,12 @@ describe("team_status data", () => {
 		assert.equal(status.waitingOnYou, 1);
 		assert.equal(teamStatus(fold(opened), { adoptionsPending: 0 }).holds, undefined);
 	});
+
+	it("counts a usage-credit confirm waiting in a Teammate's terminal as waiting on the human, until it is answered", () => {
+		const opened = through([REQUEST, APPROVE, PLAN]);
+		const consent: EffortLine[] = [...opened, { type: "model-held", family: "fable", kind: "consent", roles: ["dev"], teammate: "dev-1", at: "2026-11-02T12:11:00.000Z" }];
+
+		assert.equal(teamStatus(fold(consent), { adoptionsPending: 0 }).waitingOnYou, 1);
+		assert.equal(teamStatus(fold([...consent, { type: "model-released", family: "fable", at: "2026-11-02T12:20:00.000Z" }]), { adoptionsPending: 0 }).waitingOnYou, 0);
+	});
 });
