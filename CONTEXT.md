@@ -147,3 +147,16 @@ _Avoid_: project, job, session, run
 One unit of work the Lead hands to one Teammate, as its plan for meeting the Brief. The Brief is
 what the human wants; Tasks are how the Lead gets there.
 _Avoid_: ticket, job, assignment
+
+**Report**:
+What the Lead tells the human about an Effort's progress: when the human asks, at a cadence the
+Playbook sets, or when the Lead judges it worthwhile, starting with the plan and ending with the
+final report at sign-off. It asks the human for nothing. Approvals and escalated questions are
+not Reports.
+_Avoid_: status update, digest, summary, notification
+
+**Workspace**:
+The folder an Effort's Teammates work in, kept apart from the human's own copy of the work so
+the human can carry on alongside the Team. Each Team says what kind of Workspace it needs.
+Teammates hand work to each other through the Effort's Task records, not through the Workspace.
+_Avoid_: checkout, sandbox, working copy
