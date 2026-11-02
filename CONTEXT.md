@@ -109,7 +109,7 @@ _Avoid_: rules list, constraints summary, memory
 
 **Lead**:
 The pi session that works with the human first, until it understands what they want, then
-directs a Team's Teammates toward it. The human's single point of contact for the effort.
+directs a Team's Teammates toward it. The human's single point of contact for the Effort.
 _Avoid_: orchestrator, manager, supervisor (that is the subagents extension's)
 
 **Team**:
@@ -130,10 +130,33 @@ _Avoid_: worker, terminal, run (that is a pi child process), subagent
 **Playbook**:
 A Team's standing guidance on how the Lead runs it: who does what, in what order, what counts as
 done, and when to come back to the human. Agreed with the human in Team setup and revised only
-with them. Reused across efforts.
+with them. Reused across Efforts.
 _Avoid_: pipeline, workflow, process, SOP
 
 **Brief**:
-What the human wants from one effort, agreed with the Lead at intake. No Teammate starts until
+What the human wants from one Effort, agreed with the Lead at intake. No Teammate starts until
 the human has approved it.
-_Avoid_: spec, requirements, ticket, task
+_Avoid_: spec, requirements, ticket, task (that is a Task)
+
+**Effort**:
+One run of a Team against one approved Brief, from intake to the human's sign-off. A Lead holds
+at most one Effort at a time.
+_Avoid_: project, job, session, run
+
+**Task**:
+One unit of work the Lead hands to one Teammate, as its plan for meeting the Brief. The Brief is
+what the human wants; Tasks are how the Lead gets there.
+_Avoid_: ticket, job, assignment
+
+**Report**:
+What the Lead tells the human about an Effort's progress: when the human asks, at a cadence the
+Playbook sets, or when the Lead judges it worthwhile, starting with the plan and ending with the
+final report at sign-off. It asks the human for nothing. Approvals and escalated questions are
+not Reports.
+_Avoid_: status update, digest, summary, notification
+
+**Workspace**:
+The folder an Effort's Teammates work in, kept apart from the human's own copy of the work so
+the human can carry on alongside the Team. Each Team says what kind of Workspace it needs.
+Teammates hand work to each other through the Effort's Task records, not through the Workspace.
+_Avoid_: checkout, sandbox, working copy
