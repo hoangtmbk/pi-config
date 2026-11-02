@@ -41,6 +41,15 @@ export function restaffPointer(slug: string, taskDir: string, round: number): st
 	].join(" ");
 }
 
+/**
+ * The pointer a Teammate's launch carries for round `round` of a Task: the
+ * handoff's for the first, and for a later one, the rounds so far, since a
+ * Teammate launched on a sent-back Task has none of them in its context.
+ */
+export function launchPointer(slug: string, taskDir: string, round: number): string {
+	return round > 1 ? restaffPointer(slug, taskDir, round - 1) : handoffPointer(slug, taskDir, 1);
+}
+
 /** Who the preamble is for, and where the files it points at are. */
 export interface PreambleFor {
 	teammateId: string;

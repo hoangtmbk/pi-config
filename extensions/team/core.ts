@@ -757,6 +757,8 @@ export type EffortInput =
 			sendBackLimit: number;
 			/** The permission mode a new Teammate of the Task's Role launches in, should a send-back need one. */
 			mode?: string;
+			/** The cap of live Teammates, for a send-back whose Teammate has ended and goes through the staffing ladder. */
+			maxTeammates?: number;
 			at: string;
 	  }
 	/**
@@ -850,11 +852,11 @@ export type EffortAction =
 	 */
 	| { kind: "send-back"; teammate: string; inbox: Inbox; slug: string; folder: string; round: number; feedback: string }
 	/**
-	 * Write `feedback` as `feedback-<round>.md` in the Task's folder, then
-	 * launch a new Teammate on the Task, since its own has ended: its pointer
-	 * names `task.md`, the results and feedback so far, and `result-<round + 1>.md`.
+	 * Write `feedback` as `feedback-<round>.md` in the Task's folder, for a
+	 * send-back whose Teammate has ended: the Teammate the staffing ladder gives
+	 * it, now or once queued, launches with a pointer to the rounds so far.
 	 */
-	| { kind: "restaff-teammate"; teammate: Omit<Teammate, "task" | "startedAt">; slug: string; folder: string; round: number; feedback: string }
+	| { kind: "write-feedback"; folder: string; round: number; feedback: string }
 	/** Stop the Teammate's background session, `claude stop <short id>`, which keeps its conversation; its `--name` before it has a short id. */
 	| { kind: "stop-teammate"; teammate: string; shortId: string }
 	/** Write the Report as `reports/<nnn>.md`. */
@@ -1070,8 +1072,8 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "task-dropped":
 			return { ...withTask(state, line.slug, { dropped: line.at }), queue: state.queue.filter((queued) => queued.slug !== line.slug) };
 		case "task-reassigned":
-			// Its new Teammate's launch carries the pointer.
-			return owe(withTask(state, line.slug, { teammate: line.teammate }), line.slug, undefined);
+			// Its new Teammate's launch carries the pointer. A sent-back Task queued for one leaves the queue.
+			return { ...owe(withTask(state, line.slug, { teammate: line.teammate }), line.slug, undefined), queue: state.queue.filter((queued) => queued.slug !== line.slug) };
 		case "teammate-ended":
 			return endRequests({ ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, ended: { how: line.how, at: line.at } } : teammate)) }, line.teammate);
 		case "teammate-crashed":
@@ -2276,17 +2278,21 @@ function free(state: EffortState, teammate: Teammate): boolean {
  * A reused Teammate `agents` doesn't list has idle-stopped: its inbox is
  * closed, and a clear only reaches an inbox, so it starts afresh instead,
  * which leaves it in the same fresh context a clear would.
+ *
+ * A sent-back Task whose Teammate ended goes up the same ladder, in its own
+ * folder (and worktree): a Teammate reused for it starts afresh, since its
+ * launch is what carries the pointer to the rounds so far.
  */
 function staff(state: EffortState, task: QueuedTask, max: number, agents?: readonly string[]): { append: EffortLine[]; actions: EffortAction[]; who: string; note?: string } | undefined {
-	const handed = { type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, at: task.at, round: 1 } as const;
 	// An isolated Task needs a Teammate launched in its own worktree, so it never reuses one.
 	const reused = task.isolated ? undefined : live(state).find((teammate) => teammate.role === task.role && teammate.inbox !== undefined && free(state, teammate));
 	if (reused?.freshDue && reused.shortId) return relaunch(state, reused, task, freshForBrief(reused.role));
 	if (reused && agents !== undefined && !agents.includes(reused.name)) return relaunch(state, reused, task, FRESH_FOR_IDLE);
+	if (reused && sentBack(state, task.slug)) return relaunch(state, reused, task, FRESH_FOR_SENT_BACK);
 	if (reused?.inbox) {
 		return {
 			append: [
-				{ ...handed, teammate: reused.id },
+				takenBy(state, task, reused.id),
 				{ type: "clear-requested", teammate: reused.id, slug: task.slug, at: task.at },
 			],
 			actions: [{ kind: "clear-then-send", teammate: reused.id, inbox: reused.inbox, slug: task.slug, folder: task.folder }],
@@ -2313,6 +2319,21 @@ function freshForBrief(role: string): string {
 	return `An approved Brief change altered Role \`${role}\`'s launch options, so its old session is stopped (its conversation kept) and a new one starts with them; it keeps its id, with a new short id.`;
 }
 
+/** Whether `slug` is a sent-back Task waiting for a new Teammate, rather than one handed off for the first time. */
+function sentBack(state: EffortState, slug: string): boolean {
+	const task = state.tasks[slug];
+	return task !== undefined && task.dropped === undefined;
+}
+
+/** The line that gives `task` to `teammate`: its handoff, or for a sent-back Task, its reassignment. */
+function takenBy(state: EffortState, task: QueuedTask, teammate: string, worktree?: TaskWorktree): EffortLine {
+	if (sentBack(state, task.slug)) return { type: "task-reassigned", slug: task.slug, teammate, at: task.at };
+	return { type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate, at: task.at, round: 1, ...(worktree ? { worktree } : {}) };
+}
+
+/** Why an idle Teammate given a sent-back Task starts afresh rather than being cleared. */
+const FRESH_FOR_SENT_BACK = "It was idle, its own Task accepted, so a new session starts on this one (the old conversation is kept), launched with the pointer to the rounds so far; it keeps its id, with a new short id.";
+
 /** Why an idle-stopped Teammate starts afresh rather than being cleared. */
 const FRESH_FOR_IDLE =
 	"It had idle-stopped, and a clear only reaches a running session, so a new session starts in the fresh context a clear would leave (the old conversation is kept); it keeps its id, with a new short id.";
@@ -2327,7 +2348,7 @@ function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask, note
 	const at = new Date(Math.max(Date.parse(task.at), last + STAGGER_MS)).toISOString();
 	return {
 		append: [
-			{ type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate: teammate.id, at: task.at, round: 1 },
+			takenBy(state, task, teammate.id),
 			{ type: "teammate-relaunched", teammate: teammate.id, task: task.slug, ...(task.mode === undefined ? {} : { mode: task.mode }), at },
 		],
 		actions: [
@@ -2350,7 +2371,7 @@ function start(state: EffortState, task: QueuedTask): { append: EffortLine[]; ac
 	return {
 		append: [
 			{ type: "teammate-started", id, role: task.role, name, task: task.slug, startedAt: at, ...(task.mode === undefined ? {} : { mode: task.mode }) },
-			{ type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate: id, at: task.at, round: 1, ...(worktree ? { worktree } : {}) },
+			takenBy(state, task, id, worktree),
 		],
 		actions: worktree && state.workspace ? [{ kind: "add-task-workspace", slug: task.slug, from: state.workspace.branch, ...worktree }, launch] : [launch],
 		who: worktree
@@ -3105,26 +3126,38 @@ function review(state: EffortState, input: Extract<EffortInput, { kind: "review"
 }
 
 /**
- * A send-back of a Task whose Teammate has ended: a new Teammate of its Role
- * takes the next round in the same folder, where the Task, its results and
- * the feedback are.
+ * A send-back of a Task whose Teammate has ended: the staffing ladder gives
+ * the next round, in the same folder where the Task, its results and the
+ * feedback are, to another Teammate of its Role, reused, started under the
+ * cap or in a free one's place. While none can take it, or a pause or a hold
+ * on its Role stands, it queues, and starts by itself like any queued Task.
  */
 function restaff(state: EffortState, input: Extract<EffortInput, { kind: "review" }>, task: HandedTask, feedback: string, count: string): Step {
-	const n = state.teammates.filter((teammate) => teammate.role === task.role).length + 1;
-	const id = `${task.role}-${n}`;
-	const name = `team-${state.effortId}-${id}`;
+	const back: EffortLine = { type: "task-sent-back", slug: input.slug, round: task.round, at: input.at };
+	const after = apply(state, back);
+	const wanted: QueuedTask = { slug: input.slug, folder: task.folder, role: task.role, why: "", at: input.at, ...(input.mode === undefined ? {} : { mode: input.mode }) };
+	const write: EffortAction = { kind: "write-feedback", folder: task.folder, round: task.round, feedback };
+	const sent = `Sent Task \`${input.slug}\` back (${count}) with feedback-${task.round}.md. \`${task.teammate}\` has ended`;
+	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
+	const pauses = heldPauses(after);
+	const hold = holdOn(after, task.role);
+	const staffed = pauses.length > 0 || hold ? undefined : staff(after, wanted, max);
+	if (staffed) {
+		const id = staffed.append.flatMap((line) => (line.type === "task-reassigned" ? [line.teammate] : []))[0] ?? "";
+		return took(
+			state,
+			[back, ...staffed.append],
+			[write, ...staffed.actions, { kind: "write-plan" }],
+			`${sent}, so this ${staffed.who.replace(id, `\`${id}\``)} on it, pointed at the Task's folder; it writes result-${task.round + 1}.md next, and you are woken when it does.${staffed.note ? ` ${staffed.note}` : ""}`,
+		);
+	}
+	const why = pauses.length > 0 ? "paused" : hold ? heldWhy(hold) : waitReason(after, max);
+	const waits = pauses.length > 0 ? pauses.map(pauseText).join(", and ") : hold ? `Role \`${task.role}\` is held by ${holdText(hold)}` : why;
 	return took(
 		state,
-		[
-			{ type: "teammate-started", id, role: task.role, name, task: input.slug, startedAt: input.at, ...(input.mode === undefined ? {} : { mode: input.mode }) },
-			{ type: "task-sent-back", slug: input.slug, round: task.round, at: input.at },
-			{ type: "task-reassigned", slug: input.slug, teammate: id, at: input.at },
-		],
-		[
-			{ kind: "restaff-teammate", teammate: { id, role: task.role, name }, slug: input.slug, folder: task.folder, round: task.round, feedback },
-			{ kind: "write-plan" },
-		],
-		`Sent Task \`${input.slug}\` back (${count}) with feedback-${task.round}.md. \`${task.teammate}\` has ended, so this started \`${id}\` on it, pointed at the Task's folder; it writes result-${task.round + 1}.md next, and you are woken when it does.`,
+		[back, { type: "task-queued", ...wanted, why }],
+		[write, { kind: "write-plan" }],
+		`${sent}, and no Teammate can take it now (${waits}), so it is queued: it starts by itself once one can, pointed at the Task's folder, and writes result-${task.round + 1}.md.`,
 	);
 }
 
@@ -3335,6 +3368,8 @@ export function taskStatus(state: EffortState, slug: string): TaskStatus {
 		return "dropped";
 	}
 	if (task.accepted !== undefined) return "accepted";
+	// A send-back whose Teammate ended waits in the queue for another.
+	if (state.queue.some((queued) => queued.slug === slug)) return "queued";
 	if (task.reported === task.round) return "in review";
 	return task.round > 1 ? "sent back" : "running";
 }

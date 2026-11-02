@@ -1997,18 +1997,17 @@ describe("a Teammate's lifecycle", () => {
 
 		assert.ok(result.ok, result.ok ? "" : result.refusal);
 		assert.deepEqual(result.append, [
-			{ type: "teammate-started", id: "dev-2", role: "dev", name: "team-software-2026-11-02-dev-2", task: "rename", startedAt: "2026-11-02T13:00:00.000Z", mode: "auto" },
 			{ type: "task-sent-back", slug: "rename", round: 1, at: "2026-11-02T13:00:00.000Z" },
+			{ type: "teammate-started", id: "dev-2", role: "dev", name: "team-software-2026-11-02-dev-2", task: "rename", startedAt: "2026-11-02T13:00:00.000Z", mode: "auto" },
 			{ type: "task-reassigned", slug: "rename", teammate: "dev-2", at: "2026-11-02T13:00:00.000Z" },
 		]);
 		assert.deepEqual(result.actions, [
+			{ kind: "write-feedback", folder: "001-dev-rename", round: 1, feedback: "The loader still reads `colour`." },
 			{
-				kind: "restaff-teammate",
+				kind: "launch-teammate",
 				teammate: { id: "dev-2", role: "dev", name: "team-software-2026-11-02-dev-2" },
-				slug: "rename",
-				folder: "001-dev-rename",
-				round: 1,
-				feedback: "The loader still reads `colour`.",
+				task: { slug: "rename", folder: "001-dev-rename" },
+				at: "2026-11-02T13:00:00.000Z",
 			},
 			{ kind: "write-plan" },
 		]);

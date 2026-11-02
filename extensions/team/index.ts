@@ -115,7 +115,7 @@ import {
 	type TeamSetup,
 } from "./setup.ts";
 import { pickTeam, proposeTeam, type StartOutcome } from "./start.ts";
-import { handoffPointer, restaffPointer, sendBackPointer, teammatePrompt } from "./teammate.ts";
+import { handoffPointer, launchPointer, restaffPointer, sendBackPointer, teammatePrompt } from "./teammate.ts";
 
 /** The Lead's tools while this session runs Team setup. */
 const SETUP_TOOLS = ["team_request_approval"];
@@ -1189,38 +1189,6 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	}
 
 	/**
-	 * Send a Task back to a new Teammate of its Role, its own having ended: the
-	 * feedback is written for the pointer to name, and taken back if the launch
-	 * fails, so the Lead can send it back again; the lines go on record once it
-	 * has started, as a handoff's do.
-	 */
-	async function restaffTask(
-		held: HeldEffort,
-		result: Extract<Step, { ok: true }>,
-		{ teammate, slug, folder, round, feedback }: Extract<EffortAction, { kind: "restaff-teammate" }>,
-		ctx: ExtensionContext,
-	): Promise<void> {
-		const { roles, playbook } = approved(held);
-		const role = roles.find((each) => each.name === teammate.role);
-		const workspace = result.state.workspace;
-		if (!role || !workspace) throw new Error(`Task \`${slug}\` can't go to a new Teammate: Effort \`${held.effortId}\` has no Role \`${teammate.role}\` in its Team snapshot or no Workspace. Stop and tell the human.`);
-		const taskDir = join(held.paths.tasks, folder);
-		const written = writeFeedback(held.paths, folder, round, feedback);
-		await listenForTeammates(held, ctx);
-		const cwd = workdir(result.state, teammate.id) ?? workspace.path;
-		appendLines(held.paths, [{ type: "launch-intended", teammate: teammate.id, name: teammate.name, lines: result.append, at: now().toISOString() }]);
-		const launched = await launchBackground(paths.claudePath, cwd, launchArgs(held, teammate, role, playbook, restaffPointer(slug, taskDir, round), cwd));
-		if (launched) {
-			appendLines(held.paths, [{ type: "launch-abandoned", teammate: teammate.id, reason: launched.error, at: now().toISOString() }]);
-			rmSync(written);
-			throw new Error(`Teammate \`${teammate.id}\` didn't start, so Task \`${slug}\` isn't sent back and its feedback-${round}.md is taken back: ${launched.error}`);
-		}
-		writePlan(held.paths, result.state);
-		appendLines(held.paths, result.append);
-		wakeAboutTeammates(applyJournals(held));
-	}
-
-	/**
 	 * Accept an isolated Task by merging its branch into the Effort branch. The
 	 * intent is on record before git runs, so a merge cut short is found again;
 	 * a refused merge closes it and leaves the Task in review. Once merged, the
@@ -1327,34 +1295,42 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const { roles, playbook } = approved(held);
 		const stopped: string[] = [];
 		const added: Extract<EffortAction, { kind: "add-task-workspace" }>[] = [];
-		const still = body === undefined ? "queued" : "planned";
-		for (const action of result.actions) {
-			if (action.kind === "write-task" && body !== undefined) writeTask(held.paths, action.folder, body);
-			else if (action.kind === "add-task-workspace") {
-				const cut = addTaskWorkspace(result.state.repo, action);
-				if ("error" in cut) throw new Error(`Task \`${action.slug}\` didn't get a worktree of its own, so it is still ${still}: ${cut.error}`);
-				added.push(action);
-			}
-			else if (action.kind === "write-plan") writePlan(held.paths, result.state);
-			else if (action.kind === "stop-teammate") {
-				const failed = await stopTeammate(result.state, action);
-				if (failed) throw new Error(`Idle Teammate \`${action.teammate}\` didn't stop (${failed.error}), so no Teammate starts in its place; stop and tell the human.`);
-				stopped.push(action.teammate);
-			} else if (action.kind === "launch-teammate") {
-				// Written ahead, so a restart mid-launch finds the Teammate again rather than starting a second.
-				appendLines(held.paths, [{ type: "launch-intended", teammate: action.teammate.id, name: action.teammate.name, lines: result.append, at: now().toISOString() }]);
-				const failed = await launchTeammate(held, result.state, action, roles, playbook);
-				if (failed) {
-					// Its worktree goes with it: nothing was worked there, and a handoff again cuts it afresh.
-					for (const worktree of added) removeTaskWorkspace(result.state.repo, worktree, true);
-					// The idle Teammate stopped for it is gone either way.
-					appendLines(held.paths, [
-						...result.append.filter((line) => line.type === "teammate-retired" && stopped.includes(line.teammate)),
-						{ type: "launch-abandoned", teammate: action.teammate.id, reason: failed, at: now().toISOString() },
-					]);
-					throw new Error(`Teammate \`${action.teammate.id}\` didn't start, so Task \`${action.task.slug}\` is still ${still}: ${failed}`);
+		const feedback = result.actions.find((action) => action.kind === "write-feedback");
+		// A send-back whose Teammate ended takes its feedback back if no Teammate starts on it, so the Lead can send it back again.
+		const still = (slug: string): string =>
+			feedback ? `Task \`${slug}\` isn't sent back and its feedback-${feedback.round}.md is taken back` : `Task \`${slug}\` is still ${body === undefined ? "queued" : "planned"}`;
+		const written = feedback ? writeFeedback(held.paths, feedback.folder, feedback.round, feedback.feedback) : undefined;
+		try {
+			for (const action of result.actions) {
+				if (action.kind === "write-task" && body !== undefined) writeTask(held.paths, action.folder, body);
+				else if (action.kind === "add-task-workspace") {
+					const cut = addTaskWorkspace(result.state.repo, action);
+					if ("error" in cut) throw new Error(`Task \`${action.slug}\` didn't get a worktree of its own, so it is still ${body === undefined ? "queued" : "planned"}: ${cut.error}`);
+					added.push(action);
+				} else if (action.kind === "write-plan") writePlan(held.paths, result.state);
+				else if (action.kind === "stop-teammate") {
+					const failed = await stopTeammate(result.state, action);
+					if (failed) throw new Error(`Idle Teammate \`${action.teammate}\` didn't stop (${failed.error}), so no Teammate starts in its place; stop and tell the human.`);
+					stopped.push(action.teammate);
+				} else if (action.kind === "launch-teammate") {
+					// Written ahead, so a restart mid-launch finds the Teammate again rather than starting a second.
+					appendLines(held.paths, [{ type: "launch-intended", teammate: action.teammate.id, name: action.teammate.name, lines: result.append, at: now().toISOString() }]);
+					const failed = await launchTeammate(held, result.state, action, roles, playbook);
+					if (failed) {
+						// Its worktree goes with it: nothing was worked there, and a handoff again cuts it afresh.
+						for (const worktree of added) removeTaskWorkspace(result.state.repo, worktree, true);
+						// The idle Teammate stopped for it is gone either way.
+						appendLines(held.paths, [
+							...result.append.filter((line) => line.type === "teammate-retired" && stopped.includes(line.teammate)),
+							{ type: "launch-abandoned", teammate: action.teammate.id, reason: failed, at: now().toISOString() },
+						]);
+						throw new Error(`Teammate \`${action.teammate.id}\` didn't start, so ${still(action.task.slug)}: ${failed}`);
+					}
 				}
 			}
+		} catch (error) {
+			if (written) rmSync(written, { force: true });
+			throw error;
 		}
 		appendLines(held.paths, result.append);
 		for (const action of result.actions) {
@@ -1422,7 +1398,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const wait = Date.parse(at) - now().getTime();
 		if (wait > 0) await sleep(wait);
 		const cwd = workdir(state, teammate.id) ?? state.workspace.path;
-		const args = launchArgs(held, teammate, role, playbook, handoffPointer(task.slug, join(held.paths.tasks, task.folder), 1), cwd);
+		const args = launchArgs(held, teammate, role, playbook, launchPointer(task.slug, join(held.paths.tasks, task.folder), state.tasks[task.slug]?.round ?? 1), cwd);
 		return (await launchBackground(paths.claudePath, cwd, args))?.error;
 	}
 
@@ -2127,6 +2103,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				sendBackLimit: playbook.sendBackLimit,
 				at: now().toISOString(),
 				mode: launchMode(state, params.slug, roles, playbook),
+				maxTeammates: maxTeammates(),
 			});
 			if (!result.ok) throw new Error(result.refusal);
 			const merge = result.actions.find((action) => action.kind === "merge");
@@ -2136,9 +2113,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				paintBlock();
 				return { content: [{ type: "text", text: [said, ...started].join(" ") }], details: undefined };
 			}
-			const restaff = result.actions.find((action) => action.kind === "restaff-teammate");
-			if (restaff) {
-				await restaffTask(held, result, restaff, ctx);
+			if (result.actions.some((action) => action.kind === "write-feedback")) {
+				// Its Teammate has ended: the staffing ladder gives the next round to another, or queues it.
+				await listenForTeammates(held, ctx);
+				await staffTask(held, result);
+				wakeAboutTeammates(applyJournals(held));
 				return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
 			}
 			const sends: Extract<EffortAction, { kind: "send-back" }>[] = [];

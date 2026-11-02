@@ -2593,6 +2593,35 @@ describe("a Teammate's lifecycle", () => {
 		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /- Status: sent back, with `builder-2`/);
 	});
 
+	it("queues a send-back whose Teammate crashed while the Effort is at `maxTeammates`, and staffs it through the ladder once a Teammate frees up", async () => {
+		const crash: FakeHookStep = { event: "SessionEnd", payload: { reason: "other" }, when: "New Task `rename-key`" };
+		const { pi, dir } = await crewApproved({ settings: { maxTeammates: 1 }, hooks: [{ event: "SessionStart", payload: { source: "startup" } }, ...WORKS, crash], replies: WORKS });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await until(() => teammateWakes(pi.sent).some((wake) => /`builder-1`'s session ended/.test(wake.content)), "the Lead is woken about the crash");
+		assert.match(await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" }), /started scout-1/);
+		await until(() => existsSync(join(dir, "tasks", "002-scout-survey", "result-1.md")), "scout-1 writes its result");
+		await until(() => teammateWakes(pi.sent).some((wake) => wake.content.includes("002-scout-survey/result-1.md")), "the Lead is woken on scout-1's result");
+
+		const queued = await pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Also the docs." });
+
+		assert.match(queued, /`builder-1` has ended, and no Teammate can take it now \(cap 1 reached; waits for 002\), so it is queued/);
+		assert.equal(pi.claude.launches().length, 2, "no Teammate starts past the cap");
+		assert.ok(existsSync(join(dir, RENAME_DIR, "feedback-1.md")));
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: queued/);
+
+		const accepted = await pi.call("team_review", { slug: "survey", verdict: "accept" });
+
+		assert.match(accepted, /Queued Task `rename-key` started builder-2/);
+		assert.match(accepted, /stopped idle `scout-1`/);
+		const launches = pi.claude.launches();
+		assert.equal(launches.length, 3);
+		const pointer = launches[2]?.argv.at(-1) ?? "";
+		for (const file of ["task.md", "result-1.md", "feedback-1.md", "result-2.md"]) assert.ok(pointer.includes(join(dir, RENAME_DIR, file)), pointer);
+		await until(() => existsSync(join(dir, RENAME_DIR, "result-2.md")), "builder-2 writes round 2's result");
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: sent back, with `builder-2`/);
+	});
+
 	it("drops a handed-off Task left out of a re-plan, stopping its Teammate with `claude stop` and listing it under Dropped in plan.md", async () => {
 		const { pi, dir } = await renameReported();
 		const [session] = effortLines(dir).filter((line) => line.type === "teammate-session");
