@@ -2971,6 +2971,7 @@ describe("the Team block", () => {
 		assert.deepEqual(teamBlock(pi), [
 			"╭─ Team · software · software-2026-11-02 ─ 0 live ─╮",
 			"│ ● running  ·  intake                             │",
+			"│ 5h n/a · week n/a  · no reading yet              │",
 			"│ nothing waiting on you   reports 0               │",
 			"╰──────────────────────────────────────────────────╯",
 		]);
@@ -2994,6 +2995,7 @@ describe("the Team block", () => {
 		assert.deepEqual(teamBlock(pi), [
 			"╭─ Team · crew · crew-2026-11-02 ─────────────────────────────────── 1 live ─╮",
 			"│ ● running  ·  working · 0/3 Tasks accepted                                 │",
+			"│ 5h n/a · week n/a  · no reading yet                                        │",
 			"│ builder-1  c0ffee12  busy  001-builder-rename-key  ctx —  auto≠acceptEdits │",
 			"│ nothing waiting on you   reports 0   attach  /team                         │",
 			"╰────────────────────────────────────────────────────────────────────────────╯",
