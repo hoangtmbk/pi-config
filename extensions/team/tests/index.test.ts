@@ -331,8 +331,8 @@ describe("/team", () => {
 		await pi.team("");
 
 		assert.deepEqual(pi.notifications, [
-			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`, `attach`.", type: "error" },
-			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`, `attach`.", type: "info" },
+			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "error" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "info" },
 		]);
 	});
 });
@@ -777,7 +777,7 @@ describe("/team start on a Team with no adopted Playbook", () => {
 
 		assert.match(pi.notifications.at(-1)?.message ?? "", /^Team `software` picked: .*Playbook: adopted 2026-11-02T10:00:00\.000Z.* Effort `software-2026-11-02` opened/);
 		assert.equal(pi.sent.at(-1)?.customType, "team-intake");
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume"]);
 	});
 
 	it("goes back through setup when the adopted Playbook was edited by hand", async () => {
@@ -860,7 +860,7 @@ describe("intake: `/team start` on a Team with an adopted Playbook", () => {
 		for (const needed of [join(dir, "brief.draft.md"), sha(INTAKE_PLAYBOOK), `repo: ${repo}`, "Constraints", "small-diffs", "**AC1**", "`team_request_approval`", "`brief`"]) {
 			assert.ok(woken?.content.includes(needed), `the intake prompt doesn't mention ${needed}:\n${woken?.content}`);
 		}
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume"]);
 	});
 
 	it("gives each Effort its own id, so a second one the same day is numbered", async () => {
@@ -2437,6 +2437,101 @@ describe("`/team resume` in a session holding an Effort", () => {
 	});
 });
 
+describe("pausing: /team pause, /team resume, team_pause, team_resume", () => {
+	it("holds new Tasks while the human's pause holds: a handoff queues `paused`, the running Teammate isn't stopped, the block shows the pause, and only `/team resume` lifts it, starting the queued Task through the ladder", async () => {
+		const { pi, dir } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		await pi.call("team_plan", { tasks: STAFF_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+
+		await pi.team("pause lunch break");
+
+		assert.deepEqual(pi.notifications.at(-1), {
+			message: `Effort \`${CREW_EFFORT_ID}\` is paused: no new Task starts and handoffs queue, while running Teammates finish their Task.`,
+			type: "info",
+		});
+		const queued = await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
+		assert.match(
+			queued,
+			/^queued Task `survey` \(tasks\/002-scout-survey\/task\.md\): paused by the human since \d\d:\d\d UTC: lunch break\. It starts by itself once every pause is lifted \(only the human lifts it, with `\/team resume`\)\./,
+		);
+		assert.equal(pi.claude.launches().length, 1);
+		assert.deepEqual(
+			pi.claude.calls().filter((call) => call[0] === "stop"),
+			[],
+			"the running Teammate finishes its Task",
+		);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## survey\n[\s\S]*?- Status: queued\n/);
+		const block = teamBlock(pi) ?? [];
+		assert.ok(block.some((line) => line.includes("⏸ paused")), block.join("\n"));
+		assert.ok(block.some((line) => /by you since \d\d:\d\d UTC: lunch break {3}\/team resume/.test(line)), block.join("\n"));
+		assert.ok(block.some((line) => line.includes("queued  002-scout-survey (scout): paused")), block.join("\n"));
+		await assert.rejects(
+			pi.call("team_resume", {}),
+			/isn't paused by you, so there is nothing for you to resume\. It is paused by the human since \d\d:\d\d UTC: lunch break; only the human lifts it, with `\/team resume`/,
+		);
+		await pi.team("pause again");
+		assert.match(pi.notifications.at(-1)?.message ?? "", /is already paused by you since \d\d:\d\d UTC: lunch break\.$/);
+		const woken = pi.sent.length;
+
+		await pi.team("resume");
+
+		assert.equal(pi.notifications.at(-1)?.type, "info");
+		assert.match(
+			pi.notifications.at(-1)?.message ?? "",
+			/^Effort `crew-2026-11-02` runs again: queued Tasks start through the staffing ladder\. Queued Task `survey` started scout-1 \(tasks\/002-scout-survey\/task\.md\)/,
+		);
+		assert.equal(pi.claude.launches().length, 2);
+		assert.equal(pi.claude.launches()[1].argv.at(-1), newTaskPointer(dir, "survey", "002-scout-survey"));
+		assert.equal(pi.sent[woken]?.customType, "team-resumed");
+		assert.match(pi.sent[woken]?.content ?? "", /The human lifted their pause[\s\S]*Queued Task `survey` started scout-1/);
+		const after = teamBlock(pi) ?? [];
+		assert.ok(after.some((line) => line.includes("● running")), after.join("\n"));
+		assert.ok(!after.some((line) => line.includes("by you since")), after.join("\n"));
+		assert.deepEqual(
+			effortLines(dir)
+				.filter((line) => line.type === "paused" || line.type === "resumed")
+				.map((line) => [line.type, line.by, line.reason]),
+			[
+				["paused", "human", "lunch break"],
+				["resumed", "human", undefined],
+			],
+		);
+	});
+
+	it("lets the Lead pause with a reason and lift only its own pause, which `/team resume` leaves alone", async () => {
+		const { pi } = await crewApproved();
+
+		await assert.rejects(pi.call("team_pause", { reason: "  " }), /`team_pause` needs a `reason`/);
+		const paused = await pi.call("team_pause", { reason: "checking the API" });
+		assert.match(paused, /is paused: no new Task starts and handoffs queue/);
+		assert.ok((teamBlock(pi) ?? []).some((line) => /by the Lead since \d\d:\d\d UTC: checking the API/.test(line)), (teamBlock(pi) ?? []).join("\n"));
+		const status = JSON.parse(await pi.call("team_status", {})) as { pauses?: { by: string; reason?: string }[] };
+		assert.deepEqual(
+			status.pauses?.map(({ by, reason }) => [by, reason]),
+			[["lead", "checking the API"]],
+		);
+
+		await pi.team("resume");
+
+		assert.deepEqual(pi.notifications.at(-1)?.type, "info");
+		assert.match(
+			pi.notifications.at(-1)?.message ?? "",
+			/isn't paused by you, so there is nothing for you to resume\. It is paused by the Lead since \d\d:\d\d UTC: checking the API; only the Lead lifts it, with `team_resume`\.$/,
+		);
+		assert.match(await pi.call("team_resume", {}), /^Effort `crew-2026-11-02` runs again: queued Tasks start through the staffing ladder\.$/);
+		await assert.rejects(pi.call("team_resume", {}), /isn't paused by you, so there is nothing to resume\./);
+		assert.ok(!(teamBlock(pi) ?? []).some((line) => line.includes("⏸")), (teamBlock(pi) ?? []).join("\n"));
+	});
+
+	it("refuses `/team pause` in a session holding no Effort, naming how to open one", async () => {
+		const pi = fakePi(tempRoots());
+
+		await pi.team("pause");
+
+		assert.deepEqual(pi.notifications, [{ message: "This session holds no Effort, so there is nothing to pause; `/team start` opens one, and `/team resume` adopts one without a live Lead.", type: "error" }]);
+	});
+});
+
 describe("leaving the session", () => {
 	it("marks no live Lead on shutdown, keeping the record, so another session can adopt the Effort", async () => {
 		const { roots, repo, pi } = intakeSession();
@@ -2472,7 +2567,7 @@ describe("re-attaching: `pi -c`, `/resume` back and `/reload`", () => {
 			assert.equal(lead.stoppedAt, undefined);
 			assert.equal(typeof lead.port, "number");
 			assert.equal(lead.sessionFile, join(roots.scratch, "session.jsonl"));
-			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report"]);
+			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume"]);
 			assert.deepEqual(again.entries, []);
 			assert.deepEqual(again.notifications, [{ message: `This session leads Effort \`${EFFORT_ID}\` (${dir}) again.`, type: "info" }]);
 			assert.deepEqual(again.sent, []);
@@ -2749,8 +2844,8 @@ describe("/team attach [id]", () => {
 		await leading.team("attach qa-1");
 
 		assert.deepEqual(pi.notifications, [
-			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`, `attach`.", type: "info" },
-			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`, `attach`.", type: "info" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "info" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "info" },
 		]);
 		assert.deepEqual(leading.notifications, [{ message: "There is no Teammate `qa-1` with a session to attach to. Teammates with one: `builder-1`.", type: "error" }]);
 	});

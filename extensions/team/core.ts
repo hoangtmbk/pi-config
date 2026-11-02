@@ -195,7 +195,27 @@ export type EffortLine =
 	/** Work found outside the Brief (scope creep), kept for the final Report as a suggestion. */
 	| ({ type: "found-work" } & Logged)
 	/** Report `n` was written as `reports/<nnn>.md`; the next one covers what comes after this line. */
-	| { type: "report-written"; n: number; at: string };
+	| { type: "report-written"; n: number; at: string }
+	/** `by` paused the Effort: no new Task starts until every pause is lifted. */
+	| ({ type: "paused" } & Pause)
+	/** `by` lifted its own pause. */
+	| { type: "resumed"; by: PauseSetter; at: string }
+	/** A Task queued while paused waits on, once the Effort runs, for this reason instead. */
+	| { type: "task-requeued"; slug: string; why: string; at: string };
+
+/** Who set a pause, the only one who lifts it: the human, the Lead, or a usage limit. */
+export type PauseSetter = "human" | "lead" | "usage";
+
+/** A pause that holds. */
+export interface Pause {
+	by: PauseSetter;
+	reason?: string;
+	/** When it started. */
+	at: string;
+}
+
+/** Who lifts each pause, in the order the Team block shows them. */
+const SETTERS: readonly PauseSetter[] = ["human", "lead", "usage"];
 
 /** One entry of the decided-for-you or found-work log. */
 export interface Logged {
@@ -253,6 +273,8 @@ export interface EffortState {
 	decided: Logged[];
 	/** The found-work (scope-creep) log, oldest first. */
 	found: Logged[];
+	/** The pauses that hold, by setter; absent before the first pause. */
+	pauses?: Partial<Record<PauseSetter, Pause>>;
 }
 
 /** A new input to the core. */
@@ -322,7 +344,11 @@ export type EffortInput =
 	 */
 	| { kind: "drain"; at: string; maxTeammates?: number }
 	/** The human used the `/team` menu on a Teammate: attached here, in a tmux window, or took the command. */
-	| { kind: "attach"; teammate: string; at: string };
+	| { kind: "attach"; teammate: string; at: string }
+	/** `/team pause` from the human, or `team_pause` from the Lead, which must give a reason. */
+	| { kind: "pause"; by: "human" | "lead"; reason?: string; at: string }
+	/** `/team resume` from the human in a session holding the Effort, or `team_resume` from the Lead: each lifts only its own pause. */
+	| { kind: "resume"; by: "human" | "lead"; at: string };
 
 /** Work the core leaves to the shell. */
 export type EffortAction =
@@ -472,6 +498,16 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			const { type, ...logged } = line;
 			return type === "decided-for-you" ? { ...state, decided: [...state.decided, logged] } : { ...state, found: [...state.found, logged] };
 		}
+		case "paused": {
+			const { type: _type, ...pause } = line;
+			return { ...state, pauses: { ...state.pauses, [line.by]: pause } };
+		}
+		case "resumed": {
+			const { [line.by]: _lifted, ...rest } = state.pauses ?? {};
+			return { ...state, pauses: rest };
+		}
+		case "task-requeued":
+			return { ...state, queue: state.queue.map((queued) => (queued.slug === line.slug ? { ...queued, why: line.why } : queued)) };
 		case "report-written":
 			return state;
 		case "task-done": {
@@ -532,7 +568,72 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return report(state, input);
 		case "attach":
 			return attach(state, input);
+		case "pause":
+			return pause(state, input);
+		case "resume":
+			return resume(state, input);
 	}
+}
+
+/** The pauses that hold, the human's first, then the Lead's, then the usage pause. The Effort runs only when there are none. */
+export function heldPauses(state: EffortState): Pause[] {
+	return SETTERS.flatMap((by) => state.pauses?.[by] ?? []);
+}
+
+/** Who set a pause, as a reply to someone else names them. */
+const SETTER_NAMES: Record<PauseSetter, string> = { human: "the human", lead: "the Lead", usage: "a usage limit" };
+
+/** A pause, as a reply names it: who set it, since when, and why. */
+function pauseText(pause: Pause): string {
+	return `paused by ${SETTER_NAMES[pause.by]} since ${clock(pause.at)} UTC${pause.reason === undefined ? "" : `: ${pause.reason}`}`;
+}
+
+/** Who lifts a pause and how. */
+function lifter(pause: Pause): string {
+	if (pause.by === "human") return "only the human lifts it, with `/team resume`";
+	if (pause.by === "lead") return "only the Lead lifts it, with `team_resume`";
+	return "it lifts at its reset";
+}
+
+/** Set the human's or the Lead's pause: no new Task starts while it holds, and running Teammates finish their Task. */
+function pause(state: EffortState, input: Extract<EffortInput, { kind: "pause" }>): Step {
+	const held = state.pauses?.[input.by];
+	if (held) {
+		return { ok: false, refusal: `Effort \`${state.effortId}\` is already paused by you since ${clock(held.at)} UTC${held.reason === undefined ? "" : `: ${held.reason}`}.` };
+	}
+	const reason = input.reason?.trim();
+	if (input.by === "lead" && !reason) return { ok: false, refusal: "`team_pause` needs a `reason`: say in a sentence why the Team should hold, for the human to read in the Team block." };
+	const others = heldPauses(state);
+	return took(
+		state,
+		[{ type: "paused", by: input.by, ...(reason ? { reason } : {}), at: input.at }],
+		[],
+		`Effort \`${state.effortId}\` is paused: no new Task starts and handoffs queue, while running Teammates finish their Task.${others.length > 0 ? ` It was already ${others.map(pauseText).join(", and ")}.` : ""}`,
+	);
+}
+
+/** Lift the setter's own pause, never another's. */
+function resume(state: EffortState, input: Extract<EffortInput, { kind: "resume" }>): Step {
+	if (!state.pauses?.[input.by]) {
+		const others = heldPauses(state);
+		return {
+			ok: false,
+			refusal:
+				others.length === 0
+					? `Effort \`${state.effortId}\` isn't paused by you, so there is nothing to resume.`
+					: `Effort \`${state.effortId}\` isn't paused by you, so there is nothing for you to resume. It is ${others.map((each) => `${pauseText(each)}; ${lifter(each)}`).join(", and ")}.`,
+		};
+	}
+	const lifted: EffortLine = { type: "resumed", by: input.by, at: input.at };
+	const still = heldPauses(apply(state, lifted));
+	return took(
+		state,
+		[lifted],
+		[],
+		still.length === 0
+			? `Effort \`${state.effortId}\` runs again: queued Tasks start through the staffing ladder.`
+			: `Lifted your pause, but Effort \`${state.effortId}\` is still ${still.map(pauseText).join(", and ")}, so nothing new starts yet.`,
+	);
 }
 
 /** The human used the `/team` menu on a Teammate: its short id is recorded as the one last attached, once per change. */
@@ -731,8 +832,17 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 	const folder = `${String(Object.keys(state.tasks).length + state.queue.length + 1).padStart(3, "0")}-${task.role}-${task.slug}`;
 	const wanted: QueuedTask = { slug: task.slug, folder, role: task.role, why: "", at: input.at, ...(input.mode === undefined ? {} : { mode: input.mode }) };
 	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
-	const staffed = staff(state, wanted, max);
 	const pointer = `Task \`${task.slug}\` (tasks/${folder}/task.md)`;
+	const pauses = heldPauses(state);
+	if (pauses.length > 0) {
+		return took(
+			state,
+			[{ type: "task-queued", ...wanted, why: "paused" }],
+			[{ kind: "write-task", slug: task.slug, folder }, { kind: "write-plan" }],
+			`queued ${pointer}: ${pauses.map(pauseText).join(", and ")}. It starts by itself once every pause is lifted (${pauses.map(lifter).join("; ")}).`,
+		);
+	}
+	const staffed = staff(state, wanted, max);
 	if (staffed) {
 		return took(
 			state,
@@ -829,6 +939,7 @@ function waitReason(state: EffortState, max: number): string {
  */
 function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }>): Step {
 	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
+	if (heldPauses(state).length > 0) return took(state, [], []);
 	for (const queued of state.queue) {
 		// It starts now, whenever it was queued.
 		const staffed = staff(state, { ...queued, at: input.at }, max);
@@ -840,7 +951,13 @@ function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }
 			`Queued Task \`${queued.slug}\` ${staffed.who} (tasks/${queued.folder}/task.md).${staffed.note ? ` ${staffed.note}` : ""}`,
 		);
 	}
-	return took(state, [], []);
+	// A Task queued while paused still waits once the Effort runs: it gets the reason it waits for now, with no reply.
+	const why = waitReason(state, max);
+	return took(
+		state,
+		state.queue.filter((queued) => queued.why === "paused").map((queued) => ({ type: "task-requeued", slug: queued.slug, why, at: input.at })),
+		[],
+	);
 }
 
 /**
@@ -1045,6 +1162,10 @@ function told(line: EffortLine): string | undefined {
 			return `sent Task \`${line.slug}\` back after round ${line.round}`;
 		case "task-accepted":
 			return `accepted Task \`${line.slug}\` at round ${line.round}`;
+		case "paused":
+			return `${line.by === "human" ? "you" : line.by === "lead" ? "the Lead" : "a usage limit"} paused the Effort${line.reason === undefined ? "" : `: ${line.reason}`}`;
+		case "resumed":
+			return line.by === "human" ? "you lifted your pause" : line.by === "lead" ? "the Lead lifted its pause" : "the usage pause lifted";
 		case "permission-denied":
 			return `${line.teammate} was denied \`${line.tool}\`${line.reason === undefined ? "" : `: ${line.reason}`}`;
 		default:
