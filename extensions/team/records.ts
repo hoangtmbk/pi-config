@@ -102,7 +102,7 @@ export function appendLines(paths: EffortPaths, lines: readonly EffortLine[]): v
 }
 
 /** One line of `approvals.jsonl`: an approved act and the sha of everything it approved. */
-export type ApprovalRecord = BriefRecord | SignOffRecord | PlaybookChangeRecord;
+export type ApprovalRecord = BriefRecord | BriefChangeRecord | CheckpointRecord | SignOffRecord | PlaybookChangeRecord;
 
 /** The Brief's approval, which every record the Effort reads afterwards is checked against. */
 export interface BriefRecord {
@@ -118,6 +118,51 @@ export interface BriefRecord {
 	/** The Workspace the approval added, with the commit the Effort started from. */
 	workspace?: Workspace;
 	at: string;
+}
+
+/**
+ * A Brief change the human approved: `brief.md` is now its snapshot, while
+ * the Playbook and Team snapshots stay those the Brief approval recorded.
+ */
+export interface BriefChangeRecord {
+	act: "brief-change";
+	request: string;
+	/** Of `brief.md` as the change left it. */
+	brief: string;
+	/** The planned Tasks it held until the answer. */
+	affects: string[];
+	at: string;
+}
+
+/** An approval at one of the Playbook's checkpoints or `escalate` ids. */
+export interface CheckpointRecord {
+	act: "checkpoint";
+	/** The checkpoint or `escalate` id. */
+	checkpoint: string;
+	request: string;
+	/** The file asked about. */
+	path: string;
+	/** Of that file as the human saw it. */
+	sha256: string;
+	at: string;
+}
+
+/**
+ * Make an approved Brief change the Effort's `brief.md` and record it. Only
+ * the Brief moves: the Playbook and Team stay the snapshots taken at Brief
+ * approval, which the change was checked against.
+ */
+export function promoteBriefChange(paths: EffortPaths, promotion: { approval: PendingApproval; at: string }): BriefChangeRecord {
+	writeFileSync(paths.brief, promotion.approval.snapshot);
+	const record: BriefChangeRecord = {
+		act: "brief-change",
+		request: promotion.approval.id,
+		brief: sha256(promotion.approval.snapshot),
+		affects: [...(promotion.approval.affects ?? [])],
+		at: promotion.at,
+	};
+	recordApproval(paths, record);
+	return record;
 }
 
 /** The human's sign-off of the final Report, which ends the Effort. */
@@ -209,6 +254,8 @@ export function checkRecords(paths: EffortPaths): string[] {
 		.map((line) => JSON.parse(line) as ApprovalRecord);
 	const approved = [...records].reverse().find((record): record is BriefRecord => record.act === "brief");
 	if (!approved) return [`${paths.approvals} records no approved Brief, so no record of this Effort can be trusted`];
+	// The Brief is the one the latest approval of it left, which a Brief change can be.
+	const brief = [...records].reverse().find((record): record is BriefRecord | BriefChangeRecord => record.act === "brief" || record.act === "brief-change") ?? approved;
 	const problems: string[] = [];
 	const compare = (name: string, actual: string | undefined, expected: string) => {
 		if (actual !== expected) {
@@ -217,7 +264,7 @@ export function checkRecords(paths: EffortPaths): string[] {
 			);
 		}
 	};
-	compare(paths.brief, existsSync(paths.brief) ? sha256(readFileSync(paths.brief)) : undefined, approved.brief);
+	compare(paths.brief, existsSync(paths.brief) ? sha256(readFileSync(paths.brief)) : undefined, brief.brief);
 	compare(paths.playbook, existsSync(paths.playbook) ? sha256(readFileSync(paths.playbook)) : undefined, approved.playbook);
 	compare(`${paths.team}/`, existsSync(paths.team) ? teamDigest(paths.team) : undefined, approved.team);
 	return problems;

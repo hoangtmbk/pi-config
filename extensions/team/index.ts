@@ -24,6 +24,8 @@ import { renderTeamBlock, teamStatus } from "./block.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
 import { agentsList, CLEAR_MARKER, getUsage, humanStatusLine, installMod, launchBackground, sendToInbox, statusLineReading, stopBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
 import {
+	BRIEF,
+	BRIEF_CHANGE,
 	changeSnapshot,
 	currentResult,
 	DEFAULT_MAX_TEAMMATES,
@@ -67,6 +69,7 @@ import {
 	type EffortPaths,
 	effortPaths,
 	promoteBrief,
+	promoteBriefChange,
 	protectedRecords,
 	readJournal,
 	readLead,
@@ -115,8 +118,14 @@ const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff", "tea
 const LEAD_TOOLS = [...new Set([...SETUP_TOOLS, ...EFFORT_TOOLS])];
 
 const RequestApprovalParams = Type.Object({
-	checkpoint: Type.String({ description: "Which checkpoint: `brief` for an Effort's Brief, `adopt-playbook` during Team setup." }),
-	path: Type.String({ description: "The draft to approve: the Effort's `brief.draft.md`, or the Team setup's Playbook draft." }),
+	checkpoint: Type.String({
+		description:
+			"Which checkpoint: `brief` for an Effort's Brief, `brief-change` for a change to its approved Brief, a Playbook checkpoint id or an `escalate` id once the Brief is approved, `adopt-playbook` during Team setup.",
+	}),
+	path: Type.String({ description: "The draft to approve: the Effort's `brief.draft.md` (for `brief` and `brief-change`), the file a Playbook checkpoint or `escalate` id asks about, or the Team setup's Playbook draft." }),
+	affects: Type.Optional(
+		Type.Array(Type.String(), { description: "For `brief-change` only, and required there: the slugs of the planned Tasks the change holds until the human answers; `[]` holds none." }),
+	),
 });
 
 const PauseParams = Type.Object({
@@ -863,30 +872,56 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		return addWorkspace(team.workspace, state.repo, state.effortId);
 	}
 
-	/** `team_request_approval` at the Effort's checkpoint: check the Brief, snapshot it and add it to `/team pending`. */
-	function requestBriefApproval(held: HeldEffort, checkpoint: string, path: string): string {
+	/**
+	 * `team_request_approval` at one of the Effort's checkpoints: check the
+	 * draft (a Brief or a Brief change against its Playbook), snapshot it and
+	 * add it to `/team pending`. A Brief change, and a Playbook checkpoint or
+	 * `escalate` id, go by the Playbook the Effort snapshotted at Brief approval.
+	 */
+	function requestBriefApproval(held: HeldEffort, checkpoint: string, path: string, affects?: string[]): string {
 		const state = effortState(held);
-		const refusal = refuseRequest(state, checkpoint);
+		const snapshot_ = state.brief ? snapshotOf(held) : undefined;
+		const checkpoints = snapshot_ ? [...snapshot_.playbook.checkpoints.map(({ id }) => id), ...snapshot_.playbook.escalate.map(({ id }) => id)] : [];
+		const refusal = refuseRequest(state, checkpoint, { affects, checkpoints });
 		if (refusal !== undefined) throw new Error(refusal);
-		if (path !== held.paths.draft) {
+		const ofBrief = checkpoint === BRIEF || checkpoint === BRIEF_CHANGE;
+		if (ofBrief && path !== held.paths.draft) {
 			throw new Error(`Only the Effort's own Brief draft can be asked about: ${held.paths.draft}, not ${path}.`);
 		}
-		if (!existsSync(path)) throw new Error(`There is no Brief draft at ${path} yet; write the Brief there first.`);
+		if (!existsSync(path)) throw new Error(ofBrief ? `There is no Brief draft at ${path} yet; write the Brief there first.` : `There is no file at ${path} to ask about; write it first.`);
 		const bytes = readFileSync(path);
 		let snapshot: string;
 		try {
 			snapshot = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 		} catch {
-			throw new Error(`The Brief draft ${path} is not valid UTF-8 text; write it as markdown.`);
+			throw new Error(`${ofBrief ? "The Brief draft" : "The file"} ${path} is not valid UTF-8 text; write it as markdown.`);
 		}
-		const found = inForce(state);
-		if ("error" in found) throw new Error(`The Brief of Effort \`${state.effortId}\` can't be asked about: ${found.error}.`);
-		const problems = validateBrief(snapshot, { team: state.team, repo: state.repo, playbook: found.playbook });
-		if (problems.length > 0) throw new Error(`The Brief ${path} can't be asked about until these are fixed:\n${bullets(problems)}`);
-		const result = step(state, { kind: "request-approval", checkpoint, path, sha256: sha256(bytes), snapshot, at: now().toISOString() });
+		if (checkpoint === BRIEF) {
+			const found = inForce(state);
+			if ("error" in found) throw new Error(`The Brief of Effort \`${state.effortId}\` can't be asked about: ${found.error}.`);
+			const problems = validateBrief(snapshot, { team: state.team, repo: state.repo, playbook: found.playbook });
+			if (problems.length > 0) throw new Error(`The Brief ${path} can't be asked about until these are fixed:\n${bullets(problems)}`);
+		} else if (checkpoint === BRIEF_CHANGE && snapshot_) {
+			const problems = briefChangeProblems(state, snapshot, snapshot_);
+			if (problems.length > 0) throw new Error(`The Brief change ${path} can't be asked about until these are fixed:\n${bullets(problems)}`);
+		}
+		const result = step(state, { kind: "request-approval", checkpoint, path, sha256: sha256(bytes), snapshot, ...(affects === undefined ? {} : { affects }), checkpoints, at: now().toISOString() });
 		if (!result.ok) throw new Error(result.refusal);
 		appendLines(held.paths, result.append);
 		return result.reply ?? "";
+	}
+
+	/**
+	 * What keeps a Brief change from being asked about or approved: the Brief
+	 * skeleton and frontmatter against the Effort's Playbook snapshot, with
+	 * each override naming an id that Playbook has; and a change at all.
+	 */
+	function briefChangeProblems(state: EffortState, text: string, snapshot_: { roles: Role[]; playbook: Playbook }): string[] {
+		const problems = validateBrief(text, { team: state.team, repo: state.repo, playbook: snapshot_.playbook });
+		if (existsSync(effortPaths(paths.agentDir, state.effortId).brief) && sha256(text) === state.brief?.sha256) {
+			problems.push("it is the approved Brief as it stands, so there is no change to approve");
+		}
+		return problems;
 	}
 
 	/**
@@ -1324,7 +1359,89 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			if (!item) continue;
 			if (item.checkpoint === PLAYBOOK_CHANGE) await answerChange(held, item, ctx);
 			else if (item.checkpoint === SIGN_OFF) await answerSignOff(held, item, ctx);
-			else await answerBrief(held, item, ctx);
+			else if (item.checkpoint === BRIEF) await answerBrief(held, item, ctx);
+			else if (item.checkpoint === BRIEF_CHANGE) await answerBriefChange(held, item, ctx);
+			else await answerCheckpoint(held, item, ctx);
+		}
+	}
+
+	/** Approve, send back with a note, or leave for later: what the human answers to `title`; undefined leaves the item waiting. */
+	async function approveOrSendBack(title: string, ctx: ExtensionCommandContext): Promise<{ answer: "approved" | "sent-back"; note?: string } | undefined> {
+		const answer = await ctx.ui.select(title, [APPROVE, SEND_BACK, LATER]);
+		if (answer === APPROVE) return { answer: "approved" };
+		if (answer !== SEND_BACK) return undefined;
+		const note = (await ctx.ui.input("Note for the Lead: what should change?"))?.trim();
+		// Backing out of the note leaves the item waiting, as "later" does.
+		return note ? { answer: "sent-back", note } : undefined;
+	}
+
+	/**
+	 * A Brief change in `/team pending`. Approving checks the snapshot again
+	 * against the Effort's Playbook snapshot, makes it brief.md and records it
+	 * before the line that approves it, then starts the Tasks it held. A
+	 * send-back keeps them held.
+	 */
+	async function answerBriefChange(held: HeldEffort, item: PendingApproval, ctx: ExtensionCommandContext): Promise<void> {
+		const state = effortState(held);
+		const snapshot_ = snapshotOf(held);
+		const holds = item.affects ?? [];
+		const title = [
+			`Approve a Brief change of Effort \`${state.effortId}\` (request \`${item.id}\`)? ${item.path} (sha256 ${item.sha256})`,
+			holds.length > 0 ? `It holds Task${holds.length === 1 ? "" : "s"} ${holds.map((slug) => `\`${slug}\``).join(", ")} until you answer; every other Task goes on.` : "It holds no Task.",
+			"Approving makes exactly this snapshot brief.md; the Team and Playbook snapshots stay as they are.",
+		].join("\n");
+		const picked = await approveOrSendBack(title, ctx);
+		if (!picked) return;
+		if (picked.answer === "approved") {
+			const problems = briefChangeProblems(state, item.snapshot, snapshot_);
+			if (problems.length > 0) {
+				ctx.ui.notify(`The Brief change of Effort \`${state.effortId}\` (request \`${item.id}\`) can't be approved:\n${bullets(problems)}`, "error");
+				return;
+			}
+		}
+		const at = now().toISOString();
+		const result = step(state, { kind: "answer", id: item.id, ...picked, at });
+		if (!result.ok) {
+			ctx.ui.notify(result.refusal, "error");
+			return;
+		}
+		for (const action of result.actions) {
+			if (action.kind === "promote-brief-change") promoteBriefChange(held.paths, { approval: action.approval, at });
+		}
+		appendLines(held.paths, result.append);
+		if (picked.answer === "approved") ctx.ui.notify(`Approved the Brief change of Effort \`${state.effortId}\`: ${held.paths.brief}, sha256 ${item.sha256}.`, "info");
+		for (const action of result.actions) {
+			if (action.kind === "wake-lead") wakeLead("team-pending", action.text);
+		}
+		if (picked.answer === "approved") {
+			for (const text of await startQueued(held, effortState(held), ctx)) ctx.ui.notify(text, "info");
+		}
+	}
+
+	/** An approval at a Playbook checkpoint or \`escalate\` id in \`/team pending\`: approving records the file with its sha, as the human was asked about it. */
+	async function answerCheckpoint(held: HeldEffort, item: PendingApproval, ctx: ExtensionCommandContext): Promise<void> {
+		const picked = await approveOrSendBack(`Approve checkpoint \`${item.checkpoint}\` of Effort \`${held.effortId}\` (request \`${item.id}\`)? ${item.path} (sha256 ${item.sha256})`, ctx);
+		if (!picked) return;
+		if (picked.answer === "approved" && (!existsSync(item.path) || sha256(readFileSync(item.path)) !== item.sha256)) {
+			ctx.ui.notify(`${item.path} changed since checkpoint \`${item.checkpoint}\` was asked (request \`${item.id}\`, sha256 ${item.sha256}), so it isn't approved. Nothing changed; send it back, or ask again.`, "error");
+			return;
+		}
+		const state = effortState(held);
+		const at = now().toISOString();
+		const result = step(state, { kind: "answer", id: item.id, ...picked, at });
+		if (!result.ok) {
+			ctx.ui.notify(result.refusal, "error");
+			return;
+		}
+		for (const action of result.actions) {
+			if (action.kind === "record-checkpoint") {
+				recordApproval(held.paths, { act: "checkpoint", checkpoint: action.approval.checkpoint, request: action.approval.id, path: action.approval.path, sha256: action.approval.sha256, at });
+			}
+		}
+		appendLines(held.paths, result.append);
+		if (picked.answer === "approved") ctx.ui.notify(`Approved checkpoint \`${item.checkpoint}\` of Effort \`${state.effortId}\`: ${item.path}, sha256 ${item.sha256}.`, "info");
+		for (const action of result.actions) {
+			if (action.kind === "wake-lead") wakeLead("team-pending", action.text);
 		}
 	}
 
@@ -1666,7 +1783,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const path = resolve(ctx.cwd, params.path);
 			if (effort && params.checkpoint !== ADOPT_PLAYBOOK) {
-				const text = requestBriefApproval(effort, params.checkpoint, path);
+				const text = requestBriefApproval(effort, params.checkpoint, path, params.affects);
 				paintBlock();
 				return { content: [{ type: "text", text }], details: undefined };
 			}
