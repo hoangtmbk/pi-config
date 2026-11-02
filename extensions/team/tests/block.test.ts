@@ -114,6 +114,12 @@ describe("the Team block", () => {
 		]);
 	});
 
+	it("marks with `?` a short id nothing has confirmed since pi came back, the row drawn from saved state alone", () => {
+		const lines = render(data({ teammates: [mate("dev-1", { unconfirmed: true }), mate("dev-2", { shortId: "k3l4m5n6", activity: "busy", task: "003-dev-ttl" })] }));
+
+		assert.deepEqual(lines.slice(2, 4), ["│ dev-1  a1b2c3d4?  idle  001-dev-1-design  ctx —    │", "│ dev-2  k3l4m5n6   busy  003-dev-ttl       ctx —    │"]);
+	});
+
 	it("shows each pause that holds on a line of its own, with who set it, since when and why, and how the human lifts theirs", () => {
 		const lines = render(
 			data({
@@ -303,6 +309,21 @@ describe("team_status data", () => {
 			{ id: "architect-1", role: "architect", shortId: "a1b2c3d4", activity: "idle", task: "001-architect-design", doing: "round 1 done", mode: "auto" },
 			{ id: "dev-1", role: "dev", shortId: "d4e5f6a7", activity: "busy", task: "002-dev-ttl", mode: "acceptEdits", launchMode: "auto" },
 		]);
+	});
+
+	it("rows a Teammate unconfirmed when the shell names which ones it has heard from since a restart, and none when it names none", () => {
+		const state = fold(
+			through([REQUEST, APPROVE, PLAN, handoff("design"), handoff("ttl"), hook("architect-1", 1, "SessionStart", { source: "startup" }), hook("dev-1", 1, "SessionStart", { source: "startup" })]),
+		);
+
+		assert.deepEqual(
+			teamStatus(state, { adoptionsPending: 0, confirmed: new Set(["dev-1"]) }).teammates.map((row) => [row.id, row.unconfirmed ?? false]),
+			[
+				["architect-1", true],
+				["dev-1", false],
+			],
+		);
+		assert.ok(teamStatus(state, { adoptionsPending: 0 }).teammates.every((row) => row.unconfirmed === undefined));
 	});
 
 	it("counts the Tasks the Lead has accepted", () => {

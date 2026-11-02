@@ -242,16 +242,22 @@ export function promoteBrief(
 	return record;
 }
 
+/** The approved acts `approvals.jsonl` records, oldest first; none when it is missing. */
+export function readApprovals(paths: EffortPaths): ApprovalRecord[] {
+	if (!existsSync(paths.approvals)) return [];
+	return readFileSync(paths.approvals, "utf8")
+		.split("\n")
+		.filter((line) => line.trim() !== "")
+		.map((line) => JSON.parse(line) as ApprovalRecord);
+}
+
 /**
  * Check the Effort's approved records against `approvals.jsonl`. Each problem
  * names the record and both shas; a record with a problem is never used.
  */
 export function checkRecords(paths: EffortPaths): string[] {
 	if (!existsSync(paths.approvals)) return [`${paths.approvals} is missing, so nothing in this Effort is approved and no record can be trusted`];
-	const records = readFileSync(paths.approvals, "utf8")
-		.split("\n")
-		.filter((line) => line.trim() !== "")
-		.map((line) => JSON.parse(line) as ApprovalRecord);
+	const records = readApprovals(paths);
 	const approved = [...records].reverse().find((record): record is BriefRecord => record.act === "brief");
 	if (!approved) return [`${paths.approvals} records no approved Brief, so no record of this Effort can be trusted`];
 	// The Brief is the one the latest approval of it left, which a Brief change can be.

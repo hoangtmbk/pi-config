@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { CLEAR_MARKER, HOOK_SCRIPT, STATUSLINE_SCRIPT } from "../claude.ts";
 import { registerTeam } from "../index.ts";
-import { commit, type FakeHeldHook, type FakeHookStep, fakeClaude, fakeTmux, git, gitRepo, goodTeam, ownStdio, roleMd, type TempRoots, teamMd, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
+import { commit, type FakeClaude, type FakeHeldHook, type FakeHookStep, fakeClaude, fakeTmux, git, gitRepo, goodTeam, ownStdio, roleMd, type TempRoots, teamMd, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
 
 const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 
@@ -117,6 +117,8 @@ function fakePi(
 		sessionEntries?: Record<string, unknown>[];
 		/** How long a Teammate's held hook holds before giving the prompt back to its terminal; the hook's own when unset. */
 		holdMs?: number;
+		/** The fake `claude` an earlier pi ran, whose background sessions outlive it; a new one unless set. */
+		claude?: FakeClaude;
 	} = {},
 ) {
 	const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
@@ -163,15 +165,17 @@ function fakePi(
 		},
 		getSettings: () => structuredClone(options.settings ?? {}),
 	};
-	const claude = fakeClaude(roots, {
-		version: options.claudeVersion,
-		bgExit: options.bgExit,
-		hooks: options.hooks,
-		replies: options.replies,
-		attachExit: options.attachExit,
-		holdMs: options.holdMs,
-		usage: options.usage,
-	});
+	const claude =
+		options.claude ??
+		fakeClaude(roots, {
+			version: options.claudeVersion,
+			bgExit: options.bgExit,
+			hooks: options.hooks,
+			replies: options.replies,
+			attachExit: options.attachExit,
+			holdMs: options.holdMs,
+			usage: options.usage,
+		});
 	const tmux = fakeTmux(roots);
 	registerTeam(pi as unknown as ExtensionAPI, {
 		agentDir: roots.agentDir,
@@ -1723,7 +1727,16 @@ describe("handing off: team_handoff", () => {
 
 		await assert.rejects(pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" }), /`builder-1` didn't start, so Task `rename-key` is still planned: fake claude: the background session could not start/);
 
-		assert.equal(readFileSync(join(dir, "effort.jsonl"), "utf8"), log);
+		// Only the launch written ahead and its abandonment follow: no Teammate, no handoff.
+		const after = readFileSync(join(dir, "effort.jsonl"), "utf8");
+		assert.ok(after.startsWith(log));
+		assert.deepEqual(
+			after.slice(log.length).split("\n").filter(Boolean).map((line) => [JSON.parse(line).type, JSON.parse(line).teammate]),
+			[
+				["launch-intended", "builder-1"],
+				["launch-abandoned", "builder-1"],
+			],
+		);
 		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n(?:.*\n)*?- Status: planned/);
 	});
 });
@@ -4075,6 +4088,200 @@ describe("ending an Effort: the final Report and sign-off", () => {
 		assert.equal(teamBlock(pi), undefined);
 		await pi.team("cancel");
 		assert.match(pi.notifications.at(-1)?.message ?? "", /holds no Effort, so there is nothing to cancel/);
+	});
+});
+
+/** Cut `effort.jsonl` back to its first line of `type`, as a pi killed just after writing it leaves it. */
+function killedAfter(dir: string, type: string): void {
+	const lines = readFileSync(join(dir, "effort.jsonl"), "utf8").split("\n").filter(Boolean);
+	const at = lines.findIndex((line) => JSON.parse(line).type === type);
+	assert.ok(at !== -1, `effort.jsonl has a ${type} line`);
+	writeFileSync(join(dir, "effort.jsonl"), `${lines.slice(0, at + 1).join("\n")}\n`);
+}
+
+/** The Lead's "while you were away" wakes. */
+function awayWakes(sent: SentMessage[]): SentMessage[] {
+	return sent.filter((message) => message.customType === "team-away");
+}
+
+/** The count of `effort.jsonl` lines of `type`. */
+function counted(dir: string, type: string): number {
+	return effortLines(dir).filter((line) => line.type === type).length;
+}
+
+describe("restarting: picking an Effort up after pi comes back", () => {
+	afterEach(() => {
+		for (const fake of holding.splice(0)) fake.release();
+	});
+
+	it("finds a Teammate launched just before pi died, replays its journal once and wakes the Lead once, doorbell or not", async () => {
+		const { roots, repo, pi, dir } = await renameReported();
+		await until(() => counted(dir, "task-done") === 1, "builder-1 reports round 1");
+		await pi.emit("session_shutdown", { reason: "quit" });
+		killedAfter(dir, "launch-intended");
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.equal(pi.claude.launches().length, 1, "no second Teammate");
+		assert.equal(counted(dir, "teammate-started"), 1);
+		assert.equal(counted(dir, "task-handed-off"), 1);
+		assert.equal(counted(dir, "task-done"), 1);
+		assert.equal(again.sent.length, 1, again.sent.map((message) => message.content).join("\n---\n"));
+		const [wake] = awayWakes(again.sent);
+		assert.match(wake.content, new RegExp(`^While you were away, Effort \`${CREW_EFFORT_ID}\`:\\n- `));
+		assert.match(wake.content, /rename-key/);
+		assert.doesNotMatch(wake.content, /Read its records first/);
+
+		const lead = JSON.parse(readFileSync(join(dir, "lead.json"), "utf8")) as { port: number; token: string };
+		await ringDoorbell(lead.port, { type: "doorbell", token: lead.token, teammate: "builder-1" });
+		await again.emit("agent_settled", { aborted: false });
+
+		assert.equal(counted(dir, "task-done"), 1, "the doorbell after the replay applies nothing again");
+		assert.equal(again.sent.length, 1);
+	});
+
+	it("abandons a launch that never got in, leaving the Task planned and saying so once", async () => {
+		const { roots, repo, pi, dir } = await crewApproved({ hooks: [] });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		pi.claude.forget(BUILDER_1);
+		await pi.emit("session_shutdown", { reason: "quit" });
+		killedAfter(dir, "launch-intended");
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.equal(pi.claude.launches().length, 1, "it isn't launched again");
+		assert.equal(counted(dir, "launch-abandoned"), 1);
+		assert.equal(counted(dir, "teammate-started"), 0);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n(?:.*\n)*?- Status: planned/);
+		assert.equal(again.sent.length, 1);
+		assert.match(awayWakes(again.sent)[0].content, /builder-1/);
+	});
+
+	it("finishes an accept whose merge landed just before pi died: one merge commit, one accept, its worktree gone, one wake", async () => {
+		const { roots, repo, pi, dir, workspace, task } = await isolatedReported();
+		appendFileSync(join(dir, "effort.jsonl"), `${JSON.stringify({ type: "merge-intended", slug: "rename-key", branch: task.branch, into: `team/${CREW_EFFORT_ID}`, at: NOW.toISOString() })}\n`);
+		git(workspace, "merge", "--no-ff", "-m", "Merge the Task", task.branch);
+		const merged = git(workspace, "rev-parse", "HEAD");
+		await pi.emit("session_shutdown", { reason: "quit" });
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.equal(git(workspace, "rev-list", "--merges", "--count", "HEAD"), "1");
+		assert.equal(git(workspace, "rev-parse", "HEAD"), merged);
+		assert.equal(counted(dir, "task-accepted"), 1);
+		assert.equal(effortLines(dir).find((line) => line.type === "task-accepted")?.merge, merged);
+		assert.equal(existsSync(task.path), false);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: accepted/);
+		assert.equal(again.sent.length, 1);
+		assert.match(awayWakes(again.sent)[0].content, /rename-key/);
+	});
+
+	it("names the Effort's records in the wake when another session adopts it", async () => {
+		const { roots, repo, pi, dir } = await renameReported();
+		await until(() => counted(dir, "task-done") === 1, "builder-1 reports round 1");
+		await pi.emit("session_shutdown", { reason: "quit" });
+		killedAfter(dir, "launch-intended");
+
+		const other = fakePi(roots, { cwd: repo, sessionFile: join(roots.scratch, "other.jsonl"), claude: pi.claude });
+		other.answer(CREW_EFFORT_ID);
+		await other.team("resume");
+
+		const [wake] = awayWakes(other.sent);
+		assert.match(wake.content, new RegExp(`\\n\\nRead its records first: .*${join(dir, "brief.md").replaceAll("/", "\\/")}`));
+		assert.ok(wake.content.includes(join(dir, "plan.md")), wake.content);
+	});
+
+	it("hands a request a Teammate held across the restart to the new Lead, whose answer reaches the hook", async () => {
+		const { roots, repo, pi, request, hook } = await asking(PUBLISH);
+		await pi.emit("session_shutdown", { reason: "quit" });
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+		let answered = false;
+		for (let tries = 0; tries < 250 && !answered; tries++) {
+			answered = await again.call("team_answer", { request, decision: "deny", reason: "Not across a restart." }).then(
+				() => true,
+				async () => {
+					await new Promise((resolve) => setTimeout(resolve, 20));
+					return false;
+				},
+			);
+		}
+
+		assert.ok(answered, "the new Lead's answer reached the hook");
+		assert.deepEqual(await printed(hook), { hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Not across a restart." } } });
+		assert.deepEqual(again.sent, [], "nothing new to wake the Lead about");
+	});
+
+	it("rebuilds each Teammate's `takeover` marker from effort.jsonl, which pi may have stopped short of", async () => {
+		const { roots, repo, pi, dir } = await renameReported();
+		await until(() => counted(dir, "task-done") === 1, "builder-1 reports round 1");
+		await pi.emit("session_shutdown", { reason: "quit" });
+		const marker = join(dir, "teammates", "builder-1", "takeover");
+		appendFileSync(join(dir, "effort.jsonl"), `${JSON.stringify({ type: "takeover-started", teammate: "builder-1", cursor: 99, trigger: { kind: "prompt" }, at: NOW.toISOString() })}\n`);
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+		assert.ok(existsSync(marker), "the hook leaves its prompts to the human again");
+
+		await again.emit("session_shutdown", { reason: "quit" });
+		appendFileSync(join(dir, "effort.jsonl"), `${JSON.stringify({ type: "takeover-ended", teammate: "builder-1", by: "pi", at: NOW.toISOString() })}\n`);
+		const third = fakePi(roots, { cwd: repo, entries: again.allEntries(), claude: pi.claude });
+		await third.emit("session_start", { reason: "startup" });
+		assert.equal(existsSync(marker), false, "the hand-back's marker removal is finished");
+	});
+
+	/** builder-1 started afresh on `update-docs` after a Brief change, and pi killed just after writing that launch's intent; with the journal's line count before it. */
+	async function relaunchKilled() {
+		const crew = await crewPlanned();
+		const { pi, dir, repo } = crew;
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		writeFileSync(join(dir, "brief.draft.md"), changedBrief(repo, BUILDER_ON_SONNET));
+		await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: [] });
+		pi.answer("Approve");
+		await pi.team("pending");
+		await until(() => teammateWakes(pi.sent).length === 1, "rename-key has a result");
+		await pi.call("team_review", { slug: "rename-key", verdict: "accept" });
+		const journal = join(dir, "teammates", "builder-1", "events.jsonl");
+		const before = readFileSync(journal, "utf8").split("\n").filter(Boolean).length;
+		await pi.call("team_handoff", { slug: "update-docs", body: "# Docs\n" });
+		await until(() => teammateWakes(pi.sent).length === 2, "update-docs has a result");
+		await pi.emit("session_shutdown", { reason: "quit" });
+		const lines = readFileSync(join(dir, "effort.jsonl"), "utf8").split("\n").filter(Boolean);
+		const last = lines.map((line) => JSON.parse(line).type).lastIndexOf("launch-intended");
+		writeFileSync(join(dir, "effort.jsonl"), `${lines.slice(0, last + 1).join("\n")}\n`);
+		return { ...crew, journal, before };
+	}
+
+	it("takes a Teammate started afresh in from its new session's SessionStart, once, and doesn't start it again", async () => {
+		const { roots, repo, pi, dir } = await relaunchKilled();
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.equal(pi.claude.launches().length, 2, "no third session");
+		assert.equal(counted(dir, "teammate-relaunched"), 1);
+		assert.equal(counted(dir, "launch-abandoned"), 0);
+		assert.equal(counted(dir, "teammate-session"), 2);
+		assert.equal(counted(dir, "task-done"), 2, "its new session's journal is replayed: update-docs has its result");
+	});
+
+	it("abandons a fresh start its new session never journaled, though `claude agents --json` lists the name its old session had too", async () => {
+		const { roots, repo, pi, dir, journal, before } = await relaunchKilled();
+		writeFileSync(journal, `${readFileSync(journal, "utf8").split("\n").filter(Boolean).slice(0, before).join("\n")}\n`);
+		assert.ok(pi.claude.agents().some((agent) => agent.name === BUILDER_1));
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.equal(counted(dir, "launch-abandoned"), 1);
+		assert.equal(counted(dir, "teammate-relaunched"), 0);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## update-docs\n(?:.*\n)*?- Status: planned/);
+		assert.match(awayWakes(again.sent)[0]?.content ?? "", /`builder-1` wasn't started afresh before pi stopped/);
 	});
 });
 

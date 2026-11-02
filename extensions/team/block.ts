@@ -49,6 +49,8 @@ export interface TeammateRow {
 	shortId?: string;
 	/** Set while {@link shortId} is one a new session gave it and the human hasn't attached to through pi: shown `(new)`. */
 	newShortId?: boolean;
+	/** Set after a restart until `claude agents --json` lists it or its journal speaks: the row is drawn from saved state, shown `?`. */
+	unconfirmed?: boolean;
 	/** `starting` until a prompt first lands, then `busy` or `idle`. */
 	activity: "starting" | "busy" | "idle";
 	/** The Task in its context: its folder once handed off. */
@@ -142,6 +144,8 @@ export interface BlockOptions {
 export interface StatusExtras {
 	/** Playbook adoptions waiting in `/team pending`. */
 	adoptionsPending: number;
+	/** After a restart, the Teammates heard from since: any other is unconfirmed. Absent when there was none. */
+	confirmed?: ReadonlySet<string>;
 }
 
 /**
@@ -152,7 +156,10 @@ export interface StatusExtras {
  */
 export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockData {
 	const handed = Object.keys(state.tasks).length > 0 || state.queue.length > 0;
-	const teammates = state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined).map((teammate) => teammateRow(state, teammate));
+	const teammates = state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined).map((teammate) => {
+		const row = teammateRow(state, teammate);
+		return extras.confirmed === undefined || extras.confirmed.has(teammate.id) ? row : { ...row, unconfirmed: true };
+	});
 	return {
 		effortId: state.effortId,
 		team: state.team,
@@ -342,7 +349,7 @@ function teammateRows(data: TeamBlockData, now: number, options: BlockOptions, w
 	const rows = data.teammates.length > cap ? data.teammates.slice(0, cap - 1) : data.teammates;
 	const hidden = data.teammates.length - rows.length;
 	const ids = column(rows.map((row) => clip(oneLine(row.id), MAX_ID)));
-	const shorts = column(rows.map((row) => oneLine(row.shortId === undefined ? "—" : row.newShortId ? `${row.shortId} (new)` : row.shortId)));
+	const shorts = column(rows.map((row) => oneLine(row.shortId === undefined ? "—" : `${row.shortId}${row.unconfirmed ? "?" : ""}${row.newShortId ? " (new)" : ""}`)));
 	// A Teammate the human holds shows whose it is and for how long in place of its activity, and in
 	// place of its Task, context and mode, what started the Takeover and how to hand it back.
 	const activities = column(rows.map((row) => (row.takeover === undefined ? row.activity : `✋ YOURS ${age(now - Date.parse(row.takeover.since))}`)));

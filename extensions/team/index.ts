@@ -24,6 +24,7 @@ import { renderTeamBlock, teamStatus } from "./block.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
 import { agentsList, CLEAR_MARKER, getUsage, humanStatusLine, installMod, launchBackground, sendToInbox, statusLineReading, stopBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
 import {
+	awayText,
 	BRIEF,
 	BRIEF_CHANGE,
 	changeSnapshot,
@@ -40,6 +41,7 @@ import {
 	type Inbox,
 	openEffort,
 	openEscalations,
+	openMerges,
 	PLAYBOOK_CHANGE,
 	type PendingApproval,
 	type PlaybookChange,
@@ -73,6 +75,7 @@ import {
 	promoteBrief,
 	promoteBriefChange,
 	protectedRecords,
+	readApprovals,
 	readJournal,
 	readLead,
 	readLines,
@@ -89,7 +92,7 @@ import {
 import { repoRoot } from "./repo.ts";
 import { askedQuestions, terminalText } from "./requests.ts";
 import { REPORT_OVERLAY, type ReportChrome, ReportView, type ReportTui } from "./reports-view.ts";
-import { addTaskWorkspace, addWorkspace, effortWorktrees, endWorktrees, mergeTaskWorkspace, removeTaskWorkspace } from "./workspace.ts";
+import { addTaskWorkspace, addWorkspace, effortWorktrees, endWorktrees, mergeEvidence, mergeTaskWorkspace, removeTaskWorkspace } from "./workspace.ts";
 import {
 	ADOPT_PLAYBOOK,
 	APPROVE,
@@ -349,6 +352,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	// Whether the Lead's model is in a run, and what wakes about Teammates wait for it to settle.
 	let busy = false;
 	let waiting: string[] = [];
+	// While the Effort is picked up again after a restart: what it has to tell the Lead, said once at the end.
+	let recovering: string[] | undefined;
+	// After a restart, the Teammates heard from since; the block marks the others' short ids unconfirmed.
+	let confirmed: Set<string> | undefined;
 	// Where the Team block goes, when pi has a UI, and the lines it last showed.
 	let surface: ExtensionUIContext | undefined;
 	let shown: string[] | undefined;
@@ -379,7 +386,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const state = effort ? effortState(effort) : undefined;
 		syncClock(state);
 		if (!surface) return;
-		const lines = state ? renderTeamBlock(teamStatus(state, { adoptionsPending: pending.length }), now().getTime(), { maxTeammates: maxTeammates() }) : undefined;
+		const lines = state ? renderTeamBlock(teamStatus(state, { adoptionsPending: pending.length, ...(confirmed ? { confirmed } : {}) }), now().getTime(), { maxTeammates: maxTeammates() }) : undefined;
 		if (lines && !stopUsage) stopUsage = every(USAGE_FRESH_MS, readUsage);
 		if (!lines) endUsage();
 		if (lines === shown || (lines && shown && lines.length === shown.length && lines.every((line, index) => line === shown?.[index]))) return;
@@ -521,8 +528,12 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		await bridge;
 	}
 
-	/** Lead the Effort and hold it in this session, or say why not. */
-	async function lead(held: HeldEffort, ctx: ExtensionContext): Promise<boolean> {
+	/**
+	 * Lead the Effort and hold it in this session, or say why not. `records`:
+	 * the Effort's records, for a Lead that hasn't read them (an adoption, a
+	 * fork made before its first message), named in the wake if one comes.
+	 */
+	async function lead(held: HeldEffort, ctx: ExtensionContext, records?: readonly string[]): Promise<boolean> {
 		try {
 			await listenForTeammates(held, ctx);
 		} catch (error) {
@@ -533,9 +544,125 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		leadCtx = ctx;
 		syncLeadTools();
 		paintBlock();
-		// A reset that passed while no session led the Effort is caught up on now.
-		void tickEffort();
+		await pickUp(held, records);
 		return true;
+	}
+
+	/**
+	 * Pick the Effort up where pi left it, once this session leads it: finish
+	 * the intents left open from git's and Claude Code's evidence, replay the
+	 * journals, send again what never landed, and catch up on a reset that
+	 * passed (a reset that passed while no session led the Effort among it).
+	 * The Lead is woken once, with all of it, and not at all when none of it
+	 * needs the Lead.
+	 */
+	async function pickUp(held: HeldEffort, records?: readonly string[]): Promise<void> {
+		const away: string[] = [];
+		recovering = away;
+		try {
+			const agents = await agentsList(paths.claudePath);
+			const names = agents instanceof Map ? [...agents.keys()] : undefined;
+			confirmed = new Set(effortState(held).teammates.filter((teammate) => names?.includes(teammate.name)).map((teammate) => teammate.id));
+			paintBlock();
+			away.push(...(await recoverIntents(held, names)));
+			const sent: string[] = [];
+			away.push(...applyJournals(held, undefined, sent));
+			away.push(...(await resend(held, sent, names)));
+			await tickEffort();
+		} catch (error) {
+			away.push(`Picking Effort \`${held.effortId}\` up after the restart stopped short: ${error instanceof Error ? error.message : String(error)}. Stop and tell the human.`);
+		} finally {
+			recovering = undefined;
+		}
+		const text = awayText(effortState(held), away, records);
+		if (text === undefined) return;
+		if (busy) waiting.push(text);
+		else wakeLead("team-away", text);
+	}
+
+	/** The records a Lead new to the Effort reads first: those written so far. */
+	function recordsOf(held: HeldEffort): string[] {
+		return [held.paths.brief, held.paths.clarifications, held.paths.plan, held.paths.reports].filter((path) => existsSync(path));
+	}
+
+	/**
+	 * Finish each intent a restart left open, from the evidence: `names`, the
+	 * `--name`s `claude agents --json` lists (undefined when it couldn't be
+	 * read), each Teammate's journal, git, and `approvals.jsonl`. Returns what
+	 * the Lead must hear.
+	 */
+	async function recoverIntents(held: HeldEffort, names: string[] | undefined): Promise<string[]> {
+		const state = effortState(held);
+		// A Teammate started afresh already has a journal: only a SessionStart past its cursor, other than a clear, is its new session's.
+		const journaled = Object.keys(state.launching ?? {}).filter((id) => {
+			const known = state.teammates.find((teammate) => teammate.id === id);
+			const lines = readJournal(held.paths, id, known?.cursor ?? 0);
+			return known === undefined ? lines.length > 0 : lines.some(({ line }) => line.event === "SessionStart" && line.payload?.source !== "clear");
+		});
+		const merges = Object.fromEntries(
+			openMerges(state).flatMap(({ slug, branch }) => {
+				const evidence = state.workspace && mergeEvidence(state.workspace.path, branch);
+				return evidence ? [[slug, evidence] as const] : [];
+			}),
+		);
+		const promoted = readApprovals(held.paths).flatMap((record) => (record.act === "brief" ? [{ request: record.request, brief: record.brief, ...(record.workspace === undefined ? {} : { workspace: record.workspace }) }] : []));
+		const result = step(state, { kind: "recover", ...(names ? { agents: names } : {}), journaled, merges, promoted, at: now().toISOString() });
+		if (!result.ok) return [result.refusal];
+		appendLines(held.paths, result.append);
+		const texts: string[] = [];
+		let stopped = true;
+		for (const action of result.actions) {
+			if (action.kind === "wake-lead") texts.push(action.text);
+			else if (action.kind === "write-plan") writePlan(held.paths, effortState(held));
+			else if (action.kind === "discard-feedback") rmSync(join(held.paths.tasks, action.folder, `feedback-${action.round}.md`), { force: true });
+			else if (action.kind === "stop-teammate") {
+				const failed = await stopTeammate(result.state, action);
+				if (failed) {
+					stopped = false;
+					texts.push(`\`${action.teammate}\` didn't stop (${failed.error}), so its worktree is left in place; tell the human.`);
+				}
+			} else if (action.kind === "remove-task-workspace") {
+				// A merged Task's worktree goes as an accept removes it; an abandoned launch's had nothing worked in it.
+				const accepted = result.state.tasks[action.slug]?.accepted !== undefined;
+				if (accepted && (!stopped || !result.state.workspace)) continue;
+				const left = removeTaskWorkspace(accepted && result.state.workspace ? result.state.workspace.path : result.state.repo, action, !accepted);
+				if (left) texts.push(`Task \`${action.slug}\`'s worktree or branch is left in place: ${left}`);
+			} else if (action.kind === "merge") {
+				try {
+					texts.push(await acceptMerged(held, { ok: true, state: effortState(held), append: [], actions: [] }, action));
+				} catch (error) {
+					texts.push(error instanceof Error ? error.message : String(error));
+				}
+			}
+		}
+		return texts.filter(Boolean);
+	}
+
+	/**
+	 * Once the journals are replayed: clear again a reused Teammate whose clear
+	 * never came, and send again a pointer that never landed, unless the replay
+	 * sent it (`sent`). Returns what the Lead must hear.
+	 */
+	async function resend(held: HeldEffort, sent: string[], names: string[] | undefined): Promise<string[]> {
+		const state = effortState(held);
+		const marked = state.teammates.filter((teammate) => existsSync(join(held.paths.teammates, teammate.id, "takeover"))).map((teammate) => teammate.id);
+		const result = step(state, { kind: "reconcile", sent, ...(names ? { agents: names } : {}), marked, at: now().toISOString() });
+		if (!result.ok) return [result.refusal];
+		takeoverActions(held, result.actions.filter((action) => action.kind === "mark-takeover"));
+		const texts: string[] = result.reply === undefined ? [] : [result.reply];
+		for (const action of result.actions) {
+			if (action.kind === "clear-then-send") {
+				const failed = await sendToInbox(action.inbox, CLEAR_MARKER);
+				if (failed) texts.push(`\`${action.teammate}\` was clearing its context for Task \`${action.slug}\` when pi stopped, and the clear sent again couldn't reach its inbox (${failed.error}), so it isn't working on it. Stop and tell the human.`);
+			} else if (action.kind === "redeliver") {
+				const taskDir = join(held.paths.tasks, action.folder);
+				const pointer = action.round === 1 ? handoffPointer(action.slug, taskDir, 1) : sendBackPointer(action.slug, taskDir, action.round - 1);
+				const inbox = state.teammates.find((teammate) => teammate.id === action.teammate)?.inbox;
+				const failed = inbox ? await deliver(held, action.teammate, inbox, pointer) : { error: "it has no inbox on record" };
+				if (failed) texts.push(`Task \`${action.slug}\`'s pointer, sent to \`${action.teammate}\` before pi stopped, never landed, and sending it again failed (${failed.error}), so it isn't working on it. Stop and tell the human.`);
+			}
+		}
+		return texts;
 	}
 
 	/**
@@ -594,7 +721,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * skipped by the core, so a doorbell rung twice, or a re-read, changes
 	 * nothing.
 	 */
-	function applyJournals(held: HeldEffort, only?: string): string[] {
+	function applyJournals(held: HeldEffort, only?: string, sent?: string[]): string[] {
 		let state = effortState(held);
 		const texts: string[] = [];
 		// A reset naming no time zone is read in the machine's.
@@ -622,9 +749,13 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				if (!result.ok) break;
 				appendLines(held.paths, result.append);
 				state = result.state;
+				confirmed?.add(id);
 				for (const action of result.actions) {
 					if (action.kind === "wake-lead") texts.push(action.text);
-					else if (action.kind === "send-pointer") sendPointer(held, action);
+					else if (action.kind === "send-pointer") {
+						sendPointer(held, action);
+						sent?.push(action.slug);
+					}
 				}
 				takeoverActions(held, result.actions);
 				// Claude Code's auto-resume fired: the others on that limit get `continue`, and what it held back starts.
@@ -724,7 +855,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 	/** Wake the Lead about its Teammates now, or with everything else once its run settles. */
 	function wakeAboutTeammates(texts: string[]): void {
-		if (busy) waiting.push(...texts);
+		if (recovering) recovering.push(...texts);
+		else if (busy) waiting.push(...texts);
 		else if (texts.length > 0) wakeLead("team-teammate", texts.join("\n\n"));
 	}
 
@@ -833,7 +965,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			return;
 		}
-		if (!(await lead(held, ctx))) return;
+		if (!(await lead(held, ctx, moved ? recordsOf(held) : undefined))) return;
 		if (moved) pi.appendEntry(POINTER, { effortId: held.effortId, effortDir: held.paths.dir });
 		ctx.ui.notify(`This session leads Effort \`${held.effortId}\` (${held.paths.dir}) again.`, "info");
 	});
@@ -1099,8 +1231,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const written = writeFeedback(held.paths, folder, round, feedback);
 		await listenForTeammates(held, ctx);
 		const cwd = workdir(result.state, teammate.id) ?? workspace.path;
+		appendLines(held.paths, [{ type: "launch-intended", teammate: teammate.id, name: teammate.name, lines: result.append, at: now().toISOString() }]);
 		const launched = await launchBackground(paths.claudePath, cwd, launchArgs(held, teammate, role, playbook, restaffPointer(slug, taskDir, round), cwd));
 		if (launched) {
+			appendLines(held.paths, [{ type: "launch-abandoned", teammate: teammate.id, reason: launched.error, at: now().toISOString() }]);
 			rmSync(written);
 			throw new Error(`Teammate \`${teammate.id}\` didn't start, so Task \`${slug}\` isn't sent back and its feedback-${round}.md is taken back: ${launched.error}`);
 		}
@@ -1230,15 +1364,17 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				if (failed) throw new Error(`Idle Teammate \`${action.teammate}\` didn't stop (${failed.error}), so no Teammate starts in its place; stop and tell the human.`);
 				stopped.push(action.teammate);
 			} else if (action.kind === "launch-teammate") {
+				// Written ahead, so a restart mid-launch finds the Teammate again rather than starting a second.
+				appendLines(held.paths, [{ type: "launch-intended", teammate: action.teammate.id, name: action.teammate.name, lines: result.append, at: now().toISOString() }]);
 				const failed = await launchTeammate(held, result.state, action, roles, playbook);
 				if (failed) {
 					// Its worktree goes with it: nothing was worked there, and a handoff again cuts it afresh.
 					for (const worktree of added) removeTaskWorkspace(result.state.repo, worktree, true);
 					// The idle Teammate stopped for it is gone either way.
-					appendLines(
-						held.paths,
-						result.append.filter((line) => line.type === "teammate-retired" && stopped.includes(line.teammate)),
-					);
+					appendLines(held.paths, [
+						...result.append.filter((line) => line.type === "teammate-retired" && stopped.includes(line.teammate)),
+						{ type: "launch-abandoned", teammate: action.teammate.id, reason: failed, at: now().toISOString() },
+					]);
 					throw new Error(`Teammate \`${action.teammate.id}\` didn't start, so Task \`${action.task.slug}\` is still ${still}: ${failed}`);
 				}
 			}
@@ -1801,7 +1937,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 					ctx.ui.notify(`Effort \`${effortId}\` was ${how}, so there is nothing to adopt; \`/team start\` opens a new one.`, "error");
 					return;
 				}
-				if (!(await lead(held, ctx))) return;
+				if (!(await lead(held, ctx, recordsOf(held)))) return;
 				pi.appendEntry(POINTER, { effortId, effortDir: held.paths.dir });
 				ctx.ui.notify(`Adopted Effort \`${effortId}\` (${held.paths.dir}): this session is its Lead now.`, "info");
 			},

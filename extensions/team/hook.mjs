@@ -61,6 +61,9 @@ const DOORBELL_TIMEOUT_MS = 2_000;
  */
 const HOLD_MS = Number(process.env.TEAM_HOOK_HOLD_MS) > 0 ? Number(process.env.TEAM_HOOK_HOLD_MS) : 3_570_000;
 
+/** How often a held request looks at `lead.json` for a new Lead to offer itself to. */
+const WATCH_MS = 200;
+
 const [effortDir, teammate, workspace] = process.argv.slice(2);
 
 function readStdin() {
@@ -127,7 +130,7 @@ function heldLine(event, request) {
 	return `${JSON.stringify({ from: "hook", at: new Date().toISOString(), event, request })}\n`;
 }
 
-/** Hold the request open on the Lead bridge until the Lead decides, the human answers or the hold time runs out. */
+/** Hold the request open on the Lead bridge until a Lead decides, the human answers or the hold time runs out. */
 function hold(journal, request) {
 	let expiring = false;
 	const expire = async () => {
@@ -141,31 +144,37 @@ function hold(journal, request) {
 		appendFileSync(journal, heldLine("denied-in-terminal", request));
 		process.exit(143);
 	});
-	const lead = readLead();
-	if (lead === undefined) return expire();
 	setTimeout(expire, HOLD_MS);
-	const socket = connect({ host: "127.0.0.1", port: lead.port });
-	let buffered = "";
-	let connected = false;
-	socket.setEncoding("utf8");
-	// No Lead at the port gives the prompt back at once; a Lead that goes away
-	// after taking the request leaves it with the human until the hold time runs out.
-	socket.on("error", () => (connected ? socket.destroy() : expire()));
-	socket.on("connect", () => {
-		connected = true;
-		socket.write(`${JSON.stringify({ type: "held", token: lead.token, teammate, request })}\n`);
-	});
-	socket.on("data", (chunk) => {
-		buffered += chunk;
-		const lines = buffered.split("\n");
-		buffered = lines.pop() ?? "";
-		for (const text of lines) {
-			const line = parse(text);
-			if (line?.type !== "decision" || line.request !== request || typeof line.decision !== "object") continue;
-			process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: line.decision } }), () => process.exit(0));
-			return;
-		}
-	});
+	// Offer the request to whichever Lead `lead.json` names, and offer it again,
+	// with the same id, whenever another Lead takes its place. A Lead that isn't
+	// listening, or goes away, leaves the request held until the hold time runs out.
+	let offered;
+	let socket;
+	const offer = () => {
+		const lead = readLead();
+		if (lead === undefined || `${lead.port}:${lead.token}` === offered) return;
+		offered = `${lead.port}:${lead.token}`;
+		socket?.destroy();
+		const current = connect({ host: "127.0.0.1", port: lead.port });
+		socket = current;
+		let buffered = "";
+		current.setEncoding("utf8");
+		current.on("error", () => current.destroy());
+		current.on("connect", () => current.write(`${JSON.stringify({ type: "held", token: lead.token, teammate, request })}\n`));
+		current.on("data", (chunk) => {
+			buffered += chunk;
+			const lines = buffered.split("\n");
+			buffered = lines.pop() ?? "";
+			for (const text of lines) {
+				const line = parse(text);
+				if (line?.type !== "decision" || line.request !== request || typeof line.decision !== "object") continue;
+				process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: line.decision } }), () => process.exit(0));
+				return;
+			}
+		});
+	};
+	offer();
+	setInterval(offer, WATCH_MS);
 }
 
 /** The floor hook's `ask` for a `PreToolUse` of a floor command, or undefined to let it through. */

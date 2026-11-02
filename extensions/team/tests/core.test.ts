@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openEscalations, openMerges, type Step, step, taskStatus, type UsageReading, waitingInTerminal, workdir } from "../core.ts";
+import { awayText, currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openEscalations, openMerges, type Step, step, taskStatus, type UsageReading, waitingInTerminal, workdir } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -2701,5 +2701,315 @@ describe("usage limits", () => {
 		const cursor = fold([...lines, ...failed.append]).teammates.find((each) => each.id === "dev-1")?.cursor ?? 0;
 		const replayed = run([...lines, ...failed.append], { kind: "journal", teammate: "dev-1", cursor, line: failure("dev-1", "Your credit balance is too low", FAILED, "billing_error"), result: { path: "/r/result-1.md", written: false } });
 		assert.deepEqual(replayed.ok && replayed.actions, []);
+	});
+});
+
+describe("recovering after a restart", () => {
+	const WORKSPACE = { kind: "git-worktree", path: "/work/app/.claude/worktrees/team-software-2026-11-02", branch: "team/software-2026-11-02", base: "c".repeat(40), from: "main" } as const;
+	const asked = applied([OPENED], request("b".repeat(64)));
+	const approved = applied(asked, { kind: "answer", id: "r1", answer: "approved", workspace: WORKSPACE, at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] },
+			{ slug: "docs", role: "dev", goal: "Document it.", criteria: ["AC1"] },
+		],
+		criteria: ["AC1"],
+		roles: ["dev"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+	const T0 = "2026-11-02T11:30:00.000Z";
+	const BACK = "2026-11-02T15:00:00.000Z";
+	const NAME = "team-software-2026-11-02-dev-1";
+	const TASKS = "/agent/team/efforts/software-2026-11-02/tasks";
+	const INBOX = { socket: "/tmp/cc-socks/dev-1.sock", token: "token-dev-1" };
+	const SESSION = "dev-1000-0000-4000-8000-000000000001";
+
+	function recover(lines: EffortLine[], evidence: Omit<Extract<EffortInput, { kind: "recover" }>, "kind" | "at">): Extract<Step, { ok: true }> {
+		const result = run(lines, { kind: "recover", at: BACK, ...evidence });
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		return result;
+	}
+
+	const wakes = (result: Extract<Step, { ok: true }>) => result.actions.filter((action) => action.kind === "wake-lead");
+
+	/** A journal line of `id` at `cursor`. */
+	function hook(id: string, cursor: number, event: string, payload: Record<string, unknown>, written = false): Extract<EffortInput, { kind: "journal" }> {
+		return {
+			kind: "journal",
+			teammate: id,
+			cursor,
+			line: { from: "hook", at: `2026-11-02T12:0${cursor}:00.000Z`, event, payload, ...(event === "SessionStart" ? { inbox: INBOX } : {}) },
+			result: { path: `${TASKS}/001-dev-rename/result-1.md`, written },
+		};
+	}
+
+	/** The handoff's step, and the lines it would have had on record had pi not stopped between writing the launch's intent and launching. */
+	function launching(isolated = false): { step: Extract<Step, { ok: true }>; lines: EffortLine[] } {
+		const handoff = run(planned, { kind: "handoff", slug: "rename", at: T0, ...(isolated ? { isolated: true } : {}) });
+		assert.ok(handoff.ok, handoff.ok ? "" : handoff.refusal);
+		return { step: handoff, lines: [...planned, { type: "launch-intended", teammate: "dev-1", name: NAME, lines: handoff.append, at: T0 }] };
+	}
+
+	describe("a launch", () => {
+		it("is finished from `--name` in `claude agents --json`: its lines go on record once, and nobody is woken", () => {
+			const { step: handoff, lines } = launching();
+
+			const result = recover(lines, { agents: [NAME] });
+
+			assert.deepEqual(result.append, handoff.append);
+			assert.deepEqual(result.actions, [{ kind: "write-plan" }]);
+			assert.equal(taskStatus(result.state, "rename"), "running");
+			assert.deepEqual(result.state.teammates.map((teammate) => teammate.id), ["dev-1"]);
+			// Recovered again, it finds nothing open: no second Teammate.
+			const again = recover([...lines, ...result.append], { agents: [NAME] });
+			assert.deepEqual(again.append, []);
+			assert.deepEqual(again.actions, []);
+		});
+
+		it("is finished from the Teammate's own journal when `claude agents --json` can't be read, or no longer lists it", () => {
+			const { step: handoff, lines } = launching();
+
+			for (const agents of [undefined, []]) {
+				const result = recover(lines, { agents, journaled: ["dev-1"] });
+
+				assert.deepEqual(result.append, handoff.append);
+				assert.deepEqual(wakes(result), []);
+			}
+		});
+
+		it("that never happened is abandoned: the Task is still planned, its worktree goes, and the Lead hears it", () => {
+			const { lines } = launching(true);
+
+			const result = recover(lines, { agents: [] });
+
+			assert.deepEqual(result.append, [{ type: "launch-abandoned", teammate: "dev-1", reason: "`claude agents --json` doesn't list it and it never wrote to its journal", at: BACK }]);
+			assert.equal(taskStatus(result.state, "rename"), "planned");
+			assert.deepEqual(result.state.teammates, []);
+			assert.deepEqual(result.actions.slice(0, 1), [{ kind: "remove-task-workspace", slug: "rename", path: "/work/app/.claude/worktrees/team-software-2026-11-02-task-001", branch: "team/software-2026-11-02-task-001" }]);
+			const [wake] = wakes(result);
+			assert.match(wake?.kind === "wake-lead" ? wake.text : "", /`dev-1` didn't start .*Task `rename` is still planned.*`team_handoff`/);
+			assert.deepEqual(recover([...lines, ...result.append], { agents: [] }).append, []);
+		});
+
+		it("is left open, and the Lead told, when there is no evidence either way", () => {
+			const { lines } = launching();
+
+			const result = recover(lines, {});
+
+			assert.deepEqual(result.append, []);
+			assert.equal(Object.keys(result.state.launching ?? {}).length, 1);
+			const [wake] = wakes(result);
+			assert.match(wake?.kind === "wake-lead" ? wake.text : "", /`claude agents --json` couldn't be read/);
+		});
+
+		it("is closed by its own lines when the launch went through before pi stopped", () => {
+			const { step: handoff, lines } = launching();
+
+			const state = fold([...lines, ...handoff.append]);
+
+			assert.equal(state.launching, undefined);
+			assert.deepEqual(recover([...lines, ...handoff.append], {}).actions, []);
+		});
+
+		it("of a send-back to a new Teammate, abandoned, takes back the feedback written for it", () => {
+			const crashed = applied(applied(applied(applied(planned, { kind: "handoff", slug: "rename", at: T0 }), hook("dev-1", 1, "SessionStart", { session_id: SESSION, source: "startup" })), hook("dev-1", 2, "Stop", {}, true)), hook("dev-1", 3, "SessionEnd", { reason: "other" }));
+			const restaff = run(crashed, { kind: "review", slug: "rename", verdict: "send_back", feedback: "Still reads `colour`.", result: { path: `${TASKS}/001-dev-rename/result-1.md`, written: true }, sendBackLimit: 2, at: "2026-11-02T13:00:00.000Z" });
+			assert.ok(restaff.ok, restaff.ok ? "" : restaff.refusal);
+			const lines: EffortLine[] = [...crashed, { type: "launch-intended", teammate: "dev-2", name: "team-software-2026-11-02-dev-2", lines: restaff.append, at: "2026-11-02T13:00:00.000Z" }];
+
+			const result = recover(lines, { agents: [] });
+
+			assert.deepEqual(result.actions.slice(0, 1), [{ kind: "discard-feedback", slug: "rename", folder: "001-dev-rename", round: 1 }]);
+			assert.equal(result.state.tasks.rename?.round, 1);
+			assert.equal(result.state.tasks.rename?.teammate, "dev-1");
+		});
+	});
+
+	describe("a merge", () => {
+		const handed = applied(planned, { kind: "handoff", slug: "rename", isolated: true, at: T0 });
+		const done = applied(applied(handed, hook("dev-1", 1, "SessionStart", { session_id: SESSION, source: "startup" })), hook("dev-1", 2, "Stop", {}, true));
+		const accept = run(done, { kind: "review", slug: "rename", verdict: "accept", result: { path: `${TASKS}/001-dev-rename/result-1.md`, written: true }, sendBackLimit: 2, at: "2026-11-02T13:00:00.000Z" });
+		assert.ok(accept.ok);
+		const merging = [...done, ...accept.append];
+		const TASK_WORKTREE = { path: "/work/app/.claude/worktrees/team-software-2026-11-02-task-001", branch: "team/software-2026-11-02-task-001" };
+
+		it("already in the Effort branch is recorded as accepted with its merge commit, and never merged again", () => {
+			const result = recover(merging, { merges: { rename: { state: "merged", commit: "d".repeat(40) } } });
+
+			assert.deepEqual(result.append[0], { type: "task-accepted", slug: "rename", round: 1, merge: "d".repeat(40), at: BACK });
+			assert.ok(!result.actions.some((action) => action.kind === "merge"));
+			assert.deepEqual(
+				result.actions.filter((action) => action.kind !== "wake-lead").map((action) => action.kind),
+				["stop-teammate", "remove-task-workspace", "write-plan"],
+			);
+			assert.equal(wakes(result).length, 1);
+			assert.deepEqual(openMerges(result.state), []);
+			assert.deepEqual(recover([...merging, ...result.append], { merges: { rename: { state: "merged", commit: "d".repeat(40) } } }).actions, []);
+		});
+
+		it("cut short with `MERGE_HEAD` left behind is aborted and merged again; one not begun is merged", () => {
+			const half = recover(merging, { merges: { rename: { state: "half-done" } } });
+			const none = recover(merging, { merges: { rename: { state: "not-started" } } });
+
+			const merge = { kind: "merge", slug: "rename", folder: "001-dev-rename", into: WORKSPACE.path, ...TASK_WORKTREE };
+			assert.deepEqual(half.actions, [{ ...merge, abort: true }]);
+			assert.deepEqual(none.actions, [merge]);
+			assert.deepEqual(half.append, []);
+			assert.deepEqual(none.append, []);
+		});
+
+		it("is left open, and the Lead told, when git can't say where it stands", () => {
+			const result = recover(merging, {});
+
+			assert.deepEqual(result.append, []);
+			assert.ok(!result.actions.some((action) => action.kind === "merge"));
+			assert.equal(openMerges(result.state).length, 1);
+			const [wake] = wakes(result);
+			assert.match(wake?.kind === "wake-lead" ? wake.text : "", /Task `rename`.*team\/software-2026-11-02-task-001/);
+		});
+	});
+
+	describe("a promotion", () => {
+		const record = { request: "r1", brief: "b".repeat(64), workspace: WORKSPACE };
+
+		it("found in `approvals.jsonl` with the approved sha records the answer it promoted, and doesn't promote again", () => {
+			const result = recover(asked, { promoted: [record] });
+
+			assert.deepEqual(result.append, [{ type: "approval-answered", id: "r1", answer: "approved", workspace: WORKSPACE, at: BACK }]);
+			assert.equal(result.state.brief?.sha256, "b".repeat(64));
+			assert.deepEqual(result.state.workspace, WORKSPACE);
+			assert.ok(!result.actions.some((action) => action.kind === "promote-brief"));
+			assert.equal(wakes(result).length, 1);
+		});
+
+		it("is nothing to finish when no record matches the pending request and its sha", () => {
+			for (const promoted of [[], [{ ...record, brief: "e".repeat(64) }], [{ ...record, request: "r2" }]]) {
+				const result = recover(asked, { promoted });
+
+				assert.deepEqual(result.append, []);
+				assert.deepEqual(result.actions, []);
+				assert.equal(result.state.pending.length, 1);
+			}
+		});
+	});
+
+	describe("a relaunch", () => {
+		// dev-1 did `rename`; an approved Brief change then altered its Role's launch options, so `docs` starts it afresh.
+		const running = applied(applied(planned, { kind: "handoff", slug: "rename", at: T0 }), hook("dev-1", 1, "SessionStart", { session_id: SESSION, source: "startup" }));
+		const done = applied(running, hook("dev-1", 2, "Stop", { session_id: SESSION }, true));
+		const asked = applied(done, { kind: "request-approval", checkpoint: "brief-change", path: "/agent/team/efforts/software-2026-11-02/brief.draft.md", sha256: "c".repeat(64), snapshot: "---\n---\n", affects: [], at: "2026-11-02T12:10:00.000Z" });
+		const changed = applied(asked, { kind: "answer", id: "r2", answer: "approved", refresh: ["dev"], at: "2026-11-02T12:11:00.000Z" });
+		const accepted = applied(changed, { kind: "review", slug: "rename", verdict: "accept", result: { path: `${TASKS}/001-dev-rename/result-1.md`, written: true }, sendBackLimit: 2, at: "2026-11-02T13:00:00.000Z" });
+		const handoff = run(accepted, { kind: "handoff", slug: "docs", at: "2026-11-02T14:00:00.000Z" });
+		assert.ok(handoff.ok, handoff.ok ? "" : handoff.refusal);
+		const intended: EffortLine[] = [...accepted, { type: "launch-intended", teammate: "dev-1", name: NAME, lines: handoff.append, at: "2026-11-02T14:00:00.000Z" }];
+
+		it("that went in closes on its `teammate-relaunched` line, so a restart after it recovers nothing", () => {
+			const result = recover([...intended, ...handoff.append], { agents: [NAME], journaled: ["dev-1"] });
+
+			assert.deepEqual([result.append, result.actions], [[], []]);
+		});
+
+		it("is in once its new session journals, whatever `claude agents --json` says: the `--name` it lists is the old session's too", () => {
+			const listed = recover(intended, { agents: [NAME], journaled: [] });
+			const journaled = recover(intended, { agents: [], journaled: ["dev-1"] });
+
+			assert.deepEqual(listed.append.map((line) => line.type), ["launch-abandoned"]);
+			assert.equal(taskStatus(listed.state, "docs"), "planned");
+			const [kept] = listed.state.teammates;
+			assert.deepEqual({ freshDue: kept.freshDue, relaunching: kept.relaunching }, { freshDue: true, relaunching: undefined });
+			assert.match(wakes(listed)[0]?.text ?? "", /^`dev-1` wasn't started afresh before pi stopped: its new session never wrote to its journal.*still due a fresh start.*Task `docs` is still planned; hand it off again with `team_handoff`\.$/);
+			assert.deepEqual(journaled.append, handoff.append);
+			assert.equal(journaled.state.teammates[0].relaunching, true);
+		});
+
+		it("whose new session never started wakes the Lead once the journals are replayed, and waits while `claude agents --json` lists it", () => {
+			const relaunched = [...intended, ...handoff.append];
+			const missing = run(relaunched, { kind: "reconcile", agents: [], at: BACK });
+			const starting = run(relaunched, { kind: "reconcile", agents: [NAME], at: BACK });
+			const unread = run(relaunched, { kind: "reconcile", at: BACK });
+
+			assert.ok(missing.ok && starting.ok && unread.ok);
+			assert.match(missing.reply ?? "", /^`dev-1` was started afresh on Task `docs` before pi stopped, but its new session never started.*Stop and tell the human\.$/);
+			assert.deepEqual([starting.actions, starting.reply, unread.actions, unread.reply], [[], undefined, [], undefined]);
+		});
+	});
+
+	describe("reconciling after the journals are replayed", () => {
+		const running = applied(applied(planned, { kind: "handoff", slug: "rename", at: T0 }), hook("dev-1", 1, "SessionStart", { session_id: SESSION, source: "startup" }));
+		const done = applied(running, hook("dev-1", 2, "Stop", {}, true));
+		const sendBack = { kind: "review", slug: "rename", verdict: "send_back", feedback: "Still reads `colour`.", result: { path: `${TASKS}/001-dev-rename/result-1.md`, written: true }, sendBackLimit: 2, at: "2026-11-02T13:00:00.000Z" } as const;
+		const sentBack = applied(done, sendBack);
+		const accepted = applied(done, { ...sendBack, verdict: "accept" });
+		const cleared = applied(accepted, { kind: "handoff", slug: "docs", at: "2026-11-02T14:00:00.000Z" });
+
+		function reconcile(lines: EffortLine[], sent?: string[]): Extract<Step, { ok: true }> {
+			const result = run(lines, { kind: "reconcile", at: BACK, ...(sent === undefined ? {} : { sent }) });
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			return result;
+		}
+
+		it("sends again a send-back pointer that never landed, and nothing once its UserPromptSubmit is read", () => {
+			const landed = applied(sentBack, hook("dev-1", 3, "UserPromptSubmit", { prompt: `Round 1 of Task \`rename\` was sent back: read ${TASKS}/001-dev-rename/feedback-1.md and do what it asks. When it is done, write your result to ${TASKS}/001-dev-rename/result-2.md.` }));
+
+			assert.deepEqual(reconcile(sentBack).actions, [{ kind: "redeliver", teammate: "dev-1", slug: "rename", folder: "001-dev-rename", round: 2 }]);
+			assert.deepEqual(reconcile(landed).actions, []);
+		});
+
+		it("clears again a reused Teammate whose `SessionStart clear` never came, and sends the pointer the clear's has not reached", () => {
+			const afterClear = applied(cleared, hook("dev-1", 3, "SessionStart", { session_id: "dev-1000-0000-4000-8000-000000000002", source: "clear" }));
+			const landed = applied(afterClear, hook("dev-1", 4, "UserPromptSubmit", { prompt: `New Task \`docs\`: read ${TASKS}/002-dev-docs/task.md and do what it asks. When it is done, write your result to ${TASKS}/002-dev-docs/result-1.md.` }));
+
+			assert.deepEqual(reconcile(cleared).actions, [{ kind: "clear-then-send", teammate: "dev-1", inbox: INBOX, slug: "docs", folder: "002-dev-docs" }]);
+			assert.deepEqual(reconcile(afterClear).actions, [{ kind: "redeliver", teammate: "dev-1", slug: "docs", folder: "002-dev-docs", round: 1 }]);
+			// The replay sent it already, when it read the clear.
+			assert.deepEqual(reconcile(afterClear, ["docs"]).actions, []);
+			assert.deepEqual(reconcile(landed).actions, []);
+		});
+
+		it("rebuilds each `takeover` marker from the Takeover lines, and sends nothing again to a Teammate the human holds", () => {
+			const taken: EffortLine = { type: "takeover-started", teammate: "dev-1", cursor: 3, trigger: { kind: "prompt" }, at: "2026-11-02T13:10:00.000Z" };
+			const held = [...sentBack, taken];
+			const back = [...held, { type: "takeover-ended", teammate: "dev-1", cursor: 4, by: "terminal", at: "2026-11-02T13:20:00.000Z" } as const];
+
+			assert.deepEqual(reconcile(held).actions, [], "its owed pointer waits for the hand-back; with no markers read, none is touched");
+			const missing = run(held, { kind: "reconcile", marked: [], at: BACK });
+			const stale = run(back, { kind: "reconcile", marked: ["dev-1"], at: BACK });
+			const kept = run(held, { kind: "reconcile", marked: ["dev-1"], at: BACK });
+
+			assert.ok(missing.ok && stale.ok && kept.ok);
+			assert.deepEqual(missing.actions, [{ kind: "mark-takeover", teammate: "dev-1", on: true }]);
+			assert.deepEqual(stale.actions, [{ kind: "mark-takeover", teammate: "dev-1", on: false }, { kind: "redeliver", teammate: "dev-1", slug: "rename", folder: "001-dev-rename", round: 2 }]);
+			assert.deepEqual(kept.actions, []);
+		});
+
+		it("tells a crashed Teammate from an idle-stopped one, and wakes neither", () => {
+			const two = applied(applied(running, { kind: "handoff", slug: "docs", at: "2026-11-02T12:30:00.000Z" }), hook("dev-2", 1, "SessionStart", { session_id: "dev-2000-0000-4000-8000-000000000001", source: "startup" }));
+			const crash = applied(two, hook("dev-2", 2, "SessionEnd", { reason: "other" }));
+
+			const result = reconcile(crash);
+
+			assert.deepEqual(result.append, []);
+			assert.deepEqual(result.actions, []);
+			assert.equal(result.state.teammates.find((teammate) => teammate.id === "dev-2")?.ended?.how, "crashed");
+			assert.equal(result.state.teammates.find((teammate) => teammate.id === "dev-1")?.ended, undefined);
+		});
+	});
+
+	describe("the one message after a restart", () => {
+		it("is none when nothing needs the Lead", () => {
+			assert.equal(awayText(fold(planned), []), undefined);
+			assert.equal(awayText(fold(planned), [], ["/agent/team/efforts/software-2026-11-02"]), undefined);
+		});
+
+		it("gathers everything that needs the Lead into one message, with the records after an adoption or fork", () => {
+			const text = awayText(fold(planned), ["`dev-1` wrote result-1.md.", "`dev-2`'s session ended."], ["/agent/team/efforts/software-2026-11-02", "/agent/team/efforts/software-2026-11-02/plan.md"]) ?? "";
+
+			assert.match(text, /^While you were away, Effort `software-2026-11-02`:/);
+			assert.ok(text.includes("`dev-1` wrote result-1.md.") && text.includes("`dev-2`'s session ended."), text);
+			assert.match(text, /\/agent\/team\/efforts\/software-2026-11-02\/plan\.md/);
+			assert.ok(!(awayText(fold(planned), ["x"]) ?? "").includes("/agent/"));
+		});
 	});
 });
