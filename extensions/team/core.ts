@@ -196,6 +196,34 @@ export interface Teammate {
 	freshDue?: true;
 	/** Set from its fresh session's launch until that session's `SessionStart`, which gives it its new short id. */
 	relaunching?: true;
+	/** Set while the human has taken it over in its terminal: the Lead backs off until they hand it back. */
+	takeover?: Takeover;
+	/**
+	 * The held request the terminal killed the hook of, until something shows
+	 * whether it was a No: a call of it running says Yes, and anything else
+	 * the Teammate does first starts a Takeover.
+	 */
+	denied?: string;
+}
+
+/** What started a Takeover: a prompt or a command the human typed, Esc during a turn, or a No to a card. */
+export type TakeoverTrigger = { kind: "prompt" } | { kind: "command"; command: string } | { kind: "interrupt" } | { kind: "deny"; request: string };
+
+/** A send the Lead made to a taken-over Teammate, held until the hand-back: a message, dropped then, or a Task's pointer, sent then after a clear. */
+export interface HeldSend {
+	what: "message" | "pointer";
+	message?: string;
+	slug?: string;
+	at: string;
+}
+
+/** The human holds a Teammate: since when, what started it, what they typed since, and the sends held meanwhile. */
+export interface Takeover {
+	since: string;
+	trigger: TakeoverTrigger;
+	/** The prompts and commands (`/model sonnet`) the human typed, oldest first. */
+	inputs: string[];
+	held: HeldSend[];
 }
 
 /**
@@ -401,7 +429,17 @@ export type EffortLine =
 	/** The human answered an escalated item: in `/team pending`, or in chat with the Lead relaying it. */
 	| ({ type: "escalation-answered"; id: string } & NonNullable<Escalation["answered"]>)
 	/** The Lead sent a Teammate a prose message with `team_send`. */
-	| { type: "message-sent"; teammate: string; message: string; at: string };
+	| { type: "message-sent"; teammate: string; message: string; at: string }
+	/** The human took a Teammate over in its terminal, typing `input` (a prompt, or a command as `/name args`) when they did. */
+	| { type: "takeover-started"; teammate: string; cursor: number; trigger: TakeoverTrigger; input?: string; at: string }
+	/** The human typed another prompt or command to a Teammate they hold. */
+	| { type: "takeover-input"; teammate: string; cursor: number; input: string; at: string }
+	/** A turn of a Teammate the human holds ended: it waits on them, and nothing it wrote counts as done yet. */
+	| { type: "takeover-turn"; teammate: string; cursor: number; at: string }
+	/** A send to a Teammate the human holds, kept until the hand-back. Reads no journal line. */
+	| ({ type: "send-held"; teammate: string } & HeldSend)
+	/** The Takeover is over: handed back from the Teammate's terminal (`/handback`, a journal line) or from pi, or ended by a crash. */
+	| { type: "takeover-ended"; teammate: string; cursor?: number; by: "terminal" | "pi" | "crash"; note?: string; at: string };
 
 /**
  * A held request or a prose question the Lead escalated with
@@ -702,6 +740,8 @@ export type EffortInput =
 			tz?: number;
 			/** Each Role's model, from the Team snapshot, which a model-family limit holds Roles by. */
 			models?: Record<string, string>;
+			/** The prompts the Effort itself sent the Teammate (its pointers, `continue`): a prompt matching one is not the human's. */
+			sent?: readonly string[];
 	  }
 	/**
 	 * `team_review` of a handed-off Task, with whether its current round's
@@ -765,9 +805,12 @@ export type EffortInput =
 	 * After a restart, once the journals are replayed: what was sent and never
 	 * landed is sent again. `sent` names the Tasks whose pointer the replay
 	 * sent; `agents` the `--name`s `claude agents --json` lists, absent when it
-	 * couldn't be read.
+	 * couldn't be read; `marked` the Teammates with a `takeover` marker on disk,
+	 * absent when the markers weren't read.
 	 */
-	| { kind: "reconcile"; sent?: readonly string[]; agents?: readonly string[]; at: string };
+	| { kind: "reconcile"; sent?: readonly string[]; agents?: readonly string[]; marked?: readonly string[]; at: string }
+	/** `/team handback <teammate> [note]` in pi, with whether the Teammate's current result is on disk. */
+	| { kind: "handback"; teammate: string; note?: string; result: { path: string; written: boolean }; at: string };
 
 /** Where an open merge stands in git: in the Effort branch (by merge commit `commit`, absent when it had nothing new), cut short with `MERGE_HEAD` left behind, or never begun. */
 export type MergeEvidence = { state: "merged"; commit?: string } | { state: "half-done" } | { state: "not-started" };
@@ -842,7 +885,9 @@ export type EffortAction =
 	/** Send the Teammate the pointer to round `round` of the Task again: through its inbox, or by resuming its session. */
 	| { kind: "redeliver"; teammate: string; slug: string; folder: string; round: number }
 	/** Remove `feedback-<round>.md` from the Task's folder: the send-back that wrote it never launched its Teammate. */
-	| { kind: "discard-feedback"; slug: string; folder: string; round: number };
+	| { kind: "discard-feedback"; slug: string; folder: string; round: number }
+	/** Write (`on`) or remove the Teammate's `takeover` marker, which its hook reads to leave permission prompts to the human. */
+	| { kind: "mark-takeover"; teammate: string; on: boolean };
 
 export type Step =
 	| { ok: true; state: EffortState; append: EffortLine[]; actions: EffortAction[]; reply?: string }
@@ -854,7 +899,7 @@ export function openEffort(opened: { effortId: string; team: string; repo: strin
 }
 
 /** Lines a Report doesn't tell of: they only carry what other lines say. */
-const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested", "usage-read", "request-held", "request-answered", "launch-intended", "launch-abandoned"]);
+const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested", "usage-read", "request-held", "request-answered", "takeover-input", "takeover-turn", "send-held", "launch-intended", "launch-abandoned"]);
 
 /** Fold one line into the state, keeping what the next Report tells of. */
 function apply(state: EffortState, line: EffortLine): EffortState {
@@ -959,7 +1004,8 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 				teammates: state.teammates.map((teammate) => {
 					if (teammate.id !== line.teammate) return teammate;
 					// What the old session knew goes with it: the new one starts from its launch, with no session rules.
-					const { freshDue: _fresh, inbox: _inbox, activity: _activity, doing: _doing, limit: _limit, rules: _rules, clearing: _clearing, observedMode: _observed, mode: _mode, ...rest } = teammate;
+					// A card its old session's terminal killed the hook of goes too: the new session going on says nothing of it.
+					const { freshDue: _fresh, inbox: _inbox, activity: _activity, doing: _doing, limit: _limit, rules: _rules, clearing: _clearing, observedMode: _observed, mode: _mode, denied: _denied, ...rest } = teammate;
 					return { ...rest, task: line.task, startedAt: line.at, relaunching: true, ...(line.mode === undefined ? {} : { mode: line.mode }) };
 				}),
 			}, line.teammate);
@@ -1053,8 +1099,26 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			const { type: _type, cursor: _cursor, ...held } = line;
 			return { ...withTeammate(state, line, {}), teammateRequests: { ...state.teammateRequests, [line.request]: { ...held, state: "held" } } };
 		}
-		case "request-settled":
-			return withRequest(withTeammate(state, line, {}), line.request, line.how);
+		case "request-settled": {
+			const denied = state.teammates.find((each) => each.id === line.teammate)?.denied;
+			// A kill may still be a Yes: it is a No only once the Teammate goes on without the call.
+			const change = line.how === "denied-in-terminal" ? { denied: line.request } : denied === line.request ? { denied: undefined } : {};
+			return withRequest(withTeammate(state, line, change), line.request, line.how);
+		}
+		case "takeover-started":
+			return withTeammate(state, line, { takeover: { since: line.at, trigger: line.trigger, inputs: line.input === undefined ? [] : [line.input], held: [] }, denied: undefined });
+		case "takeover-input":
+			return withTakeover(withTeammate(state, line, {}), line.teammate, (takeover) => ({ ...takeover, inputs: [...takeover.inputs, line.input] }));
+		case "takeover-turn":
+			return endRequests(withTeammate(state, line, { activity: "idle", doing: "yours" }), line.teammate);
+		case "send-held": {
+			const { type: _type, teammate: _teammate, ...held } = line;
+			return withTakeover(state, line.teammate, (takeover) => ({ ...takeover, held: [...takeover.held, held] }));
+		}
+		case "takeover-ended": {
+			const moved = line.cursor === undefined ? state : withTeammate(state, { teammate: line.teammate, cursor: line.cursor }, {});
+			return { ...moved, teammates: moved.teammates.map((teammate) => (teammate.id === line.teammate ? withoutTakeover(teammate) : teammate)) };
+		}
 		case "request-answered": {
 			const answered = withRequest(state, line.request, "answered");
 			if (line.rule === undefined) return answered;
@@ -1250,6 +1314,16 @@ function withTeammate(state: EffortState, line: { teammate: string; cursor: numb
 	};
 }
 
+/** The state with `teammate`'s Takeover changed by `change`; a Teammate nobody holds is left alone. */
+function withTakeover(state: EffortState, teammate: string, change: (takeover: Takeover) => Takeover): EffortState {
+	return { ...state, teammates: state.teammates.map((each) => (each.id === teammate && each.takeover ? { ...each, takeover: change(each.takeover) } : each)) };
+}
+
+function withoutTakeover(teammate: Teammate): Teammate {
+	const { takeover: _takeover, denied: _denied, ...rest } = teammate;
+	return rest;
+}
+
 /** The state with request `request` moved to `to`. */
 function withRequest(state: EffortState, request: string, to: HeldRequest["state"]): EffortState {
 	const held = state.teammateRequests[request];
@@ -1336,6 +1410,8 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return recover(state, input);
 		case "reconcile":
 			return reconcile(state, input);
+		case "handback":
+			return handBackInPi(state, input);
 	}
 }
 
@@ -1448,6 +1524,9 @@ function answerRequest(state: EffortState, input: Extract<EffortInput, { kind: "
 	const held = state.teammateRequests[input.request];
 	if (!held) return { ok: false, refusal: noRequestText(state, input.request) };
 	if (held.state !== "held") return { ok: false, refusal: closedText(held) };
+	if (underTakeover(state, held.teammate)) {
+		return { ok: false, refusal: `The human has taken \`${held.teammate}\` over, so its permission prompts are theirs to answer in its terminal; you're woken when they hand it back.` };
+	}
 	const taken = takeAnswer(held, input);
 	if (typeof taken === "string") return { ok: false, refusal: taken };
 	const task = held.task === undefined ? {} : { task: held.task };
@@ -1631,6 +1710,14 @@ function send(state: EffortState, input: Extract<EffortInput, { kind: "send" }>)
 	const message = input.message.trim();
 	if (message === "") return { ok: false, refusal: "The message is empty: say what the Teammate should know." };
 	if (message.length > SEND_LIMIT) return { ok: false, refusal: `A message is at most ${SEND_LIMIT} characters, and this one is ${message.length}: put longer instructions in a Task.` };
+	if (teammate.takeover) {
+		return took(
+			state,
+			[{ type: "send-held", teammate: teammate.id, what: "message", message, at: input.at }],
+			[],
+			`The human has taken \`${teammate.id}\` over, so your message is held, and dropped when they hand it back. You're woken then.`,
+		);
+	}
 	return took(
 		state,
 		[{ type: "message-sent", teammate: teammate.id, message, at: input.at }],
@@ -2173,7 +2260,8 @@ function live(state: EffortState): Teammate[] {
 
 /** Whether `teammate` is between Tasks: its Task is accepted and it hasn't been given another. */
 function free(state: EffortState, teammate: Teammate): boolean {
-	return state.tasks[teammate.task]?.accepted !== undefined && teammate.clearing === undefined;
+	// A Teammate the human holds is never cleared for a new Task.
+	return state.tasks[teammate.task]?.accepted !== undefined && teammate.clearing === undefined && teammate.takeover === undefined;
 }
 
 /**
@@ -2334,8 +2422,189 @@ function journal(state: EffortState, input: Extract<EffortInput, { kind: "journa
 	return took(state, [{ type: "teammate-mode", teammate: teammate.id, cursor: input.cursor, mode, at: input.line.at }, ...event.append], event.actions, event.reply);
 }
 
+/** The commands that only look, which never start a Takeover. */
+export const READ_ONLY_COMMANDS: readonly string[] = ["context", "cost", "usage", "status", "help"];
+
+/** The hook events that show a card the terminal killed the hook of was a No: the Teammate went on without the call. */
+const AFTER_A_NO: ReadonlySet<string> = new Set(["Stop", "UserPromptSubmit", "Notification"]);
+
+/**
+ * What the human typed, by a mod journal line: a prompt that isn't one the
+ * Effort sent, or a command (`/model sonnet`) not on the read-only list.
+ * Undefined for anything else, `/handback` included.
+ */
+function humanInput(line: JournalLine, sent: readonly string[] | undefined): string | undefined {
+	const payload = line.payload ?? {};
+	if (line.event === "prompt.submit") {
+		const typed = (text(payload.text) ?? "").trim();
+		if (typed === "" || typed.startsWith("/")) return undefined;
+		return (sent ?? []).some((each) => each.trim() === typed) ? undefined : typed;
+	}
+	if (line.event === "command.run") {
+		const command = (text(payload.command) ?? "").replace(/^\//, "");
+		if (command === "" || command === "handback" || READ_ONLY_COMMANDS.includes(command)) return undefined;
+		return `/${command} ${text(payload.args) ?? ""}`.trim();
+	}
+	return undefined;
+}
+
+/** What a mod journal line starts a Takeover with, or undefined when it doesn't. */
+function triggerOf(line: JournalLine, sent: readonly string[] | undefined): TakeoverTrigger | undefined {
+	if (line.event === "turn.complete") return line.payload?.aborted === true ? { kind: "interrupt" } : undefined;
+	const input = humanInput(line, sent);
+	if (input === undefined) return undefined;
+	return line.event === "command.run" ? { kind: "command", command: input.split(" ")[0] ?? input } : { kind: "prompt" };
+}
+
+/** What started a Takeover, as the Lead and the Team block say it: `typed a prompt`. */
+export function takeoverText(trigger: TakeoverTrigger): string {
+	switch (trigger.kind) {
+		case "prompt":
+			return "typed a prompt";
+		case "command":
+			return `ran \`${trigger.command}\``;
+		case "interrupt":
+			return "interrupted a turn";
+		case "deny":
+			return `said No to its permission prompt \`${trigger.request}\``;
+	}
+}
+
+/** Whether the human holds Teammate `id` in a Takeover. */
+export function underTakeover(state: EffortState, id: string): boolean {
+	return state.teammates.find((each) => each.id === id)?.takeover !== undefined;
+}
+
+/** A Takeover starting: one line, the Lead woken once, and the hook's marker written. */
+function takeoverStart(teammate: Teammate, cursor: number, trigger: TakeoverTrigger, input: string | undefined, at: string): { append: EffortLine[]; actions: EffortAction[] } {
+	return {
+		append: [{ type: "takeover-started", teammate: teammate.id, cursor, trigger, ...(input === undefined ? {} : { input }), at }],
+		actions: [
+			{ kind: "mark-takeover", teammate: teammate.id, on: true },
+			{
+				kind: "wake-lead",
+				text: `The human took over \`${teammate.id}\` in its terminal: they ${takeoverText(trigger)}${input === undefined ? "" : ` (${JSON.stringify(input)})`}. Until they hand it back, sends to it are held and dropped at the hand-back, its permission prompts are theirs, and nothing it does counts as done; re-plan around it. You're woken once more at the hand-back.`,
+			},
+		],
+	};
+}
+
+/**
+ * A journal line of a Teammate the human may be taking over. A mod line of
+ * their input starts a Takeover or adds to it, and `/handback` ends it; a
+ * card the terminal killed the hook of is a No once the Teammate goes on
+ * without the call. Undefined for a line the usual rules take.
+ */
+function takeoverEvent(state: EffortState, teammate: Teammate, input: Extract<EffortInput, { kind: "journal" }>): Step | undefined {
+	const { cursor, line } = input;
+	const at = line.at;
+	const mod = line.from === "mod";
+	if (teammate.ended !== undefined || teammate.retiredAt !== undefined) return mod ? took(state, [], []) : undefined;
+	// Until its fresh session starts, what the human types reaches only the old one, which is being stopped (#112).
+	if (teammate.relaunching && teammate.takeover === undefined) return mod ? took(state, [], []) : undefined;
+	if (teammate.takeover === undefined && teammate.denied !== undefined && (mod ? line.event !== "handback" : AFTER_A_NO.has(line.event ?? ""))) {
+		const start = takeoverStart(teammate, cursor, { kind: "deny", request: teammate.denied }, mod ? humanInput(line, input.sent) : undefined, at);
+		if (mod) return took(state, start.append, start.actions);
+		const after = start.append.reduce(apply, state);
+		const rest = journalEvent(after, after.teammates.find((each) => each.id === teammate.id) ?? teammate, input);
+		return rest.ok ? took(state, [...start.append, ...rest.append], [...start.actions, ...rest.actions], rest.reply) : rest;
+	}
+	if (teammate.takeover === undefined) {
+		if (!mod) return undefined;
+		const trigger = triggerOf(line, input.sent);
+		if (trigger === undefined) return took(state, [], []);
+		const start = takeoverStart(teammate, cursor, trigger, humanInput(line, input.sent), at);
+		return took(state, start.append, start.actions);
+	}
+	if (mod) {
+		if (line.event === "handback") return handBack(state, teammate, { by: "terminal", note: text(line.payload?.note), result: input.result, at, cursor });
+		const typed = humanInput(line, input.sent);
+		return took(state, typed === undefined ? [] : [{ type: "takeover-input", teammate: teammate.id, cursor, input: typed, at }], []);
+	}
+	switch (line.event) {
+		case "Stop":
+			// Nothing a Teammate the human holds writes counts as done until they hand it back.
+			return took(state, [{ type: "takeover-turn", teammate: teammate.id, cursor, at }, ...wentThrough(state, teammate, at)], []);
+		case "SessionStart": {
+			const sessionId = text(line.payload?.session_id);
+			if (sessionId === undefined || teammate.clearing === undefined || text(line.payload?.source) !== "clear") return undefined;
+			// A clear asked for before the human took over landed: the Task's pointer waits for the hand-back.
+			const plain = journalEvent(state, { ...teammate, clearing: undefined }, input);
+			if (!plain.ok) return plain;
+			return took(state, [...plain.append, { type: "send-held", teammate: teammate.id, what: "pointer", slug: teammate.clearing, at }], []);
+		}
+		case "SessionEnd": {
+			const ended = sessionEnded(state, teammate, input);
+			if (!ended.ok || ended.append.length === 0) return ended;
+			return took(state, [...ended.append, { type: "takeover-ended", teammate: teammate.id, cursor, by: "crash", at }], [{ kind: "mark-takeover", teammate: teammate.id, on: false }, ...ended.actions]);
+		}
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * The human handed a Teammate back: from its terminal with `/handback`, or
+ * from pi. Held messages are dropped; a held Task pointer goes after a clear,
+ * since the context is the human's now. A result written meanwhile is done
+ * now, and the Lead is woken once with what the human did.
+ */
+function handBack(
+	state: EffortState,
+	teammate: Teammate,
+	from: { by: "terminal" | "pi"; note?: string; result: { path: string; written: boolean }; at: string; cursor?: number },
+): Step {
+	const takeover = teammate.takeover;
+	if (takeover === undefined) {
+		if (from.by === "terminal") return took(state, [], []);
+		return { ok: false, refusal: `Nobody holds \`${teammate.id}\`: it isn't taken over, so there is nothing to hand back.` };
+	}
+	const { at } = from;
+	const note = from.note?.trim() || undefined;
+	const append: EffortLine[] = [
+		{ type: "takeover-ended", teammate: teammate.id, ...(from.cursor === undefined ? {} : { cursor: from.cursor }), by: from.by, ...(note === undefined ? {} : { note }), at },
+	];
+	const actions: EffortAction[] = [{ kind: "mark-takeover", teammate: teammate.id, on: false }];
+	const due = currentResult(state, teammate.id);
+	const task = due === undefined ? undefined : state.tasks[due.slug];
+	const done = due !== undefined && task !== undefined && task.teammate === teammate.id && task.accepted === undefined && task.dropped === undefined && from.result.written && task.reported !== due.round;
+	if (done) append.push({ type: "task-done", teammate: teammate.id, cursor: from.cursor ?? teammate.cursor ?? 0, slug: due.slug, round: due.round, at });
+	const pointer = [...takeover.held].reverse().find((held) => held.what === "pointer");
+	const next = pointer?.slug === undefined ? undefined : state.tasks[pointer.slug];
+	if (pointer?.slug !== undefined && next !== undefined && teammate.inbox !== undefined) {
+		append.push({ type: "clear-requested", teammate: teammate.id, slug: pointer.slug, at });
+		actions.push({ kind: "clear-then-send", teammate: teammate.id, inbox: teammate.inbox, slug: pointer.slug, folder: next.folder });
+	}
+	const after = append.reduce(apply, state).teammates.find((each) => each.id === teammate.id) ?? teammate;
+	const messages = takeover.held.filter((held) => held.what === "message");
+	const lines = [
+		`The human handed \`${teammate.id}\` back ${from.by === "pi" ? "in pi" : "from its terminal"}. They took it over at ${clock(takeover.since)}, when they ${takeoverText(takeover.trigger)}.`,
+		takeover.inputs.length === 0 ? "They typed no prompt or command to it." : `What they typed to it, in order:\n${takeover.inputs.map((each) => `- ${JSON.stringify(each)}`).join("\n")}`,
+		due === undefined
+			? `It has no open Task.`
+			: from.result.written
+				? `Round ${due.round}'s result of Task \`${due.slug}\` is written: ${from.result.path}.`
+				: `Round ${due.round}'s result of Task \`${due.slug}\` isn't written: ${from.result.path} isn't there.`,
+		`It is ${after.activity ?? "not started"}${after.doing === undefined ? "" : ` (${after.doing})`}${pointer?.slug === undefined ? "" : `, and gets Task \`${pointer.slug}\`'s pointer after a clear`}.`,
+		messages.length === 0 ? "No send was held." : `The ${messages.length === 1 ? "send" : `${messages.length} sends`} held meanwhile, now dropped:\n${messages.map((held) => `- ${JSON.stringify(held.message ?? "")}`).join("\n")}`,
+		note === undefined ? "They left no note." : `Their note: ${note}`,
+		`What they did is part of ${due === undefined ? "its work" : `Task \`${due.slug}\``}: review it like any result. It never amends the Brief. Decide afresh what comes next.`,
+	];
+	actions.push({ kind: "wake-lead", text: lines.join("\n\n") });
+	return took(state, append, actions, `Handed \`${teammate.id}\` back: ${messages.length === 0 ? "no send was held" : `${messages.length} held send${messages.length === 1 ? " is" : "s are"} dropped`}, and the Lead reviews what you did.`);
+}
+
+/** `/team handback <teammate> [note]` in pi. */
+function handBackInPi(state: EffortState, input: Extract<EffortInput, { kind: "handback" }>): Step {
+	const teammate = teammateOf(state, input.teammate);
+	if (typeof teammate === "string") return { ok: false, refusal: teammate };
+	return handBack(state, teammate, { by: "pi", ...(input.note === undefined ? {} : { note: input.note }), result: input.result, at: input.at });
+}
+
 /** What one journal event of `teammate` appends, past its cursor. */
 function journalEvent(state: EffortState, teammate: Teammate, input: Extract<EffortInput, { kind: "journal" }>): Step {
+	const taken = takeoverEvent(state, teammate, input);
+	if (taken !== undefined) return taken;
 	const { cursor, line } = input;
 	const payload = line.payload ?? {};
 	const at = line.at;
@@ -2391,7 +2660,8 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 			const { state: _state, ...fields } = held;
 			return took(state, [{ type: "request-held", cursor, ...fields }], [{ kind: "wake-lead", text: askText(held) }]);
 		}
-		case "PostToolUse": {
+		case "PostToolUse":
+		case "PostToolUseFailure": {
 			// A call a held request asked for ran: the human answered it in the terminal first.
 			// A hook killed by the terminal looks like a deny until the call runs.
 			const tool = text(payload.tool_name);
@@ -2576,7 +2846,7 @@ export function usageHolds(state: EffortState): boolean {
 }
 
 function continuable(state: EffortState): Teammate[] {
-	return live(state).filter((each) => each.limit !== undefined && each.limit.armed === undefined && each.activity === "idle" && each.inbox !== undefined);
+	return live(state).filter((each) => each.limit !== undefined && each.limit.armed === undefined && each.activity === "idle" && each.inbox !== undefined && each.takeover === undefined);
 }
 
 /**
@@ -2743,6 +3013,9 @@ function review(state: EffortState, input: Extract<EffortInput, { kind: "review"
 	}
 	if (task.dropped !== undefined) {
 		return { ok: false, refusal: `Task \`${input.slug}\` was dropped from the plan, so there is nothing to review; plan it again with \`team_plan\` and hand it off afresh.` };
+	}
+	if (underTakeover(state, task.teammate)) {
+		return { ok: false, refusal: `The human has taken \`${task.teammate}\` over, so Task \`${input.slug}\` waits on them: review it once they hand it back, when you're woken with what they did.` };
 	}
 	if (briefHeld(state, input.slug)) {
 		return {
@@ -2991,7 +3264,13 @@ function recoverMerge(state: EffortState, slug: string, input: Extract<EffortInp
  */
 function reconcile(state: EffortState, input: Extract<EffortInput, { kind: "reconcile" }>): Step {
 	const actions: EffortAction[] = [];
+	// The hook reads the marker, so it must say what the Takeover lines say: pi may have stopped between the two.
+	for (const teammate of input.marked === undefined ? [] : state.teammates) {
+		const on = teammate.takeover !== undefined;
+		if (on !== input.marked?.includes(teammate.id)) actions.push({ kind: "mark-takeover", teammate: teammate.id, on });
+	}
 	for (const teammate of live(state)) {
+		if (teammate.takeover !== undefined) continue;
 		const task = teammate.clearing === undefined ? undefined : state.tasks[teammate.clearing];
 		if (teammate.clearing !== undefined && task && teammate.inbox) actions.push({ kind: "clear-then-send", teammate: teammate.id, inbox: teammate.inbox, slug: teammate.clearing, folder: task.folder });
 	}
@@ -3000,7 +3279,8 @@ function reconcile(state: EffortState, input: Extract<EffortInput, { kind: "reco
 	for (const [slug, round] of Object.entries(state.undelivered ?? {})) {
 		const task = state.tasks[slug];
 		const teammate = state.teammates.find((each) => each.id === task?.teammate);
-		if (!task || !teammate || teammate.ended || teammate.retiredAt !== undefined || teammate.clearing === slug || input.sent?.includes(slug)) continue;
+		// A Teammate the human holds gets what it is owed at the hand-back.
+		if (!task || !teammate || teammate.ended || teammate.retiredAt !== undefined || teammate.takeover !== undefined || teammate.clearing === slug || input.sent?.includes(slug)) continue;
 		actions.push({ kind: "redeliver", teammate: teammate.id, slug, folder: task.folder, round });
 	}
 	const reply = unstarted

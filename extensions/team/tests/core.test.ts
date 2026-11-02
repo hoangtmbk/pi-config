@@ -2968,6 +2968,22 @@ describe("recovering after a restart", () => {
 			assert.deepEqual(reconcile(landed).actions, []);
 		});
 
+		it("rebuilds each `takeover` marker from the Takeover lines, and sends nothing again to a Teammate the human holds", () => {
+			const taken: EffortLine = { type: "takeover-started", teammate: "dev-1", cursor: 3, trigger: { kind: "prompt" }, at: "2026-11-02T13:10:00.000Z" };
+			const held = [...sentBack, taken];
+			const back = [...held, { type: "takeover-ended", teammate: "dev-1", cursor: 4, by: "terminal", at: "2026-11-02T13:20:00.000Z" } as const];
+
+			assert.deepEqual(reconcile(held).actions, [], "its owed pointer waits for the hand-back; with no markers read, none is touched");
+			const missing = run(held, { kind: "reconcile", marked: [], at: BACK });
+			const stale = run(back, { kind: "reconcile", marked: ["dev-1"], at: BACK });
+			const kept = run(held, { kind: "reconcile", marked: ["dev-1"], at: BACK });
+
+			assert.ok(missing.ok && stale.ok && kept.ok);
+			assert.deepEqual(missing.actions, [{ kind: "mark-takeover", teammate: "dev-1", on: true }]);
+			assert.deepEqual(stale.actions, [{ kind: "mark-takeover", teammate: "dev-1", on: false }, { kind: "redeliver", teammate: "dev-1", slug: "rename", folder: "001-dev-rename", round: 2 }]);
+			assert.deepEqual(kept.actions, []);
+		});
+
 		it("tells a crashed Teammate from an idle-stopped one, and wakes neither", () => {
 			const two = applied(applied(running, { kind: "handoff", slug: "docs", at: "2026-11-02T12:30:00.000Z" }), hook("dev-2", 1, "SessionStart", { session_id: "dev-2000-0000-4000-8000-000000000001", source: "startup" }));
 			const crash = applied(two, hook("dev-2", 2, "SessionEnd", { reason: "other" }));

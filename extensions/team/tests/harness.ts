@@ -5,7 +5,7 @@
  * Nothing here is a test of its own; `npm test` only runs `*.test.ts`.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { existsSync, fstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -130,9 +130,10 @@ export interface FakeClaudeOptions {
  * and event name filled in), write the result its handoff pointer asks for,
  * edit a file in its working directory, committing it when a message is given,
  * or update its status line, which runs the `statusLine.command` of its
- * `--settings` with the payload (the session id and folder filled in).
+ * `--settings` with the payload (the session id and folder filled in), or
+ * raise the human's input at its terminal through its mods (`mod`).
  */
-export type FakeHookStep = ({ event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string } | { statusLine: Record<string, unknown> }) & {
+export type FakeHookStep = ({ event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string } | { statusLine: Record<string, unknown> } | { mod: string; input: Record<string, unknown> }) & {
 	/** Play the step only for a pointer that includes this text. */
 	when?: string;
 };
@@ -184,6 +185,8 @@ export interface FakeClaude {
 	release(): void;
 	/** Every session it started, live or not, as its registry holds it. */
 	agents(): FakeAgent[];
+	/** Play `steps` on the session named `name` now, as the human at its terminal does, resolving once they have played. */
+	terminal(name: string, steps: FakeHookStep[]): Promise<void>;
 	/** Idle-stop the session named `name`, as Claude Code does after about an hour: gone from `agents --json`, its socket closed, no hook. */
 	idleStop(name: string): void;
 	/** Close the socket of the session named `name` but leave it in `agents --json`, so a send to it is refused. */
@@ -303,6 +306,11 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 			for (const { pid, exit } of jsonLines<{ pid: number; exit: string }>(heldOut)) if (!existsSync(exit)) kill(pid);
 		},
 		agents: () => readdirSync(agents).map((file) => JSON.parse(readFileSync(join(agents, file), "utf8")) as FakeAgent),
+		// Not synchronous: a hook rings the Lead's doorbell in this very process, which must be free to answer it.
+		terminal: (name, steps) =>
+			new Promise((resolve, reject) => {
+				execFile(path, ["--fake-terminal", JSON.stringify({ name, steps })], (error) => (error ? reject(error) : resolve()));
+			}),
 		idleStop: (name) =>
 			change(name, (agent) => {
 				rmSync(agent.socket, { force: true });

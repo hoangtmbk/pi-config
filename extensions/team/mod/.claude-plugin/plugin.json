@@ -1,1 +1,1 @@
-{ "name": "team", "version": "0.1.0", "description": "The team extension's mod for Teammates: clears a Teammate's context when the Lead's inbox message carries __TEAM_CLEAR__" }
+{ "name": "team", "version": "0.1.0", "description": "The team extension's mod for Teammates: clears a Teammate's context when the Lead's inbox message carries __TEAM_CLEAR__, journals what the human does in its terminal (a Takeover), and adds /handback to give it back to the Lead" }

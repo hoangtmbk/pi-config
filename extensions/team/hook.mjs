@@ -36,10 +36,18 @@
  *     `hold-expired` with a doorbell, the hook exits 0 printing nothing and
  *     the prompt is the human's alone. The hold time stops short of the hook's own timeout so the
  *     hook, not Claude Code's kill, decides how the hold ended.
+ *
+ * During a Takeover (`teammates/<id>/takeover` exists) a `PermissionRequest`
+ * isn't held: it is journalled without a request id, the doorbell rings, and
+ * the hook exits 0 printing nothing, so the prompt is the human's.
+ *
+ * The Team's mod runs this command too, with `{ mod, payload }` on stdin for
+ * what the human does in the terminal: it is journalled as a `mod` line and
+ * the doorbell rings, as for any event.
  */
 
 import { randomBytes } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { connect } from "node:net";
 import { join } from "node:path";
 import { floorAction } from "./floor.mjs";
@@ -77,8 +85,11 @@ function parse(text) {
 	}
 }
 
-/** One journal line. A `SessionStart` also carries the inbox socket and token, which reach hooks only through the environment. */
+/**
+ * One journal line. What the mod hands over, `{ mod, payload }` (the human's
+ * input in the Teammate's terminal), is a mod line of that event. A `SessionStart` also carries the inbox socket and token, which reach hooks only through the environment. */
 function journalLine(payload, request) {
+	if (typeof payload?.mod === "string" && payload.hook_event_name === undefined) return `${JSON.stringify({ from: "mod", at: new Date().toISOString(), event: payload.mod, payload: payload.payload ?? {} })}\n`;
 	const line = { from: "hook", at: new Date().toISOString(), event: payload?.hook_event_name, payload };
 	if (request) line.request = request;
 	const socket = process.env.CLAUDE_CODE_MESSAGING_SOCKET;
@@ -188,7 +199,9 @@ if (effortDir && teammate) {
 	const dir = join(effortDir, "teammates", teammate);
 	mkdirSync(dir, { recursive: true });
 	const journal = join(dir, "events.jsonl");
-	if (payload?.hook_event_name === "PermissionRequest") {
+	// A Takeover (the marker the Lead writes) leaves every prompt with the human: journalled
+	// without a request id, so nothing waits on the Lead, and the doorbell rings as for any event.
+	if (payload?.hook_event_name === "PermissionRequest" && !existsSync(join(dir, "takeover"))) {
 		const request = `req-${randomBytes(4).toString("hex")}`;
 		appendFileSync(journal, journalLine(payload, request));
 		hold(journal, request);
