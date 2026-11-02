@@ -23,18 +23,20 @@ import { launchBackground, teammateArgs, teammateSettings, trustFolder, versionW
 import { currentResult, type EffortAction, type EffortState, fold, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace } from "./core.ts";
 import { EVERY_ROLE, listTeams, loadTeam, type Playbook, readSnapshot, type Role, sha256, type Team, type TeamRoots } from "./definitions.ts";
 import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
+import { adoptable, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
 import {
 	appendLines,
 	briefCriteria,
 	checkRecords,
 	createEffort,
 	type EffortPaths,
+	effortPaths,
 	promoteBrief,
 	protectedRecords,
 	readJournal,
+	readLead,
 	readLines,
 	validateBrief,
-	writeLead,
 	writePlan,
 	writeTask,
 } from "./records.ts";
@@ -103,6 +105,8 @@ export interface TeamDeps {
 	bundledTeamsDir?: string;
 	/** The clock adoption times are read from. Injected by tests, and by nothing else. */
 	now?: () => Date;
+	/** The pid this session leads an Effort as. Injected by tests standing in for another pi process, and by nothing else. */
+	pid?: number;
 }
 
 /** The paths the extension runs against once defaults are filled in. */
@@ -130,6 +134,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		claudePath: deps.claudePath ?? "claude",
 	};
 	const now = deps.now ?? (() => new Date());
+	const pid = deps.pid ?? process.pid;
 
 	// What this session is running, which decides whether the Lead's tools are on.
 	let setup: TeamSetup | undefined;
@@ -137,7 +142,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	let pending: PendingAdoption[] = [];
 	// The one Effort this session's Lead holds.
 	let effort: HeldEffort | undefined;
-	// The Lead bridge the held Effort's hooks ring, once a Teammate is launched.
+	// The Lead bridge the held Effort's hooks ring, open while this session is its Lead.
 	let bridge: Promise<Bridge> | undefined;
 	// Whether the Lead's model is in a run, and what wakes about Teammates wait for it to settle.
 	let busy = false;
@@ -174,24 +179,48 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		pi.sendMessage({ customType, content: text, display: true }, { triggerTurn: true, deliverAs: "followUp" });
 	}
 
+	function leader(ctx: ExtensionContext): Leader {
+		return { pid, sessionFile: ctx.sessionManager.getSessionFile() };
+	}
+
 	/**
-	 * Start the Lead bridge for the held Effort, once, and write `lead.json`
-	 * so the hook script can ring it. Every launch waits for it first.
+	 * Lead the Effort: start the Lead bridge, once, and take the lock, which
+	 * writes `lead.json` so the hook script can ring it. Throws, with the bridge
+	 * closed again, while another session is its live Lead. Every launch waits
+	 * for it first.
 	 */
 	async function listenForTeammates(held: HeldEffort, ctx: ExtensionContext): Promise<void> {
-		bridge ??= openBridge((teammate) => {
-			if (effort) wakeAboutTeammates(applyJournals(effort, teammate));
-		}).then(
-			(opened) => {
-				writeLead(held.paths, { pid: process.pid, port: opened.port, token: opened.token, sessionFile: ctx.sessionManager.getSessionFile(), startedAt: now().toISOString() });
-				return opened;
-			},
-			(error: unknown) => {
-				bridge = undefined;
+		bridge ??= (async () => {
+			const opened = await openBridge((teammate) => {
+				if (effort) wakeAboutTeammates(applyJournals(effort, teammate));
+			});
+			const refused = await takeLead(held.paths, leader(ctx), opened, now().toISOString()).catch((error: unknown) => {
+				opened.close();
 				throw error;
-			},
-		);
+			});
+			if (refused) {
+				opened.close();
+				throw new Error(refused.refusal);
+			}
+			return opened;
+		})().catch((error: unknown) => {
+			bridge = undefined;
+			throw error;
+		});
 		await bridge;
+	}
+
+	/** Lead the Effort and hold it in this session, or say why not. */
+	async function lead(held: HeldEffort, ctx: ExtensionContext): Promise<boolean> {
+		try {
+			await listenForTeammates(held, ctx);
+		} catch (error) {
+			ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			return false;
+		}
+		effort = held;
+		syncLeadTools();
+		return true;
 	}
 
 	/**
@@ -245,6 +274,86 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		);
 	});
 
+	// Leaving the session leaves the Effort with no live Lead, marked in `lead.json` for whoever leads it next.
+	// `/tree` moves along the session's branches, but the Effort lives in its files: the Lead hears where it stands on its next turn.
+	pi.on("session_tree", () => {
+		if (!effort) return;
+		const state = effortState(effort);
+		const text = [
+			`This session still leads Effort \`${effort.effortId}\` (${effort.paths.dir}), whichever branch of the tree you are on: its state lives in its files.`,
+			`Brief: ${state.brief ? `approved ${state.brief.approvedAt}` : "not yet approved"}.`,
+			`Tasks handed off: ${Object.keys(state.tasks).length}.`,
+			`Teammates: ${state.teammates.length}.`,
+			`Waiting on the human: ${state.pending.length}.`,
+		].join(" ");
+		pi.sendMessage({ customType: "team-status", content: text, display: true }, { deliverAs: "nextTurn" });
+	});
+
+	// Switching to another session leaves the Effort with no live Lead, so the human is asked first.
+	pi.on("session_before_switch", async (event, ctx) => {
+		if (!effort || !ctx.hasUI) return undefined;
+		if (event.reason === "resume" && event.targetSessionFile === ctx.sessionManager.getSessionFile()) return undefined;
+		const leave = await ctx.ui.confirm(
+			`Leave Effort \`${effort.effortId}\`?`,
+			`This session leads it. Switching leaves it with no live Lead until \`/resume\` brings you back here, or \`/team resume ${effort.effortId}\` adopts it in another session.`,
+		);
+		return leave ? undefined : { cancel: true };
+	});
+
+	// `/fork` and `/clone` move the Effort to the new session, which re-attaches to it.
+	pi.on("session_shutdown", async (event, ctx) => {
+		if (!effort) return;
+		try {
+			await leaveLead(effort.paths, leader(ctx), now().toISOString(), event.reason === "fork" ? event.targetSessionFile : undefined);
+		} catch (error) {
+			// Best effort: a Lead that can't mark it is taken over once its pid has died.
+			ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+		}
+	});
+
+	/**
+	 * Re-attach to the Effort this session leads: `pi -c`, `/resume` back to
+	 * it, `/reload`, or the session a fork or clone moved it to. The session's
+	 * pointer names the Effort, and `lead.json` must name this session file: a
+	 * session that has since handed the Effort on leaves it where it is.
+	 */
+	pi.on("session_start", async (event, ctx) => {
+		if (effort) return;
+		const sessionFile = ctx.sessionManager.getSessionFile();
+		if (!sessionFile) return;
+		let pointer = pointerIn(ctx.sessionManager.getEntries());
+		let moved = false;
+		if (!pointer && event.reason === "fork") {
+			// Forked before its first message, a session carries none of its Lead's entries; lead.json names it already.
+			const effortId = ledFrom(paths.agentDir, sessionFile);
+			if (effortId !== undefined) {
+				pointer = { effortId, effortDir: effortPaths(paths.agentDir, effortId).dir };
+				moved = true;
+			}
+		}
+		if (!pointer) return;
+		const held = { effortId: pointer.effortId, paths: effortPaths(paths.agentDir, pointer.effortId) };
+		try {
+			if (!existsSync(held.paths.log)) {
+				ctx.ui.notify(`This session led Effort \`${pointer.effortId}\`, whose files are no longer at ${held.paths.dir}.`, "warning");
+				return;
+			}
+			const record = readLead(held.paths);
+			if (record && record.sessionFile !== sessionFile) {
+				const live = liveLead(held.paths);
+				const where = live ? `${holderText(live)}; \`/team resume ${pointer.effortId}\` adopts it here once that session leaves it` : `${record.sessionFile ?? "a pi session kept in memory"}, which has left it; \`/team resume ${pointer.effortId}\` adopts it here`;
+				ctx.ui.notify(`This session led Effort \`${pointer.effortId}\`, which is now led from ${where}.`, "info");
+				return;
+			}
+		} catch (error) {
+			ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			return;
+		}
+		if (!(await lead(held, ctx))) return;
+		if (moved) pi.appendEntry(POINTER, { effortId: held.effortId, effortDir: held.paths.dir });
+		ctx.ui.notify(`This session leads Effort \`${held.effortId}\` (${held.paths.dir}) again.`, "info");
+	});
+
 	function runSetup(team: Team, startsTeam: boolean): void {
 		const begun = beginSetup(paths.agentDir, team, startsTeam);
 		// A setup for another Team ends the one before it, and with it what that one asked.
@@ -254,7 +363,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		wakeLead("team-setup", begun.prompt);
 	}
 
-	function land(outcome: StartOutcome, ctx: ExtensionCommandContext): void {
+	async function land(outcome: StartOutcome, ctx: ExtensionCommandContext): Promise<void> {
 		switch (outcome.kind) {
 			case "notify":
 				ctx.ui.notify(outcome.text, outcome.level);
@@ -267,13 +376,13 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				runSetup(outcome.team, true);
 				return;
 			case "intake":
-				openIntake(outcome.team, outcome.playbook, outcome.text, ctx);
+				await openIntake(outcome.team, outcome.playbook, outcome.text, ctx);
 				return;
 		}
 	}
 
 	/** Open an Effort on the Team in the repo pi runs in, and wake the Lead to draft its Brief. */
-	function openIntake(team: Team, playbook: Playbook, picked: string, ctx: ExtensionCommandContext): void {
+	async function openIntake(team: Team, playbook: Playbook, picked: string, ctx: ExtensionCommandContext): Promise<void> {
 		const repo = repoRoot(ctx.cwd);
 		if ("error" in repo) {
 			ctx.ui.notify(`Team \`${team.name}\` can't open an Effort here: ${repo.error}. An Effort works on a git repo, which its Brief records; start pi in that repo and run \`/team start ${team.name}\` again.`, "error");
@@ -282,9 +391,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const at = now();
 		const { effortId, paths: files } = createEffort(paths.agentDir, team.name, at);
 		appendLines(files, [openEffort({ effortId, team: team.name, repo: repo.root, playbook: playbook.sha256, at: at.toISOString() })]);
-		pi.appendEntry("team-effort", { effortId, effortDir: files.dir });
-		effort = { effortId, paths: files };
-		syncLeadTools();
+		if (!(await lead({ effortId, paths: files }, ctx))) return;
+		pi.appendEntry(POINTER, { effortId, effortDir: files.dir });
 		ctx.ui.notify(openedText(picked, effortId, files), "info");
 		wakeLead("team-intake", intakePrompt({ effortId, paths: files, team, playbook, repo: repo.root }));
 	}
@@ -437,7 +545,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			syncLeadTools();
 			ctx.ui.notify(`Adopted the \`${item.team}\` Playbook: ${adopted}.`, "info");
 			wakeLead("team-pending", adoptedText(item, adopted));
-			if (startsTeam) land(pickTeam(listTeams(paths), item.team), ctx);
+			if (startsTeam) await land(pickTeam(listTeams(paths), item.team), ctx);
 		} else if (answer === SEND_BACK) {
 			const note = (await ctx.ui.input("Note for the Lead: what should change?"))?.trim();
 			// Backing out of the note leaves the item waiting, as "later" does.
@@ -462,7 +570,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				if (warning) ctx.ui.notify(warning, "warning");
 				// Read fresh every time, so a fixed file is picked up without `/reload`.
 				const teams = listTeams(paths);
-				land(args[0] === undefined ? proposeTeam(teams) : pickTeam(teams, args[0]), ctx);
+				await land(args[0] === undefined ? proposeTeam(teams) : pickTeam(teams, args[0]), ctx);
 			},
 		},
 		setup: {
@@ -485,6 +593,33 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				}
 				for (const item of [...pending]) await answerAdoption(item, ctx);
 				if (held) for (const item of briefs) await answerBrief(held, item, ctx);
+			},
+		},
+		resume: {
+			async run(args, ctx) {
+				if (effort) {
+					// Only the human's pause is lifted here; adopting is for a session holding no Effort.
+					ctx.ui.notify(`Effort \`${effort.effortId}\` isn't paused by you, so there is nothing to resume.`, "info");
+					return;
+				}
+				const candidates = adoptable(paths.agentDir);
+				const named = args[0];
+				if (named === undefined && candidates.length === 0) {
+					ctx.ui.notify("No Effort is without a live Lead, so there is nothing to adopt; `/team start` opens a new one.", "info");
+					return;
+				}
+				// One with a live Lead is still tried, so the refusal names the session leading it.
+				if (named !== undefined && !existsSync(effortPaths(paths.agentDir, named).log)) {
+					const none = candidates.length === 0 ? "none" : candidates.map((id) => `\`${id}\``).join(", ");
+					ctx.ui.notify(`There is no Effort \`${named}\` to adopt. Efforts without a live Lead: ${none}.`, "error");
+					return;
+				}
+				const effortId = named ?? (await ctx.ui.select("Adopt which Effort? These have no live Lead:", candidates));
+				if (effortId === undefined) return;
+				const held = { effortId, paths: effortPaths(paths.agentDir, effortId) };
+				if (!(await lead(held, ctx))) return;
+				pi.appendEntry(POINTER, { effortId, effortDir: held.paths.dir });
+				ctx.ui.notify(`Adopted Effort \`${effortId}\` (${held.paths.dir}): this session is its Lead now.`, "info");
 			},
 		},
 	};
@@ -595,7 +730,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	});
 
 	pi.registerCommand("team", {
-		description: "Run a Team on one Effort: /team start [team], /team setup <team>, /team pending",
+		description: "Run a Team on one Effort: /team start [team], /team setup <team>, /team pending, /team resume [effort]",
 		async handler(args, ctx) {
 			const [name, ...rest] = args.trim().split(/\s+/).filter(Boolean);
 			if (name === undefined) {

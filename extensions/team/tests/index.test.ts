@@ -4,6 +4,7 @@
  */
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
@@ -55,7 +56,23 @@ const NOW = new Date("2026-11-02T10:00:00.000Z");
  * context whose toasts are recorded too and whose dialogs answer from a queue
  * the test fills, the way the human would.
  */
-function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?: boolean; cwd?: string; bgExit?: number; hooks?: FakeHookStep[] } = {}) {
+function fakePi(
+	roots: TempRoots,
+	options: {
+		claudeVersion?: string;
+		streaming?: boolean;
+		cwd?: string;
+		bgExit?: number;
+		hooks?: FakeHookStep[];
+		/** The session's file; `session.jsonl` in the scratch folder unless set. */
+		sessionFile?: string;
+		/** Custom entries the session already carries, as a resumed or forked one does. */
+		entries?: { customType: string; data: unknown }[];
+		/** The pid the extension takes the Lead as, standing in for another pi process. */
+		pid?: number;
+		hasUI?: boolean;
+	} = {},
+) {
 	const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
 	const tools = new Map<string, RegisteredTool>();
 	const sent: SentMessage[] = [];
@@ -65,6 +82,8 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 	let activeTools = [...PI_TOOLS];
 	const activations: string[][] = [];
 	const entries: { customType: string; data: unknown }[] = [];
+	const carried = options.entries ?? [];
+	const sessionFile = options.sessionFile ?? join(roots.scratch, "session.jsonl");
 	const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
 	const pi = {
 		on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
@@ -95,6 +114,7 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 		claudeConfigPath: roots.claudeConfigPath,
 		claudePath: claude.path,
 		now: () => NOW,
+		pid: options.pid,
 	});
 	function answer(kind: Dialog["kind"], title: string, choices?: string[]) {
 		assert.ok(answers.length > 0, `the extension opened a ${kind} dialog "${title}" the test has no answer for`);
@@ -103,10 +123,13 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 		return played;
 	}
 	const ctx = {
-		hasUI: true,
+		hasUI: options.hasUI ?? true,
 		cwd: options.cwd ?? roots.scratch,
 		isIdle: () => !options.streaming,
-		sessionManager: { getSessionFile: () => join(roots.scratch, "session.jsonl") },
+		sessionManager: {
+			getSessionFile: () => sessionFile,
+			getEntries: () => [...carried, ...entries].map((entry, index) => ({ type: "custom", id: `e${index}`, ...entry })),
+		},
 		async waitForIdle() {
 			throw new Error("a `/team` command waited for the Lead to finish streaming");
 		},
@@ -144,10 +167,14 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 		answer(...played: (string | boolean | undefined)[]) {
 			answers.push(...played);
 		},
-		/** Fire one of pi's events at the extension's handlers, as pi does: `agent_start`, `agent_settled`, `session_shutdown`. */
-		async emit(event: string, payload: Record<string, unknown> = {}): Promise<void> {
-			for (const handler of handlers.get(event) ?? []) await handler({ type: event, ...payload }, ctx);
+		/** Fire one of pi's events at the extension's handlers, as pi does, returning the last result any handler gave. */
+		async emit(event: string, payload: Record<string, unknown> = {}): Promise<unknown> {
+			let result: unknown;
+			for (const handler of handlers.get(event) ?? []) result = (await handler({ type: event, ...payload }, ctx)) ?? result;
+			return result;
 		},
+		/** The session's custom entries, the ones it carried in included, as the next session in its file sees them. */
+		allEntries: () => [...carried, ...entries],
 		/** Run `/team <args>` the way pi does when the human types it. */
 		async team(args: string): Promise<void> {
 			const command = commands.get("team");
@@ -181,8 +208,8 @@ describe("/team", () => {
 		await pi.team("");
 
 		assert.deepEqual(pi.notifications, [
-			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`.", type: "error" },
-			{ message: "`/team` needs a subcommand. Subcommands: `start`, `setup`, `pending`.", type: "error" },
+			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `resume`.", type: "error" },
+			{ message: "`/team` needs a subcommand. Subcommands: `start`, `setup`, `pending`, `resume`.", type: "error" },
 		]);
 	});
 });
@@ -1699,5 +1726,294 @@ describe("the package manifest", () => {
 		const manifest = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")) as { pi: { extensions: string[] } };
 
 		assert.ok(manifest.pi.extensions.includes("./extensions/team/index.ts"), manifest.pi.extensions.join(", "));
+	});
+});
+
+/** A pid no process has any more: a child that has already exited. */
+function deadPid(): number {
+	const pid = spawnSync(process.execPath, ["-e", ""]).pid;
+	assert.ok(pid !== undefined, "expected the child to have a pid");
+	return pid;
+}
+
+interface LeadFile {
+	pid: number;
+	port?: number;
+	token?: string;
+	sessionFile?: string;
+	startedAt: string;
+	stoppedAt?: string;
+}
+
+function leadOf(dir: string): LeadFile {
+	return JSON.parse(readFileSync(join(dir, "lead.json"), "utf8")) as LeadFile;
+}
+
+describe("leading an Effort: the lock", () => {
+	it("refuses a second session that tries to lead a held Effort, naming the session that holds it", async () => {
+		const { roots, repo, pi } = intakeSession();
+		await pi.team("start software");
+		const dir = effortDir(roots);
+		const held = leadOf(dir);
+		const other = fakePi(roots, { cwd: repo, sessionFile: join(roots.scratch, "other.jsonl"), pid: process.ppid });
+
+		await other.team(`resume ${EFFORT_ID}`);
+
+		assert.equal(other.notifications.length, 1);
+		assert.equal(other.notifications[0].type, "error");
+		assert.ok(other.notifications[0].message.includes(join(roots.scratch, "session.jsonl")), other.notifications[0].message);
+		assert.ok(other.notifications[0].message.includes(`pid ${process.pid}`), other.notifications[0].message);
+		assert.deepEqual(leadOf(dir), held);
+		assert.deepEqual(other.entries, []);
+		assert.ok(!other.activeTools().includes("team_plan"));
+	});
+
+	it("takes over a lock and a Lead whose pid has died", async () => {
+		const { roots, repo } = intakeSession();
+		const crashed = deadPid();
+		const crashedPi = fakePi(roots, { cwd: repo, pid: crashed });
+		await crashedPi.team("start software");
+		const dir = effortDir(roots);
+		writeFileSync(join(dir, "lead.lock"), `${crashed}\n`);
+		const other = fakePi(roots, { cwd: repo, sessionFile: join(roots.scratch, "other.jsonl") });
+
+		await other.team(`resume ${EFFORT_ID}`);
+
+		const lead = leadOf(dir);
+		assert.equal(lead.pid, process.pid);
+		assert.equal(lead.sessionFile, join(roots.scratch, "other.jsonl"));
+		assert.equal(typeof lead.port, "number");
+		assert.equal(existsSync(join(dir, "lead.lock")), false);
+		assert.deepEqual(other.entries, [{ customType: "team-effort", data: { effortId: EFFORT_ID, effortDir: dir } }]);
+		assert.ok(other.activeTools().includes("team_plan"));
+		assert.equal(other.notifications.length, 1);
+		assert.equal(other.notifications[0].type, "info");
+		assert.ok(other.notifications[0].message.includes(dir), other.notifications[0].message);
+	});
+});
+
+describe("adopting an Effort: `/team resume` in a session holding none", () => {
+	it("lists the Efforts with no live Lead and adopts the one chosen", async () => {
+		const { roots, repo, pi } = intakeSession();
+		await pi.team("start software");
+		const crashed = fakePi(roots, { cwd: repo, sessionFile: join(roots.scratch, "crashed.jsonl"), pid: deadPid() });
+		await crashed.team("start software");
+		const other = fakePi(roots, { cwd: repo, sessionFile: join(roots.scratch, "other.jsonl") });
+
+		other.answer(`${EFFORT_ID}-2`);
+		await other.team("resume");
+
+		assert.equal(other.dialogs.length, 1);
+		assert.deepEqual(other.dialogs[0].options, [`${EFFORT_ID}-2`]);
+		const dir = effortDir(roots, `${EFFORT_ID}-2`);
+		assert.equal(leadOf(dir).sessionFile, join(roots.scratch, "other.jsonl"));
+		assert.deepEqual(other.entries, [{ customType: "team-effort", data: { effortId: `${EFFORT_ID}-2`, effortDir: dir } }]);
+		assert.ok(other.activeTools().includes("team_handoff"));
+	});
+
+	it("says so when no Effort is without a live Lead, and names the candidates for an Effort that doesn't exist", async () => {
+		const { roots, repo, pi } = intakeSession();
+		const other = fakePi(roots, { cwd: repo, sessionFile: join(roots.scratch, "other.jsonl") });
+		await other.team("resume");
+		await pi.team("start software");
+		const crashed = fakePi(roots, { cwd: repo, sessionFile: join(roots.scratch, "crashed.jsonl"), pid: deadPid() });
+		await crashed.team("start software");
+
+		await other.team("resume software-2026-10-01");
+
+		assert.deepEqual(other.notifications, [
+			{ message: "No Effort is without a live Lead, so there is nothing to adopt; `/team start` opens a new one.", type: "info" },
+			{ message: `There is no Effort \`software-2026-10-01\` to adopt. Efforts without a live Lead: \`${EFFORT_ID}-2\`.`, type: "error" },
+		]);
+		assert.deepEqual(other.entries, []);
+	});
+});
+
+describe("`/team resume` in a session holding an Effort", () => {
+	it("is about the human's pause, not adoption: with none to lift it says so and leaves the Lead as it is", async () => {
+		const { roots, pi } = intakeSession();
+		await pi.team("start software");
+		const lead = leadOf(effortDir(roots));
+
+		await pi.team("resume");
+
+		assert.deepEqual(pi.notifications.at(-1), { message: `Effort \`${EFFORT_ID}\` isn't paused by you, so there is nothing to resume.`, type: "info" });
+		assert.equal(pi.entries.length, 1);
+		assert.deepEqual(leadOf(effortDir(roots)), lead);
+	});
+});
+
+describe("leaving the session", () => {
+	it("marks no live Lead on shutdown, keeping the record, so another session can adopt the Effort", async () => {
+		const { roots, repo, pi } = intakeSession();
+		await pi.team("start software");
+		const dir = effortDir(roots);
+
+		await pi.emit("session_shutdown", { reason: "quit" });
+
+		assert.deepEqual(leadOf(dir), { pid: process.pid, sessionFile: join(roots.scratch, "session.jsonl"), startedAt: NOW.toISOString(), stoppedAt: NOW.toISOString() });
+		const other = fakePi(roots, { cwd: repo, sessionFile: join(roots.scratch, "other.jsonl") });
+		other.answer(EFFORT_ID);
+		await other.team("resume");
+		assert.equal(leadOf(dir).sessionFile, join(roots.scratch, "other.jsonl"));
+	});
+});
+
+describe("re-attaching: `pi -c`, `/resume` back and `/reload`", () => {
+	for (const [left, started] of [
+		["quit", "startup"],
+		["resume", "resume"],
+		["reload", "reload"],
+	] as const) {
+		it(`re-attaches on session_start (${started}) a session carrying the pointer whose file lead.json names`, async () => {
+			const { roots, repo, pi } = intakeSession();
+			await pi.team("start software");
+			await pi.emit("session_shutdown", { reason: left });
+			const dir = effortDir(roots);
+
+			const again = fakePi(roots, { cwd: repo, entries: pi.allEntries() });
+			await again.emit("session_start", { reason: started });
+
+			const lead = leadOf(dir);
+			assert.equal(lead.stoppedAt, undefined);
+			assert.equal(typeof lead.port, "number");
+			assert.equal(lead.sessionFile, join(roots.scratch, "session.jsonl"));
+			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff"]);
+			assert.deepEqual(again.entries, []);
+			assert.deepEqual(again.notifications, [{ message: `This session leads Effort \`${EFFORT_ID}\` (${dir}) again.`, type: "info" }]);
+			assert.deepEqual(again.sent, []);
+		});
+	}
+
+	it("leaves the Effort alone when lead.json names another session, saying which", async () => {
+		const { roots, repo, pi } = intakeSession();
+		await pi.team("start software");
+		await pi.emit("session_shutdown", { reason: "quit" });
+		const other = fakePi(roots, { cwd: repo, sessionFile: join(roots.scratch, "other.jsonl") });
+		other.answer(EFFORT_ID);
+		await other.team("resume");
+		const lead = leadOf(effortDir(roots));
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), pid: process.ppid });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.deepEqual(leadOf(effortDir(roots)), lead);
+		assert.ok(!again.activeTools().includes("team_plan"));
+		assert.deepEqual(again.notifications, [
+			{ message: `This session led Effort \`${EFFORT_ID}\`, which is now led from the pi session ${join(roots.scratch, "other.jsonl")} (pid ${process.pid}); \`/team resume ${EFFORT_ID}\` adopts it here once that session leaves it.`, type: "info" },
+		]);
+	});
+
+	it("does nothing for a session that carries no pointer", async () => {
+		const { roots, repo, pi } = intakeSession();
+		await pi.team("start software");
+		await pi.emit("session_shutdown", { reason: "quit" });
+
+		const fresh = fakePi(roots, { cwd: repo, sessionFile: join(roots.scratch, "fresh.jsonl") });
+		await fresh.emit("session_start", { reason: "startup" });
+
+		assert.deepEqual(fresh.notifications, []);
+		assert.equal(leadOf(effortDir(roots)).stoppedAt, NOW.toISOString());
+	});
+});
+
+describe("moving the Effort: `/fork` and `/clone`", () => {
+	it("names the new session file in lead.json, and the new session leads it", async () => {
+		const { roots, repo, pi } = intakeSession();
+		await pi.team("start software");
+		const fork = join(roots.scratch, "fork.jsonl");
+		await pi.emit("session_shutdown", { reason: "fork", targetSessionFile: fork });
+		const dir = effortDir(roots);
+		assert.equal(leadOf(dir).sessionFile, fork);
+		assert.equal(leadOf(dir).stoppedAt, NOW.toISOString());
+
+		const moved = fakePi(roots, { cwd: repo, sessionFile: fork, entries: pi.allEntries() });
+		await moved.emit("session_start", { reason: "fork", previousSessionFile: join(roots.scratch, "session.jsonl") });
+
+		assert.equal(leadOf(dir).sessionFile, fork);
+		assert.equal(leadOf(dir).stoppedAt, undefined);
+		assert.ok(moved.activeTools().includes("team_plan"));
+		assert.deepEqual(moved.entries, []);
+	});
+
+	it("re-attaches a fork made before the Lead's first message, writing the pointer it lacks", async () => {
+		const { roots, repo, pi } = intakeSession();
+		await pi.team("start software");
+		const fork = join(roots.scratch, "fork.jsonl");
+		await pi.emit("session_shutdown", { reason: "fork", targetSessionFile: fork });
+		const dir = effortDir(roots);
+
+		const moved = fakePi(roots, { cwd: repo, sessionFile: fork });
+		await moved.emit("session_start", { reason: "fork" });
+
+		assert.equal(leadOf(dir).stoppedAt, undefined);
+		assert.deepEqual(moved.entries, [{ customType: "team-effort", data: { effortId: EFFORT_ID, effortDir: dir } }]);
+		assert.deepEqual(moved.notifications, [{ message: `This session leads Effort \`${EFFORT_ID}\` (${dir}) again.`, type: "info" }]);
+	});
+});
+
+describe("switching away: `/new` and `/resume` elsewhere", () => {
+	for (const [reason, extra] of [
+		["new", {}],
+		["resume", { targetSessionFile: "/elsewhere/other.jsonl" }],
+	] as const) {
+		it(`asks first on \`${reason}\`, and cancels on "no", the Effort still led`, async () => {
+			const { roots, pi } = intakeSession();
+			await pi.team("start software");
+			pi.answer(false);
+
+			const result = await pi.emit("session_before_switch", { reason, ...extra });
+
+			assert.deepEqual(result, { cancel: true });
+			assert.deepEqual(
+				pi.dialogs.map(({ kind, title }) => ({ kind, title })),
+				[{ kind: "confirm", title: `Leave Effort \`${EFFORT_ID}\`?` }],
+			);
+			assert.equal(leadOf(effortDir(roots)).stoppedAt, undefined);
+		});
+	}
+
+	it("lets the switch go ahead on \"yes\"", async () => {
+		const { pi } = intakeSession();
+		await pi.team("start software");
+		pi.answer(true);
+
+		assert.equal(await pi.emit("session_before_switch", { reason: "new" }), undefined);
+		assert.equal(pi.dialogs.length, 1);
+	});
+
+	it("doesn't ask in a session leading no Effort", async () => {
+		const { pi } = intakeSession();
+
+		assert.equal(await pi.emit("session_before_switch", { reason: "new" }), undefined);
+		assert.deepEqual(pi.dialogs, []);
+	});
+});
+
+describe("moving in the tree: `/tree`", () => {
+	it("queues the Effort's status for the Lead's next turn, starting none", async () => {
+		const { roots, pi } = intakeSession();
+		await pi.team("start software");
+		const before = pi.sent.length;
+
+		await pi.emit("session_tree", { newLeafId: "e1", oldLeafId: "e2" });
+
+		assert.deepEqual(pi.sent.slice(before), [
+			{
+				customType: "team-status",
+				content: `This session still leads Effort \`${EFFORT_ID}\` (${effortDir(roots)}), whichever branch of the tree you are on: its state lives in its files. Brief: not yet approved. Tasks handed off: 0. Teammates: 0. Waiting on the human: 0.`,
+				display: true,
+				triggerTurn: undefined,
+				deliverAs: "nextTurn",
+			},
+		]);
+	});
+
+	it("says nothing in a session leading no Effort", async () => {
+		const { pi } = intakeSession();
+
+		await pi.emit("session_tree", { newLeafId: "e1" });
+
+		assert.deepEqual(pi.sent, []);
 	});
 });

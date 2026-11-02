@@ -430,11 +430,38 @@ export interface LeadRecord {
 	startedAt: string;
 }
 
+/**
+ * `lead.json` once its Lead has left: marked, never deleted, so the session
+ * that led it is still known. It has no bridge, so the hook script rings no one.
+ */
+export interface NoLiveLead {
+	pid: number;
+	sessionFile?: string;
+	startedAt: string;
+	/** When the Lead left; its mark. */
+	stoppedAt: string;
+}
+
 /** Write `lead.json` whole, through a rename, so the hook script never reads half of it. */
-export function writeLead(paths: EffortPaths, lead: LeadRecord): void {
+export function writeLead(paths: EffortPaths, lead: LeadRecord | NoLiveLead): void {
 	const partial = `${paths.lead}.${process.pid}.tmp`;
 	writeFileSync(partial, `${JSON.stringify(lead)}\n`);
 	renameSync(partial, paths.lead);
+}
+
+/** What `lead.json` says, or undefined before the Effort was ever led. */
+export function readLead(paths: EffortPaths): LeadRecord | NoLiveLead | undefined {
+	if (!existsSync(paths.lead)) return undefined;
+	let lead: unknown;
+	try {
+		lead = JSON.parse(readFileSync(paths.lead, "utf8"));
+	} catch (error) {
+		lead = error;
+	}
+	if (!isMapping(lead) || typeof lead.pid !== "number" || typeof lead.startedAt !== "string") {
+		throw new Error(`${paths.lead} isn't a Lead record of \`{ pid, port, token, sessionFile, startedAt }\`; only the extension writes it. Move it aside once no pi session leads the Effort, and lead it again.`);
+	}
+	return lead as unknown as LeadRecord | NoLiveLead;
 }
 
 /** A Teammate's journal, `teammates/<id>/events.jsonl`, which the hook script appends to. */
