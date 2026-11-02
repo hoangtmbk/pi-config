@@ -112,8 +112,21 @@ A new Teammate starts as `claude --bg` in the Workspace, named
 - `mcp.json`, when the Role has `mcpServers`.
 
 The Effort directory is added with `--add-dir`, `EnterPlanMode` is always disallowed, and the
-first turn is a pointer to `task.md`. A launch that fails leaves the Task planned (or queued). A
-Task that needs a worktree of its own (`isolated`) is refused.
+first turn is a pointer to `task.md`. A launch that fails leaves the Task planned (or queued).
+
+### Isolated Tasks
+
+A Task handed off with `isolated: true` gets a worktree and branch of its own, cut from the
+Effort branch's tip when its Teammate starts: `…/team-<effort-id>-task-<nnn>/` beside the
+Workspace (never inside it) on branch `team/<effort-id>-task-<nnn>`, with what your repo's
+`.worktreeinclude` lists copied in. Its Teammate always starts fresh there, never reused, and a
+Teammate restaffed after a crash launches in the same worktree. Only what it commits merges.
+
+Accepting it with `team_review` writes a `merge-intended` line to `effort.jsonl`, then merges the
+branch into the Effort branch with `--no-ff`. Once merged, the Task is accepted, its Teammate
+stopped, and its worktree and branch removed. The merge is refused, with a `merge-failed` line,
+while the Workspace or the Task's worktree has uncommitted changes, or when it would conflict
+(the merge is aborted): nothing is merged, and the Task stays in review with its branch intact.
 
 ### Clearing between Tasks
 

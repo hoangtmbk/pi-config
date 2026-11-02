@@ -155,3 +155,80 @@ function addWorktree(repo: string, effortId: string): { workspace: Workspace; co
 		throw error;
 	}
 }
+
+/**
+ * Add an isolated Task's worktree at `path` on new branch `branch`, cut from
+ * the Effort branch `from`'s tip, beside the Workspace rather than in it, and
+ * copy what the repo's `.worktreeinclude` lists into it, as for the Workspace.
+ */
+export function addTaskWorkspace(repo: string, task: { path: string; branch: string; from: string }): { copied: string[] } | { error: string } {
+	try {
+		if (hasBranch(repo, task.branch)) throw new GitError(`branch \`${task.branch}\` already exists`);
+		if (existsSync(task.path)) throw new GitError(`${task.path} already exists`);
+		git(repo, ["worktree", "add", "--quiet", "-b", task.branch, task.path, task.from]);
+		return { copied: copyIncluded(repo, task.path) };
+	} catch (error) {
+		if (error instanceof GitError) return { error: error.message };
+		throw error;
+	}
+}
+
+/**
+ * Merge an isolated Task's branch into the Effort's Workspace at `into` with
+ * `--no-ff`: the merge commit, or undefined when the branch is in already.
+ * Refused, with nothing merged, while either worktree has uncommitted changes
+ * (the Workspace's would mix into the merge; the Task's would be left out of
+ * it) and on a conflict, which is aborted so no half-merge stays behind.
+ */
+export function mergeTaskWorkspace(merge: { into: string; path: string; branch: string; slug: string; folder: string }): { commit?: string } | { error: string } {
+	try {
+		const dirty = changed(merge.into);
+		if (dirty.length > 0) return { error: `the Effort's Workspace ${merge.into} has uncommitted changes (${listed(dirty)}); commit or remove them first` };
+		const left = changed(merge.path);
+		if (left.length > 0) {
+			return { error: `${merge.path} has uncommitted changes (${listed(left)}), and only committed work merges; send it back so its Teammate commits them` };
+		}
+		if (gitSucceeds(merge.into, ["merge-base", "--is-ancestor", merge.branch, "HEAD"])) return {};
+		try {
+			git(merge.into, ["merge", "--no-ff", "--no-edit", "-m", `Merge Task ${merge.folder.slice(0, 3)} ${merge.slug} (${merge.branch})`, merge.branch]);
+		} catch (error) {
+			if (!(error instanceof GitError)) throw error;
+			const conflicted = gitSucceeds(merge.into, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]) ? git(merge.into, ["diff", "--name-only", "--diff-filter=U"]).split("\n").filter(Boolean) : [];
+			if (gitSucceeds(merge.into, ["rev-parse", "-q", "--verify", "MERGE_HEAD"])) git(merge.into, ["merge", "--abort"]);
+			return { error: conflicted.length > 0 ? `merging it would conflict in ${listed(conflicted)}, so the merge was aborted` : error.message };
+		}
+		return { commit: git(merge.into, ["rev-parse", "HEAD"]).trim() };
+	} catch (error) {
+		if (error instanceof GitError) return { error: error.message };
+		throw error;
+	}
+}
+
+/**
+ * Remove an isolated Task's worktree and its branch: once merged, or with
+ * `force` to undo one whose Teammate never launched. Undefined when both are
+ * gone, else what git said.
+ */
+export function removeTaskWorkspace(repo: string, task: { path: string; branch: string }, force = false): string | undefined {
+	try {
+		if (existsSync(task.path)) git(repo, ["worktree", "remove", ...(force ? ["--force"] : []), task.path]);
+		if (hasBranch(repo, task.branch)) git(repo, ["branch", force ? "-D" : "-d", task.branch]);
+		return undefined;
+	} catch (error) {
+		if (error instanceof GitError) return error.message;
+		throw error;
+	}
+}
+
+/** The paths `git status` shows as changed or untracked in the worktree at `dir`. */
+function changed(dir: string): string[] {
+	return git(dir, ["status", "--porcelain", "-z"])
+		.split("\0")
+		.filter(Boolean)
+		.map((entry) => entry.slice(3));
+}
+
+function listed(paths: string[]): string {
+	const shown = paths.slice(0, 5).map((path) => `\`${path}\``);
+	return paths.length > 5 ? `${shown.join(", ")} and ${paths.length - 5} more` : shown.join(", ");
+}

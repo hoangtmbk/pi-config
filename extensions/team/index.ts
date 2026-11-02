@@ -23,7 +23,7 @@ import { attachTarget, chooseAttach, pickerLabel } from "./attach.ts";
 import { renderTeamBlock, teamStatus } from "./block.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
 import { agentsList, CLEAR_MARKER, installMod, launchBackground, sendToInbox, stopBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
-import { currentResult, DEFAULT_MAX_TEAMMATES, type EffortAction, type EffortState, fold, type Inbox, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace } from "./core.ts";
+import { currentResult, DEFAULT_MAX_TEAMMATES, type EffortAction, type EffortState, fold, type Inbox, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace, workdir } from "./core.ts";
 import { EVERY_ROLE, listTeams, loadTeam, type Playbook, readSnapshot, type Role, sha256, type Team, type TeamRoots } from "./definitions.ts";
 import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
 import { adoptable, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
@@ -49,7 +49,7 @@ import {
 } from "./records.ts";
 import { repoRoot } from "./repo.ts";
 import { REPORT_OVERLAY, type ReportChrome, ReportView, type ReportTui } from "./reports-view.ts";
-import { addWorkspace } from "./workspace.ts";
+import { addTaskWorkspace, addWorkspace, mergeTaskWorkspace, removeTaskWorkspace } from "./workspace.ts";
 import {
 	ADOPT_PLAYBOOK,
 	APPROVE,
@@ -655,7 +655,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const sessionId = teammate?.sessionId;
 		const workspace = effortState(held).workspace;
 		if (sessionId === undefined || !workspace) return sent;
-		const resumed = await launchBackground(paths.claudePath, workspace.path, ["--bg", "--resume", sessionId, pointer]);
+		const resumed = await launchBackground(paths.claudePath, workdir(effortState(held), teammateId) ?? workspace.path, ["--bg", "--resume", sessionId, pointer]);
 		return resumed ? { error: `${sent.error}, and resuming its session failed: ${resumed.error}` } : undefined;
 	}
 
@@ -678,7 +678,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const taskDir = join(held.paths.tasks, folder);
 		const written = writeFeedback(held.paths, folder, round, feedback);
 		await listenForTeammates(held, ctx);
-		const launched = await launchBackground(paths.claudePath, workspace.path, launchArgs(held, teammate, role, playbook, restaffPointer(slug, taskDir, round)));
+		const cwd = workdir(result.state, teammate.id) ?? workspace.path;
+		const launched = await launchBackground(paths.claudePath, cwd, launchArgs(held, teammate, role, playbook, restaffPointer(slug, taskDir, round)));
 		if (launched) {
 			rmSync(written);
 			throw new Error(`Teammate \`${teammate.id}\` didn't start, so Task \`${slug}\` isn't sent back and its feedback-${round}.md is taken back: ${launched.error}`);
@@ -686,6 +687,40 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		writePlan(held.paths, result.state);
 		appendLines(held.paths, result.append);
 		wakeAboutTeammates(applyJournals(held));
+	}
+
+	/**
+	 * Accept an isolated Task by merging its branch into the Effort branch. The
+	 * intent is on record before git runs, so a merge cut short is found again;
+	 * a refused merge closes it and leaves the Task in review. Once merged, the
+	 * Task is accepted for good: a Teammate that won't stop or a worktree that
+	 * won't go is told to the Lead, not undone.
+	 */
+	async function acceptMerged(held: HeldEffort, result: Extract<Step, { ok: true }>, merge: Extract<EffortAction, { kind: "merge" }>): Promise<string> {
+		appendLines(held.paths, result.append);
+		const merged = mergeTaskWorkspace(merge);
+		const outcome = step(result.state, { kind: "merge-result", slug: merge.slug, at: now().toISOString(), ...merged });
+		if (!outcome.ok) throw new Error(outcome.refusal);
+		appendLines(held.paths, outcome.append);
+		if ("error" in merged) {
+			writePlan(held.paths, outcome.state);
+			throw new Error(outcome.reply);
+		}
+		const notes: string[] = [];
+		let stopped = true;
+		for (const action of outcome.actions) {
+			if (action.kind === "stop-teammate") {
+				const failed = await stopTeammate(outcome.state, action);
+				if (failed) {
+					stopped = false;
+					notes.push(`\`${action.teammate}\` didn't stop (${failed.error}), so its worktree is left in place; tell the human.`);
+				}
+			} else if (action.kind === "remove-task-workspace" && stopped && result.state.workspace) {
+				const left = removeTaskWorkspace(result.state.workspace.path, action);
+				if (left) notes.push(`Its worktree or branch is left in place: ${left}`);
+			} else if (action.kind === "write-plan") writePlan(held.paths, outcome.state);
+		}
+		return [outcome.reply ?? "", ...notes].join(" ");
 	}
 
 	/** The `claude --bg` arguments that start `teammate` in `role`, with `pointer` as its first turn. */
@@ -745,8 +780,15 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	async function staffTask(held: HeldEffort, result: Extract<Step, { ok: true }>, body?: string): Promise<void> {
 		const { roles, playbook } = snapshotOf(held);
 		const stopped: string[] = [];
+		const added: Extract<EffortAction, { kind: "add-task-workspace" }>[] = [];
+		const still = body === undefined ? "queued" : "planned";
 		for (const action of result.actions) {
 			if (action.kind === "write-task" && body !== undefined) writeTask(held.paths, action.folder, body);
+			else if (action.kind === "add-task-workspace") {
+				const cut = addTaskWorkspace(result.state.repo, action);
+				if ("error" in cut) throw new Error(`Task \`${action.slug}\` didn't get a worktree of its own, so it is still ${still}: ${cut.error}`);
+				added.push(action);
+			}
 			else if (action.kind === "write-plan") writePlan(held.paths, result.state);
 			else if (action.kind === "stop-teammate") {
 				const failed = await stopTeammate(result.state, action);
@@ -755,12 +797,14 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			} else if (action.kind === "launch-teammate") {
 				const failed = await launchTeammate(held, result.state, action, roles, playbook);
 				if (failed) {
+					// Its worktree goes with it: nothing was worked there, and a handoff again cuts it afresh.
+					for (const worktree of added) removeTaskWorkspace(result.state.repo, worktree, true);
 					// The idle Teammate stopped for it is gone either way.
 					appendLines(
 						held.paths,
 						result.append.filter((line) => line.type === "teammate-retired" && stopped.includes(line.teammate)),
 					);
-					throw new Error(`Teammate \`${action.teammate.id}\` didn't start, so Task \`${action.task.slug}\` is still ${body === undefined ? "queued" : "planned"}: ${failed}`);
+					throw new Error(`Teammate \`${action.teammate.id}\` didn't start, so Task \`${action.task.slug}\` is still ${still}: ${failed}`);
 				}
 			}
 		}
@@ -814,7 +858,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const wait = Date.parse(at) - now().getTime();
 		if (wait > 0) await sleep(wait);
 		const args = launchArgs(held, teammate, role, playbook, handoffPointer(task.slug, join(held.paths.tasks, task.folder), 1));
-		return (await launchBackground(paths.claudePath, state.workspace.path, args))?.error;
+		return (await launchBackground(paths.claudePath, workdir(state, teammate.id) ?? state.workspace.path, args))?.error;
 	}
 
 	/** One adoption in `/team pending`: approve, send back with a note, or leave it for later. */
@@ -1019,7 +1063,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		description: [
 			"Hand a planned Task to a Teammate of its Role, which the extension staffs: it reuses an idle Teammate of the Role (clearing its context first), else starts one as a Claude Code background session in the Effort's Workspace while under the human's `maxTeammates`, else stops an idle Teammate no queued Task needs and starts one, else queues the Task until a Teammate frees up.",
 			"`body` becomes the Task's `task.md`: make it self-contained, listing the Effort's `brief.md` and `clarifications.md` among its inputs, since the Teammate has no earlier conversation.",
-			"Returns which Teammate was started or reused, or that the Task is queued and why. Refused until the human approves the Brief, for a Task already handed off or queued (running, in review, sent back or accepted), and for `isolated`, which isn't built yet.",
+			"Returns which Teammate was started or reused, or that the Task is queued and why. Refused until the human approves the Brief, and for a Task already handed off or queued (running, in review, sent back or accepted).",
+			"`isolated: true` gives the Task a worktree and branch of its own, cut from the Effort branch's tip beside the Workspace, for work that would clash with other Tasks' uncommitted files; its Teammate always starts fresh there. Say in `body` that only what it commits merges: accepting it merges its branch into the Effort branch.",
 		].join(" "),
 		promptSnippet: "Hand a planned Task to a Teammate once the Brief is approved",
 		parameters: HandoffParams,
@@ -1028,9 +1073,6 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { held, state } = approvedEffort("team_handoff", ctx);
-			if (params.isolated) {
-				throw new Error(`Task \`${params.slug}\` can't be handed off isolated yet: a Task with a worktree of its own isn't built. Hand it off without \`isolated\`, into the Effort's Workspace.`);
-			}
 			const { roles, playbook } = snapshotOf(held);
 			const result = step(state, {
 				kind: "handoff",
@@ -1038,6 +1080,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				at: now().toISOString(),
 				mode: launchMode(state, params.slug, roles, playbook),
 				maxTeammates: maxTeammates(),
+				...(params.isolated ? { isolated: true } : {}),
 			});
 			if (!result.ok) throw new Error(result.refusal);
 			if (!state.workspace) throw new Error(`Effort \`${held.effortId}\` has no Workspace, so no Teammate starts; stop and tell the human.`);
@@ -1055,6 +1098,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		description: [
 			"Decide on the newest result of a handed-off Task, once its Teammate has written it and you were woken about it.",
 			"`accept` marks the Task accepted in plan.md, and starts any queued Task its Teammate frees room for.",
+			"Accepting an isolated Task first merges its branch into the Effort branch (`--no-ff`), then stops its Teammate and removes its worktree and branch; while the Workspace has uncommitted changes, the Task's worktree does, or the merge conflicts, nothing is merged and it stays in review.",
 			"`send_back` writes `feedback` to the Task's `feedback-<n>.md` and sends its Teammate a pointer to it; the Teammate writes `result-<n+1>.md` and you are woken again.",
 			"Refused while the round's result isn't written, for an accepted Task, and for a send-back past the Playbook's `sendBackLimit`, when you escalate to the human instead.",
 		].join(" "),
@@ -1079,6 +1123,13 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				mode: launchMode(state, params.slug, roles, playbook),
 			});
 			if (!result.ok) throw new Error(result.refusal);
+			const merge = result.actions.find((action) => action.kind === "merge");
+			if (merge) {
+				const said = await acceptMerged(held, result, merge);
+				const started = await startQueued(held, effortState(held), ctx);
+				paintBlock();
+				return { content: [{ type: "text", text: [said, ...started].join(" ") }], details: undefined };
+			}
 			const restaff = result.actions.find((action) => action.kind === "restaff-teammate");
 			if (restaff) {
 				await restaffTask(held, result, restaff, ctx);

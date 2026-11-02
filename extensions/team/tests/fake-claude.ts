@@ -20,8 +20,11 @@
  *   command its `--settings` file gives for that event, as Claude Code does,
  *   with the payload on stdin and the inbox socket and token in the
  *   environment; `{ write: "result" }` writes the result its handoff pointer
- *   asks for. Each session gets a session id of its own unless a payload
- *   names one.
+ *   asks for; `{ edit: <file>, commit?: <message> }` writes `<file>` in the
+ *   session's working directory, `{task}` in its name standing for the Task
+ *   folder the pointer names, and commits just that file when a message is
+ *   given. Each session gets a session id of its own unless a payload names
+ *   one.
  * - `FAKE_CLAUDE_SOCKETS`: a short folder a session with hooks opens its inbox
  *   socket in. The socket is real: a small server process outlives the
  *   launch, as the real session does, and stops once the test process
@@ -216,7 +219,7 @@ function fileOf(flag: string): string | undefined {
 }
 
 /** One scripted step of a started session. */
-type HookStep = { event: string; payload?: Record<string, unknown> } | { write: "result" };
+type HookStep = { event: string; payload?: Record<string, unknown> } | { write: "result" } | { edit: string; commit?: string };
 
 /** Start the session's inbox server, detached so it outlives this launch, and wait until it listens. */
 async function openInbox(session: Session): Promise<void> {
@@ -331,6 +334,16 @@ function playSteps(steps: HookStep[], session: Session, pointer: string): void {
 	const settings = JSON.parse(session.settings ?? "{}") as { hooks?: Record<string, { matcher?: string; hooks: { command: string }[] }[]> };
 	const inbox = { CLAUDE_CODE_MESSAGING_SOCKET: session.socket, CLAUDE_CODE_MESSAGING_TOKEN: session.token };
 	for (const step of steps) {
+		if ("edit" in step) {
+			const task = /write your result to (\S+)\/result-\d+\.md\./.exec(pointer)?.[1]?.split("/").at(-1) ?? "task";
+			const file = step.edit.replaceAll("{task}", task);
+			writeFileSync(join(session.cwd, file), `edited for ${task}\n`);
+			if (step.commit !== undefined) {
+				execFileSync("git", ["add", "--", file], { cwd: session.cwd, stdio: "ignore" });
+				execFileSync("git", ["commit", "-q", "--allow-empty", "-m", step.commit], { cwd: session.cwd, stdio: "ignore" });
+			}
+			continue;
+		}
 		if ("write" in step) {
 			const result = /write your result to (\S+\.md)\./.exec(pointer)?.[1];
 			if (result === undefined) throw new Error(`fake claude: the pointer names no result to write: ${pointer}`);
