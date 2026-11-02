@@ -6,13 +6,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { join, relative } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { CLEAR_MARKER, HOOK_SCRIPT } from "../claude.ts";
+import { CLEAR_MARKER, HOOK_SCRIPT, STATUSLINE_SCRIPT } from "../claude.ts";
 import { registerTeam } from "../index.ts";
 import { commit, type FakeHeldHook, type FakeHookStep, fakeClaude, fakeTmux, git, gitRepo, goodTeam, ownStdio, roleMd, type TempRoots, teamMd, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
 
@@ -109,6 +109,10 @@ function fakePi(
 		env?: Record<string, string | undefined>;
 		/** The exit code of the fake `claude attach`. */
 		attachExit?: number;
+		/** What the fake `get_usage` control request answers; an error response when unset. */
+		usage?: Record<string, unknown>;
+		/** pi's own entries the session carries, such as the Lead's assistant messages with their usage. */
+		sessionEntries?: Record<string, unknown>[];
 		/** How long a Teammate's held hook holds before giving the prompt back to its terminal; the hook's own when unset. */
 		holdMs?: number;
 	} = {},
@@ -130,9 +134,9 @@ function fakePi(
 	const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
 	const copied: string[] = [];
 	const tuiEvents: string[] = [];
-	// The clock the extension reads, which a test moves on, and the timers it set on it.
+	// The clock the extension reads, which only a test moves, and the timers it set, which only a test fires.
 	let clock = NOW;
-	const timers: { ms: number; fn: () => unknown; live: boolean }[] = [];
+	const tickers: { ms: number; tick: () => Promise<void> | void; stopped: boolean }[] = [];
 	const pi = {
 		on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -164,18 +168,20 @@ function fakePi(
 		replies: options.replies,
 		attachExit: options.attachExit,
 		holdMs: options.holdMs,
+		usage: options.usage,
 	});
 	const tmux = fakeTmux(roots);
 	registerTeam(pi as unknown as ExtensionAPI, {
 		agentDir: roots.agentDir,
 		claudeConfigPath: roots.claudeConfigPath,
+		claudeDir: roots.claudeDir,
 		claudePath: claude.path,
 		now: () => clock,
-		every(ms, fn) {
-			const timer = { ms, fn, live: true };
-			timers.push(timer);
+		every(ms, tick) {
+			const ticker = { ms, tick, stopped: false };
+			tickers.push(ticker);
 			return () => {
-				timer.live = false;
+				ticker.stopped = true;
 			};
 		},
 		pid: options.pid,
@@ -212,7 +218,7 @@ function fakePi(
 		isIdle: () => !options.streaming,
 		sessionManager: {
 			getSessionFile: () => sessionFile,
-			getEntries: () => [...carried, ...entries].map((entry, index) => ({ type: "custom", id: `e${index}`, ...entry })),
+			getEntries: () => [...(options.sessionEntries ?? []), ...[...carried, ...entries].map((entry, index) => ({ type: "custom", id: `e${index}`, ...entry }))],
 		},
 		async waitForIdle() {
 			throw new Error("a `/team` command waited for the Lead to finish streaming");
@@ -278,16 +284,20 @@ function fakePi(
 		copied,
 		/** What the extension did with pi's TUI, oldest first. */
 		tuiEvents,
-		/** Move the clock the extension reads to `at`. */
+		/** Move the extension's clock to `at`. */
 		travel(at: string) {
 			clock = new Date(at);
 		},
-		/** Fire every live timer the extension set, as their interval coming round does, and wait for what each does. */
-		async tick(): Promise<void> {
-			for (const timer of timers.filter((each) => each.live)) await timer.fn();
+		/** Move the extension's clock on by `ms`. */
+		advance(ms: number) {
+			clock = new Date(clock.getTime() + ms);
 		},
-		/** The intervals of the timers still set, in ms. */
-		timers: () => timers.filter((each) => each.live).map((each) => each.ms),
+		/** The repeating timers the extension has running, by period in ms. */
+		timers: () => tickers.filter((ticker) => !ticker.stopped).map((ticker) => ticker.ms),
+		/** Fire every repeating timer the extension has running, once each, as its period passing would. */
+		async tick() {
+			for (const ticker of tickers.filter((each) => !each.stopped)) await ticker.tick();
+		},
 		/** Queue the human's answers to the next dialogs, in order. */
 		answer(...played: (string | boolean | undefined)[]) {
 			answers.push(...played);
@@ -360,8 +370,8 @@ describe("/team", () => {
 		await pi.team("");
 
 		assert.deepEqual(pi.notifications, [
-			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "error" },
-			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "info" },
+			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`.", type: "error" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`.", type: "info" },
 		]);
 	});
 });
@@ -860,10 +870,10 @@ function effortDir(roots: TempRoots, effortId = EFFORT_ID): string {
 }
 
 /** A session in a git repo whose `software` Team has {@link INTAKE_PLAYBOOK} adopted. */
-function intakeSession(roots = tempRoots()) {
+function intakeSession(roots = tempRoots(), options: Pick<NonNullable<Parameters<typeof fakePi>[1]>, "hasUI"> = {}) {
 	adopt(roots, "software", INTAKE_PLAYBOOK);
 	const repo = gitRepo(roots);
-	return { roots, repo, pi: fakePi(roots, { cwd: repo }) };
+	return { roots, repo, pi: fakePi(roots, { cwd: repo, ...options }) };
 }
 
 describe("intake: `/team start` on a Team with an adopted Playbook", () => {
@@ -1415,7 +1425,7 @@ function crewBrief(repo: string): string {
 async function crewApproved(
 	options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown> } & Pick<
 		NonNullable<Parameters<typeof fakePi>[1]>,
-		"mode" | "env" | "attachExit" | "holdMs"
+		"mode" | "env" | "attachExit" | "holdMs" | "usage" | "sessionEntries"
 	> = {},
 ) {
 	const roots = tempRoots();
@@ -1450,6 +1460,8 @@ async function crewApproved(
 		mode: options.mode,
 		env: options.env,
 		attachExit: options.attachExit,
+		usage: options.usage,
+		sessionEntries: options.sessionEntries,
 		holdMs: options.holdMs,
 	});
 	await pi.team("start crew");
@@ -1631,16 +1643,30 @@ describe("handing off: team_handoff", () => {
 		const records = ["brief.md", "clarifications.md", "approvals.jsonl", "playbook.md", "team/**", "effort.jsonl"].map((record) => `Edit(/${dir}/${record})`);
 		const ask = ["Bash(git rebase:*)", "Bash(git push --force:*)", "Edit(package-lock.json)"];
 		const [builder, scout] = pi.claude.launches().map((launch) => JSON.parse(launch.settings ?? "null"));
+		const statusLine = (id: string) => ({ type: "command", command: `'${process.execPath}' '${STATUSLINE_SCRIPT}' '${dir}' '${id}'` });
 		assert.deepEqual(builder, {
 			permissions: { allow: ["Bash(npm run build:*)", "Bash(git status)"], deny: ["Bash(npm publish:*)", "Bash(curl:*)", ...records], ask },
 			crossSessionInbound: "accept",
 			hooks: hooks("builder-1"),
+			statusLine: statusLine("builder-1"),
 		});
 		assert.deepEqual(scout, {
 			permissions: { allow: ["Bash(git status)"], deny: ["Bash(curl:*)", ...records], ask },
 			crossSessionInbound: "accept",
 			hooks: hooks("scout-1"),
+			statusLine: statusLine("scout-1"),
 		});
+	});
+
+	it("gives the Teammate a status line that runs the human's own status line command and keeps its readings", async () => {
+		const { roots, pi, dir } = await crewApproved();
+		writeFiles(roots.claudeDir, { "settings.json": JSON.stringify({ statusLine: { type: "command", command: "~/bin/my 'status'" } }) });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+
+		const settings = JSON.parse(pi.claude.launches()[0].settings ?? "null");
+		assert.deepEqual(settings.statusLine, { type: "command", command: `'${process.execPath}' '${STATUSLINE_SCRIPT}' '${dir}' 'builder-1' '~/bin/my '\\''status'\\'''` });
 	});
 
 	it("appends the Role's prompt after a preamble that names the Teammate, its one contact and how it works, pointing at the Brief's files rather than copying them", async () => {
@@ -2000,7 +2026,7 @@ describe("usage limits: a Teammate's StopFailure", () => {
 		assert.deepEqual(pi.timers(), [], "the clock stops with the session");
 	});
 
-	it("asks the human about a weekly limit with no reset it can read, in `/team pending`, and cancelling stops the Teammates and has the Lead write the final Report", async () => {
+	it("asks the human about a weekly limit with no reset it can read, in `/team pending`, and cancelling ends the Effort as `/team cancel` does", async () => {
 		const weekly: FakeHookStep[] = [
 			{ event: "SessionStart", payload: { source: "startup" } },
 			{ event: "UserPromptSubmit" },
@@ -2012,14 +2038,15 @@ describe("usage limits: a Teammate's StopFailure", () => {
 		await until(() => effortLines(dir).some((line) => line.type === "usage-escalated"), "the weekly limit waits on the human");
 		const [session] = effortLines(dir).filter((line) => line.type === "teammate-session");
 
-		pi.answer("Cancel the Effort: stop its Teammates, and the Lead writes the final Report");
+		pi.answer("Cancel the Effort: stop every Teammate and end it without sign-off");
 		await pi.team("pending");
 		const asked = pi.dialogs.at(-1);
 		assert.match(asked?.title ?? "", /weekly limit/);
-		assert.deepEqual(asked?.options, ["Stay paused until it resets", "Cancel the Effort: stop its Teammates, and the Lead writes the final Report", "Later"]);
+		assert.deepEqual(asked?.options, ["Stay paused until it resets", "Cancel the Effort: stop every Teammate and end it without sign-off", "Later"]);
 		assert.ok(pi.claude.calls().some((argv) => argv[0] === "stop" && argv[1] === session.shortId), JSON.stringify(pi.claude.calls()));
 		assert.ok(effortLines(dir).some((line) => line.type === "usage-answered" && line.choice === "cancel"));
-		assert.match(teammateWakes(pi.sent).at(-1)?.content ?? "", /cancelled Effort .* Write the final Report with `team_report`/s);
+		assert.ok(effortLines(dir).some((line) => line.type === "effort-ended" && line.how === "cancelled"));
+		assert.match(pi.sent.at(-1)?.content ?? "", /Cancelled Effort .* holds no Effort now/s);
 	});
 });
 
@@ -2555,6 +2582,113 @@ describe("the Team block", () => {
 		assert.match(block[0], / 3 live ─╮$/);
 		assert.match(block[2], /^│ builder-1 /);
 		assert.match(block[3], /^│ \+2 more Teammates +│$/);
+	});
+});
+
+/** What a Teammate's status line gets on stdin: a subscription's, with the weekly window only. */
+const STATUS_LINE = {
+	context_window: { total_input_tokens: 410_000, total_output_tokens: 2_000, used_percentage: 21 },
+	rate_limits: { seven_day: { used_percentage: 73, resets_at: Date.parse("2026-11-05T09:00:00.000Z") / 1000 } },
+	cost: { total_cost_usd: 3.1 },
+};
+
+/** What `get_usage` answers for the same account a little later. */
+const GET_USAGE = {
+	subscription_type: "max",
+	rate_limits_available: true,
+	rate_limits: { five_hour: { utilization: 12, resets_at: "2026-11-02T13:00:00.000Z" }, seven_day: { utilization: 74, resets_at: "2026-11-05T09:00:00.000Z" } },
+	session: { total_cost_usd: 0 },
+};
+
+/** The crew Effort with `rename-key` handed off to builder-1, whose status line has run once, `ago` ms before the clock. */
+async function statusLineRan(ago: number, options: Pick<NonNullable<Parameters<typeof fakePi>[1]>, "sessionEntries"> = {}) {
+	const crew = await crewApproved({
+		hooks: [{ event: "SessionStart", payload: { source: "startup", session_id: "c0ffee12-0000-4000-8000-000000000001" } }, { statusLine: STATUS_LINE }],
+		usage: GET_USAGE,
+		...options,
+	});
+	await crew.pi.call("team_plan", { tasks: CREW_PLAN });
+	await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+	const file = join(crew.dir, "teammates", "builder-1", "statusline.json");
+	// The reading's time is the file's: set it against the test's clock.
+	const taken = new Date(NOW.getTime() - ago);
+	utimesSync(file, taken, taken);
+	return { ...crew, file };
+}
+
+describe("usage readings", () => {
+	it("reads each live Teammate's status line into the block once a minute while it shows, its context into the Teammate's row", async () => {
+		const { pi, file } = await statusLineRan(12_000);
+		// The real wrapper wrote it, run by the fake `claude` as Claude Code runs a status line.
+		assert.deepEqual(JSON.parse(readFileSync(file, "utf8")).rate_limits, STATUS_LINE.rate_limits);
+		assert.deepEqual(pi.timers(), [60_000]);
+
+		await pi.tick();
+
+		const block = teamBlock(pi) ?? [];
+		assert.match(block[2], /^│ 5h n\/a · week 73% ↻Thu 09:00  · builder-1's status line, 12s ago +│$/);
+		assert.match(block[3], /^│ builder-1  c0ffee12  starting  001-builder-rename-key  ctx 21% /);
+		assert.equal(pi.claude.usageCalls(), 0, "a status line under a minute old means no get_usage");
+	});
+
+	it("asks get_usage when no status line is under a minute old, at most once a minute", async () => {
+		const { pi } = await statusLineRan(12_000);
+		await pi.tick();
+
+		pi.advance(50_000);
+		await pi.tick();
+		assert.equal(pi.claude.usageCalls(), 1);
+		assert.match(teamBlock(pi)?.[2] ?? "", /^│ 5h 12% ↻13:00 · week 74% ↻Thu 09:00  · get_usage, 1s ago +│$/);
+
+		pi.advance(30_000);
+		await pi.tick();
+		assert.equal(pi.claude.usageCalls(), 1, "asked again within the minute");
+
+		pi.advance(30_000);
+		await pi.tick();
+		assert.equal(pi.claude.usageCalls(), 2);
+	});
+
+	it("asks get_usage with no Teammate live, and never once the block is gone", async () => {
+		const roots = tempRoots();
+		const { pi } = intakeSession(roots);
+		pi.claude.setUsage(GET_USAGE);
+		await pi.team("start software");
+
+		await pi.tick();
+
+		assert.equal(pi.claude.usageCalls(), 1);
+		assert.match(teamBlock(pi)?.[2] ?? "", /^│ 5h 12% ↻13:00 · week 74% ↻Thu 09:00  · get_usage \(no Teammate live\), 1s ago +│$/);
+
+		await pi.emit("session_shutdown");
+		pi.advance(120_000);
+		await pi.tick();
+		assert.deepEqual(pi.timers(), []);
+		assert.equal(pi.claude.usageCalls(), 1);
+	});
+
+	it("sets no timer and asks nothing in a session with no UI, where there is no block", async () => {
+		const roots = tempRoots();
+		const { pi } = intakeSession(roots, { hasUI: false });
+		pi.claude.setUsage(GET_USAGE);
+		await pi.team("start software");
+
+		assert.deepEqual(pi.timers(), []);
+		assert.equal(pi.claude.usageCalls(), 0);
+	});
+
+	it("gives the Report the account's usage, each Role's estimate from its status lines, and the Lead's own cost as pi reports it", async () => {
+		const assistant = (total: number) => ({ type: "message", id: `m${total}`, message: { role: "assistant", usage: { cost: { total } } } });
+		const { pi } = await statusLineRan(12_000, { sessionEntries: [assistant(0.25), assistant(0.18), { type: "message", id: "u1", message: { role: "user" } }] });
+
+		const result = await pi.result("team_report", { headline: "Planned.", coverage: [{ criterion: "AC1", note: "`rename-key` covers it." }] });
+		const markdown = (result.details as { markdown: string }).markdown;
+
+		assert.match(markdown, /## Usage\n\n/);
+		assert.match(markdown, /Account, from builder-1's status line at 09:59 UTC: 5h n\/a · week 73% \(\+0 since the Effort began\)/);
+		assert.match(markdown, /By Role: builder 412k tokens ≈ \$3\.10\. \*API-price equivalent, not your bill\.\*/);
+		assert.match(markdown, /The Lead: \$0\.43, as pi reports it\./);
+		assert.equal(pi.claude.usageCalls(), 0, "the Report reads the status lines; it never asks get_usage");
 	});
 });
 
@@ -3236,8 +3370,8 @@ describe("/team attach [id]", () => {
 		await leading.team("attach qa-1");
 
 		assert.deepEqual(pi.notifications, [
-			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "info" },
-			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "info" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`.", type: "info" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`.", type: "info" },
 		]);
 		assert.deepEqual(leading.notifications, [{ message: "There is no Teammate `qa-1` with a session to attach to. Teammates with one: `builder-1`.", type: "error" }]);
 	});
@@ -3385,5 +3519,222 @@ describe("an isolated Task in a worktree of its own", () => {
 		await pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Also the docs." });
 
 		assert.equal(pi.claude.launches()[1]?.cwd, task.path);
+	});
+});
+
+/** The criteria of {@link crewBrief}, each with its evidence, as the final Report maps them. */
+const FINAL_COVERAGE = [
+	{ criterion: "AC1", note: "`rename-key` accepted: no file mentions `colour`." },
+	{ criterion: "AC2", note: "`check-old-configs` accepted: old configs load." },
+];
+
+/**
+ * A crew Effort at its end: two isolated Tasks with their Teammates running,
+ * `survey`'s worktree left with an uncommitted file, and the final Report
+ * written with `changes`, which asks the human to sign off.
+ */
+async function finalReported(changes?: Record<string, unknown>[]) {
+	const crew = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+	await crew.pi.call("team_plan", { tasks: CREW_PLAN });
+	await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true });
+	await crew.pi.call("team_handoff", { slug: "survey", body: "# Survey\n", isolated: true });
+	await until(() => effortLines(crew.dir).filter((line) => line.type === "teammate-session").length === 2, "both Teammates start");
+	const [clean, dirty] = [crewTask(crew.repo, "001"), crewTask(crew.repo, "002")];
+	writeFileSync(join(dirty.path, "notes.txt"), "not committed\n");
+	const reply = await crew.pi.call("team_report", { headline: "Both criteria are met.", coverage: FINAL_COVERAGE, final: true, ...(changes ? { changes } : {}) });
+	return { ...crew, clean, dirty, reply, report: join(crew.dir, "reports", "001.md") };
+}
+
+function approvals(dir: string): Record<string, unknown>[] {
+	return readFileSync(join(dir, "approvals.jsonl"), "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+const EFFORT_TOOL_NAMES = ["team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer"];
+
+describe("ending an Effort: the final Report and sign-off", () => {
+	it("writes the final Report mapping each criterion to its evidence, with the checkpoints and the worktrees, and asks the human to sign it off", async () => {
+		const { pi, reply, report, clean, dirty } = await finalReported();
+
+		assert.match(reply, /^The final Report 1 of Effort `crew-2026-11-02` is written as reports\/001\.md/);
+		assert.match(reply, /sign off .*`r2`/);
+		const written = readFileSync(report, "utf8");
+		for (const needed of [
+			"# Final Report 1 · Effort `crew-2026-11-02`",
+			"- AC1: `rename-key` accepted: no file mentions `colour`.",
+			"## Checkpoints",
+			"- Brief: `r1` approved at 10:00 UTC",
+			"## Found work",
+			"## Worktrees",
+			`- ${clean.path} (\`${clean.branch}\`): clean, removed at sign-off; the branch is kept`,
+			`- ${dirty.path} (\`${dirty.branch}\`): has uncommitted changes, so it is kept; the branch is kept`,
+		]) {
+			assert.ok(written.includes(needed), `reports/001.md doesn't say ${needed}:\n${written}`);
+		}
+		assert.match(teamBlock(pi)?.join("\n") ?? "", /pending/);
+	});
+
+	it("refuses a final Report that leaves a criterion without evidence, writing nothing", async () => {
+		const { pi, dir } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await assert.rejects(pi.call("team_report", { headline: "Done.", coverage: [FINAL_COVERAGE[0]], final: true }), /AC2/);
+		assert.equal(existsSync(join(dir, "reports")), false);
+	});
+
+	it("signing off records the act with the Report's sha, stops every Teammate, removes the clean worktrees, keeps the dirty one and every branch, and ends the Effort", async () => {
+		const { pi, dir, repo, report, workspace, clean, dirty } = await finalReported();
+		const shortIds = effortLines(dir)
+			.filter((line) => line.type === "teammate-session")
+			.map((line) => line.shortId);
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		assert.match(pi.dialogs.at(-1)?.title ?? "", /[Ss]ign off.*reports\/001\.md/s);
+		const signed = approvals(dir).at(-1);
+		assert.equal(signed?.act, "sign-off");
+		assert.equal(signed?.request, "r2");
+		assert.equal(signed?.report, sha(readFileSync(report)));
+		const stops = pi.claude.calls().filter((argv) => argv[0] === "stop").map((argv) => argv[1]);
+		assert.deepEqual(stops.sort(), [...shortIds].sort());
+		assert.deepEqual(effortLines(dir).at(-1), { type: "effort-ended", how: "signed-off", at: NOW.toISOString() });
+		assert.equal(existsSync(workspace), false);
+		assert.equal(existsSync(clean.path), false);
+		assert.ok(existsSync(join(dirty.path, "notes.txt")));
+		for (const branch of [`team/${CREW_EFFORT_ID}`, clean.branch, dirty.branch]) assert.ok(gitOk(repo, "rev-parse", "--verify", branch), `${branch} is kept`);
+		const said = pi.notifications.at(-1)?.message ?? "";
+		assert.match(said, /[Ss]igned off/);
+		assert.ok(said.includes(dirty.path), said);
+		assert.deepEqual(
+			pi.activeTools().filter((name) => EFFORT_TOOL_NAMES.includes(name)),
+			[],
+		);
+		assert.equal(teamBlock(pi), undefined);
+	});
+
+	it("leaves nothing waiting once signed off, and adopts nothing ended with `/team resume`", async () => {
+		const { pi } = await finalReported();
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		await pi.team("pending");
+		await pi.team("resume");
+
+		assert.equal(pi.notifications.at(-2)?.message, "Nothing is waiting on you.");
+		assert.match(pi.notifications.at(-1)?.message ?? "", /nothing to adopt/);
+	});
+
+	it("refuses to adopt a signed-off Effort by name, and a new session leading it doesn't take it back", async () => {
+		const { pi, roots, repo } = await finalReported();
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		await pi.team(`resume ${CREW_EFFORT_ID}`);
+		assert.match(pi.notifications.at(-1)?.message ?? "", /`crew-2026-11-02` was signed off, so there is nothing to adopt/);
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries() });
+		await again.emit("session_start", { reason: "startup" });
+		assert.deepEqual(
+			again.activeTools().filter((name) => EFFORT_TOOL_NAMES.includes(name)),
+			[],
+		);
+		assert.deepEqual(again.notifications, []);
+	});
+
+	it("a send-back of the final Report wakes the Lead with the note and leaves the Teammates running", async () => {
+		const { pi, dir } = await finalReported();
+		const woken = pi.sent.length;
+
+		pi.answer("Send back with a note", "AC2 needs a test.");
+		await pi.team("pending");
+
+		assert.equal(pi.claude.calls().filter((argv) => argv[0] === "stop").length, 0);
+		const wake = pi.sent.slice(woken).find((message) => message.customType === "team-pending");
+		assert.match(wake?.content ?? "", /sent back the final Report .*AC2 needs a test\..*still running/s);
+		assert.equal(effortLines(dir).some((line) => line.type === "effort-ended"), false);
+		assert.equal(approvals(dir).some((record) => record.act === "sign-off"), false);
+		assert.ok(pi.activeTools().includes("team_report"));
+		await pi.team("pending");
+		assert.equal(pi.notifications.at(-1)?.message, "Nothing is waiting on you.");
+	});
+
+	it("asks about each proposed Playbook change on its own: an adopted one changes the Team's adopted Playbook for the next Effort, never this Effort's snapshot", async () => {
+		const changes = [
+			{ id: "tiny-diffs", summary: "Diffs were still too big.", oldText: "keep each Task's diff small.", newText: "keep each Task's diff under 200 lines." },
+			{ id: "no-curl", summary: "Nobody needed curl.", oldText: "## Rules", newText: "## Rules\n\n- **no-curl**: never fetch with curl." },
+		];
+		const { pi, roots, dir } = await finalReported(changes);
+		const adopted = join(playbooksDir(roots), "crew.md");
+		const snapshot = readFileSync(join(dir, "playbook.md"), "utf8");
+		const asked = pi.dialogs.length;
+
+		pi.answer("Adopt for the next Effort", "Decline", "Approve");
+		await pi.team("pending");
+
+		const titles = pi.dialogs.slice(asked).map((dialog) => dialog.title);
+		assert.match(titles[0], /`tiny-diffs`.*under 200 lines/s);
+		assert.match(titles[1], /`no-curl`/);
+		assert.match(titles[2], /[Ss]ign off/);
+		const now = readFileSync(adopted, "utf8");
+		assert.ok(now.includes("keep each Task's diff under 200 lines."));
+		assert.ok(!now.includes("no-curl"));
+		assert.equal(readFileSync(join(dir, "playbook.md"), "utf8"), snapshot);
+		const record = approvals(dir).find((each) => each.act === "playbook-change");
+		assert.deepEqual(record && { request: record.request, change: record.change, playbook: record.playbook }, { request: "r3", change: "tiny-diffs", playbook: sha(Buffer.from(now)) });
+		const json = JSON.parse(readFileSync(join(playbooksDir(roots), "crew.adopted.json"), "utf8")) as { sha256: string };
+		assert.equal(json.sha256, sha(Buffer.from(now)));
+		assert.equal(effortLines(dir).at(-1)?.type, "effort-ended");
+	});
+
+	it("waits to sign off until each proposed change is answered", async () => {
+		const changes = [{ id: "tiny-diffs", summary: "Smaller.", oldText: "keep each Task's diff small.", newText: "keep each Task's diff tiny." }];
+		const { pi, dir } = await finalReported(changes);
+
+		pi.answer("Later", "Approve");
+		await pi.team("pending");
+
+		assert.match(pi.notifications.at(-1)?.message ?? "", /Adopt or decline each proposed Playbook change before signing off.*`tiny-diffs`/);
+		assert.equal(effortLines(dir).some((line) => line.type === "effort-ended"), false);
+	});
+
+	it("refuses a final Report whose Playbook change doesn't apply to the Effort's Playbook, writing nothing", async () => {
+		const { pi, dir } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await assert.rejects(
+			pi.call("team_report", { headline: "Done.", coverage: FINAL_COVERAGE, final: true, changes: [{ id: "nope", summary: "x", oldText: "not in it", newText: "y" }] }),
+			/`nope`: its `oldText` isn't in the Playbook/,
+		);
+		assert.equal(existsSync(join(dir, "reports")), false);
+	});
+
+	it("`/team cancel`, confirmed, stops every Teammate and ends the Effort without sign-off; declined, it changes nothing", async () => {
+		const { pi, dir, workspace, clean, dirty } = await finalReported();
+
+		pi.answer(false);
+		await pi.team("cancel");
+		assert.equal(pi.claude.calls().filter((argv) => argv[0] === "stop").length, 0);
+		assert.ok(pi.activeTools().includes("team_report"));
+
+		pi.answer(true);
+		await pi.team("cancel");
+
+		assert.match(pi.dialogs.at(-1)?.title ?? "", /Cancel Effort `crew-2026-11-02`\?/);
+		assert.equal(pi.claude.calls().filter((argv) => argv[0] === "stop").length, 2);
+		assert.deepEqual(effortLines(dir).at(-1), { type: "effort-ended", how: "cancelled", at: NOW.toISOString() });
+		assert.equal(approvals(dir).some((record) => record.act === "sign-off"), false);
+		assert.equal(existsSync(workspace), false);
+		assert.equal(existsSync(clean.path), false);
+		assert.ok(existsSync(dirty.path));
+		assert.match(pi.notifications.at(-1)?.message ?? "", /Cancelled Effort/);
+		assert.deepEqual(
+			pi.activeTools().filter((name) => EFFORT_TOOL_NAMES.includes(name)),
+			[],
+		);
+		assert.equal(teamBlock(pi), undefined);
+		await pi.team("cancel");
+		assert.match(pi.notifications.at(-1)?.message ?? "", /holds no Effort, so there is nothing to cancel/);
 	});
 });

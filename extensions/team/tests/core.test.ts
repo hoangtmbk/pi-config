@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, heldPauses, type JournalLine, openEffort, openMerges, type Step, step, taskStatus, waitingInTerminal, workdir } from "../core.ts";
+import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openMerges, type Step, step, taskStatus, type UsageReading, waitingInTerminal, workdir } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -1693,6 +1693,289 @@ describe("a Teammate's lifecycle", () => {
 });
 
 
+describe("the final Report and sign-off", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "design", role: "architect", goal: "Design the rename.", criteria: ["AC2"] },
+			{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] },
+		],
+		criteria: ["AC1", "AC2"],
+		roles: ["architect", "dev"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+	const plannedReport = applied(planned, { kind: "report", headline: "Planned.", criteria: ["AC1", "AC2"], modes: [], found: ["The docs misspell the key too."], at: "2026-11-02T11:15:00.000Z" });
+	const handed = applied(applied(plannedReport, { kind: "handoff", slug: "design", at: "2026-11-02T11:20:00.000Z" }), { kind: "handoff", slug: "rename", at: "2026-11-02T11:21:00.000Z" });
+	// architect-1's session started and gave it a short id; dev-1's hasn't yet.
+	const running: EffortLine[] = [...handed, { type: "teammate-session", teammate: "architect-1", cursor: 1, source: "startup", sessionId: "s-1", shortId: "abc123", at: "2026-11-02T11:22:00.000Z" }];
+	const CHANGE = { id: "qa-first", summary: "QA reviews the design before devs start.", oldText: "design-first", newText: "design-and-qa-first" };
+	const WORKTREES = [
+		{ path: "/work/app/.claude/worktrees/team-software-2026-11-02", branch: "team/software-2026-11-02", dirty: false },
+		{ path: "/work/app/.claude/worktrees/team-software-2026-11-02-task-002", branch: "team/software-2026-11-02-task-002", dirty: true },
+	];
+	const EVIDENCE = [
+		{ criterion: "AC1", note: "renamed in `config.ts`, tests in `config.test.ts` pass" },
+		{ criterion: "AC2", note: "design accepted in `001-architect-design/result-1.md`" },
+	];
+
+	function finalReport(at: string, extra: Partial<Extract<EffortInput, { kind: "report" }>> = {}): Extract<EffortInput, { kind: "report" }> {
+		return {
+			kind: "report",
+			headline: "Done: the key is renamed.",
+			coverage: EVIDENCE,
+			criteria: ["AC1", "AC2"],
+			modes: [],
+			final: { checkpoints: ["design-review"], changes: [CHANGE], worktrees: WORKTREES },
+			at,
+			...extra,
+		};
+	}
+
+	function written(result: Step) {
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "write-report");
+		assert.ok(action?.kind === "write-report", "expected a write-report action");
+		return action.report;
+	}
+
+	function signOffRequest(at = "2026-11-02T12:01:00.000Z"): Extract<EffortInput, { kind: "request-sign-off" }> {
+		return { kind: "request-sign-off", path: "/agent/team/efforts/software-2026-11-02/reports/002.md", sha256: "d".repeat(64), snapshot: "# Final Report 2", changes: [{ change: CHANGE, sha256: "e".repeat(64) }], at };
+	}
+
+	const reported = applied(running, finalReport("2026-11-02T12:00:00.000Z"));
+	const asked = applied(reported, signOffRequest());
+
+	it("refuses a final Report that leaves a criterion without evidence, or proposes a change twice", () => {
+		assert.match(refusal(running, finalReport("2026-11-02T12:00:00.000Z", { coverage: [EVIDENCE[0]] })), /`AC2`/);
+		assert.match(refusal(running, finalReport("2026-11-02T12:00:00.000Z", { coverage: [EVIDENCE[0], { criterion: "AC2", note: " " }] })), /`AC2`/);
+		const twice = finalReport("2026-11-02T12:00:00.000Z", { final: { checkpoints: [], changes: [CHANGE, CHANGE], worktrees: [] } });
+		assert.match(refusal(running, twice), /`qa-first`.*once/);
+		const unkebab = finalReport("2026-11-02T12:00:00.000Z", { final: { checkpoints: [], changes: [{ ...CHANGE, id: "QA First" }], worktrees: [] } });
+		assert.match(refusal(running, unkebab), /kebab-case/);
+	});
+
+	it("maps every criterion to evidence and lists every checkpoint, all found work, each proposed change and the worktrees", () => {
+		const report = written(run(running, finalReport("2026-11-02T12:00:00.000Z")));
+		assert.equal(report.final, true);
+		assert.deepEqual(report.coverage, EVIDENCE);
+		const section = (title: string) => report.sections.find((each) => each.title === title)?.lines;
+		assert.deepEqual(section("Checkpoints"), [
+			`Playbook: adopted before the Effort opened (sha256 ${"a".repeat(64)})`,
+			`Brief: \`r1\` approved at 11:00 UTC (sha256 ${"b".repeat(64)})`,
+			"`design-review`: never asked",
+		]);
+		assert.deepEqual(section("Found work"), ["The docs misspell the key too."]);
+		assert.deepEqual(section("Proposed Playbook changes"), [
+			"`qa-first`: QA reviews the design before devs start.",
+			"Each is adopted or declined on its own in `/team pending`. An adopted one is the Playbook of the next Effort; this Effort keeps its snapshot.",
+		]);
+		assert.deepEqual(section("Worktrees"), [
+			"/work/app/.claude/worktrees/team-software-2026-11-02 (`team/software-2026-11-02`): clean, removed at sign-off; the branch is kept",
+			"/work/app/.claude/worktrees/team-software-2026-11-02-task-002 (`team/software-2026-11-02-task-002`): has uncommitted changes, so it is kept; the branch is kept",
+		]);
+	});
+
+	it("asks for sign-off and for each proposed Playbook change separately", () => {
+		const state = fold(asked);
+		assert.deepEqual(
+			state.pending.map((item) => [item.id, item.checkpoint, item.change?.id]),
+			[
+				["r2", "sign-off", undefined],
+				["r3", "playbook-change", "qa-first"],
+			],
+		);
+		assert.match(refusal(running, signOffRequest()), /final Report/);
+		assert.match(refusal(running, request("c".repeat(64))), /already approved/);
+		assert.match(refusal(reported, { ...request("c".repeat(64)), checkpoint: "sign-off" }), /final Report.*`final: true`/);
+	});
+
+	it("refuses sign-off while a proposed Playbook change is unanswered", () => {
+		assert.match(refusal(asked, { kind: "answer", id: "r2", answer: "approved", at: "2026-11-02T12:10:00.000Z" }), /`r3`/);
+	});
+
+	it("adopts or declines a Playbook change without waking the Lead", () => {
+		const adopted = run(asked, { kind: "answer", id: "r3", answer: "approved", at: "2026-11-02T12:05:00.000Z" });
+		assert.ok(adopted.ok);
+		assert.deepEqual(
+			adopted.actions.map((action) => action.kind),
+			["adopt-playbook-change"],
+		);
+		const declined = run(asked, { kind: "answer", id: "r3", answer: "declined", at: "2026-11-02T12:05:00.000Z" });
+		assert.ok(declined.ok);
+		assert.deepEqual(declined.actions, []);
+		assert.deepEqual(declined.state.pending.map((item) => item.id), ["r2"]);
+		assert.match(refusal(asked, { kind: "answer", id: "r3", answer: "sent-back", note: "no", at: "2026-11-02T12:05:00.000Z" }), /adopted or declined/);
+		assert.match(refusal(asked, { kind: "answer", id: "r2", answer: "declined", at: "2026-11-02T12:05:00.000Z" }), /Playbook change/);
+	});
+
+	it("signing off records the act, stops every live Teammate and ends the Effort", () => {
+		const changed = applied(asked, { kind: "answer", id: "r3", answer: "declined", at: "2026-11-02T12:05:00.000Z" });
+		const result = run(changed, { kind: "answer", id: "r2", answer: "approved", at: "2026-11-02T12:10:00.000Z" });
+		assert.ok(result.ok);
+		assert.deepEqual(result.actions, [
+			{ kind: "record-sign-off", approval: fold(changed).pending[0], at: "2026-11-02T12:10:00.000Z" },
+			{ kind: "stop-teammate", teammate: "architect-1", shortId: "abc123" },
+			{ kind: "stop-teammate", teammate: "dev-1", shortId: "team-software-2026-11-02-dev-1" },
+			{ kind: "end-effort", how: "signed-off" },
+		]);
+		assert.deepEqual(result.state.ended, { how: "signed-off", at: "2026-11-02T12:10:00.000Z" });
+		assert.ok(result.state.teammates.every((teammate) => teammate.ended?.how === "stopped"));
+		assert.deepEqual(result.state.pending, []);
+	});
+
+	it("a send-back at sign-off wakes the Lead with the note, keeps the Teammates and drops the proposed changes", () => {
+		const result = run(asked, { kind: "answer", id: "r2", answer: "sent-back", note: "AC1 has no test for the old key.", at: "2026-11-02T12:10:00.000Z" });
+		assert.ok(result.ok);
+		assert.equal(result.actions.length, 1);
+		const [wake] = result.actions;
+		assert.ok(wake?.kind === "wake-lead");
+		assert.match(wake.text, /AC1 has no test for the old key\./);
+		assert.match(wake.text, /`final: true`/);
+		assert.equal(result.state.ended, undefined);
+		assert.ok(result.state.teammates.every((teammate) => teammate.ended === undefined));
+		assert.deepEqual(result.state.pending, []);
+
+		const next = run([...asked, ...result.append], { kind: "report", headline: "Re-planning.", criteria: ["AC1", "AC2"], modes: [], at: "2026-11-02T12:20:00.000Z" });
+		assert.deepEqual(written(next).sections.find((each) => each.title === "Since the last Report")?.lines, [
+			"12:01 asked for your sign-off (`r2`)",
+			"12:01 proposed Playbook change `qa-first` (`r3`)",
+			"12:10 you sent back the final Report (`r2`): AC1 has no test for the old key.",
+		]);
+	});
+
+	it("cancelling stops every live Teammate and ends the Effort without sign-off", () => {
+		const result = run(asked, { kind: "cancel", at: "2026-11-02T12:30:00.000Z" });
+		assert.ok(result.ok);
+		assert.deepEqual(
+			result.actions.map((action) => action.kind),
+			["stop-teammate", "stop-teammate", "end-effort"],
+		);
+		assert.deepEqual(result.state.ended, { how: "cancelled", at: "2026-11-02T12:30:00.000Z" });
+		assert.deepEqual(result.state.pending, []);
+	});
+
+	it("takes nothing more once the Effort has ended", () => {
+		const ended = applied(asked, { kind: "cancel", at: "2026-11-02T12:30:00.000Z" });
+		assert.match(refusal(ended, { kind: "cancel", at: "2026-11-02T12:31:00.000Z" }), /ended.*cancelled/);
+		assert.match(refusal(ended, finalReport("2026-11-02T12:31:00.000Z")), /ended/);
+		assert.match(refusal(ended, { kind: "handoff", slug: "rename", at: "2026-11-02T12:31:00.000Z" }), /ended/);
+	});
+});
+
+describe("usage readings", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "design", role: "architect", goal: "Design the rename.", criteria: ["AC2"] },
+			{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] },
+			{ slug: "docs", role: "dev", goal: "Document the key.", criteria: ["AC1"] },
+		],
+		criteria: ["AC1", "AC2"],
+		roles: ["architect", "dev"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+	const staffed = ["design", "rename", "docs"].reduce((lines, slug) => applied(lines, { kind: "handoff", slug, at: "2026-11-02T11:20:00.000Z" }), planned);
+
+	function statusLine(teammate: string, at: string, extra: Partial<UsageReading> = {}): EffortInput {
+		return { kind: "usage", reading: { source: "status-line", at, teammate, sessionId: `${teammate}-a`, rateLimits: true, ...extra } };
+	}
+
+	function report(lines: EffortLine[], at: string, extra: Partial<Extract<EffortInput, { kind: "report" }>> = {}): string[] | undefined {
+		const result = run(lines, { kind: "report", headline: "On track.", criteria: ["AC1", "AC2"], modes: [], at, ...extra });
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "write-report");
+		assert.ok(action?.kind === "write-report");
+		return action.report.sections.find((each) => each.title === "Usage")?.lines;
+	}
+
+	it("keeps a status line reading once, as the last reading with its source and time, and its Teammate's context", () => {
+		const reading = statusLine("dev-1", "2026-11-02T11:30:00.000Z", { sevenDay: { percent: 73, resetsAt: "2026-11-06T09:00:00.000Z" }, ctx: 21 });
+		const read = applied(staffed, reading);
+
+		assert.deepEqual(read.slice(staffed.length), [{ type: "usage-read", ...(reading as Extract<EffortInput, { kind: "usage" }>).reading }]);
+		assert.equal(fold(read).usage?.latest.source, "status-line");
+		assert.equal(fold(read).usage?.latest.at, "2026-11-02T11:30:00.000Z");
+		assert.equal(fold(read).usage?.statusLines["dev-1"]?.ctx, 21);
+		// The same file read again, or an older one, adds nothing.
+		const again = run(read, reading);
+		assert.ok(again.ok);
+		assert.deepEqual(again.append, []);
+		const older = run(read, statusLine("dev-1", "2026-11-02T11:29:00.000Z"));
+		assert.ok(older.ok);
+		assert.deepEqual(older.append, []);
+	});
+
+	it("leaves usage out of the Report until there is a reading, and out of what happened since the last Report", () => {
+		assert.equal(report(staffed, "2026-11-02T11:40:00.000Z"), undefined);
+		const read = applied(staffed, statusLine("dev-1", "2026-11-02T11:30:00.000Z", { sevenDay: { percent: 70 } }));
+		assert.ok(report(read, "2026-11-02T11:40:00.000Z"));
+		const result = run(read, { kind: "report", headline: "On track.", criteria: ["AC1", "AC2"], modes: [], at: "2026-11-02T11:40:00.000Z" });
+		assert.ok(result.ok);
+		const action = result.actions.find((each) => each.kind === "write-report");
+		assert.ok(action?.kind === "write-report");
+		assert.equal(action.report.sections.find((each) => each.title === "Since the last Report")?.lines.some((line) => line.includes("usage")), false);
+	});
+
+	it("gives the freshest account reading and its change since the Effort began, which includes the human's own use", () => {
+		const lines = [
+			statusLine("dev-1", "2026-11-02T11:30:00.000Z", { fiveHour: { percent: 10, resetsAt: "2026-11-02T14:00:00.000Z" }, sevenDay: { percent: 66, resetsAt: "2026-11-06T09:00:00.000Z" } }),
+			statusLine("architect-1", "2026-11-02T12:10:00.000Z", { fiveHour: { percent: 31, resetsAt: "2026-11-02T14:00:00.000Z" }, sevenDay: { percent: 73, resetsAt: "2026-11-06T09:00:00.000Z" } }),
+			// Older than the reading above, so not the freshest, though read later.
+			statusLine("dev-2", "2026-11-02T12:00:00.000Z", { fiveHour: { percent: 29, resetsAt: "2026-11-02T14:00:00.000Z" }, sevenDay: { percent: 72, resetsAt: "2026-11-06T09:00:00.000Z" } }),
+		].reduce(applied, staffed);
+
+		assert.deepEqual(report(lines, "2026-11-02T12:15:00.000Z")?.[0], "Account, from architect-1's status line at 12:10 UTC: 5h 31% (+21 since the Effort began) · week 73% (+7 since the Effort began). It includes your own use outside the Team.");
+	});
+
+	it("says n/a for a window no reading gives, and that a window reset rather than a change across its reset", () => {
+		const lines = [
+			statusLine("dev-1", "2026-11-02T11:30:00.000Z", { fiveHour: { percent: 80, resetsAt: "2026-11-02T12:00:00.000Z" } }),
+			{ kind: "usage", reading: { source: "get-usage", at: "2026-11-02T12:30:00.000Z", rateLimits: true, fiveHour: { percent: 4, resetsAt: "2026-11-02T17:00:00.000Z" } } } as EffortInput,
+		].reduce(applied, staffed);
+
+		assert.equal(report(lines, "2026-11-02T12:35:00.000Z")?.[0], "Account, from get_usage at 12:30 UTC: 5h 4% (reset since the Effort began) · week n/a. It includes your own use outside the Team.");
+	});
+
+	it("sums each Role's tokens and estimate across session ids, a value that drops counting as a reset, labelled as not the bill", () => {
+		const lines = [
+			statusLine("dev-1", "2026-11-02T11:30:00.000Z", { tokens: 40_000, costUsd: 0.5 }),
+			statusLine("dev-1", "2026-11-02T11:40:00.000Z", { tokens: 60_000, costUsd: 0.7 }),
+			// A clear: a new session id, counted from its own start.
+			statusLine("dev-1", "2026-11-02T11:50:00.000Z", { sessionId: "dev-1-b", tokens: 10_000, costUsd: 0.1 }),
+			// The first session's figure dropped: it reset, so what it had counts too.
+			statusLine("dev-1", "2026-11-02T12:00:00.000Z", { tokens: 5_000, costUsd: 0.05 }),
+			statusLine("dev-2", "2026-11-02T12:00:00.000Z", { tokens: 21_000, costUsd: 0.25 }),
+			statusLine("architect-1", "2026-11-02T12:00:00.000Z", { tokens: 412_000, costUsd: 3.1 }),
+		].reduce(applied, staffed);
+
+		assert.deepEqual(report(lines, "2026-11-02T12:05:00.000Z")?.slice(1), ["By Role: architect 412k tokens ≈ $3.10 · dev 96k tokens ≈ $1.10. *API-price equivalent, not your bill.*"]);
+	});
+
+	it("says the estimate is the nearest thing to a charge when no reading has rate_limits, as with an API key", () => {
+		const lines = [statusLine("dev-1", "2026-11-02T11:30:00.000Z", { rateLimits: false, tokens: 96_000, costUsd: 1.1 })].reduce(applied, staffed);
+
+		assert.deepEqual(report(lines, "2026-11-02T11:35:00.000Z"), [
+			"Account, from dev-1's status line at 11:30 UTC: 5h n/a · week n/a. It includes your own use outside the Team.",
+			"By Role: dev 96k tokens ≈ $1.10. No reading has `rate_limits`, as with an API key, so the estimate is the nearest thing to a charge.",
+		]);
+	});
+
+	it("gives the Lead's own cost as pi reports it", () => {
+		assert.deepEqual(report(staffed, "2026-11-02T11:35:00.000Z", { leadCostUsd: 0.4321 }), ["The Lead: $0.43, as pi reports it."]);
+		assert.equal(report(staffed, "2026-11-02T11:35:00.000Z", { leadCostUsd: 0 }), undefined);
+	});
+
+	it("tells whether a status line is under a minute old", () => {
+		const read = fold(applied(staffed, statusLine("dev-1", "2026-11-02T11:30:00.000Z")));
+
+		assert.equal(freshStatusLine(fold(staffed), Date.parse("2026-11-02T11:30:00.000Z")), false);
+		assert.equal(freshStatusLine(read, Date.parse("2026-11-02T11:30:59.000Z")), true);
+		assert.equal(freshStatusLine(read, Date.parse("2026-11-02T11:31:00.000Z")), false);
+	});
+});
+
 describe("an isolated Task", () => {
 	const WORKSPACE = { kind: "git-worktree", path: "/work/app/.claude/worktrees/team-software-2026-11-02", branch: "team/software-2026-11-02", base: "c".repeat(40), from: "main" } as const;
 	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", workspace: WORKSPACE, at: "2026-11-02T11:00:00.000Z" });
@@ -2010,8 +2293,10 @@ describe("usage limits", () => {
 			["dev-1", "qa-1"],
 		);
 		assert.deepEqual(cancel.state.teammates.map((each) => each.ended?.how), ["stopped", "stopped"]);
-		const woken = cancel.actions.find((action) => action.kind === "wake-lead");
-		assert.match(woken?.kind === "wake-lead" ? woken.text : "", /cancelled.*weekly limit.*final Report with `team_report`/s);
+		// It is `/team cancel`: the Effort ends without sign-off.
+		assert.equal(cancel.state.ended?.how, "cancelled");
+		assert.ok(cancel.actions.some((action) => action.kind === "end-effort" && action.how === "cancelled"));
+		assert.deepEqual(cancel.state.usageItems, []);
 
 		// A reset Claude Code didn't give asks too: nobody knows when it lifts.
 		const unsaid = journalStep(lines, "dev-1", failure("dev-1", "You've hit your session limit"));

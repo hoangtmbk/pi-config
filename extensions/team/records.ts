@@ -101,7 +101,10 @@ export function appendLines(paths: EffortPaths, lines: readonly EffortLine[]): v
 }
 
 /** One line of `approvals.jsonl`: an approved act and the sha of everything it approved. */
-export interface ApprovalRecord {
+export type ApprovalRecord = BriefRecord | SignOffRecord | PlaybookChangeRecord;
+
+/** The Brief's approval, which every record the Effort reads afterwards is checked against. */
+export interface BriefRecord {
 	act: "brief";
 	/** The pending request the human answered. */
 	request: string;
@@ -114,6 +117,33 @@ export interface ApprovalRecord {
 	/** The Workspace the approval added, with the commit the Effort started from. */
 	workspace?: Workspace;
 	at: string;
+}
+
+/** The human's sign-off of the final Report, which ends the Effort. */
+export interface SignOffRecord {
+	act: "sign-off";
+	request: string;
+	/** Of the final Report's file, as the human signed it off. */
+	report: string;
+	at: string;
+}
+
+/** A Playbook change the human adopted for the Team's next Effort. */
+export interface PlaybookChangeRecord {
+	act: "playbook-change";
+	request: string;
+	/** The change's id in the final Report. */
+	change: string;
+	/** Of the change as the human saw it. */
+	sha256: string;
+	/** Of the adopted Playbook it made. */
+	playbook: string;
+	at: string;
+}
+
+/** Add an approved act to the Effort's `approvals.jsonl`. */
+export function recordApproval(paths: EffortPaths, record: ApprovalRecord): void {
+	appendFileSync(paths.approvals, `${JSON.stringify(record)}\n`);
 }
 
 /**
@@ -148,12 +178,12 @@ export function teamDigest(dir: string): string {
 export function promoteBrief(
 	paths: EffortPaths,
 	promotion: { approval: PendingApproval; playbookFile: string; teamDir: string; workspace?: Workspace; at: string },
-): ApprovalRecord {
+): BriefRecord {
 	writeFileSync(paths.brief, promotion.approval.snapshot);
 	const playbook = readFileSync(promotion.playbookFile);
 	writeFileSync(paths.playbook, playbook);
 	cpSync(promotion.teamDir, paths.team, { recursive: true });
-	const record: ApprovalRecord = {
+	const record: BriefRecord = {
 		act: "brief",
 		request: promotion.approval.id,
 		brief: sha256(promotion.approval.snapshot),
@@ -162,7 +192,7 @@ export function promoteBrief(
 		...(promotion.workspace === undefined ? {} : { workspace: promotion.workspace }),
 		at: promotion.at,
 	};
-	appendFileSync(paths.approvals, `${JSON.stringify(record)}\n`);
+	recordApproval(paths, record);
 	return record;
 }
 
@@ -176,7 +206,7 @@ export function checkRecords(paths: EffortPaths): string[] {
 		.split("\n")
 		.filter((line) => line.trim() !== "")
 		.map((line) => JSON.parse(line) as ApprovalRecord);
-	const approved = [...records].reverse().find((record) => record.act === "brief");
+	const approved = [...records].reverse().find((record): record is BriefRecord => record.act === "brief");
 	if (!approved) return [`${paths.approvals} records no approved Brief, so no record of this Effort can be trusted`];
 	const problems: string[] = [];
 	const compare = (name: string, actual: string | undefined, expected: string) => {
@@ -517,7 +547,7 @@ function journalLine(text: string): JournalLine {
 
 /** A Report as the human reads it, in chat and in `reports/<nnn>.md`. */
 export function reportMarkdown(effortId: string, report: Report): string {
-	const parts = [`# Report ${report.n} · Effort \`${effortId}\``, `_${report.at.slice(0, 10)} ${report.at.slice(11, 16)} UTC_`, report.headline];
+	const parts = [`# ${report.final ? "Final Report" : "Report"} ${report.n} · Effort \`${effortId}\``, `_${report.at.slice(0, 10)} ${report.at.slice(11, 16)} UTC_`, report.headline];
 	if (report.coverage.length > 0) parts.push(`## Brief coverage\n\n${report.coverage.map(({ criterion, note }) => `- ${criterion}: ${note.trim()}`).join("\n")}`);
 	for (const section of report.sections) parts.push(`## ${section.title}\n\n${section.lines.map((line) => `- ${line}`).join("\n")}`);
 	return `${parts.join("\n\n")}\n`;

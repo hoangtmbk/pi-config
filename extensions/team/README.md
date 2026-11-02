@@ -22,6 +22,8 @@ an Effort and runs its intake up to the human approving its Brief. Planning and 
                      Effort no pi session leads (pick one, or name it)
 /team report         ask the Lead for a Report on everything since the last one
 /team reports        pick a Report, newest first, and read it in an overlay
+/team cancel         end the held Effort without sign-off, once you confirm: every Teammate stops,
+                     clean worktrees are removed, branches are kept
 /team attach [id]    attach to a Teammate's session (pick one, or name it); also just `/team`
 ```
 
@@ -161,6 +163,17 @@ is also read when the Lead's run settles, so a lost doorbell loses nothing.
 
 Wakes that come while the Lead is busy are sent together as one follow-up once its run settles.
 
+### Usage
+
+Every Teammate's status line runs `statusline.mjs`, which runs the human's own status line
+command (local, then project, then user settings, as Claude Code picks it) and prints its output
+unchanged, then writes the JSON it got to `teammates/<id>/statusline.json`. While the Team block
+shows, the extension reads those files once a minute: the block's usage line shows the freshest
+reading, where it came from and how old it is, and each row's `ctx` comes from them. With no
+status line under a minute old it asks Claude Code's undocumented `get_usage` control request
+instead, at most once a minute. Each Report's Usage section has the freshest reading and its change
+since the Effort began, each Role's tokens and API-price estimate summed across its sessions, and
+the Lead's own cost as pi reports it.
 ### Held requests
 
 A Teammate's permission prompt, an `AskUserQuestion` included, is held by its `PermissionRequest`
@@ -217,6 +230,19 @@ adds the logged sections from `effort.jsonl`, leaving out any with nothing in th
 The first Report, written once the plan is, is the plan Report. Each is saved as
 `reports/<nnn>.md` in the Effort directory, numbered from 001 and never overwritten, and shows in
 chat collapsed to its headline; the Lead gets back only where it went. The Team block counts them.
+
+### Ending an Effort
+
+The Lead ends the work with a final Report: `team_report` with `final: true`. It must map every
+Brief criterion id to evidence, and may propose Playbook `changes`, each an `oldText` to replace
+with `newText` in the Playbook the Effort runs on; a change that doesn't apply is refused. The
+final Report adds the checkpoints with their approvals and the found work, and puts sign-off in
+`/team pending`. There each Playbook change is asked first, one by one: adopted, it becomes the
+Team's Playbook for the next Effort (this Effort keeps its snapshot); declined, it is dropped.
+Approving sign-off records the Report's sha256 in `approvals.jsonl`, stops every Teammate and ends
+the Effort; sending it back wakes the Lead with your note and drops the proposed changes. At the
+end clean worktrees are removed and every branch is kept; a dirty worktree is kept and named.
+`/team cancel` ends the Effort the same way without a Report. An ended Effort can't be adopted.
 
 ### Pausing
 
