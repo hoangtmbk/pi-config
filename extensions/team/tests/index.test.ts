@@ -2701,6 +2701,25 @@ describe("staffing: the ladder and clearing between Tasks", () => {
 		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## update-docs\n[\s\S]*?- Status: running, with `builder-1` \(tasks\/002-builder-update-docs\/\)/);
 	});
 
+	it("starts an idle-stopped `builder-1` afresh for its Role's next Task, since a clear can't reach a session `claude agents --json` doesn't list", async () => {
+		const { pi, dir } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }, ...WORKS], replies: WORKS });
+		await pi.call("team_plan", { tasks: STAFF_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await pi.call("team_review", { slug: "rename-key", verdict: "accept" });
+		pi.claude.idleStop(BUILDER_1);
+
+		const reply = await pi.call("team_handoff", { slug: "update-docs", body: "# Docs\n" });
+
+		assert.match(reply, /^started builder-1 afresh on Task `update-docs` \(tasks\/002-builder-update-docs\/task\.md\)\. It had idle-stopped/);
+		assert.equal(pi.claude.launches().length, 2);
+		const argv = pi.claude.launches()[1]?.argv ?? [];
+		assert.equal(argv[argv.indexOf("--name") + 1], BUILDER_1);
+		assert.equal(argv.at(-1), newTaskPointer(dir, "update-docs", "002-builder-update-docs"));
+		assert.deepEqual(pi.claude.inbox(), [], "no clear marker goes to a closed inbox");
+		await until(() => teammateWakes(pi.sent).length === 2, "the Lead is woken on the new Task's result");
+		assert.equal(effortLines(dir).filter((line) => line.type === "teammate-started").length, 1, "the id is kept");
+	});
+
 	it("queues a Task at pi's `maxTeammates`, saying why in the reply and the Team block, and starts it when an acceptance frees room", async () => {
 		const { pi, dir } = await crewApproved({ settings: { maxTeammates: 1 }, hooks: [{ event: "SessionStart", payload: { source: "startup" } }, ...WORKS], replies: WORKS });
 		await pi.call("team_plan", { tasks: STAFF_PLAN });

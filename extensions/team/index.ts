@@ -562,8 +562,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const away: string[] = [];
 		recovering = away;
 		try {
-			const agents = await agentsList(paths.claudePath);
-			const names = agents instanceof Map ? [...agents.keys()] : undefined;
+			const names = await listedNames();
 			confirmed = new Set(effortState(held).teammates.filter((teammate) => names?.includes(teammate.name)).map((teammate) => teammate.id));
 			paintBlock();
 			away.push(...(await recoverIntents(held, names)));
@@ -580,6 +579,12 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		if (text === undefined) return;
 		if (busy) waiting.push(text);
 		else wakeLead("team-away", text);
+	}
+
+	/** The `--name`s `claude agents --json` lists, or undefined when it can't be read. */
+	async function listedNames(): Promise<string[] | undefined> {
+		const agents = await agentsList(paths.claudePath);
+		return agents instanceof Map ? [...agents.keys()] : undefined;
 	}
 
 	/** The records a Lead new to the Effort reads first: those written so far. */
@@ -1371,7 +1376,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	async function startQueued(held: HeldEffort, state: EffortState, ctx: ExtensionContext): Promise<string[]> {
 		const said: string[] = [];
 		for (;;) {
-			const drained = step(state, { kind: "drain", at: now().toISOString(), maxTeammates: maxTeammates() });
+			const agents = await listedNames();
+			const drained = step(state, { kind: "drain", at: now().toISOString(), maxTeammates: maxTeammates(), ...(agents ? { agents } : {}) });
 			if (!drained.ok) break;
 			if (drained.reply === undefined) {
 				// Nothing starts; the lines left say why each queued Task still waits, now that a pause no longer does.
@@ -2072,6 +2078,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { held, state } = approvedEffort("team_handoff", ctx);
 			const { roles, playbook } = approved(held);
+			const agents = await listedNames();
 			const result = step(state, {
 				kind: "handoff",
 				slug: params.slug,
@@ -2079,6 +2086,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				mode: launchMode(state, params.slug, roles, playbook),
 				maxTeammates: maxTeammates(),
 				...(params.isolated ? { isolated: true } : {}),
+				...(agents ? { agents } : {}),
 			});
 			if (!result.ok) throw new Error(result.refusal);
 			if (!state.workspace) throw new Error(`Effort \`${held.effortId}\` has no Workspace, so no Teammate starts; stop and tell the human.`);

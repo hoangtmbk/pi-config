@@ -721,9 +721,10 @@ export type EffortInput =
 	/**
 	 * `team_handoff` of a planned Task, with the permission mode a Teammate
 	 * started for it launches in and the cap of live Teammates (pi's
-	 * `maxTeammates` setting, {@link DEFAULT_MAX_TEAMMATES} by default).
+	 * `maxTeammates` setting, {@link DEFAULT_MAX_TEAMMATES} by default), and
+	 * the `--name`s `claude agents --json` lists (undefined when it couldn't be read).
 	 */
-	| { kind: "handoff"; slug: string; at: string; mode?: string; maxTeammates?: number; isolated?: boolean }
+	| { kind: "handoff"; slug: string; at: string; mode?: string; maxTeammates?: number; isolated?: boolean; agents?: readonly string[] }
 	/** What the merge an accept intended came to: merge commit `commit` (absent when there was nothing to merge), or why git refused it, nothing half-done. */
 	| { kind: "merge-result"; slug: string; commit?: string; error?: string; at: string }
 	/**
@@ -762,9 +763,10 @@ export type EffortInput =
 	 * Start the first queued Task the staffing ladder can staff now, with the
 	 * cap of live Teammates. The shell asks after each acceptance, once the
 	 * acceptance is on record, and again while one starts: each start is its
-	 * own step, so a launch that fails leaves only its own Task queued.
+	 * own step, so a launch that fails leaves only its own Task queued. With
+	 * `agents` as for a handoff.
 	 */
-	| { kind: "drain"; at: string; maxTeammates?: number }
+	| { kind: "drain"; at: string; maxTeammates?: number; agents?: readonly string[] }
 	/** The human used the `/team` menu on a Teammate: attached here, in a tmux window, or took the command. */
 	| { kind: "attach"; teammate: string; at: string }
 	/** `/team pause` from the human, or `team_pause` from the Lead, which must give a reason. */
@@ -2230,7 +2232,7 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 			`queued ${pointer}: Role \`${task.role}\` is held by ${holdText(hold)}, while other Roles go on. It starts by itself once the hold lifts.`,
 		);
 	}
-	const staffed = staff(state, wanted, max);
+	const staffed = staff(state, wanted, max, input.agents);
 	if (staffed) {
 		return took(
 			state,
@@ -2270,12 +2272,17 @@ function free(state: EffortState, teammate: Teammate): boolean {
  * a new one under the cap; else, at the cap, stop a free Teammate of a Role
  * with no Task queued and start one in its place. Undefined when none applies,
  * and the Task queues. A queued Task taken here leaves the queue.
+ *
+ * A reused Teammate `agents` doesn't list has idle-stopped: its inbox is
+ * closed, and a clear only reaches an inbox, so it starts afresh instead,
+ * which leaves it in the same fresh context a clear would.
  */
-function staff(state: EffortState, task: QueuedTask, max: number): { append: EffortLine[]; actions: EffortAction[]; who: string; note?: string } | undefined {
+function staff(state: EffortState, task: QueuedTask, max: number, agents?: readonly string[]): { append: EffortLine[]; actions: EffortAction[]; who: string; note?: string } | undefined {
 	const handed = { type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, at: task.at, round: 1 } as const;
 	// An isolated Task needs a Teammate launched in its own worktree, so it never reuses one.
 	const reused = task.isolated ? undefined : live(state).find((teammate) => teammate.role === task.role && teammate.inbox !== undefined && free(state, teammate));
-	if (reused?.freshDue && reused.shortId) return relaunch(state, reused, task);
+	if (reused?.freshDue && reused.shortId) return relaunch(state, reused, task, freshForBrief(reused.role));
+	if (reused && agents !== undefined && !agents.includes(reused.name)) return relaunch(state, reused, task, FRESH_FOR_IDLE);
 	if (reused?.inbox) {
 		return {
 			append: [
@@ -2301,13 +2308,21 @@ function staff(state: EffortState, task: QueuedTask, max: number): { append: Eff
 	};
 }
 
+/** Why a Teammate starts afresh when an approved Brief change altered its Role's launch options. */
+function freshForBrief(role: string): string {
+	return `An approved Brief change altered Role \`${role}\`'s launch options, so its old session is stopped (its conversation kept) and a new one starts with them; it keeps its id, with a new short id.`;
+}
+
+/** Why an idle-stopped Teammate starts afresh rather than being cleared. */
+const FRESH_FOR_IDLE =
+	"It had idle-stopped, and a clear only reaches a running session, so a new session starts in the fresh context a clear would leave (the old conversation is kept); it keeps its id, with a new short id.";
+
 /**
- * Start a free Teammate afresh on the Task, since an approved Brief change
- * altered its Role's launch options: its old session is stopped (its
- * conversation kept), and a new one launched under the same id and name, at
- * a Task boundary, never mid-Task.
+ * Start a free Teammate afresh on the Task, for `note`'s reason: its old
+ * session is stopped (its conversation kept), and a new one launched under
+ * the same id and name, at a Task boundary, never mid-Task.
  */
-function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask): { append: EffortLine[]; actions: EffortAction[]; who: string; note: string } {
+function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask, note: string): { append: EffortLine[]; actions: EffortAction[]; who: string; note: string } {
 	const last = Math.max(...state.teammates.map((each) => Date.parse(each.startedAt)));
 	const at = new Date(Math.max(Date.parse(task.at), last + STAGGER_MS)).toISOString();
 	return {
@@ -2320,7 +2335,7 @@ function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask): { a
 			{ kind: "launch-teammate", teammate: { id: teammate.id, role: teammate.role, name: teammate.name }, task: { slug: task.slug, folder: task.folder }, at },
 		],
 		who: `started ${teammate.id} afresh`,
-		note: `An approved Brief change altered Role \`${teammate.role}\`'s launch options, so its old session is stopped (its conversation kept) and a new one starts with them; it keeps its id, with a new short id.`,
+		note,
 	};
 }
 
@@ -2366,7 +2381,7 @@ function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }
 	for (const queued of state.queue) {
 		if (holdOn(state, queued.role) || briefHeld(state, queued.slug)) continue;
 		// It starts now, whenever it was queued.
-		const staffed = staff(state, { ...queued, at: input.at }, max);
+		const staffed = staff(state, { ...queued, at: input.at }, max, input.agents);
 		if (!staffed) continue;
 		return took(
 			state,
