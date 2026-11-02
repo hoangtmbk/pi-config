@@ -12,7 +12,7 @@ import { join, relative } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { HOOK_SCRIPT } from "../claude.ts";
+import { CLEAR_MARKER, HOOK_SCRIPT } from "../claude.ts";
 import { registerTeam } from "../index.ts";
 import { commit, type FakeHookStep, fakeClaude, git, gitRepo, goodTeam, roleMd, type TempRoots, teamMd, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
 
@@ -94,6 +94,7 @@ function fakePi(
 	const carried = options.entries ?? [];
 	const sessionFile = options.sessionFile ?? join(roots.scratch, "session.jsonl");
 	const widgets: Widget[] = [];
+	const sleeps: number[] = [];
 	const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
 	const pi = {
 		on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
@@ -126,6 +127,9 @@ function fakePi(
 		claudePath: claude.path,
 		now: () => NOW,
 		pid: options.pid,
+		sleep: async (ms: number) => {
+			sleeps.push(ms);
+		},
 	});
 	function answer(kind: Dialog["kind"], title: string, choices?: string[]) {
 		assert.ok(answers.length > 0, `the extension opened a ${kind} dialog "${title}" the test has no answer for`);
@@ -177,6 +181,8 @@ function fakePi(
 		entries,
 		/** Every widget the extension set or cleared, oldest first. */
 		widgets,
+		/** Each wait the extension asked for, in ms, oldest first; none really waits. */
+		sleeps,
 		activeTools: () => [...activeTools],
 		claude,
 		/** Queue the human's answers to the next dialogs, in order. */
@@ -1367,8 +1373,9 @@ describe("handing off: team_handoff", () => {
 		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /running, with `builder-1` \(tasks\/001-builder-rename-key\/\)/);
 	});
 
-	it("launches `claude --bg` with the Role's flags, the mode in force, the generated files, the Effort dir and the first handoff pointer as the prompt", async () => {
-		const { pi, dir, plugin } = await crewApproved();
+	it("launches `claude --bg` with the Role's flags, the mode in force, the generated files, the Effort dir, the Team's mod and the first handoff pointer as the prompt, about 5 s apart", async () => {
+		const { pi, dir, plugin, roots } = await crewApproved();
+		const mod = join(roots.agentDir, "team", "mod");
 		await pi.call("team_plan", { tasks: CREW_PLAN });
 
 		for (const slug of ["rename-key", "check-old-configs", "survey"]) await pi.call("team_handoff", { slug, body: `# ${slug}\n` });
@@ -1402,6 +1409,8 @@ describe("handing off: team_handoff", () => {
 					"--mcp-config",
 					join(teammate("builder-1"), "mcp.json"),
 					"--plugin-dir",
+					mod,
+					"--plugin-dir",
 					plugin,
 					"--name",
 					"team-crew-2026-11-02-builder-1",
@@ -1419,6 +1428,8 @@ describe("handing off: team_handoff", () => {
 					dir,
 					"--disallowedTools",
 					"EnterPlanMode",
+					"--plugin-dir",
+					mod,
 					"--name",
 					"team-crew-2026-11-02-reviewer-1",
 					pointer("002-reviewer-check-old-configs"),
@@ -1435,6 +1446,8 @@ describe("handing off: team_handoff", () => {
 					dir,
 					"--disallowedTools",
 					"EnterPlanMode",
+					"--plugin-dir",
+					mod,
 					"--name",
 					"team-crew-2026-11-02-scout-1",
 					pointer("003-scout-survey"),
@@ -1442,6 +1455,9 @@ describe("handing off: team_handoff", () => {
 			],
 		);
 		assert.deepEqual(JSON.parse(pi.claude.launches()[0].mcpConfig ?? "null"), { mcpServers: { docs: { command: "docs-server" } } });
+		assert.ok(existsSync(join(mod, "hooks", "register.ts")), "the mod isn't copied under pi's agent folder");
+		// Claude Code's limit on how fast background sessions start: each launch waits until 5 s after the last.
+		assert.deepEqual(pi.sleeps, [5000, 10000]);
 	});
 
 	it("gives the Teammate settings that add the hooks, the Playbook's rules for its Role, every escalate ask and a deny on editing the Effort's records, and nothing that replaces the human's own", async () => {
@@ -1854,6 +1870,96 @@ describe("reviewing: team_review", () => {
 	});
 });
 
+/** The crew plan with a second `builder` Task, which `builder-1` can be reused for once `rename-key` is accepted. */
+const STAFF_PLAN = [...CREW_PLAN, { slug: "update-docs", role: "builder", goal: "Update the docs for the new key.", dependsOn: ["rename-key"] }];
+
+/** The first handoff pointer of the Task in `folder`, written out from the spec rather than from the extension. */
+function newTaskPointer(dir: string, slug: string, folder: string): string {
+	return `New Task \`${slug}\`: read ${join(dir, "tasks", folder, "task.md")} and do what it asks. When it is done, write your result to ${join(dir, "tasks", folder, "result-1.md")}.`;
+}
+
+/** The content of the user message in an inbox connection's second line. */
+function sentContent(connection: { lines: string[] }): string {
+	return (JSON.parse(connection.lines[1] ?? "{}") as { message?: { content?: string } }).message?.content ?? "";
+}
+
+describe("staffing: the ladder and clearing between Tasks", () => {
+	it("reuses idle `builder-1` for its Role's next Task: the clear marker, then SessionStart clear, then the pointer, recording the new session id under the same short id", async () => {
+		const { pi, dir } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }, ...WORKS], replies: WORKS });
+		await pi.call("team_plan", { tasks: STAFF_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await pi.call("team_review", { slug: "rename-key", verdict: "accept" });
+		const [first] = effortLines(dir).filter((line) => line.type === "teammate-session");
+
+		const reply = await pi.call("team_handoff", { slug: "update-docs", body: "# Docs\n" });
+
+		assert.match(reply, /^reused builder-1 on Task `update-docs` \(tasks\/002-builder-update-docs\/task\.md\)\. Its context is cleared first/);
+		await until(() => teammateWakes(pi.sent).length === 2, "the Lead is woken on the new Task's result");
+		assert.ok(teammateWakes(pi.sent)[1].content.includes(join(dir, "tasks", "002-builder-update-docs", "result-1.md")), teammateWakes(pi.sent)[1].content);
+		assert.equal(pi.claude.launches().length, 1, "no new session starts");
+		const inbox = pi.claude.inbox();
+		assert.deepEqual(
+			inbox.map((connection) => [connection.authorized, sentContent(connection)]),
+			[
+				[true, CLEAR_MARKER],
+				[true, newTaskPointer(dir, "update-docs", "002-builder-update-docs")],
+			],
+		);
+		const journal = readFileSync(join(dir, "teammates", "builder-1", "events.jsonl"), "utf8")
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line) as { event: string; payload: { session_id: string; source?: string; reason?: string; prompt?: string } });
+		assert.deepEqual(
+			journal.slice(3).map(({ event, payload }) => [event, payload.source ?? payload.reason ?? payload.prompt ?? ""]),
+			[
+				["SessionEnd", "clear"],
+				["SessionStart", "clear"],
+				["UserPromptSubmit", newTaskPointer(dir, "update-docs", "002-builder-update-docs")],
+				["Stop", ""],
+			],
+		);
+		const sessions = effortLines(dir).filter((line) => line.type === "teammate-session");
+		assert.equal(sessions.length, 2);
+		assert.equal(sessions[1].source, "clear");
+		assert.equal(sessions[1].sessionId, journal[4].payload.session_id);
+		assert.notEqual(sessions[1].sessionId, first.sessionId);
+		assert.equal(sessions[1].shortId, first.shortId);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## update-docs\n[\s\S]*?- Status: running, with `builder-1` \(tasks\/002-builder-update-docs\/\)/);
+	});
+
+	it("queues a Task at pi's `maxTeammates`, saying why in the reply and the Team block, and starts it when an acceptance frees room", async () => {
+		const { pi, dir } = await crewApproved({ settings: { maxTeammates: 1 }, hooks: [{ event: "SessionStart", payload: { source: "startup" } }, ...WORKS], replies: WORKS });
+		await pi.call("team_plan", { tasks: STAFF_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+
+		const reply = await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
+
+		assert.match(reply, /^queued Task `survey` \(tasks\/002-scout-survey\/task\.md\): cap 1 reached; waits for 001\./);
+		assert.equal(pi.claude.launches().length, 1);
+		assert.equal(readFileSync(join(dir, "tasks", "002-scout-survey", "task.md"), "utf8"), "# Survey\n");
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## survey\n[\s\S]*?- Status: queued\n/);
+		assert.ok(
+			(teamBlock(pi) ?? []).some((line) => line.includes("queued  002-scout-survey (scout): cap 1 reached; waits for 001")),
+			(teamBlock(pi) ?? []).join("\n"),
+		);
+		await assert.rejects(pi.call("team_handoff", { slug: "survey", body: "# Again\n" }), /already queued/);
+		const [session] = effortLines(dir).filter((line) => line.type === "teammate-session");
+
+		const accepted = await pi.call("team_review", { slug: "rename-key", verdict: "accept" });
+
+		assert.match(accepted, /^Accepted Task `rename-key` at round 1/);
+		assert.match(accepted, /Queued Task `survey` started scout-1 \(tasks\/002-scout-survey\/task\.md\)\. It stopped idle `builder-1`/);
+		assert.deepEqual(
+			pi.claude.calls().filter((call) => call[0] === "stop"),
+			[["stop", session.shortId]],
+		);
+		assert.equal(pi.claude.launches().length, 2);
+		assert.equal(pi.claude.launches()[1].argv.at(-1), newTaskPointer(dir, "survey", "002-scout-survey"));
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## survey\n[\s\S]*?- Status: [a-z ]+, with `scout-1` \(tasks\/002-scout-survey\/\)/);
+		assert.ok(!(teamBlock(pi) ?? []).some((line) => line.startsWith("│ builder-1")), "a stopped Teammate leaves the block");
+	});
+});
+
 describe("/team while the Lead is streaming", () => {
 	it("runs setup and pending without waiting for the Lead to go idle", async () => {
 		const roots = tempRoots();
@@ -1928,10 +2034,14 @@ describe("the Team block", () => {
 	});
 
 	it("is never taller than pi's `maxTeammates` setting allows, counting the Teammates it has no row for", async () => {
-		const { pi } = await crewApproved({ settings: { maxTeammates: 2 } });
+		const settings = { maxTeammates: 3 };
+		const { pi } = await crewApproved({ settings });
 		await pi.call("team_plan", { tasks: CREW_PLAN });
-
 		for (const slug of ["rename-key", "check-old-configs", "survey"]) await pi.call("team_handoff", { slug, body: `# ${slug}\n` });
+
+		// The human lowers the setting and runs `/reload`, while three Teammates still live.
+		settings.maxTeammates = 2;
+		await pi.call("team_plan", { tasks: CREW_PLAN });
 
 		const block = teamBlock(pi) ?? [];
 		assert.equal(block.length, 6, block.join("\n"));

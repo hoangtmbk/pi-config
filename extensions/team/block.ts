@@ -101,19 +101,20 @@ export interface StatusExtras {
 }
 
 /**
- * The Effort's status, as the block shows it and `team_status` returns it.
- * Nothing yet queues a Task or writes a Report, so those are empty and 0
- * until the tickets that add them fill them in here.
+ * The Effort's status, as the block shows it and `team_status` returns it:
+ * live Teammates only, since one stopped to make room under the cap is gone,
+ * and the queued Tasks by folder. Nothing yet writes a Report, so that is 0
+ * until the ticket that adds them fills it in here.
  */
 export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockData {
-	const handed = Object.keys(state.tasks).length > 0;
+	const handed = Object.keys(state.tasks).length > 0 || state.queue.length > 0;
 	return {
 		effortId: state.effortId,
 		team: state.team,
 		phase: !state.brief ? "intake" : handed ? "working" : "planning",
 		tasks: { accepted: Object.values(state.tasks).filter((task) => task.accepted !== undefined).length, planned: state.plan?.length ?? 0 },
-		teammates: state.teammates.map((teammate) => teammateRow(state, teammate)),
-		queued: [],
+		teammates: state.teammates.filter((teammate) => teammate.retiredAt === undefined).map((teammate) => teammateRow(state, teammate)),
+		queued: state.queue.map((queued) => ({ task: queued.folder, role: queued.role, why: queued.why })),
 		waitingOnYou: state.pending.length + extras.adoptionsPending,
 		reports: 0,
 	};

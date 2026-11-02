@@ -34,6 +34,15 @@
  *   session plays each time an authorized user message lands in its inbox,
  *   with that message as its pointer. A `UserPromptSubmit` without a payload
  *   reports the message as its prompt.
+ * - Each `--plugin-dir` a session was launched with is loaded as Claude Code
+ *   loads a mod: the `modules` its `hooks/hooks.json` names are imported and
+ *   their `register` called. Every user message in the inbox goes through the
+ *   `session.receive` handlers first, and one a handler consumes plays no
+ *   replies. A handler's `$.command.run({ command: "clear" })` clears as
+ *   `/clear` does: `SessionEnd` with reason `clear`, a new session id, then
+ *   `SessionStart` with source `clear`, through the settings' hook commands.
+ * - `stop <short id>` stops a background session: it exits 0, recorded in
+ *   its argv, and the session is left to the test.
  *
  * Anything else it is asked to do exits 1 with a message saying so, so a test
  * that reaches further than the fake goes is loud about it.
@@ -54,6 +63,8 @@ interface Session {
 	socket: string;
 	token: string;
 	settings: string | undefined;
+	/** The `--plugin-dir` folders, loaded as mods. */
+	plugins: string[];
 }
 
 if (argv[0] === "--fake-inbox") {
@@ -68,6 +79,11 @@ async function main(): Promise<void> {
 
 	if (argv[0] === "--version") {
 		process.stdout.write(`${process.env.FAKE_CLAUDE_VERSION ?? "2.1.316 (Claude Code)"}\n`);
+		process.exit(0);
+	}
+
+	if (argv[0] === "stop" && argv[1] !== undefined) {
+		process.stdout.write(`fake claude: stopped ${argv[1]}\n`);
 		process.exit(0);
 	}
 
@@ -93,6 +109,7 @@ async function main(): Promise<void> {
 				socket: sockets ? join(sockets, `${randomBytes(4).toString("hex")}.sock`) : `/tmp/cc-socks/${process.pid}.sock`,
 				token: `inbox-${id.slice(0, 8)}`,
 				settings: launch.settings,
+				plugins: argv.flatMap((arg, index) => (arg === "--plugin-dir" && argv[index + 1] !== undefined ? [argv[index + 1]] : [])),
 			};
 			if (process.env.FAKE_CLAUDE_HOOKS && sockets) await openInbox(session);
 			play(process.env.FAKE_CLAUDE_HOOKS, session, argv.at(-1) ?? "");
@@ -140,7 +157,7 @@ function serveInbox(session: Session): void {
 		connection.on("data", (chunk: string) => {
 			buffered += chunk;
 		});
-		connection.on("end", () => {
+		connection.on("end", async () => {
 			const lines = buffered.split("\n").filter(Boolean);
 			const auth = parsed(lines[0]);
 			const authorized = auth?.type === "auth" && auth.token === session.token;
@@ -151,7 +168,8 @@ function serveInbox(session: Session): void {
 			for (const line of lines.slice(1)) {
 				const message = parsed(line) as { type?: string; message?: { content?: unknown } } | undefined;
 				if (message?.type === "user" && typeof message.message?.content === "string") {
-					play(process.env.FAKE_CLAUDE_REPLIES, session, message.message.content);
+					const content = message.message.content;
+					if (!(await consumed(session, content))) play(process.env.FAKE_CLAUDE_REPLIES, session, content);
 				}
 			}
 		});
@@ -161,6 +179,40 @@ function serveInbox(session: Session): void {
 	setInterval(() => {
 		if (!existsSync(session.socket) || !alive(owner)) process.exit(0);
 	}, 200);
+}
+
+/** A mod's `session.receive` handler, as Claude Code calls it. */
+type Receive = ($: unknown, event: { text: string }, next: (event: { text: string }) => unknown) => unknown;
+
+/** Run the message through the session's mods; true when one consumed it. */
+async function consumed(session: Session, text: string): Promise<boolean> {
+	const handlers: Receive[] = [];
+	for (const plugin of session.plugins) {
+		const hooks = join(plugin, "hooks", "hooks.json");
+		if (!existsSync(hooks)) continue;
+		for (const module of (JSON.parse(readFileSync(hooks, "utf8")) as { modules?: string[] }).modules ?? []) {
+			const loaded = (await import(join(plugin, "hooks", module))) as { register?: (on: (event: string, handler: Receive) => void) => void };
+			loaded.register?.((event, handler) => {
+				if (event === "session.receive") handlers.push(handler);
+			});
+		}
+	}
+	const $ = {
+		command: {
+			async run({ command }: { command: string }): Promise<void> {
+				if (command !== "clear") throw new Error(`fake claude: no scripted command /${command}`);
+				playSteps([{ event: "SessionEnd", payload: { reason: "clear" } }], session, "");
+				session.id = randomUUID();
+				playSteps([{ event: "SessionStart", payload: { source: "clear" } }], session, "");
+			},
+		},
+	};
+	const through = (index: number, event: { text: string }): unknown => {
+		const handler = handlers[index];
+		return handler === undefined ? undefined : handler($, event, (next) => through(index + 1, next));
+	};
+	const result = (await through(0, { text })) as { consumed?: unknown } | undefined;
+	return result?.consumed !== undefined;
 }
 
 function parsed(line: string | undefined): Record<string, unknown> | undefined {
@@ -183,8 +235,11 @@ function alive(pid: number): boolean {
 
 /** Play a script of steps against the session's settings and pointer. */
 function play(script: string | undefined, session: Session, pointer: string): void {
-	if (!script) return;
-	const steps = JSON.parse(readFileSync(script, "utf8")) as HookStep[];
+	if (script) playSteps(JSON.parse(readFileSync(script, "utf8")) as HookStep[], session, pointer);
+}
+
+/** Play steps against the session's settings and pointer. */
+function playSteps(steps: HookStep[], session: Session, pointer: string): void {
 	const settings = JSON.parse(session.settings ?? "{}") as { hooks?: Record<string, { matcher?: string; hooks: { command: string }[] }[]> };
 	const inbox = { CLAUDE_CODE_MESSAGING_SOCKET: session.socket, CLAUDE_CODE_MESSAGING_TOKEN: session.token };
 	for (const step of steps) {
