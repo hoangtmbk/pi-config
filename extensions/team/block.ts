@@ -114,7 +114,8 @@ export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockD
 		team: state.team,
 		phase: !state.brief ? "intake" : handed ? "working" : "planning",
 		tasks: { accepted: Object.values(state.tasks).filter((task) => task.accepted !== undefined).length, planned: state.plan?.length ?? 0 },
-		teammates: state.teammates.map((teammate) => teammateRow(state, teammate)),
+		// A Teammate that ended (stopped with its dropped Task, or crashed) is gone for this Effort.
+		teammates: state.teammates.filter((teammate) => teammate.ended === undefined).map((teammate) => teammateRow(state, teammate)),
 		queued: [],
 		waitingOnYou: state.pending.length + extras.adoptionsPending,
 		reports: 0,

@@ -125,6 +125,21 @@ export function launchBackground(claudePath: string, cwd: string, args: string[]
 	});
 }
 
+/** Long enough for `claude stop` to end a background session. */
+const STOP_TIMEOUT_MS = 30_000;
+
+/**
+ * Stop a background session with `claude stop <short id>`, which keeps its
+ * conversation. Returns an error to show the Lead when it fails.
+ */
+export function stopBackground(claudePath: string, shortId: string): Promise<{ error: string } | undefined> {
+	return new Promise((resolve) => {
+		execFile(claudePath, ["stop", shortId], { timeout: STOP_TIMEOUT_MS, encoding: "utf8" }, (error, _stdout, stderr) => {
+			resolve(error ? { error: (stderr.trim() || error.message).split("\n")[0] } : undefined);
+		});
+	});
+}
+
 /** Long enough for a live session's inbox to take one message. */
 const SEND_TIMEOUT_MS = 10_000;
 
@@ -150,6 +165,49 @@ export function sendToInbox(inbox: Inbox, content: string): Promise<{ error: str
 			socket.end(
 				`${JSON.stringify({ type: "auth", token: inbox.token })}\n${JSON.stringify({ type: "user", message: { role: "user", content } })}\n`,
 			);
+		});
+	});
+}
+
+/** What `claude agents --json` says of one live background session. */
+export interface AgentStatus {
+	status?: string;
+	state?: string;
+	waitingFor?: string;
+}
+
+/** Long enough for `claude agents --json` to list the background sessions. */
+const AGENTS_TIMEOUT_MS = 10_000;
+
+/**
+ * The live background sessions, from `claude agents --json`, by `--name`: a
+ * session missing from it was stopped, idle or not. Its shape is read
+ * leniently, as a list of sessions or an object holding one, since Claude
+ * Code doesn't document it; a session without a name is left out.
+ */
+export function agentsList(claudePath: string): Promise<Map<string, AgentStatus> | { error: string }> {
+	return new Promise((resolve) => {
+		execFile(claudePath, ["agents", "--json"], { timeout: AGENTS_TIMEOUT_MS, encoding: "utf8" }, (error, stdout, stderr) => {
+			if (error) return resolve({ error: (stderr.trim() || error.message).split("\n")[0] });
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(stdout);
+			} catch {
+				return resolve({ error: "`claude agents --json` printed something that isn't JSON" });
+			}
+			const holder = isObject(parsed) ? parsed : {};
+			const list = Array.isArray(parsed) ? parsed : [holder.agents, holder.sessions].find(Array.isArray);
+			const agents = new Map<string, AgentStatus>();
+			for (const entry of (list ?? []) as unknown[]) {
+				if (!isObject(entry) || typeof entry.name !== "string") continue;
+				const status: AgentStatus = {};
+				for (const key of ["status", "state", "waitingFor"] as const) {
+					const value = entry[key];
+					if (typeof value === "string") status[key] = value;
+				}
+				agents.set(entry.name, status);
+			}
+			resolve(agents);
 		});
 	});
 }

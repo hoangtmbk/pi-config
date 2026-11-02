@@ -39,6 +39,16 @@
  *   on, so a test can tell whether it was handed the terminal pi runs on.
  * - `FAKE_CLAUDE_ATTACH_EXIT`: the exit code of an `attach`, `0` when unset.
  *   It prints nothing, since the terminal it inherits is the test runner's.
+ * - `FAKE_CLAUDE_AGENTS`: a folder that holds one JSON file per started
+ *   session, `<session id>.json` ({@link Agent}), as Claude Code's own
+ *   registry of background sessions. `agents --json` prints the live ones as
+ *   a JSON array; `stop <short id>` ends one, keeping its record, as the real
+ *   one keeps the conversation; `--bg --resume <session id> <message>` wakes one
+ *   with a new socket, plays `SessionStart` with `source:
+ *   "resume"`, then plays `FAKE_CLAUDE_REPLIES` with the message as its
+ *   pointer. A session idle-stops when its record says `live: false` and its
+ *   socket is gone (the harness's `idleStop`), and a played `SessionEnd`
+ *   step ends it, as a crash does.
  *
  * Anything else it is asked to do exits 1 with a message saying so, so a test
  * that reaches further than the fake goes is loud about it.
@@ -46,7 +56,7 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, fstatSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, fstatSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 
@@ -61,6 +71,15 @@ interface Session {
 	settings: string | undefined;
 }
 
+/** A session in `FAKE_CLAUDE_AGENTS`: what resuming it needs, and what `agents --json` says of it. */
+interface Agent extends Session {
+	name: string | undefined;
+	live: boolean;
+	status: string;
+	state: string;
+	waitingFor?: string;
+}
+
 if (argv[0] === "--fake-inbox") {
 	serveInbox(JSON.parse(argv[1] ?? "{}") as Session);
 } else {
@@ -73,6 +92,39 @@ async function main(): Promise<void> {
 
 	if (argv[0] === "--version") {
 		process.stdout.write(`${process.env.FAKE_CLAUDE_VERSION ?? "2.1.316 (Claude Code)"}\n`);
+		process.exit(0);
+	}
+
+	if (argv[0] === "agents" && argv[1] === "--json") {
+		const agents = registry().filter((agent) => agent.live);
+		process.stdout.write(`${JSON.stringify(agents.map((agent) => ({ id: agent.id.slice(0, 8), sessionId: agent.id, name: agent.name, status: agent.status, state: agent.state, ...(agent.waitingFor === undefined ? {} : { waitingFor: agent.waitingFor }) })))}\n`);
+		process.exit(0);
+	}
+
+	if (argv[0] === "stop" && argv[1] !== undefined) {
+		const agent = registry().find((each) => each.live && each.id.startsWith(argv[1] ?? ""));
+		if (!agent) {
+			process.stderr.write(`fake claude: no running session ${argv[1]}\n`);
+			process.exit(1);
+		}
+		end(agent);
+		process.exit(0);
+	}
+
+	if (argv[0] === "--bg" && argv[1] === "--resume") {
+		const agent = registry().find((each) => each.id === argv[2]);
+		if (!agent) {
+			process.stderr.write(`fake claude: no session ${argv[2]} to resume\n`);
+			process.exit(1);
+		}
+		rmSync(agent.socket, { force: true });
+		const sockets = process.env.FAKE_CLAUDE_SOCKETS;
+		const session: Session = { ...agent, socket: sockets ? join(sockets, `${randomBytes(4).toString("hex")}.sock`) : agent.socket, token: `inbox-${randomBytes(4).toString("hex")}` };
+		record({ ...agent, ...session, live: true, status: "running", state: "idle" });
+		if (sockets) await openInbox(session);
+		play(undefined, session, "", [{ event: "SessionStart", payload: { source: "resume" } }]);
+		play(process.env.FAKE_CLAUDE_REPLIES, session, argv[3] ?? "");
+		process.stdout.write("fake claude: background session resumed\n");
 		process.exit(0);
 	}
 
@@ -99,6 +151,8 @@ async function main(): Promise<void> {
 				token: `inbox-${id.slice(0, 8)}`,
 				settings: launch.settings,
 			};
+			const name = argv.indexOf("--name") === -1 ? undefined : argv[argv.indexOf("--name") + 1];
+			record({ ...session, name, live: true, status: "running", state: "idle" });
 			if (process.env.FAKE_CLAUDE_HOOKS && sockets) await openInbox(session);
 			play(process.env.FAKE_CLAUDE_HOOKS, session, argv.at(-1) ?? "");
 			process.stdout.write("fake claude: background session started\n");
@@ -118,6 +172,26 @@ async function main(): Promise<void> {
 
 	process.stderr.write(`fake claude: no scripted behaviour for ${JSON.stringify(argv)}\n`);
 	process.exit(1);
+}
+
+/** Every session `FAKE_CLAUDE_AGENTS` holds, live or not. */
+function registry(): Agent[] {
+	const dir = process.env.FAKE_CLAUDE_AGENTS;
+	if (!dir || !existsSync(dir)) return [];
+	return readdirSync(dir)
+		.filter((file) => file.endsWith(".json"))
+		.map((file) => JSON.parse(readFileSync(join(dir, file), "utf8")) as Agent);
+}
+
+function record(agent: Agent): void {
+	const dir = process.env.FAKE_CLAUDE_AGENTS;
+	if (dir) writeFileSync(join(dir, `${agent.id}.json`), JSON.stringify(agent));
+}
+
+/** End a session: gone from `agents --json`, its inbox closed with its socket, its record kept for a resume. */
+function end(agent: Agent): void {
+	record({ ...agent, live: false });
+	rmSync(agent.socket, { force: true });
 }
 
 /** The contents of the file a flag names, or undefined when the flag or the file is absent. */
@@ -197,9 +271,9 @@ function alive(pid: number): boolean {
 }
 
 /** Play a script of steps against the session's settings and pointer. */
-function play(script: string | undefined, session: Session, pointer: string): void {
-	if (!script) return;
-	const steps = JSON.parse(readFileSync(script, "utf8")) as HookStep[];
+function play(script: string | undefined, session: Session, pointer: string, given?: HookStep[]): void {
+	if (!script && !given) return;
+	const steps = given ?? (JSON.parse(readFileSync(script ?? "", "utf8")) as HookStep[]);
 	const settings = JSON.parse(session.settings ?? "{}") as { hooks?: Record<string, { matcher?: string; hooks: { command: string }[] }[]> };
 	const inbox = { CLAUDE_CODE_MESSAGING_SOCKET: session.socket, CLAUDE_CODE_MESSAGING_TOKEN: session.token };
 	for (const step of steps) {
@@ -216,6 +290,10 @@ function play(script: string | undefined, session: Session, pointer: string): vo
 			for (const hook of group.hooks) {
 				execFileSync("sh", ["-c", hook.command], { cwd: session.cwd, input: JSON.stringify(payload), env: { ...process.env, ...inbox }, stdio: ["pipe", "ignore", "inherit"] });
 			}
+		}
+		if (step.event === "SessionEnd" && payload.reason !== "clear" && payload.reason !== "resume") {
+			const agent = registry().find((each) => each.id === session.id);
+			if (agent) end(agent);
 		}
 	}
 }

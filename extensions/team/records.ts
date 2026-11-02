@@ -371,7 +371,8 @@ export function briefCriteria(text: string): string[] {
 export function writePlan(paths: EffortPaths, state: EffortState): void {
 	const lines = [`# Plan of Effort \`${state.effortId}\``, "", "A view of `effort.jsonl`, rewritten by the team extension; editing it changes nothing.", ""];
 	for (const task of state.plan ?? []) {
-		const handed = state.tasks[task.slug];
+		// A dropped handoff is over: a Task planned again waits for a fresh one.
+		const handed = state.tasks[task.slug]?.dropped === undefined ? state.tasks[task.slug] : undefined;
 		const sendBacks = handed?.sendBacks ?? 0;
 		lines.push(
 			`## ${task.slug}`,
@@ -384,6 +385,8 @@ export function writePlan(paths: EffortPaths, state: EffortState): void {
 			"",
 		);
 	}
+	const dropped = Object.entries(state.tasks).filter(([slug]) => taskStatus(state, slug) === "dropped");
+	if (dropped.length > 0) lines.push("## Dropped", "", ...dropped.map(([slug, task]) => `- ${slug}: was with \`${task.teammate}\` (tasks/${task.folder}/)`), "");
 	writeFileSync(paths.plan, lines.join("\n"));
 }
 

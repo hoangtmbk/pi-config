@@ -12,7 +12,7 @@
  * human's real agent dir or Claude Code config.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
@@ -21,8 +21,8 @@ import { Type } from "typebox";
 import { attachTarget, chooseAttach, pickerLabel } from "./attach.ts";
 import { renderTeamBlock, teamStatus } from "./block.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
-import { launchBackground, sendToInbox, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
-import { currentResult, type EffortAction, type EffortState, fold, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace } from "./core.ts";
+import { agentsList, launchBackground, sendToInbox, stopBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
+import { currentResult, type EffortAction, type EffortState, fold, type Inbox, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace } from "./core.ts";
 import { EVERY_ROLE, listTeams, loadTeam, type Playbook, readSnapshot, type Role, sha256, type Team, type TeamRoots } from "./definitions.ts";
 import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
 import { adoptable, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
@@ -63,7 +63,7 @@ import {
 	type TeamSetup,
 } from "./setup.ts";
 import { pickTeam, proposeTeam, type StartOutcome } from "./start.ts";
-import { handoffPointer, sendBackPointer, teammatePrompt } from "./teammate.ts";
+import { handoffPointer, restaffPointer, sendBackPointer, teammatePrompt } from "./teammate.ts";
 
 /** The Lead's tools while this session runs Team setup. */
 const SETUP_TOOLS = ["team_request_approval"];
@@ -594,11 +594,88 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		return role ? modeInForce(playbook, role) : undefined;
 	}
 
+	/**
+	 * Get `pointer` to Teammate `teammateId` as its next turn: through its inbox
+	 * while `claude agents --json` lists it and the send goes through, otherwise
+	 * by resuming its session with the pointer as the message (ADR-0006), whose
+	 * `SessionStart` brings the new socket. Only a send wakes a Teammate.
+	 */
+	async function deliver(held: HeldEffort, teammateId: string, inbox: Inbox, pointer: string): Promise<{ error: string } | undefined> {
+		const teammate = effortState(held).teammates.find((each) => each.id === teammateId);
+		const agents = await agentsList(paths.claudePath);
+		// When the list can't be read, the send is the test of whether it is there.
+		const listed = !(agents instanceof Map) || (teammate !== undefined && agents.has(teammate.name));
+		const sent = listed ? await sendToInbox(inbox, pointer) : { error: "it isn't in `claude agents --json`" };
+		if (!sent) return undefined;
+		const sessionId = teammate?.sessionId;
+		const workspace = effortState(held).workspace;
+		if (sessionId === undefined || !workspace) return sent;
+		const resumed = await launchBackground(paths.claudePath, workspace.path, ["--bg", "--resume", sessionId, pointer]);
+		return resumed ? { error: `${sent.error}, and resuming its session failed: ${resumed.error}` } : undefined;
+	}
+
+	/**
+	 * Send a Task back to a new Teammate of its Role, its own having ended: the
+	 * feedback is written for the pointer to name, and taken back if the launch
+	 * fails, so the Lead can send it back again; the lines go on record once it
+	 * has started, as a handoff's do.
+	 */
+	async function restaffTask(
+		held: HeldEffort,
+		result: Extract<Step, { ok: true }>,
+		{ teammate, slug, folder, round, feedback }: Extract<EffortAction, { kind: "restaff-teammate" }>,
+		ctx: ExtensionContext,
+	): Promise<void> {
+		const { roles, playbook } = snapshotOf(held);
+		const role = roles.find((each) => each.name === teammate.role);
+		const workspace = result.state.workspace;
+		if (!role || !workspace) throw new Error(`Task \`${slug}\` can't go to a new Teammate: Effort \`${held.effortId}\` has no Role \`${teammate.role}\` in its Team snapshot or no Workspace. Stop and tell the human.`);
+		const taskDir = join(held.paths.tasks, folder);
+		const written = writeFeedback(held.paths, folder, round, feedback);
+		await listenForTeammates(held, ctx);
+		const launched = await launchBackground(paths.claudePath, workspace.path, launchArgs(held, teammate, role, playbook, restaffPointer(slug, taskDir, round)));
+		if (launched) {
+			rmSync(written);
+			throw new Error(`Teammate \`${teammate.id}\` didn't start, so Task \`${slug}\` isn't sent back and its feedback-${round}.md is taken back: ${launched.error}`);
+		}
+		writePlan(held.paths, result.state);
+		appendLines(held.paths, result.append);
+		wakeAboutTeammates(applyJournals(held));
+	}
+
+	/** The `claude --bg` arguments that start `teammate` in `role`, with `pointer` as its first turn. */
+	function launchArgs(held: HeldEffort, teammate: { id: string; name: string }, role: Role, playbook: Playbook, pointer: string): string[] {
+		return teammateArgs({
+			name: teammate.name,
+			role,
+			mode: modeInForce(playbook, role),
+			effortDir: held.paths.dir,
+			dir: join(held.paths.teammates, teammate.id),
+			settings: teammateSettings({
+				effortDir: held.paths.dir,
+				teammateId: teammate.id,
+				allow: [role.name, EVERY_ROLE].flatMap((key) => playbook.roles[key]?.allow ?? []),
+				deny: [role.name, EVERY_ROLE].flatMap((key) => playbook.roles[key]?.deny ?? []),
+				ask: playbook.escalate.flatMap((entry) => entry.ask),
+				records: protectedRecords(held.paths),
+			}),
+			prompt: teammatePrompt({ teammateId: teammate.id, role: role.name, brief: held.paths.brief, clarifications: held.paths.clarifications, tasks: held.paths.tasks }, role.prompt),
+			pointer,
+		});
+	}
+
 	/** Carry out a step's actions in order, then append its lines: records are written before the line that claims them. */
 	async function carryOut(held: HeldEffort, result: Extract<Step, { ok: true }>, launch: (action: Extract<EffortAction, { kind: "launch-teammate" }>) => Promise<void>): Promise<void> {
 		for (const action of result.actions) {
 			if (action.kind === "write-plan") writePlan(held.paths, result.state);
 			else if (action.kind === "launch-teammate") await launch(action);
+			else if (action.kind === "stop-teammate") {
+				// `claude stop` keeps the conversation, so the human can still read it; one already idle-stopped needs none.
+				const stopped = await stopBackground(paths.claudePath, action.shortId);
+				const agents = stopped && (await agentsList(paths.claudePath));
+				const name = result.state.teammates.find((teammate) => teammate.id === action.teammate)?.name;
+				if (stopped && (!(agents instanceof Map) || (name !== undefined && agents.has(name)))) throw new Error(`Teammate \`${action.teammate}\` couldn't be stopped with \`claude stop ${action.shortId}\` (${stopped.error}), so nothing was re-planned. Stop and tell the human.`);
+			}
 		}
 		appendLines(held.paths, result.append);
 	}
@@ -825,16 +902,23 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			if (verdict === undefined) throw new Error(`\`verdict\` is \`accept\` or \`send_back\`, not \`${params.verdict}\`.`);
 			const due = state.tasks[params.slug];
 			const path = due ? join(held.paths.tasks, due.folder, `result-${due.round}.md`) : "";
+			const { roles, playbook } = snapshotOf(held);
 			const result = step(state, {
 				kind: "review",
 				slug: params.slug,
 				verdict,
 				feedback: params.feedback,
 				result: { path, written: path !== "" && existsSync(path) },
-				sendBackLimit: snapshotOf(held).playbook.sendBackLimit,
+				sendBackLimit: playbook.sendBackLimit,
 				at: now().toISOString(),
+				mode: launchMode(state, params.slug, roles, playbook),
 			});
 			if (!result.ok) throw new Error(result.refusal);
+			const restaff = result.actions.find((action) => action.kind === "restaff-teammate");
+			if (restaff) {
+				await restaffTask(held, result, restaff, ctx);
+				return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
+			}
 			const sends: Extract<EffortAction, { kind: "send-back" }>[] = [];
 			for (const action of result.actions) {
 				if (action.kind === "send-back") {
@@ -846,7 +930,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			appendLines(held.paths, result.append);
 			for (const send of sends) {
 				const pointer = sendBackPointer(send.slug, join(held.paths.tasks, send.folder), send.round);
-				const failed = await sendToInbox(send.inbox, pointer);
+				const failed = await deliver(held, send.teammate, send.inbox, pointer);
 				if (failed) {
 					throw new Error(
 						`Task \`${send.slug}\` is sent back and its feedback-${send.round}.md is written, but the pointer couldn't reach \`${send.teammate}\`'s inbox (${failed.error}), so it isn't working on round ${send.round + 1}. Stop and tell the human.`,
@@ -869,7 +953,18 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		defaultActive: false,
 		async execute() {
 			if (!effort) throw new Error("No Effort is open in this session, so there is no status to give; the human opens one with `/team start <team>`.");
-			const status = teamStatus(effortState(effort), { adoptionsPending: pending.length });
+			const state = effortState(effort);
+			const block = teamStatus(state, { adoptionsPending: pending.length });
+			// One `claude agents --json` for every row: what Claude Code says of each session, or `missing` once it is gone (idle-stopped).
+			const agents = await agentsList(paths.claudePath);
+			const status = {
+				...block,
+				teammates: block.teammates.map((row) => {
+					const name = state.teammates.find((teammate) => teammate.id === row.id)?.name;
+					if (!(agents instanceof Map) || name === undefined) return row;
+					return { ...row, agent: agents.get(name) ?? "missing" };
+				}),
+			};
 			return { content: [{ type: "text", text: JSON.stringify(status, null, 2) }], details: status };
 		},
 	});
