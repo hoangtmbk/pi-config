@@ -120,16 +120,33 @@ export interface FakeClaudeOptions {
 	attachExit?: number;
 	/** What the `get_usage` control request answers; an error response when unset. */
 	usage?: Record<string, unknown>;
+	/** How long a held hook holds before giving the prompt back to the terminal, `TEAM_HOOK_HOLD_MS`; the hook's own when unset. */
+	holdMs?: number;
 }
 
 /**
  * One step a fake background session plays: fire a hook event through the
  * hook commands of its `--settings` (the payload gets the session id, folder
- * and event name filled in), write the result its handoff pointer asks for, or
- * update its status line, which runs the `statusLine.command` of its
+ * and event name filled in), write the result its handoff pointer asks for,
+ * edit a file in its working directory, committing it when a message is given,
+ * or update its status line, which runs the `statusLine.command` of its
  * `--settings` with the payload (the session id and folder filled in).
  */
-export type FakeHookStep = { event: string; payload?: Record<string, unknown> } | { write: "result" } | { statusLine: Record<string, unknown> };
+export type FakeHookStep = { event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string } | { statusLine: Record<string, unknown> };
+
+/**
+ * A hook command a fake session started without waiting on, as Claude Code
+ * holds a `PermissionRequest` while its prompt is live in the terminal.
+ */
+export interface FakeHeldHook {
+	event: string;
+	/** What it printed, once it exited; undefined while it holds. */
+	output(): string | undefined;
+	/** Its exit code once it exited by itself; undefined while it holds, or once killed. */
+	exitCode(): number | undefined;
+	/** SIGTERM its process group, as Claude Code does when the human answers the prompt in the terminal. */
+	terminate(): void;
+}
 
 /** One `claude --bg` launch, as the fake saw it. */
 export interface FakeLaunch {
@@ -158,6 +175,10 @@ export interface FakeClaude {
 	inbox(): FakeInboxConnection[];
 	/** Every `claude attach`, oldest first. */
 	attaches(): FakeAttach[];
+	/** Every hook command a session holds or held, oldest first. */
+	held(): FakeHeldHook[];
+	/** SIGTERM every held hook still running, so none outlives the test. */
+	release(): void;
 	/** Every session it started, live or not, as its registry holds it. */
 	agents(): FakeAgent[];
 	/** Idle-stop the session named `name`, as Claude Code does after about an hour: gone from `agents --json`, its socket closed, no hook. */
@@ -225,6 +246,7 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 	const launchOut = join(dir, "launches.jsonl");
 	const inboxOut = join(dir, "inbox.jsonl");
 	const attachOut = join(dir, "attaches.jsonl");
+	const heldOut = join(dir, "held.jsonl");
 	const hooks = join(dir, "hooks.json");
 	const replies = join(dir, "replies.json");
 	if (options.hooks) writeFileSync(hooks, JSON.stringify(options.hooks));
@@ -259,6 +281,8 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 		FAKE_CLAUDE_AGENTS: agents,
 		FAKE_CLAUDE_ATTACH_EXIT: options.attachExit === undefined ? undefined : String(options.attachExit),
 		FAKE_CLAUDE_USAGE: usage,
+		FAKE_CLAUDE_HELD_OUT: heldOut,
+		TEAM_HOOK_HOLD_MS: options.holdMs === undefined ? undefined : String(options.holdMs),
 	};
 	const exports = Object.entries(env)
 		.filter((entry): entry is [string, string] => entry[1] !== undefined)
@@ -271,6 +295,10 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 		launches: () => jsonLines<FakeLaunch>(launchOut),
 		inbox: () => jsonLines<FakeInboxConnection>(inboxOut),
 		attaches: () => jsonLines<FakeAttach>(attachOut),
+		held: () => jsonLines<{ pid: number; event: string; out: string; exit: string }>(heldOut).map(heldHook),
+		release() {
+			for (const { pid, exit } of jsonLines<{ pid: number; exit: string }>(heldOut)) if (!existsSync(exit)) kill(pid);
+		},
 		agents: () => readdirSync(agents).map((file) => JSON.parse(readFileSync(join(agents, file), "utf8")) as FakeAgent),
 		idleStop: (name) =>
 			change(name, (agent) => {
@@ -291,6 +319,25 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 		setUsage: (next) => (next === undefined ? rmSync(usage, { force: true }) : writeFileSync(usage, JSON.stringify(next))),
 		usageCalls: () => jsonLines<string[]>(argvOut).filter((args) => args[0] === "-p").length,
 	};
+}
+
+function heldHook({ pid, event, out, exit }: { pid: number; event: string; out: string; exit: string }): FakeHeldHook {
+	const exited = () => existsSync(exit) && readFileSync(exit, "utf8").trim() !== "";
+	return {
+		event,
+		output: () => (exited() ? readFileSync(out, "utf8") : undefined),
+		exitCode: () => (exited() ? Number(readFileSync(exit, "utf8").trim()) : undefined),
+		terminate: () => kill(pid),
+	};
+}
+
+/** SIGTERM a process group, which may be gone already. */
+function kill(group: number): void {
+	try {
+		process.kill(-group, "SIGTERM");
+	} catch {
+		// Gone already.
+	}
 }
 
 /** A fake `tmux` on disk, and the argv of every call to it. */

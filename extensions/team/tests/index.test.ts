@@ -9,12 +9,12 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { join, relative } from "node:path";
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { CLEAR_MARKER, HOOK_SCRIPT, STATUSLINE_SCRIPT } from "../claude.ts";
 import { registerTeam } from "../index.ts";
-import { commit, type FakeHookStep, fakeClaude, fakeTmux, git, gitRepo, goodTeam, ownStdio, roleMd, type TempRoots, teamMd, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
+import { commit, type FakeHeldHook, type FakeHookStep, fakeClaude, fakeTmux, git, gitRepo, goodTeam, ownStdio, roleMd, type TempRoots, teamMd, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
 
 const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 
@@ -113,6 +113,8 @@ function fakePi(
 		usage?: Record<string, unknown>;
 		/** pi's own entries the session carries, such as the Lead's assistant messages with their usage. */
 		sessionEntries?: Record<string, unknown>[];
+		/** How long a Teammate's held hook holds before giving the prompt back to its terminal; the hook's own when unset. */
+		holdMs?: number;
 	} = {},
 ) {
 	const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
@@ -159,7 +161,15 @@ function fakePi(
 		},
 		getSettings: () => structuredClone(options.settings ?? {}),
 	};
-	const claude = fakeClaude(roots, { version: options.claudeVersion, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies, attachExit: options.attachExit, usage: options.usage });
+	const claude = fakeClaude(roots, {
+		version: options.claudeVersion,
+		bgExit: options.bgExit,
+		hooks: options.hooks,
+		replies: options.replies,
+		attachExit: options.attachExit,
+		holdMs: options.holdMs,
+		usage: options.usage,
+	});
 	const tmux = fakeTmux(roots);
 	registerTeam(pi as unknown as ExtensionAPI, {
 		agentDir: roots.agentDir,
@@ -802,7 +812,7 @@ describe("/team start on a Team with no adopted Playbook", () => {
 
 		assert.match(pi.notifications.at(-1)?.message ?? "", /^Team `software` picked: .*Playbook: adopted 2026-11-02T10:00:00\.000Z.* Effort `software-2026-11-02` opened/);
 		assert.equal(pi.sent.at(-1)?.customType, "team-intake");
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer"]);
 	});
 
 	it("goes back through setup when the adopted Playbook was edited by hand", async () => {
@@ -885,7 +895,7 @@ describe("intake: `/team start` on a Team with an adopted Playbook", () => {
 		for (const needed of [join(dir, "brief.draft.md"), sha(INTAKE_PLAYBOOK), `repo: ${repo}`, "Constraints", "small-diffs", "**AC1**", "`team_request_approval`", "`brief`"]) {
 			assert.ok(woken?.content.includes(needed), `the intake prompt doesn't mention ${needed}:\n${woken?.content}`);
 		}
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer"]);
 	});
 
 	it("gives each Effort its own id, so a second one the same day is numbered", async () => {
@@ -1411,7 +1421,7 @@ function crewBrief(repo: string): string {
 async function crewApproved(
 	options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown> } & Pick<
 		NonNullable<Parameters<typeof fakePi>[1]>,
-		"mode" | "env" | "attachExit" | "usage" | "sessionEntries"
+		"mode" | "env" | "attachExit" | "holdMs" | "usage" | "sessionEntries"
 	> = {},
 ) {
 	const roots = tempRoots();
@@ -1448,6 +1458,7 @@ async function crewApproved(
 		attachExit: options.attachExit,
 		usage: options.usage,
 		sessionEntries: options.sessionEntries,
+		holdMs: options.holdMs,
 	});
 	await pi.team("start crew");
 	const dir = effortDir(roots, CREW_EFFORT_ID);
@@ -1704,16 +1715,6 @@ describe("handing off: team_handoff", () => {
 		assert.equal(readFileSync(join(dir, "effort.jsonl"), "utf8"), log);
 		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n(?:.*\n)*?- Status: planned/);
 	});
-
-	it("refuses an isolated Task, which needs a worktree of its own, without launching anything", async () => {
-		const { pi, dir } = await crewApproved();
-		await pi.call("team_plan", { tasks: CREW_PLAN });
-
-		await assert.rejects(pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true }), /isolated/);
-
-		assert.equal(pi.claude.launches().length, 0);
-		assert.equal(existsSync(join(dir, "tasks")), false);
-	});
 });
 
 /** The `effort.jsonl` lines of an Effort, parsed. */
@@ -1919,6 +1920,169 @@ async function renameReported(options: { hooks?: FakeHookStep[]; replies?: FakeH
 	await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
 	return crew;
 }
+
+/** The fakes whose Teammates hold hooks open, released after each test so no hook outlives it. */
+const holding: { release(): void }[] = [];
+
+const PUBLISH = { tool_name: "Bash", tool_input: { command: "npm publish --dry-run", description: "See what would publish" } };
+const FORMAT_QUESTIONS = {
+	tool_name: "AskUserQuestion",
+	tool_input: {
+		questions: [
+			{ question: "Which format should old configs load from?", header: "Format", multiSelect: false, options: [{ label: "YAML", description: "As today" }, { label: "JSON", description: "As the new key" }] },
+			{ question: "Which checks should run?", header: "Checks", multiSelect: true, options: [{ label: "lint", description: "" }, { label: "test", description: "" }, { label: "build", description: "" }] },
+		],
+	},
+};
+
+/**
+ * An approved crew Effort whose `builder-1`, handed `rename-key` in session
+ * `c0ffee12`, asks `asked` through its held PermissionRequest hook, once the
+ * Lead was woken about it.
+ */
+async function asking(asked: Record<string, unknown>, options: { holdMs?: number } = {}) {
+	const crew = await crewApproved({
+		holdMs: options.holdMs,
+		hooks: [
+			{ event: "SessionStart", payload: { source: "startup", session_id: "c0ffee12-0000-4000-8000-000000000001" } },
+			{ event: "UserPromptSubmit", payload: { prompt: "New Task `rename-key`" } },
+			{ event: "PermissionRequest", payload: asked, hold: true },
+		],
+	});
+	holding.push(crew.pi.claude);
+	await crew.pi.call("team_plan", { tasks: CREW_PLAN });
+	await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+	await until(() => effortLines(crew.dir).some((line) => line.type === "request-held"), "the Lead holds builder-1's request");
+	const request = String(effortLines(crew.dir).find((line) => line.type === "request-held")?.request);
+	const [hook] = crew.pi.claude.held();
+	return { ...crew, request, hook };
+}
+
+/** The decision a held hook printed, once it exited. */
+async function printed(hook: FakeHeldHook): Promise<unknown> {
+	await until(() => hook.exitCode() !== undefined, "the held hook exits");
+	assert.equal(hook.exitCode(), 0);
+	return JSON.parse(hook.output() ?? "");
+}
+
+function journalled(dir: string, event: string): boolean {
+	return readFileSync(join(dir, "teammates", "builder-1", "events.jsonl"), "utf8").includes(`"event":"${event}"`);
+}
+
+describe("a Teammate's held requests: team_answer", () => {
+	afterEach(() => {
+		for (const fake of holding.splice(0)) fake.release();
+	});
+
+	it("wakes the Lead with the request, and turns its allow, with a session rule, into the hook's decision", async () => {
+		const { pi, request, hook } = await asking(PUBLISH);
+
+		const [wake] = teammateWakes(pi.sent);
+		assert.ok(wake.content.includes(`\`builder-1\` asks permission to use \`Bash\` on Task \`rename-key\` (\`${request}\`)`), wake.content);
+		assert.ok(wake.content.includes("npm publish --dry-run"), wake.content);
+		assert.equal(hook.exitCode(), undefined, "the hook holds until the Lead answers");
+
+		const reply = await pi.call("team_answer", { request, decision: "allow", reason: "A dry run publishes nothing.", rule: "Bash(npm publish --dry-run)", grant: "dry-runs" });
+
+		assert.match(reply, new RegExp(`Answered \`${request}\``));
+		assert.deepEqual(await printed(hook), {
+			hookSpecificOutput: {
+				hookEventName: "PermissionRequest",
+				decision: {
+					behavior: "allow",
+					updatedPermissions: [{ type: "addRules", rules: [{ toolName: "Bash", ruleContent: "npm publish --dry-run" }], behavior: "allow", destination: "session" }],
+				},
+			},
+		});
+	});
+
+	it("turns a deny into the hook's decision with the reason, and refuses a second answer", async () => {
+		const { pi, request, hook } = await asking(PUBLISH);
+
+		await pi.call("team_answer", { request, decision: "deny", reason: "Publishing is the human's call." });
+
+		assert.deepEqual(await printed(hook), { hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Publishing is the human's call." } } });
+		await assert.rejects(pi.call("team_answer", { request, decision: "allow", reason: "On second thought." }), /already answered: you answered it/);
+	});
+
+	it("answers an AskUserQuestion with every original field and the answers keyed by each question's text", async () => {
+		const { pi, request, hook } = await asking(FORMAT_QUESTIONS);
+		assert.ok(teammateWakes(pi.sent)[0].content.includes('"Which checks should run?"'), teammateWakes(pi.sent)[0].content);
+
+		await pi.call("team_answer", { request, answers: { "Which format should old configs load from?": "YAML", "Which checks should run?": ["lint", "test"] }, reason: "The Brief keeps YAML." });
+
+		assert.deepEqual(await printed(hook), {
+			hookSpecificOutput: {
+				hookEventName: "PermissionRequest",
+				decision: {
+					behavior: "allow",
+					updatedInput: {
+						...FORMAT_QUESTIONS.tool_input,
+						answers: { "Which format should old configs load from?": "YAML", "Which checks should run?": ["lint", "test"] },
+					},
+				},
+			},
+		});
+	});
+
+	it("logs the answers in the next Report's Decided for you, with the Task", async () => {
+		const { pi, dir, request } = await asking(PUBLISH);
+		await pi.call("team_answer", { request, decision: "allow", reason: "A dry run publishes nothing.", rule: "Bash(npm publish --dry-run)", grant: "dry-runs" });
+
+		await pi.call("team_report", { headline: "builder-1 is renaming." });
+
+		const report = readFileSync(join(dir, "reports", "001.md"), "utf8");
+		for (const needed of ["## Decided for you", "allowed builder-1's `Bash`", "A dry run publishes nothing.", "added session rule `Bash(npm publish --dry-run)` for builder-1", "used grant `dry-runs` for builder-1's `Bash` (Task `rename-key`)"]) {
+			assert.ok(report.includes(needed), `reports/001.md doesn't say ${needed}:\n${report}`);
+		}
+	});
+
+	it("journals the hook's kill as denied in the terminal, then a PostToolUse as answered there, refusing the Lead's answer after either", async () => {
+		const { pi, dir, request, hook } = await asking(PUBLISH);
+
+		hook.terminate();
+		await until(() => journalled(dir, "denied-in-terminal"), "the killed hook journals it");
+
+		await assert.rejects(pi.call("team_answer", { request, decision: "allow", reason: "ok" }), /already answered: the human denied it in builder-1's terminal/);
+		const ran = { session_id: "c0ffee12-0000-4000-8000-000000000001", hook_event_name: "PostToolUse", ...PUBLISH, tool_response: { stdout: "" } };
+		appendFileSync(join(dir, "teammates", "builder-1", "events.jsonl"), `${JSON.stringify({ from: "hook", at: NOW.toISOString(), event: "PostToolUse", payload: ran })}\n`);
+		await assert.rejects(pi.call("team_answer", { request, decision: "allow", reason: "ok" }), /already answered: the human answered it in builder-1's terminal/);
+	});
+
+	it("leaves a request its hook gave up on to the terminal: refused to the Lead, and a `/team pending` item that attaches", async () => {
+		const { pi, dir, request, hook } = await asking(PUBLISH, { holdMs: 300 });
+
+		await until(() => effortLines(dir).some((line) => line.type === "request-settled" && line.how === "expired"), "the hook's hold runs out");
+		await until(() => hook.exitCode() !== undefined, "the hook exits");
+		assert.deepEqual([hook.exitCode(), hook.output()], [0, ""]);
+		await assert.rejects(pi.call("team_answer", { request, decision: "allow", reason: "ok" }), /only the human can answer it now, in builder-1's terminal/);
+		assert.equal(JSON.parse(await pi.call("team_status", {})).waitingOnYou, 1);
+
+		pi.answer("Attach to builder-1", "Attach here");
+		await pi.team("pending");
+
+		assert.deepEqual(pi.dialogs.slice(-2), [
+			{
+				kind: "select",
+				title: `\`${request}\` waited past its hook's hold: answer builder-1's \`Bash\` prompt in builder-1's terminal (\`/team attach builder-1\`)`,
+				options: ["Attach to builder-1", "Later"],
+				answer: "Attach to builder-1",
+			},
+			{ kind: "select", title: "builder-1 (c0ffee12)", options: ["Attach here", "Copy the command"], answer: "Attach here" },
+		]);
+		assert.deepEqual(
+			pi.claude.attaches().map((attach) => attach.argv),
+			[["attach", "c0ffee12"]],
+		);
+	});
+
+	it("refuses a request no hook holds, naming the ones that are", async () => {
+		const { pi, request } = await asking(PUBLISH);
+
+		await assert.rejects(pi.call("team_answer", { request: "req-00000000", decision: "allow", reason: "ok" }), new RegExp(`No request \`req-00000000\` waits on you.*\`${request}\``, "s"));
+		await assert.rejects(pi.call("team_answer", { request, decision: "maybe", reason: "ok" }), /`decision` is `allow` or `deny`/);
+	});
+});
 
 describe("reviewing: team_review", () => {
 	it("refuses a review while there is no new result for the round, and changes nothing", async () => {
@@ -2848,7 +3012,7 @@ describe("re-attaching: `pi -c`, `/resume` back and `/reload`", () => {
 			assert.equal(lead.stoppedAt, undefined);
 			assert.equal(typeof lead.port, "number");
 			assert.equal(lead.sessionFile, join(roots.scratch, "session.jsonl"));
-			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume"]);
+			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer"]);
 			assert.deepEqual(again.entries, []);
 			assert.deepEqual(again.notifications, [{ message: `This session leads Effort \`${EFFORT_ID}\` (${dir}) again.`, type: "info" }]);
 			assert.deepEqual(again.sent, []);
@@ -3129,5 +3293,150 @@ describe("/team attach [id]", () => {
 			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "info" },
 		]);
 		assert.deepEqual(leading.notifications, [{ message: "There is no Teammate `qa-1` with a session to attach to. Teammates with one: `builder-1`.", type: "error" }]);
+	});
+});
+
+/** The task worktree and branch of Task `nnn` in the crew Effort's repo. */
+function crewTask(repo: string, nnn: string): { path: string; branch: string } {
+	return { path: `${workspaceOf(repo, CREW_EFFORT_ID)}-task-${nnn}`, branch: `team/${CREW_EFFORT_ID}-task-${nnn}` };
+}
+
+/** Whether `git` succeeds in `dir`. */
+function gitOk(dir: string, ...args: string[]): boolean {
+	return spawnSync("git", args, { cwd: dir, stdio: "ignore" }).status === 0;
+}
+
+/** A Teammate that commits its edit in its working directory, then writes its result and stops. */
+const COMMITS: FakeHookStep[] = [
+	{ event: "SessionStart", payload: { source: "startup" } },
+	{ event: "UserPromptSubmit" },
+	{ edit: "{task}.txt", commit: "Do the Task" },
+	{ write: "result" },
+	{ event: "Stop", payload: { last_assistant_message: "Done." } },
+];
+
+/** An approved crew Effort whose `rename-key` Task is handed off isolated to `builder-1`, who has written round 1's result. */
+async function isolatedReported(hooks: FakeHookStep[] = COMMITS) {
+	const crew = await crewApproved({ hooks });
+	await crew.pi.call("team_plan", { tasks: CREW_PLAN });
+	await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true });
+	await until(() => existsSync(join(crew.dir, RENAME_RESULT)), "builder-1 writes its result");
+	return { ...crew, task: crewTask(crew.repo, "001") };
+}
+
+describe("an isolated Task in a worktree of its own", () => {
+	it("cuts a worktree and branch beside the Workspace from the Effort branch's tip, copying `.worktreeinclude`, and launches its Teammate there", async () => {
+		const { pi, repo, workspace } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		const tip = commit(workspace, { "effort.txt": "on the Effort branch\n", ".gitignore": ".env\n" }, "Effort work");
+		commit(repo, { ".gitignore": ".env\n" }, "ignore .env");
+		writeFileSync(join(repo, ".worktreeinclude"), ".env\n");
+		writeFileSync(join(repo, ".env"), "SECRET=1\n");
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		const reply = await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true });
+
+		const task = crewTask(repo, "001");
+		assert.match(reply, /started builder-1 .*`team\/crew-2026-11-02-task-001`/);
+		assert.match(reply, /commits/);
+		assert.equal(pi.claude.launches()[0].cwd, task.path);
+		assert.ok(relative(workspace, task.path).startsWith(".."), "the task worktree is not nested in the Workspace");
+		assert.equal(git(task.path, "branch", "--show-current"), task.branch);
+		assert.equal(git(task.path, "rev-parse", "HEAD"), tip);
+		assert.equal(readFileSync(join(task.path, ".env"), "utf8"), "SECRET=1\n");
+		assert.equal(git(task.path, "status", "--porcelain"), "");
+	});
+
+	it("gives two isolated Tasks worked in parallel a worktree each, so each Teammate sees only its own uncommitted files", async () => {
+		const { pi, repo, workspace } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }, { event: "UserPromptSubmit" }, { edit: "{task}.txt" }] });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true });
+		await pi.call("team_handoff", { slug: "survey", body: "# Survey\n", isolated: true });
+
+		const [first, second] = [crewTask(repo, "001"), crewTask(repo, "002")];
+		assert.deepEqual(
+			pi.claude.launches().map((launch) => launch.cwd),
+			[first.path, second.path],
+		);
+		assert.equal(git(first.path, "status", "--porcelain"), "?? 001-builder-rename-key.txt");
+		assert.equal(git(second.path, "status", "--porcelain"), "?? 002-scout-survey.txt");
+		assert.equal(git(workspace, "status", "--porcelain"), "");
+	});
+
+	it("merges an accepted Task's branch into the Effort branch with `--no-ff`, recording the intent first, then removes its worktree and branch", async () => {
+		const { pi, repo, dir, workspace, task } = await isolatedReported();
+
+		const reply = await pi.call("team_review", { slug: "rename-key", verdict: "accept" });
+
+		assert.match(reply, /^Accepted Task `rename-key` at round 1.*merged `team\/crew-2026-11-02-task-001` into `team\/crew-2026-11-02`/);
+		const parents = git(workspace, "rev-list", "--parents", "-n", "1", "HEAD").split(" ");
+		assert.equal(parents.length, 3, "a merge commit, never a fast-forward");
+		assert.equal(readFileSync(join(workspace, "001-builder-rename-key.txt"), "utf8"), "edited for 001-builder-rename-key\n");
+		assert.equal(existsSync(task.path), false);
+		assert.equal(git(repo, "branch", "--list", task.branch), "");
+		const types = effortLines(dir).map((line) => line.type);
+		assert.ok(types.indexOf("merge-intended") !== -1 && types.indexOf("merge-intended") < types.indexOf("task-accepted"), types.join(", "));
+		assert.equal(effortLines(dir).find((line) => line.type === "task-accepted")?.merge, parents[0]);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: accepted/);
+		assert.ok(pi.claude.calls().some((argv) => argv[0] === "stop"), "its Teammate is stopped");
+	});
+
+	it("refuses to accept while the Effort's Workspace has uncommitted changes, leaving the Task in review and its branch intact", async () => {
+		const { pi, dir, workspace, task } = await isolatedReported();
+		const head = git(workspace, "rev-parse", "HEAD");
+		writeFileSync(join(workspace, "wip.txt"), "the Lead's own edit\n");
+
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /uncommitted changes/);
+
+		assert.equal(git(workspace, "rev-parse", "HEAD"), head);
+		assert.equal(gitOk(workspace, "rev-parse", "-q", "--verify", "MERGE_HEAD"), false);
+		assert.ok(gitOk(task.path, "rev-parse", "--verify", task.branch));
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: in review/);
+		assert.deepEqual(
+			effortLines(dir)
+				.map((line) => line.type)
+				.filter((type) => type === "merge-intended" || type === "merge-failed"),
+			["merge-intended", "merge-failed"],
+		);
+
+		unlinkSync(join(workspace, "wip.txt"));
+		assert.match(await pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /^Accepted Task `rename-key`/);
+	});
+
+	it("refuses a merge that conflicts, aborting it so nothing is half-merged, and leaves the Task in review with its branch intact", async () => {
+		const { pi, dir, workspace, task } = await isolatedReported();
+		const head = commit(workspace, { "001-builder-rename-key.txt": "the Effort's own\n" }, "Clash");
+		const tip = git(task.path, "rev-parse", "HEAD");
+
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /conflict.*001-builder-rename-key\.txt/);
+
+		assert.equal(git(workspace, "rev-parse", "HEAD"), head);
+		assert.equal(git(workspace, "status", "--porcelain"), "");
+		assert.equal(gitOk(workspace, "rev-parse", "-q", "--verify", "MERGE_HEAD"), false);
+		assert.equal(git(task.path, "rev-parse", task.branch), tip);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: in review/);
+	});
+
+	it("refuses to accept work its Teammate left uncommitted, which wouldn't merge, telling the Lead to send it back", async () => {
+		const { pi, task } = await isolatedReported([
+			{ event: "SessionStart", payload: { source: "startup" } },
+			{ event: "UserPromptSubmit" },
+			{ edit: "{task}.txt" },
+			{ write: "result" },
+			{ event: "Stop", payload: { last_assistant_message: "Done." } },
+		]);
+
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /uncommitted.*send it back/s);
+
+		assert.ok(existsSync(join(task.path, "001-builder-rename-key.txt")));
+	});
+
+	it("restaffs a crashed Teammate's isolated Task in the same worktree", async () => {
+		const { pi, task } = await isolatedReported([...COMMITS, { event: "SessionEnd", payload: { reason: "other" } }]);
+		await until(() => teammateWakes(pi.sent).some((wake) => wake.content.includes("ended")), "the Lead is woken about the crash");
+
+		await pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Also the docs." });
+
+		assert.equal(pi.claude.launches()[1]?.cwd, task.path);
 	});
 });

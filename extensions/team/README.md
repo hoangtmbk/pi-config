@@ -72,7 +72,7 @@ From then on the Effort reads only those copies, so editing your Team or Playboo
 in it; a copy whose sha no longer matches its approval is reported and never used. A Brief can't
 be approved once its Playbook has been adopted again: start a new Effort.
 
-`team_plan`, `team_handoff`, `team_review` and `team_report` are switched on with the Effort, and
+`team_plan`, `team_handoff`, `team_review`, `team_report` and `team_answer` are switched on with the Effort, and
 refuse until the Brief is approved. `team_status`, `team_pause` and `team_resume` come on with them.
 
 ### Planning and handing off
@@ -114,8 +114,21 @@ A new Teammate starts as `claude --bg` in the Workspace, named
 - `mcp.json`, when the Role has `mcpServers`.
 
 The Effort directory is added with `--add-dir`, `EnterPlanMode` is always disallowed, and the
-first turn is a pointer to `task.md`. A launch that fails leaves the Task planned (or queued). A
-Task that needs a worktree of its own (`isolated`) is refused.
+first turn is a pointer to `task.md`. A launch that fails leaves the Task planned (or queued).
+
+### Isolated Tasks
+
+A Task handed off with `isolated: true` gets a worktree and branch of its own, cut from the
+Effort branch's tip when its Teammate starts: `…/team-<effort-id>-task-<nnn>/` beside the
+Workspace (never inside it) on branch `team/<effort-id>-task-<nnn>`, with what your repo's
+`.worktreeinclude` lists copied in. Its Teammate always starts fresh there, never reused, and a
+Teammate restaffed after a crash launches in the same worktree. Only what it commits merges.
+
+Accepting it with `team_review` writes a `merge-intended` line to `effort.jsonl`, then merges the
+branch into the Effort branch with `--no-ff`. Once merged, the Task is accepted, its Teammate
+stopped, and its worktree and branch removed. The merge is refused, with a `merge-failed` line,
+while the Workspace or the Task's worktree has uncommitted changes, or when it would conflict
+(the merge is aborted): nothing is merged, and the Task stays in review with its branch intact.
 
 ### Clearing between Tasks
 
@@ -159,6 +172,23 @@ status line under a minute old it asks Claude Code's undocumented `get_usage` co
 instead, at most once a minute. Each Report's Usage section has the freshest reading and its change
 since the Effort began, each Role's tokens and API-price estimate summed across its sessions, and
 the Lead's own cost as pi reports it.
+### Held requests
+
+A Teammate's permission prompt, an `AskUserQuestion` included, is held by its `PermissionRequest`
+hook: the hook journals it with a request id `req-<8 hex>`, keeps a socket open to the Lead
+bridge, and the Lead is woken with the tool and its input. The prompt stays live in the
+Teammate's terminal meanwhile, and the first answer wins. Nothing is allowed by default.
+
+- `team_answer` with `allow` or `deny` and a `reason` goes to the hook as its decision. An allow
+  may add a session `rule` for the same tool, such as `Bash(npm test:*)`, and name the `grant` it
+  relies on. An `AskUserQuestion` is answered with `answers`, keyed by each question's exact text.
+- The human answering in the terminal kills the hook, journalled as denied in the terminal; a
+  `PostToolUse` for the call after it shows it was allowed. Either way the Lead's answer is then
+  refused as already answered.
+- A hook that holds 3570 s without an answer gives the prompt back to the terminal. It waits in
+  `/team pending` as an item that attaches to the Teammate, and in the Report's Waiting on you.
+
+The next Report logs every answer, rule and grant under Decided for you, with the Task.
 
 ### Reviewing
 

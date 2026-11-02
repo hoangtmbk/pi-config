@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, type Step, step, taskStatus, type UsageReading } from "../core.ts";
+import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openMerges, type Step, step, taskStatus, type UsageReading, waitingInTerminal, workdir } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -968,6 +968,225 @@ describe("clearing between Tasks", () => {
 	});
 });
 
+describe("a Teammate's held requests", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const started = applied(
+		applied(approved, {
+			kind: "plan",
+			tasks: [{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] }],
+			criteria: ["AC1"],
+			roles: ["dev"],
+			at: "2026-11-02T11:10:00.000Z",
+		}),
+		{ kind: "handoff", slug: "rename", at: "2026-11-02T11:30:00.000Z" },
+	);
+	const RESULT = "/agent/team/efforts/software-2026-11-02/tasks/001-dev-rename/result-1.md";
+	const SESSION = "8f3c2a1b-0000-4000-8000-000000000001";
+	const BASH = { command: "npm publish --dry-run", description: "Check the package contents" };
+	const QUESTIONS = {
+		questions: [
+			{ question: "Which store should the renamed key live in?", header: "Store", multiSelect: false, options: [{ label: "Redis", description: "Shared" }, { label: "Memory", description: "Per process" }] },
+			{ question: "Which callers should move now?", header: "Callers", multiSelect: true, options: [{ label: "api", description: "" }, { label: "worker", description: "" }] },
+		],
+	};
+
+	function line(cursor: number, event: string, extra: Partial<JournalLine> = {}, payload?: Record<string, unknown>): Extract<EffortInput, { kind: "journal" }> {
+		return {
+			kind: "journal",
+			teammate: "dev-1",
+			cursor,
+			line: { from: "hook", at: `2026-11-02T11:4${cursor}:00.000Z`, event, ...(payload === undefined ? {} : { payload: { session_id: SESSION, hook_event_name: event, ...payload } }), ...extra },
+			result: { path: RESULT, written: false },
+		};
+	}
+
+	function asked(cursor: number, request: string, tool = "Bash", input: Record<string, unknown> = BASH): Extract<EffortInput, { kind: "journal" }> {
+		return line(cursor, "PermissionRequest", { request } as Partial<JournalLine>, { tool_name: tool, tool_input: input });
+	}
+
+	function answer(request: string, extra: Partial<Extract<EffortInput, { kind: "answer-request" }>>): Extract<EffortInput, { kind: "answer-request" }> {
+		return { kind: "answer-request", request, at: "2026-11-02T11:50:00.000Z", ...extra };
+	}
+
+	/** The decision a successful answer sends the hook holding the request. */
+	function decision(result: Step): unknown {
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "answer-hook");
+		assert.ok(action?.kind === "answer-hook", "expected an answer-hook action");
+		return action.decision;
+	}
+
+	function wake(result: Step): string {
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "wake-lead");
+		assert.ok(action?.kind === "wake-lead", "expected the Lead to be woken");
+		return action.text;
+	}
+
+	const held = applied(started, asked(1, "req-0000000a"));
+
+	it("wakes the Lead with a permission request: who asks, on which Task, for what, and that the terminal can answer first", () => {
+		const text = wake(run(started, asked(1, "req-0000000a")));
+
+		assert.match(text, /`dev-1` asks permission to use `Bash` on Task `rename` \(`req-0000000a`\)/);
+		assert.match(text, /npm publish --dry-run/);
+		assert.match(text, /team_answer/);
+		assert.match(text, /live in dev-1's terminal; the first answer wins/);
+	});
+
+	it("sends an allow or a deny to the hook holding the request, each with the Lead's reason", () => {
+		assert.deepEqual(decision(run(held, answer("req-0000000a", { decision: "allow", reason: "a dry run publishes nothing" }))), { behavior: "allow" });
+		assert.deepEqual(decision(run(held, answer("req-0000000a", { decision: "deny", reason: "publishing is the human's call" }))), {
+			behavior: "deny",
+			message: "publishing is the human's call",
+		});
+	});
+
+	it("passes a rule only as a session-scoped rule for the request's tool, and keeps it on the Teammate with its Task", () => {
+		const result = run(held, answer("req-0000000a", { decision: "allow", reason: "dry runs are harmless", rule: "Bash(npm publish --dry-run:*)" }));
+
+		assert.deepEqual(decision(result), {
+			behavior: "allow",
+			updatedPermissions: [{ type: "addRules", rules: [{ toolName: "Bash", ruleContent: "npm publish --dry-run:*" }], behavior: "allow", destination: "session" }],
+		});
+		assert.ok(result.ok);
+		assert.deepEqual(result.state.teammates[0].rules, [{ rule: "Bash(npm publish --dry-run:*)", task: "rename" }]);
+	});
+
+	it("refuses an answer without a decision or a reason, a rule on a deny or for another tool, and answers to a permission request", () => {
+		assert.match(refusal(held, answer("req-0000000a", { reason: "fine" })), /allow or deny/);
+		assert.match(refusal(held, answer("req-0000000a", { decision: "allow" })), /reason/);
+		assert.match(refusal(held, answer("req-0000000a", { decision: "deny", reason: "no", rule: "Bash(npm:*)" })), /only with an allow/);
+		assert.match(refusal(held, answer("req-0000000a", { decision: "allow", reason: "ok", rule: "Edit(src/**)" })), /`Bash`/);
+		assert.match(refusal(held, answer("req-0000000a", { decision: "allow", reason: "ok", rule: "Bash(" })), /`Bash\(npm test:\*\)`/);
+		assert.match(refusal(held, answer("req-0000000a", { answers: { x: "y" } })), /AskUserQuestion/);
+	});
+
+	it("refuses a request no hook holds, naming the ones that are held", () => {
+		assert.match(refusal(held, answer("req-ffffffff", { decision: "allow", reason: "ok" })), /`req-0000000a`/);
+		assert.match(refusal(started, answer("req-ffffffff", { decision: "allow", reason: "ok" })), /no request is held/);
+	});
+
+	it("wakes the Lead with an AskUserQuestion's questions and their options, one or any", () => {
+		const text = wake(run(started, asked(1, "req-0000000b", "AskUserQuestion", QUESTIONS)));
+
+		assert.match(text, /`dev-1` asks on Task `rename` \(`req-0000000b`\)/);
+		assert.match(text, /"Which store should the renamed key live in\?" \(one of `Redis`, `Memory`\)/);
+		assert.match(text, /"Which callers should move now\?" \(any of `api`, `worker`\)/);
+		assert.match(text, /answers/);
+	});
+
+	it("answers an AskUserQuestion as an allow with every original field unchanged plus answers keyed by the exact question text", () => {
+		const question = applied(started, asked(1, "req-0000000b", "AskUserQuestion", QUESTIONS));
+		const answers = { "Which store should the renamed key live in?": "Redis", "Which callers should move now?": ["api", "worker"] };
+
+		assert.deepEqual(decision(run(question, answer("req-0000000b", { answers }))), { behavior: "allow", updatedInput: { ...QUESTIONS, answers } });
+	});
+
+	it("refuses answers that miss a question, name one it didn't ask, or give one label where it allows many and back", () => {
+		const question = applied(started, asked(1, "req-0000000b", "AskUserQuestion", QUESTIONS));
+		const store = "Which store should the renamed key live in?";
+		const callers = "Which callers should move now?";
+
+		assert.match(refusal(question, answer("req-0000000b", { answers: { [store]: "Redis" } })), /Which callers should move now\?/);
+		assert.match(refusal(question, answer("req-0000000b", { answers: { [store]: "Redis", [callers]: ["api"], "Which store?": "Redis" } })), /"Which store\?"/);
+		assert.match(refusal(question, answer("req-0000000b", { answers: { [store]: "Redis", [callers]: "api" } })), /list of labels/);
+		assert.match(refusal(question, answer("req-0000000b", { answers: { [store]: ["Redis"], [callers]: ["api"] } })), /one label/);
+		assert.match(refusal(question, answer("req-0000000b", { decision: "allow", reason: "ok" })), /answers/);
+	});
+
+	it("refuses a second answer: the first answer wins", () => {
+		const answered = applied(held, answer("req-0000000a", { decision: "allow", reason: "a dry run publishes nothing" }));
+
+		assert.match(refusal(answered, answer("req-0000000a", { decision: "deny", reason: "changed my mind" })), /already answered: you answered it/);
+	});
+
+	it("drops the Lead's pending decision when a PostToolUse shows the request was answered in the terminal, by tool call id or by tool and input", () => {
+		const byId = applied(started, line(1, "PermissionRequest", { request: "req-0000000a" } as Partial<JournalLine>, { tool_name: "Bash", tool_input: BASH, tool_use_id: "toolu_01" }));
+		const settledById = run(byId, line(2, "PostToolUse", {}, { tool_name: "Bash", tool_input: BASH, tool_use_id: "toolu_01", tool_response: {} }));
+		const settledByInput = run(held, line(2, "PostToolUse", {}, { tool_name: "Bash", tool_input: BASH, tool_response: {} }));
+
+		for (const [lines, result] of [
+			[byId, settledById],
+			[held, settledByInput],
+		] as const) {
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			assert.deepEqual(result.actions, []);
+			assert.match(refusal([...lines, ...result.append], answer("req-0000000a", { decision: "allow", reason: "ok" })), /already answered: the human answered it in dev-1's terminal/);
+		}
+	});
+
+	it("ignores a PostToolUse for a call no request held, and one after the Lead's own answer", () => {
+		const other = run(held, line(2, "PostToolUse", {}, { tool_name: "Bash", tool_input: { command: "npm test" }, tool_response: {} }));
+		const answered = applied(held, answer("req-0000000a", { decision: "allow", reason: "ok" }));
+		const after = run(answered, line(2, "PostToolUse", {}, { tool_name: "Bash", tool_input: BASH, tool_response: {} }));
+
+		assert.ok(other.ok && after.ok);
+		assert.deepEqual([other.append, after.append], [[], []]);
+		assert.match(refusal([...answered, ...after.append], answer("req-0000000a", { decision: "deny", reason: "no" })), /you answered it/);
+	});
+
+	it("records a held hook killed by the terminal as denied in the terminal, refusing the Lead's answer after it", () => {
+		const denied = applied(held, line(2, "denied-in-terminal", { request: "req-0000000a" } as Partial<JournalLine>));
+
+		assert.match(refusal(denied, answer("req-0000000a", { decision: "allow", reason: "ok" })), /already answered: the human denied it in dev-1's terminal/);
+	});
+
+	it("takes a PostToolUse after the kill as the human's allow in the terminal", () => {
+		const denied = applied(held, line(2, "denied-in-terminal", { request: "req-0000000a" } as Partial<JournalLine>));
+		const ran = applied(denied, line(3, "PostToolUse", {}, { tool_name: "Bash", tool_input: BASH, tool_response: {} }));
+
+		assert.match(refusal(ran, answer("req-0000000a", { decision: "deny", reason: "no" })), /already answered: the human answered it in dev-1's terminal/);
+	});
+
+	describe("one whose hook gave up holding it", () => {
+		const expired = applied(held, line(2, "hold-expired", { request: "req-0000000a" } as Partial<JournalLine>));
+
+		it("waits on the human as an 'answer in dev-1's terminal' item, until the Teammate goes on", () => {
+			assert.deepEqual(
+				waitingInTerminal(fold(expired)).map((each) => [each.request, each.teammate, each.tool]),
+				[["req-0000000a", "dev-1", "Bash"]],
+			);
+			assert.match(refusal(expired, answer("req-0000000a", { decision: "allow", reason: "ok" })), /only the human can answer it now, in dev-1's terminal/);
+
+			const answered = applied(expired, line(3, "PostToolUse", {}, { tool_name: "Bash", tool_input: BASH, tool_response: {} }));
+			const stopped = applied(expired, line(3, "Stop", {}, { last_assistant_message: "I stopped." }));
+			assert.deepEqual([waitingInTerminal(fold(answered)), waitingInTerminal(fold(stopped))], [[], []]);
+		});
+
+		it("shows in a Report's Waiting on you, with the attach command", () => {
+			const result = run(expired, { kind: "report", headline: "On track.", criteria: ["AC1"], modes: [], at: "2026-11-02T12:00:00.000Z" });
+
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			const action = result.actions.find((each) => each.kind === "write-report");
+			assert.ok(action?.kind === "write-report");
+			assert.deepEqual(action.report.sections.find((each) => each.title === "Waiting on you")?.lines, [
+				"`req-0000000a`: answer dev-1's `Bash` prompt in dev-1's terminal (`/team attach dev-1`)",
+			]);
+		});
+	});
+
+	it("logs every answer, rule and grant with its Task for the next Report's Decided for you", () => {
+		const question = applied(held, asked(2, "req-0000000b", "AskUserQuestion", QUESTIONS));
+		const answered = applied(
+			applied(question, answer("req-0000000a", { decision: "allow", reason: "the Brief asks for a dry run", rule: "Bash(npm publish --dry-run:*)", grant: "publish-dry-run" })),
+			answer("req-0000000b", { answers: { "Which store should the renamed key live in?": "Redis", "Which callers should move now?": ["api", "worker"] } }),
+		);
+
+		const result = run(answered, { kind: "report", headline: "On track.", criteria: ["AC1"], modes: [], at: "2026-11-02T12:00:00.000Z" });
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "write-report");
+		assert.ok(action?.kind === "write-report");
+		assert.deepEqual(action.report.sections.find((each) => each.title === "Decided for you")?.lines, [
+			"11:50 allowed dev-1's `Bash` `npm publish --dry-run`: the Brief asks for a dry run (Task `rename`)",
+			"11:50 added session rule `Bash(npm publish --dry-run:*)` for dev-1 (Task `rename`)",
+			"11:50 used grant `publish-dry-run` for dev-1's `Bash` (Task `rename`)",
+			'11:50 answered dev-1\'s "Which store should the renamed key live in?": Redis; "Which callers should move now?": api, worker (Task `rename`)',
+		]);
+	});
+});
+
 describe("reporting", () => {
 	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
 	const planned = applied(approved, {
@@ -1584,5 +1803,118 @@ describe("usage readings", () => {
 		assert.equal(freshStatusLine(fold(staffed), Date.parse("2026-11-02T11:30:00.000Z")), false);
 		assert.equal(freshStatusLine(read, Date.parse("2026-11-02T11:30:59.000Z")), true);
 		assert.equal(freshStatusLine(read, Date.parse("2026-11-02T11:31:00.000Z")), false);
+	});
+});
+
+describe("an isolated Task", () => {
+	const WORKSPACE = { kind: "git-worktree", path: "/work/app/.claude/worktrees/team-software-2026-11-02", branch: "team/software-2026-11-02", base: "c".repeat(40), from: "main" } as const;
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", workspace: WORKSPACE, at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] },
+			{ slug: "docs", role: "dev", goal: "Document it.", criteria: ["AC1"] },
+		],
+		criteria: ["AC1"],
+		roles: ["dev"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+	const T0 = "2026-11-02T11:30:00.000Z";
+	const TASKS = "/agent/team/efforts/software-2026-11-02/tasks";
+	const INBOX = { socket: "/tmp/cc-socks/dev-1.sock", token: "token-dev-1" };
+
+	/** Play `id`'s round to a Stop with its result written, its SessionStart first. */
+	function done(lines: EffortLine[], id: string): EffortLine[] {
+		const due = currentResult(fold(lines), id);
+		const result = { path: `${TASKS}/${due?.folder}/result-${due?.round}.md`, written: true };
+		const started = applied(lines, {
+			kind: "journal",
+			teammate: id,
+			cursor: 1,
+			line: { from: "hook", at: T0, event: "SessionStart", payload: { session_id: `${id.padEnd(8, "0")}-0000-4000-8000-000000000001`, source: "startup" }, inbox: INBOX },
+			result,
+		});
+		return applied(started, { kind: "journal", teammate: id, cursor: 2, line: { from: "hook", at: T0, event: "Stop", payload: {} }, result });
+	}
+
+	function review(lines: EffortLine[], slug: string, at = "2026-11-02T13:00:00.000Z"): Extract<EffortInput, { kind: "review" }> {
+		const task = fold(lines).tasks[slug];
+		return { kind: "review", slug, verdict: "accept", result: { path: `${TASKS}/${task?.folder}/result-${task?.round}.md`, written: true }, sendBackLimit: 2, at };
+	}
+
+	it("gets a worktree and branch of its own beside the Workspace, cut from the Effort branch, before its Teammate launches there", () => {
+		const result = run(planned, { kind: "handoff", slug: "rename", isolated: true, at: T0 });
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const worktree = { path: "/work/app/.claude/worktrees/team-software-2026-11-02-task-001", branch: "team/software-2026-11-02-task-001" };
+		assert.deepEqual(result.append[1], { type: "task-handed-off", slug: "rename", folder: "001-dev-rename", role: "dev", teammate: "dev-1", at: T0, round: 1, worktree });
+		assert.deepEqual(
+			result.actions.map((action) => action.kind),
+			["write-task", "add-task-workspace", "launch-teammate", "write-plan"],
+		);
+		assert.deepEqual(result.actions[1], { kind: "add-task-workspace", slug: "rename", ...worktree, from: "team/software-2026-11-02" });
+		assert.equal(workdir(result.state, "dev-1"), worktree.path);
+		assert.match(result.reply ?? "", /team\/software-2026-11-02-task-001/);
+	});
+
+	it("never goes to a reused Teammate, whose working directory is elsewhere", () => {
+		const renamed = done(applied(planned, { kind: "handoff", slug: "rename", at: T0 }), "dev-1");
+		const accepted = applied(renamed, review(renamed, "rename"));
+
+		const result = run(accepted, { kind: "handoff", slug: "docs", isolated: true, at: "2026-11-02T14:00:00.000Z" });
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.equal(result.state.tasks.docs.teammate, "dev-2");
+		assert.equal(workdir(result.state, "dev-1"), WORKSPACE.path);
+		assert.equal(workdir(result.state, "dev-2"), "/work/app/.claude/worktrees/team-software-2026-11-02-task-002");
+	});
+
+	it("records the merge as a write-ahead intent on accept, and accepts only once the merge is in, ending its Teammate and its worktree", () => {
+		const inReview = done(applied(planned, { kind: "handoff", slug: "rename", isolated: true, at: T0 }), "dev-1");
+
+		const intent = run(inReview, review(inReview, "rename"));
+
+		assert.ok(intent.ok, intent.ok ? "" : intent.refusal);
+		assert.deepEqual(intent.append, [
+			{ type: "merge-intended", slug: "rename", branch: "team/software-2026-11-02-task-001", into: "team/software-2026-11-02", at: "2026-11-02T13:00:00.000Z" },
+		]);
+		assert.deepEqual(intent.actions, [
+			{ kind: "merge", slug: "rename", folder: "001-dev-rename", path: "/work/app/.claude/worktrees/team-software-2026-11-02-task-001", branch: "team/software-2026-11-02-task-001", into: WORKSPACE.path },
+		]);
+		assert.equal(taskStatus(intent.state, "rename"), "in review");
+		assert.deepEqual(openMerges(intent.state), [{ slug: "rename", branch: "team/software-2026-11-02-task-001", into: "team/software-2026-11-02" }]);
+		const merging = [...inReview, ...intent.append];
+		assert.match(refusal(merging, review(merging, "rename")), /merge .*under way/);
+
+		const merged = run(merging, { kind: "merge-result", slug: "rename", commit: "d".repeat(40), at: "2026-11-02T13:00:01.000Z" });
+
+		assert.ok(merged.ok, merged.ok ? "" : merged.refusal);
+		assert.deepEqual(merged.append, [
+			{ type: "task-accepted", slug: "rename", round: 1, merge: "d".repeat(40), at: "2026-11-02T13:00:01.000Z" },
+			{ type: "teammate-ended", teammate: "dev-1", how: "stopped", at: "2026-11-02T13:00:01.000Z" },
+		]);
+		assert.deepEqual(merged.actions, [
+			{ kind: "stop-teammate", teammate: "dev-1", shortId: "dev-1000" },
+			{ kind: "remove-task-workspace", slug: "rename", path: "/work/app/.claude/worktrees/team-software-2026-11-02-task-001", branch: "team/software-2026-11-02-task-001" },
+			{ kind: "write-plan" },
+		]);
+		assert.equal(taskStatus(merged.state, "rename"), "accepted");
+		assert.deepEqual(openMerges(merged.state), []);
+		assert.match(merged.reply ?? "", /^Accepted Task `rename`.*merged `team\/software-2026-11-02-task-001` into `team\/software-2026-11-02`/);
+	});
+
+	it("leaves the Task in review when the merge fails, closing the intent so the Lead can decide again", () => {
+		const inReview = done(applied(planned, { kind: "handoff", slug: "rename", isolated: true, at: T0 }), "dev-1");
+		const merging = applied(inReview, review(inReview, "rename"));
+
+		const failed = run(merging, { kind: "merge-result", slug: "rename", error: "conflict in config.ts", at: "2026-11-02T13:00:01.000Z" });
+
+		assert.ok(failed.ok, failed.ok ? "" : failed.refusal);
+		assert.deepEqual(failed.append, [{ type: "merge-failed", slug: "rename", reason: "conflict in config.ts", at: "2026-11-02T13:00:01.000Z" }]);
+		assert.deepEqual(failed.actions, []);
+		assert.equal(taskStatus(failed.state, "rename"), "in review");
+		assert.deepEqual(openMerges(failed.state), []);
+		const after = [...merging, ...failed.append];
+		assert.equal(run(after, review(after, "rename", "2026-11-02T13:10:00.000Z")).ok, true);
 	});
 });
