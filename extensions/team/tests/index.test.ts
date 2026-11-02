@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { join, relative } from "node:path";
 import { describe, it } from "node:test";
@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { CLEAR_MARKER, HOOK_SCRIPT } from "../claude.ts";
 import { registerTeam } from "../index.ts";
-import { commit, type FakeHookStep, fakeClaude, git, gitRepo, goodTeam, roleMd, type TempRoots, teamMd, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
+import { commit, type FakeHookStep, fakeClaude, fakeTmux, git, gitRepo, goodTeam, ownStdio, roleMd, type TempRoots, teamMd, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
 
 const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 
@@ -42,8 +42,31 @@ interface Dialog {
 interface RegisteredTool {
 	name: string;
 	defaultActive?: boolean;
-	execute(id: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: unknown): Promise<{ content: { type: string; text: string }[] }>;
+	execute(id: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: unknown): Promise<ToolResult>;
+	renderResult?(result: ToolResult, options: { expanded: boolean; isPartial: boolean }, theme: unknown, context: unknown): Drawn;
 }
+
+/** What a tool returns: `content` is what the Lead reads, `details` only the human's view. */
+interface ToolResult {
+	content: { type: string; text: string }[];
+	details?: unknown;
+}
+
+/** Anything pi draws: a tool result's view, or an overlay. */
+interface Drawn {
+	render(width: number): string[];
+	handleInput?(data: string): void;
+}
+
+/** An overlay the extension opened, drawn and handed keys as the human would, and whether it has closed. */
+interface Overlay {
+	view: Drawn;
+	options: unknown;
+	closed: boolean;
+}
+
+/** pi's theme with its colours taken out, so what the extension draws reads as plain text. */
+const PLAIN_THEME = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 
 /** A widget the extension set above the editor, or cleared with `lines` undefined. */
 interface Widget {
@@ -80,6 +103,12 @@ function fakePi(
 		/** The pid the extension takes the Lead as, standing in for another pi process. */
 		pid?: number;
 		hasUI?: boolean;
+		/** pi's mode; `tui` unless set. */
+		mode?: "tui" | "rpc" | "json" | "print";
+		/** The environment the extension reads, `$TMUX` among it; empty unless set, whatever the test runner's is. */
+		env?: Record<string, string | undefined>;
+		/** The exit code of the fake `claude attach`. */
+		attachExit?: number;
 	} = {},
 ) {
 	const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
@@ -95,7 +124,10 @@ function fakePi(
 	const sessionFile = options.sessionFile ?? join(roots.scratch, "session.jsonl");
 	const widgets: Widget[] = [];
 	const sleeps: number[] = [];
+	const overlays: Overlay[] = [];
 	const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
+	const copied: string[] = [];
+	const tuiEvents: string[] = [];
 	const pi = {
 		on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -120,7 +152,8 @@ function fakePi(
 		},
 		getSettings: () => structuredClone(options.settings ?? {}),
 	};
-	const claude = fakeClaude(roots, { version: options.claudeVersion, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies });
+	const claude = fakeClaude(roots, { version: options.claudeVersion, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies, attachExit: options.attachExit });
+	const tmux = fakeTmux(roots);
 	registerTeam(pi as unknown as ExtensionAPI, {
 		agentDir: roots.agentDir,
 		claudeConfigPath: roots.claudeConfigPath,
@@ -130,7 +163,23 @@ function fakePi(
 		sleep: async (ms: number) => {
 			sleeps.push(ms);
 		},
+		env: options.env ?? {},
+		tmuxPath: tmux.path,
+		async copy(text) {
+			copied.push(text);
+		},
 	});
+	/**
+	 * pi's TUI as `ctx.ui.custom` hands it to a factory. Each call is recorded
+	 * with how many `claude attach` runs the fake had seen by then, so a test
+	 * sees what happened before and after the attach.
+	 */
+	const tui = {
+		stop: () => tuiEvents.push(`stop, ${claude.attaches().length} attached`),
+		start: () => tuiEvents.push(`start, ${claude.attaches().length} attached`),
+		requestRender: (force?: boolean) => tuiEvents.push(`requestRender(${force === true})`),
+		terminal: { rows: 40, columns: 100, write: (data: string) => tuiEvents.push(`write ${JSON.stringify(data)}`) },
+	};
 	function answer(kind: Dialog["kind"], title: string, choices?: string[]) {
 		assert.ok(answers.length > 0, `the extension opened a ${kind} dialog "${title}" the test has no answer for`);
 		const played = answers.shift();
@@ -139,6 +188,7 @@ function fakePi(
 	}
 	const ctx = {
 		hasUI: options.hasUI ?? true,
+		mode: options.mode ?? "tui",
 		cwd: options.cwd ?? roots.scratch,
 		isIdle: () => !options.streaming,
 		sessionManager: {
@@ -167,6 +217,23 @@ function fakePi(
 			setWidget(key: string, lines: string[] | undefined, widgetOptions?: { placement?: string }) {
 				widgets.push({ key, lines, placement: widgetOptions?.placement });
 			},
+			// As pi does, the promise settles with what `done` is given; a component never shown once `done` has run.
+			custom<T>(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: T) => void) => unknown, customOptions?: unknown): Promise<T> {
+				return new Promise<T>((settle, fail) => {
+					const overlay: Overlay = { view: { render: () => [] }, options: customOptions, closed: false };
+					const made = factory(tui, PLAIN_THEME, {}, (result) => {
+						overlay.closed = true;
+						settle(result);
+					});
+					if (made instanceof Promise) {
+						made.catch(fail);
+						return;
+					}
+					// A component drawn at once is an overlay a test can read and hand keys to.
+					overlay.view = made as Drawn;
+					overlays.push(overlay);
+				});
+			},
 		},
 	} as unknown as ExtensionCommandContext;
 
@@ -183,8 +250,15 @@ function fakePi(
 		widgets,
 		/** Each wait the extension asked for, in ms, oldest first; none really waits. */
 		sleeps,
+		/** Every overlay the extension opened, oldest first. */
+		overlays,
 		activeTools: () => [...activeTools],
 		claude,
+		tmux,
+		/** Every command the extension put on the clipboard, oldest first. */
+		copied,
+		/** What the extension did with pi's TUI, oldest first. */
+		tuiEvents,
 		/** Queue the human's answers to the next dialogs, in order. */
 		answer(...played: (string | boolean | undefined)[]) {
 			answers.push(...played);
@@ -212,6 +286,33 @@ function fakePi(
 			const result = await tool.execute("call-1", params, undefined, undefined, ctx);
 			return result.content.map((part) => part.text).join("\n");
 		},
+		/** Call one of the Lead's tools and keep its whole result, the human's view of it included. */
+		async result(name: string, params: Record<string, unknown>): Promise<ToolResult> {
+			const tool = tools.get(name);
+			assert.ok(tool, `expected a \`${name}\` tool`);
+			return tool.execute("call-1", params, undefined, undefined, ctx);
+		},
+		/** Draw a tool's result the way pi does in chat, collapsed unless `expanded`, as plain lines. */
+		drawResult(name: string, result: ToolResult, expanded: boolean, width = 100): string[] {
+			const render = tools.get(name)?.renderResult;
+			assert.ok(render, `\`${name}\` draws its result with pi's generic view`);
+			return render(result, { expanded, isPartial: false }, PLAIN_THEME, ctx)
+				.render(width)
+				.map((line) => line.trimEnd());
+		},
+		/**
+		 * Run `/team <args>` while it waits on an overlay: resolves once the
+		 * command opened one, with the command still running until it closes.
+		 */
+		async teamOpening(args: string): Promise<{ overlay: Overlay; done: Promise<void> }> {
+			const command = commands.get("team");
+			assert.ok(command, "expected a `team` command");
+			const before = overlays.length;
+			const done = command.handler(args, ctx);
+			for (let tick = 0; tick < 200 && overlays.length === before; tick++) await new Promise((resolve) => setImmediate(resolve));
+			assert.ok(overlays.length > before, `\`/team ${args}\` opened no overlay`);
+			return { overlay: overlays[before], done };
+		},
 	};
 }
 
@@ -223,15 +324,15 @@ describe("/team", () => {
 		assert.match(pi.commands.get("team")?.description ?? "", /start/);
 	});
 
-	it("names the subcommands when given one it doesn't know, or none", async () => {
+	it("names the subcommands when given one it doesn't know, or none while there is nothing to attach to", async () => {
 		const pi = fakePi(tempRoots());
 
 		await pi.team("launch software");
 		await pi.team("");
 
 		assert.deepEqual(pi.notifications, [
-			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `resume`.", type: "error" },
-			{ message: "`/team` needs a subcommand. Subcommands: `start`, `setup`, `pending`, `resume`.", type: "error" },
+			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`, `attach`.", type: "error" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`, `attach`.", type: "info" },
 		]);
 	});
 });
@@ -676,7 +777,7 @@ describe("/team start on a Team with no adopted Playbook", () => {
 
 		assert.match(pi.notifications.at(-1)?.message ?? "", /^Team `software` picked: .*Playbook: adopted 2026-11-02T10:00:00\.000Z.* Effort `software-2026-11-02` opened/);
 		assert.equal(pi.sent.at(-1)?.customType, "team-intake");
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report"]);
 	});
 
 	it("goes back through setup when the adopted Playbook was edited by hand", async () => {
@@ -759,7 +860,7 @@ describe("intake: `/team start` on a Team with an adopted Playbook", () => {
 		for (const needed of [join(dir, "brief.draft.md"), sha(INTAKE_PLAYBOOK), `repo: ${repo}`, "Constraints", "small-diffs", "**AC1**", "`team_request_approval`", "`brief`"]) {
 			assert.ok(woken?.content.includes(needed), `the intake prompt doesn't mention ${needed}:\n${woken?.content}`);
 		}
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report"]);
 	});
 
 	it("gives each Effort its own id, so a second one the same day is numbered", async () => {
@@ -1282,7 +1383,12 @@ function crewBrief(repo: string): string {
  * A session whose `crew` Effort has its Brief approved: a user Team whose
  * Roles set every launch flag between them, on {@link CREW_PLAYBOOK}.
  */
-async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown> } = {}) {
+async function crewApproved(
+	options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown> } & Pick<
+		NonNullable<Parameters<typeof fakePi>[1]>,
+		"mode" | "env" | "attachExit"
+	> = {},
+) {
 	const roots = tempRoots();
 	const plugin = join(roots.scratch, "plugins", "lint");
 	writeUserTeam(roots, "crew", {
@@ -1306,7 +1412,16 @@ async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; 
 	});
 	adopt(roots, "crew", CREW_PLAYBOOK);
 	const repo = gitRepo(roots);
-	const pi = fakePi(roots, { cwd: repo, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies, settings: options.settings });
+	const pi = fakePi(roots, {
+		cwd: repo,
+		bgExit: options.bgExit,
+		hooks: options.hooks,
+		replies: options.replies,
+		settings: options.settings,
+		mode: options.mode,
+		env: options.env,
+		attachExit: options.attachExit,
+	});
 	await pi.team("start crew");
 	const dir = effortDir(roots, CREW_EFFORT_ID);
 	writeFileSync(join(dir, "brief.draft.md"), crewBrief(repo));
@@ -2018,7 +2133,7 @@ describe("the Team block", () => {
 			"╭─ Team · crew · crew-2026-11-02 ─────────────────────────────────── 1 live ─╮",
 			"│ ● running  ·  working · 0/3 Tasks accepted                                 │",
 			"│ builder-1  c0ffee12  busy  001-builder-rename-key  ctx —  auto≠acceptEdits │",
-			"│ nothing waiting on you   reports 0                                         │",
+			"│ nothing waiting on you   reports 0   attach  /team                         │",
 			"╰────────────────────────────────────────────────────────────────────────────╯",
 		]);
 		assert.deepEqual(JSON.parse(await pi.call("team_status", {})), {
@@ -2048,6 +2163,155 @@ describe("the Team block", () => {
 		assert.match(block[0], / 3 live ─╮$/);
 		assert.match(block[2], /^│ builder-1 /);
 		assert.match(block[3], /^│ \+2 more Teammates +│$/);
+	});
+});
+
+/** The crew Effort planned, its plan Report written, and `rename-key` handed off. */
+async function crewReported() {
+	const crew = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+	await crew.pi.call("team_plan", { tasks: CREW_PLAN });
+	await crew.pi.call("team_report", { headline: "Planned three Tasks.", coverage: [{ criterion: "AC1", note: "`rename-key` covers it." }] });
+	await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+	return crew;
+}
+
+describe("reporting: team_report", () => {
+	it("writes the plan Report as reports/001.md with the logged sections, and tells the Lead only where it went", async () => {
+		const { pi, dir } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		const reply = await pi.call("team_report", {
+			headline: "Planned three Tasks.",
+			coverage: [
+				{ criterion: "AC1", note: "`rename-key` covers it." },
+				{ criterion: "AC2", note: "`check-old-configs` covers it." },
+			],
+		});
+
+		assert.equal(reply, "Report 1 of Effort `crew-2026-11-02` is written as reports/001.md. The human sees it in chat, so don't repeat it.");
+		const written = readFileSync(join(dir, "reports", "001.md"), "utf8");
+		for (const needed of [
+			"# Report 1 · Effort `crew-2026-11-02`",
+			"Planned three Tasks.",
+			"## Brief coverage",
+			"- AC1: `rename-key` covers it.",
+			"## Since the last Report",
+			"planned 3 Tasks",
+			"## Plan",
+			"## Teammate modes",
+			"- builder: acceptEdits",
+			"- reviewer: dontAsk",
+		]) {
+			assert.ok(written.includes(needed), `reports/001.md doesn't say ${needed}:\n${written}`);
+		}
+		assert.equal(written.includes("## Waiting on you"), false, `an empty section is left out:\n${written}`);
+	});
+
+	it("writes the next Report as reports/002.md, covering only what happened since the first", async () => {
+		const { pi, dir } = await crewReported();
+
+		await pi.call("team_report", { headline: "`rename-key` is with builder-1." });
+
+		assert.deepEqual(readdirSync(join(dir, "reports")).sort(), ["001.md", "002.md"]);
+		const second = readFileSync(join(dir, "reports", "002.md"), "utf8");
+		assert.ok(second.includes("# Report 2"), second);
+		assert.ok(second.includes("handed Task `rename-key` to builder-1"), second);
+		assert.equal(second.includes("planned 3 Tasks"), false, second);
+		assert.equal(second.includes("## Teammate modes"), false, second);
+		assert.equal(second.includes("## Brief coverage"), false, `no coverage was given:\n${second}`);
+	});
+
+	it("shows in chat collapsed to its headline, and whole when expanded", async () => {
+		const { pi } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		const result = await pi.result("team_report", { headline: "Planned three Tasks.", coverage: [{ criterion: "AC1", note: "`rename-key` covers it." }] });
+
+		const collapsed = pi.drawResult("team_report", result, false);
+		assert.equal(collapsed.length, 1, collapsed.join("\n"));
+		assert.match(collapsed[0], /Report 1 · Planned three Tasks\./);
+		const expanded = pi.drawResult("team_report", result, true).join("\n");
+		for (const needed of ["Planned three Tasks.", "AC1: `rename-key` covers it.", "Teammate modes", "builder: acceptEdits"]) {
+			assert.ok(expanded.includes(needed), `the expanded Report doesn't say ${needed}:\n${expanded}`);
+		}
+	});
+
+	it("is refused before the human approves the Brief, writing nothing", async () => {
+		const { roots, pi } = intakeSession();
+		await pi.team("start software");
+
+		await assert.rejects(pi.call("team_report", { headline: "Nothing yet." }), /no approved Brief yet/);
+		assert.equal(existsSync(join(effortDir(roots), "reports")), false);
+	});
+
+	it("counts the Reports in the Team block and in `team_status`", async () => {
+		const { pi } = await crewReported();
+
+		assert.match(teamBlock(pi)?.at(-2) ?? "", /reports 1 {2}\/team reports/);
+		assert.equal(JSON.parse(await pi.call("team_status", {})).reports, 1);
+	});
+});
+
+describe("/team report", () => {
+	it("wakes the Lead to write a Report covering everything since the last one", async () => {
+		const { pi } = await crewReported();
+
+		await pi.team("report");
+
+		const woken = pi.sent.at(-1);
+		assert.equal(woken?.customType, "team-report-request");
+		assert.equal(woken?.triggerTurn, true);
+		assert.match(woken?.content ?? "", /`team_report`/);
+		assert.match(woken?.content ?? "", /since the last Report/);
+	});
+
+	it("says there is nothing to report on without an Effort whose Brief is approved", async () => {
+		const pi = fakePi(tempRoots());
+
+		await pi.team("report");
+
+		assert.deepEqual(pi.sent, []);
+		assert.equal(pi.notifications.at(-1)?.type, "error");
+		assert.match(pi.notifications.at(-1)?.message ?? "", /No Effort/);
+	});
+});
+
+describe("/team reports", () => {
+	it("lists the Reports newest first and opens the chosen one in an overlay, closed with escape", async () => {
+		const { pi } = await crewReported();
+		await pi.call("team_report", { headline: "`rename-key` is with builder-1." });
+		pi.answer("Report 1 · 10:00 · Planned three Tasks.");
+
+		const { overlay, done } = await pi.teamOpening("reports");
+
+		assert.deepEqual(pi.dialogs.at(-1)?.options, ["Report 2 · 10:00 · `rename-key` is with builder-1.", "Report 1 · 10:00 · Planned three Tasks."]);
+		const drawn = overlay.view.render(100).join("\n");
+		assert.ok(drawn.includes("# Report 1 · Effort `crew-2026-11-02`"), drawn);
+		assert.ok(drawn.includes("builder: acceptEdits"), drawn);
+		assert.equal(overlay.closed, false);
+		overlay.view.handleInput?.("\x1b");
+		await done;
+		assert.equal(overlay.closed, true);
+	});
+
+	it("says when there are none yet", async () => {
+		const { pi } = await crewApproved();
+
+		await pi.team("reports");
+
+		assert.deepEqual(pi.notifications.at(-1), { message: "No Reports yet for Effort `crew-2026-11-02`.", type: "info" });
+	});
+
+	it("names the chosen Report's file outside pi's terminal, where there is no overlay to open", async () => {
+		const { pi, dir } = await crewApproved({ mode: "rpc" });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_report", { headline: "Planned three Tasks." });
+		pi.answer("Report 1 · 10:00 · Planned three Tasks.");
+
+		await pi.team("reports");
+
+		assert.deepEqual(pi.overlays, []);
+		assert.deepEqual(pi.notifications.at(-1), { message: `Report 1 is ${join(dir, "reports", "001.md")}.`, type: "info" });
 	});
 });
 
@@ -2208,7 +2472,7 @@ describe("re-attaching: `pi -c`, `/resume` back and `/reload`", () => {
 			assert.equal(lead.stoppedAt, undefined);
 			assert.equal(typeof lead.port, "number");
 			assert.equal(lead.sessionFile, join(roots.scratch, "session.jsonl"));
-			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status"]);
+			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report"]);
 			assert.deepEqual(again.entries, []);
 			assert.deepEqual(again.notifications, [{ message: `This session leads Effort \`${EFFORT_ID}\` (${dir}) again.`, type: "info" }]);
 			assert.deepEqual(again.sent, []);
@@ -2353,5 +2617,141 @@ describe("moving in the tree: `/tree`", () => {
 		await pi.emit("session_tree", { newLeafId: "e1" });
 
 		assert.deepEqual(pi.sent, []);
+	});
+});
+
+/** The menu entry, and the picker row, of the Teammate {@link attachable} hands off. */
+const BUILDER_ROW = "builder-1  c0ffee12  busy  001-builder-rename-key";
+
+/** A crew Effort with `builder-1` handed `rename-key` and its session started as short id `c0ffee12`. */
+async function attachable(options: Pick<NonNullable<Parameters<typeof fakePi>[1]>, "mode" | "env" | "attachExit"> = {}) {
+	const approved = await crewApproved({
+		...options,
+		hooks: [
+			{ event: "SessionStart", payload: { source: "startup", session_id: "c0ffee12-0000-4000-8000-000000000001", permission_mode: "acceptEdits" } },
+			{ event: "UserPromptSubmit", payload: { prompt: "New Task `rename-key`", permission_mode: "acceptEdits" } },
+		],
+	});
+	await approved.pi.call("team_plan", { tasks: CREW_PLAN });
+	await approved.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+	approved.pi.dialogs.length = 0;
+	approved.pi.notifications.length = 0;
+	return approved;
+}
+
+function attachedLines(dir: string): Record<string, unknown>[] {
+	return effortLines(dir).filter((line) => line.type === "teammate-attached");
+}
+
+describe("/team attach [id]", () => {
+	it("picks a live Teammate, then attaches here: the TUI stops, the Ctrl+Z hint, `claude attach` on pi's own terminal, the TUI back and a toast", async () => {
+		const { pi, dir } = await attachable();
+		pi.answer(BUILDER_ROW, "Attach here");
+
+		await pi.team("");
+
+		assert.deepEqual(pi.dialogs, [
+			{ kind: "select", title: "Attach to which Teammate?", options: [BUILDER_ROW], answer: BUILDER_ROW },
+			{ kind: "select", title: "builder-1 (c0ffee12)", options: ["Attach here", "Copy the command"], answer: "Attach here" },
+		]);
+		assert.deepEqual(pi.tuiEvents, [
+			"stop, 0 attached",
+			`write ${JSON.stringify("\nAttaching to builder-1 (c0ffee12). Ctrl+Z returns to pi.\n\n")}`,
+			"start, 1 attached",
+			"requestRender(true)",
+		]);
+		assert.deepEqual(pi.claude.attaches(), [{ argv: ["attach", "c0ffee12"], stdio: ownStdio() }]);
+		assert.deepEqual(pi.notifications, [{ message: "Back in pi from `builder-1` (c0ffee12).", type: "info" }]);
+		assert.deepEqual(attachedLines(dir), [{ type: "teammate-attached", teammate: "builder-1", shortId: "c0ffee12", at: NOW.toISOString() }]);
+	});
+
+	it("skips the picker for a Teammate it is given, and says so when `claude attach` fails", async () => {
+		const { pi } = await attachable({ attachExit: 1 });
+		pi.answer("Attach here");
+
+		await pi.team("attach builder-1");
+
+		assert.deepEqual(
+			pi.dialogs.map((dialog) => dialog.title),
+			["builder-1 (c0ffee12)"],
+		);
+		assert.deepEqual(pi.tuiEvents.slice(-2), ["start, 1 attached", "requestRender(true)"]);
+		assert.deepEqual(pi.notifications, [{ message: "`claude attach c0ffee12` exited with code 1; back in pi.", type: "warning" }]);
+	});
+
+	it("opens a tmux window running `claude attach` only inside tmux, and copies the exact command", async () => {
+		const { pi, dir } = await attachable({ env: { TMUX: "/tmp/tmux-501/default,4242,0" } });
+		const command = `${pi.claude.path} attach c0ffee12`;
+		pi.answer("Open in a tmux window");
+
+		await pi.team("attach builder-1");
+
+		assert.deepEqual(pi.dialogs[0]?.options, ["Attach here", "Open in a tmux window", "Copy the command"]);
+		assert.deepEqual(pi.tmux.calls(), [["new-window", "-n", "builder-1", command]]);
+		assert.deepEqual(pi.tuiEvents, []);
+		assert.deepEqual(pi.notifications, [{ message: "Opened `builder-1` in a new tmux window.", type: "info" }]);
+
+		pi.answer(BUILDER_ROW, "Copy the command");
+		await pi.team("attach");
+
+		assert.deepEqual(pi.copied, [command]);
+		assert.deepEqual(pi.notifications.at(-1), { message: `Copied \`${command}\`.`, type: "info" });
+		assert.equal(pi.claude.attaches().length, 0);
+		// The same short id twice is one record.
+		assert.equal(attachedLines(dir).length, 1);
+	});
+
+	it("shows the command instead outside the TUI, and still records it", async () => {
+		const { pi, dir } = await attachable({ mode: "rpc" });
+
+		await pi.team("attach builder-1");
+
+		assert.deepEqual(pi.dialogs, []);
+		assert.deepEqual(pi.notifications, [{ message: `Attach to \`builder-1\` from a terminal: ${pi.claude.path} attach c0ffee12`, type: "info" }]);
+		assert.equal(pi.claude.attaches().length, 0);
+		assert.equal(attachedLines(dir).length, 1);
+	});
+
+	it("clears a Teammate's `(new)` mark once the human uses the menu on it", async () => {
+		const { pi, dir } = await attachable();
+		appendFileSync(
+			join(dir, "effort.jsonl"),
+			`${JSON.stringify({ type: "teammate-session", teammate: "builder-1", cursor: 3, source: "startup", sessionId: "k3l4m5n6-0000", shortId: "k3l4m5n6", at: NOW.toISOString() })}\n`,
+		);
+		assert.equal(JSON.parse(await pi.call("team_status", {})).teammates[0].newShortId, true);
+		pi.answer("builder-1  k3l4m5n6 (new)  busy  001-builder-rename-key", "Copy the command");
+
+		await pi.team("");
+
+		assert.deepEqual(pi.copied, [`${pi.claude.path} attach k3l4m5n6`]);
+		assert.equal(JSON.parse(await pi.call("team_status", {})).teammates[0].newShortId, undefined);
+		assert.equal(teamBlock(pi)?.some((line) => line.includes("(new)")), false);
+		assert.deepEqual(attachedLines(dir).at(-1), { type: "teammate-attached", teammate: "builder-1", shortId: "k3l4m5n6", at: NOW.toISOString() });
+	});
+
+	it("records nothing when the human backs out of the picker or the menu", async () => {
+		const { pi, dir } = await attachable();
+		pi.answer(undefined);
+		await pi.team("");
+		pi.answer(undefined);
+		await pi.team("attach builder-1");
+
+		assert.equal(attachedLines(dir).length, 0);
+		assert.deepEqual(pi.claude.attaches(), []);
+		assert.deepEqual(pi.notifications, []);
+	});
+
+	it("names what there is to attach to when there is nothing, or no such Teammate", async () => {
+		const pi = fakePi(tempRoots());
+		await pi.team("");
+		await pi.team("attach builder-1");
+		const { pi: leading } = await attachable();
+		await leading.team("attach qa-1");
+
+		assert.deepEqual(pi.notifications, [
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`, `attach`.", type: "info" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`, `attach`.", type: "info" },
+		]);
+		assert.deepEqual(leading.notifications, [{ message: "There is no Teammate `qa-1` with a session to attach to. Teammates with one: `builder-1`.", type: "error" }]);
 	});
 });

@@ -47,6 +47,8 @@ export interface TeammateRow {
 	role: string;
 	/** The id `claude attach` takes; absent until its first `SessionStart`. */
 	shortId?: string;
+	/** Set while {@link shortId} is one a new session gave it and the human hasn't attached to through pi: shown `(new)`. */
+	newShortId?: boolean;
 	/** `starting` until a prompt first lands, then `busy` or `idle`. */
 	activity: "starting" | "busy" | "idle";
 	/** The Task in its context: its folder once handed off. */
@@ -116,7 +118,7 @@ export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockD
 		teammates: state.teammates.filter((teammate) => teammate.retiredAt === undefined).map((teammate) => teammateRow(state, teammate)),
 		queued: state.queue.map((queued) => ({ task: queued.folder, role: queued.role, why: queued.why })),
 		waitingOnYou: state.pending.length + extras.adoptionsPending,
-		reports: 0,
+		reports: state.reports,
 	};
 }
 
@@ -127,6 +129,7 @@ function teammateRow(state: EffortState, teammate: Teammate): TeammateRow {
 		id: teammate.id,
 		role: teammate.role,
 		...(teammate.shortId === undefined ? {} : { shortId: teammate.shortId }),
+		...(teammate.newShortId ? { newShortId: true } : {}),
 		activity: teammate.activity ?? "starting",
 		task: state.tasks[teammate.task]?.folder ?? teammate.task,
 		...(teammate.activity === "idle" && teammate.doing !== undefined ? { doing: teammate.doing } : {}),
@@ -172,7 +175,7 @@ function teammateRows(data: TeamBlockData, _now: number, options: BlockOptions, 
 	const rows = data.teammates.length > cap ? data.teammates.slice(0, cap - 1) : data.teammates;
 	const hidden = data.teammates.length - rows.length;
 	const ids = column(rows.map((row) => clip(oneLine(row.id), MAX_ID)));
-	const shorts = column(rows.map((row) => oneLine(row.shortId ?? "—")));
+	const shorts = column(rows.map((row) => oneLine(row.shortId === undefined ? "—" : row.newShortId ? `${row.shortId} (new)` : row.shortId)));
 	const activities = column(rows.map((row) => row.activity));
 	const ctxs = column(rows.map((row) => (row.ctx === undefined ? "ctx —" : `ctx ${Math.round(row.ctx)}%`)));
 	const modes = rows.map((row) => oneLine(row.launchMode === undefined || row.launchMode === row.mode ? (row.mode ?? "") : `${row.mode ?? "?"}≠${row.launchMode}`));
@@ -195,7 +198,11 @@ function queuedLines(data: TeamBlockData): string[] {
 
 function footerLine(data: TeamBlockData): string[] {
 	const waiting = data.waitingOnYou > 0 ? `▲ ${data.waitingOnYou} waiting on you  /team pending` : "nothing waiting on you";
-	return [`${waiting}   reports ${data.reports}`];
+	// Where to read them, once there are any.
+	const reports = data.reports > 0 ? `reports ${data.reports}  /team reports` : `reports ${data.reports}`;
+	// Attaching needs a short id, so the hint shows once a Teammate's session has started.
+	const attach = data.teammates.some((row) => row.shortId !== undefined) ? "   attach  /team" : "";
+	return [`${waiting}   ${reports}${attach}`];
 }
 
 /** Each cell padded to the widest in the column. */

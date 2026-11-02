@@ -53,7 +53,7 @@ describe("the Team block", () => {
 			"│ ● running  ·  working · 1/4 Tasks accepted                                                  │",
 			"│ architect-1  a1b2c3d4  idle  001-architect-design · round 1 done  ctx 18%  auto             │",
 			"│ dev-1        d4e5f6a7  busy  002-dev-ttl                          ctx —    acceptEdits≠auto │",
-			"│ ▲ 1 waiting on you  /team pending   reports 2                                               │",
+			"│ ▲ 1 waiting on you  /team pending   reports 2  /team reports   attach  /team                │",
 			"╰─────────────────────────────────────────────────────────────────────────────────────────────╯",
 		]);
 	});
@@ -91,14 +91,27 @@ describe("the Team block", () => {
 		);
 
 		assert.deepEqual(lines, [
-			"╭─ Team · software · flaky-cache ─────── 3 live ─╮",
-			"│ ● running  ·  working · 0/3 Tasks accepted     │",
-			"│ dev-1  a1b2c3d4  idle  001-dev-1-design  ctx — │",
-			"│ +2 more Teammates                              │",
-			"│ nothing waiting on you   reports 0             │",
-			"╰────────────────────────────────────────────────╯",
+			"╭─ Team · software · flaky-cache ─────────── 3 live ─╮",
+			"│ ● running  ·  working · 0/3 Tasks accepted         │",
+			"│ dev-1  a1b2c3d4  idle  001-dev-1-design  ctx —     │",
+			"│ +2 more Teammates                                  │",
+			"│ nothing waiting on you   reports 0   attach  /team │",
+			"╰────────────────────────────────────────────────────╯",
 		]);
 		assert.deepEqual(render(data({ teammates: [mate("dev-3", { shortId: undefined, activity: "starting", task: "003-dev-3-design" })] }))[2], "│ dev-3  —  starting  003-dev-3-design  ctx — │");
+	});
+
+	it("marks a short id the human hasn't attached to through pi `(new)`, and says how to attach once a Teammate has one", () => {
+		const lines = render(data({ teammates: [mate("dev-1"), mate("dev-2", { shortId: "k3l4m5n6", newShortId: true, activity: "busy", task: "003-dev-ttl" })] }));
+
+		assert.deepEqual(lines, [
+			"╭─ Team · software · flaky-cache ───────────── 2 live ─╮",
+			"│ ● running  ·  working · 1/4 Tasks accepted           │",
+			"│ dev-1  a1b2c3d4        idle  001-dev-1-design  ctx — │",
+			"│ dev-2  k3l4m5n6 (new)  busy  003-dev-ttl       ctx — │",
+			"│ nothing waiting on you   reports 0   attach  /team   │",
+			"╰──────────────────────────────────────────────────────╯",
+		]);
 	});
 
 	it("never gets wider than 96 columns, clipping every cell and flattening newlines, wide characters included, in plain lines RPC can take", () => {
@@ -251,5 +264,33 @@ describe("team_status data", () => {
 		const capped = through([REQUEST, APPROVE, PLAN, { ...handoff("design"), maxTeammates: 0 } as EffortInput]);
 
 		assert.equal(teamStatus(fold(capped), { adoptionsPending: 0 }).phase, "working");
+	});
+
+	it("counts the Reports written", () => {
+		const report = (at: string): EffortInput => ({ kind: "report", headline: "On track.", criteria: ["AC1"], modes: [], at });
+
+		assert.equal(teamStatus(fold(through([REQUEST, APPROVE, PLAN])), { adoptionsPending: 0 }).reports, 0);
+		assert.equal(teamStatus(fold(through([REQUEST, APPROVE, PLAN, report("2026-11-02T10:20:00.000Z"), report("2026-11-02T10:25:00.000Z")])), { adoptionsPending: 0 }).reports, 2);
+	});
+
+	it("rows a Teammate whose new session gave it a new short id as new, until the human attaches to it through pi", () => {
+		const opened = through([REQUEST, APPROVE, PLAN, handoff("design"), hook("architect-1", 1, "SessionStart", { source: "startup", permission_mode: "auto" })]);
+		const relaunched: EffortLine[] = [
+			...opened,
+			{ type: "teammate-session", teammate: "architect-1", cursor: 2, source: "startup", sessionId: "k3l4m5n6-0000", shortId: "k3l4m5n6", at: "2026-11-02T11:00:00.000Z" },
+		];
+
+		assert.deepEqual(teamStatus(fold(relaunched), { adoptionsPending: 0 }).teammates[0], {
+			id: "architect-1",
+			role: "architect",
+			shortId: "k3l4m5n6",
+			newShortId: true,
+			activity: "starting",
+			task: "001-architect-design",
+			mode: "auto",
+		});
+		const attached = step(fold(relaunched), { kind: "attach", teammate: "architect-1", at: "2026-11-02T11:10:00.000Z" });
+		assert.ok(attached.ok);
+		assert.equal(teamStatus(attached.state, { adoptionsPending: 0 }).teammates[0].newShortId, undefined);
 	});
 });

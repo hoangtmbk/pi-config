@@ -127,6 +127,7 @@ describe("the human's answer", () => {
 		assert.deepEqual(result.actions[0], { kind: "promote-brief", approval: fold(asked).pending[0], at: "2026-11-02T11:00:00.000Z" });
 		assert.equal(result.actions[1].kind, "wake-lead");
 		assert.match(result.actions[1].kind === "wake-lead" ? result.actions[1].text : "", /approved the Brief/);
+		assert.match(result.actions[1].kind === "wake-lead" ? result.actions[1].text : "", /`team_plan`.*the plan Report with `team_report`/);
 	});
 
 	it("lets Teammates start once the Brief is approved", () => {
@@ -937,5 +938,216 @@ describe("clearing between Tasks", () => {
 		assert.ok(!result.actions.some((action) => action.kind === "clear-then-send"));
 		assert.equal(fold(running).teammates[0].task, "rename");
 		assert.equal(result.state.teammates[0].task, "rename");
+	});
+});
+
+describe("reporting", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "design", role: "architect", goal: "Design the rename.", criteria: ["AC2"] },
+			{ slug: "rename", role: "dev", goal: "Rename the key.", dependsOn: ["design"], criteria: ["AC1"] },
+		],
+		criteria: ["AC1", "AC2"],
+		roles: ["architect", "dev"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+	const MODES = [
+		{ role: "architect", mode: "auto" },
+		{ role: "dev", mode: "acceptEdits" },
+	];
+
+	function report(at: string, extra: Partial<Extract<EffortInput, { kind: "report" }>> = {}): Extract<EffortInput, { kind: "report" }> {
+		return { kind: "report", headline: "On track.", criteria: ["AC1", "AC2"], modes: MODES, at, ...extra };
+	}
+
+	/** The Report a successful step asks the shell to write. */
+	function written(result: Step) {
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "write-report");
+		assert.ok(action?.kind === "write-report", "expected a write-report action");
+		return action.report;
+	}
+
+	function section(result: Step, title: string): string[] | undefined {
+		return written(result).sections.find((each) => each.title === title)?.lines;
+	}
+
+	it("numbers Reports consecutively, keeping the last number in effort.jsonl", () => {
+		const first = run(planned, report("2026-11-02T11:15:00.000Z"));
+		assert.equal(written(first).n, 1);
+		assert.ok(first.ok);
+		assert.deepEqual(first.append, [{ type: "report-written", n: 1, at: "2026-11-02T11:15:00.000Z" }]);
+		assert.equal(first.state.reports, 1);
+
+		const second = run([...planned, ...first.append], report("2026-11-02T12:00:00.000Z"));
+		assert.equal(written(second).n, 2);
+		assert.equal(fold([...planned, ...first.append, ...(second.ok ? second.append : [])]).reports, 2);
+	});
+
+	it("covers only what happened since the last Report", () => {
+		const first = applied(planned, report("2026-11-02T11:15:00.000Z"));
+		const handed = applied(first, { kind: "handoff", slug: "design", at: "2026-11-02T11:30:00.000Z", mode: "auto" });
+
+		const firstSince = section(run(planned, report("2026-11-02T11:15:00.000Z")), "Since the last Report");
+		assert.ok(firstSince?.some((line) => /approved the Brief/.test(line)));
+		assert.ok(firstSince?.some((line) => /planned 2 Tasks/.test(line)));
+
+		const since = section(run(handed, report("2026-11-02T12:00:00.000Z")), "Since the last Report");
+		assert.deepEqual(since, ["11:30 handed Task `design` to architect-1"]);
+	});
+
+	it("tells of a Task queued at the cap and of a Teammate stopped to make room, but not of a clear asked for", () => {
+		const first = applied(planned, report("2026-11-02T11:15:00.000Z"));
+		const queued = applied(applied(first, { kind: "handoff", slug: "design", at: "2026-11-02T11:30:00.000Z", maxTeammates: 1 }), {
+			kind: "handoff",
+			slug: "rename",
+			at: "2026-11-02T11:31:00.000Z",
+			maxTeammates: 1,
+		});
+		const retired: EffortLine[] = [...queued, { type: "clear-requested", teammate: "architect-1", slug: "design", at: "2026-11-02T11:40:00.000Z" }, { type: "teammate-retired", teammate: "architect-1", at: "2026-11-02T11:45:00.000Z" }];
+
+		const since = section(run(retired, report("2026-11-02T12:00:00.000Z")), "Since the last Report");
+
+		assert.deepEqual(since, [
+			"11:30 handed Task `design` to architect-1",
+			"11:31 queued Task `rename`: cap 1 reached; waits for 001",
+			"11:45 stopped idle architect-1 to make room",
+		]);
+	});
+
+	it("refuses a Report before the Brief is approved, and coverage of a criterion the Brief doesn't have", () => {
+		assert.match(refusal([OPENED], report("2026-11-02T10:30:00.000Z")), /plan Report/);
+		assert.match(refusal(planned, report("2026-11-02T11:15:00.000Z", { coverage: [{ criterion: "AC9", note: "done" }] })), /`AC9`.*`AC1`, `AC2`/);
+		assert.match(refusal(planned, report("2026-11-02T11:15:00.000Z", { headline: "  " })), /headline/);
+	});
+
+	it("gives the plan Report the plan, the Role modes and what waits on the human, and later Reports only the sections with something new", () => {
+		const first = run(planned, report("2026-11-02T11:15:00.000Z", { coverage: [{ criterion: "AC1", note: "planned in `rename`" }] }));
+		assert.deepEqual(written(first).coverage, [{ criterion: "AC1", note: "planned in `rename`" }]);
+		assert.deepEqual(section(first, "Plan"), ["`design` (architect): planned", "`rename` (dev): planned"]);
+		assert.deepEqual(section(first, "Teammate modes"), ["architect: auto", "dev: acceptEdits"]);
+		assert.equal(section(first, "Waiting on you"), undefined);
+		assert.equal(section(first, "Decided for you"), undefined);
+		assert.equal(section(first, "Found work"), undefined);
+
+		const reported = [...planned, ...(first.ok ? first.append : [])];
+		const quiet = run(reported, report("2026-11-02T11:20:00.000Z"));
+		assert.deepEqual(
+			written(quiet).sections.map((each) => each.title),
+			[],
+		);
+	});
+
+	it("shows re-plan reasons and plan statuses once the plan changes", () => {
+		const first = applied(planned, report("2026-11-02T11:15:00.000Z"));
+		const replanned = applied(first, {
+			kind: "plan",
+			tasks: [{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1", "AC2"] }],
+			criteria: ["AC1", "AC2"],
+			roles: ["architect", "dev"],
+			reason: "The design is a one-liner.",
+			at: "2026-11-02T11:20:00.000Z",
+		});
+
+		const result = run(replanned, report("2026-11-02T11:25:00.000Z"));
+		assert.deepEqual(section(result, "Since the last Report"), ["11:20 re-planned 1 Task"]);
+		assert.deepEqual(section(result, "Plan"), ["`rename` (dev): planned", "re-planned at 11:20: The design is a one-liner."]);
+		assert.equal(section(result, "Teammate modes"), undefined);
+	});
+
+	it("lists what was decided for the human since the last Report, and mode drift only on change", () => {
+		const first = applied(planned, report("2026-11-02T11:15:00.000Z"));
+		const handed = applied(first, { kind: "handoff", slug: "design", at: "2026-11-02T11:30:00.000Z", mode: "auto" });
+		const logged: EffortLine[] = [
+			...handed,
+			{ type: "decided-for-you", what: "allowed `npm test` for architect-1", task: "design", at: "2026-11-02T11:35:00.000Z" },
+			{ type: "teammate-mode", teammate: "architect-1", cursor: 1, mode: "manual", at: "2026-11-02T11:36:00.000Z" },
+		];
+
+		const result = run(logged, report("2026-11-02T12:00:00.000Z"));
+		assert.deepEqual(section(result, "Decided for you"), ["11:35 allowed `npm test` for architect-1 (Task `design`)"]);
+		assert.deepEqual(section(result, "Teammate modes"), ["architect-1: manual, launched in auto (11:36)"]);
+
+		const next = run(applied(logged, report("2026-11-02T12:00:00.000Z")), report("2026-11-02T12:30:00.000Z"));
+		assert.equal(section(next, "Decided for you"), undefined);
+		assert.equal(section(next, "Teammate modes"), undefined);
+	});
+
+	it("keeps found work in the core's log, showing a running count and the new items", () => {
+		const first = applied(planned, report("2026-11-02T11:15:00.000Z", { found: ["The cache key is also misspelt in docs."] }));
+		assert.deepEqual(fold(first).found, [{ what: "The cache key is also misspelt in docs.", at: "2026-11-02T11:15:00.000Z" }]);
+
+		const second = run(first, report("2026-11-02T12:00:00.000Z", { found: ["`old-config` has no tests."] }));
+		assert.deepEqual(section(second, "Found work"), [
+			"2 found so far outside the Brief, kept as suggestions for the final Report; new since the last Report:",
+			"`old-config` has no tests.",
+		]);
+	});
+
+	it("lists what waits on the human whenever something does", () => {
+		const asked = applied([OPENED], request("b".repeat(64)));
+		const approved2 = applied(asked, { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+		const waiting: EffortLine[] = [...approved2, { type: "approval-requested", id: "r2", checkpoint: "brief", path: DRAFT, sha256: "c".repeat(64), snapshot: "x", at: "2026-11-02T11:05:00.000Z" }];
+
+		assert.deepEqual(section(run(waiting, report("2026-11-02T11:15:00.000Z")), "Waiting on you"), [
+			`\`r2\`: approve the Brief, ${DRAFT} (sha256 ${"c".repeat(64)}), in \`/team pending\``,
+		]);
+	});
+});
+
+describe("attaching to a Teammate", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const started = applied(
+		applied(approved, {
+			kind: "plan",
+			tasks: [{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] }],
+			criteria: ["AC1"],
+			roles: ["dev"],
+			at: "2026-11-02T11:10:00.000Z",
+		}),
+		{ kind: "handoff", slug: "rename", at: "2026-11-02T11:30:00.000Z" },
+	);
+	const opened = applied(started, {
+		kind: "journal",
+		teammate: "dev-1",
+		cursor: 1,
+		line: { from: "hook", at: "2026-11-02T11:31:00.000Z", event: "SessionStart", payload: { session_id: "8f3c2a1b-0000-4000-8000-000000000001", source: "startup" } },
+		result: { path: "", written: false },
+	});
+	/** A fresh session's `SessionStart` with a new short id, as a relaunch (#112) records it. */
+	const fresh: EffortLine = { type: "teammate-session", teammate: "dev-1", cursor: 2, source: "startup", sessionId: "k3l4m5n6-0000", shortId: "k3l4m5n6", at: "2026-11-02T12:00:00.000Z" };
+
+	it("records the short id last attached through pi, once per change", () => {
+		const result = run(opened, { kind: "attach", teammate: "dev-1", at: "2026-11-02T11:40:00.000Z" });
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append, [{ type: "teammate-attached", teammate: "dev-1", shortId: "8f3c2a1b", at: "2026-11-02T11:40:00.000Z" }]);
+		assert.deepEqual(result.actions, []);
+		assert.equal(result.state.teammates[0].attached, "8f3c2a1b");
+
+		const again = run([...opened, ...result.append], { kind: "attach", teammate: "dev-1", at: "2026-11-02T11:50:00.000Z" });
+		assert.ok(again.ok);
+		assert.deepEqual(again.append, []);
+	});
+
+	it("marks a short id new when a Teammate's session gets another, until the human attaches through pi", () => {
+		assert.equal(fold(opened).teammates[0].newShortId, undefined);
+
+		const relaunched = [...opened, fresh];
+		assert.equal(fold(relaunched).teammates[0].shortId, "k3l4m5n6");
+		assert.equal(fold(relaunched).teammates[0].newShortId, true);
+
+		const attached = run(relaunched, { kind: "attach", teammate: "dev-1", at: "2026-11-02T12:10:00.000Z" });
+		assert.ok(attached.ok);
+		assert.deepEqual(attached.append, [{ type: "teammate-attached", teammate: "dev-1", shortId: "k3l4m5n6", at: "2026-11-02T12:10:00.000Z" }]);
+		assert.equal(attached.state.teammates[0].newShortId, undefined);
+		assert.equal(attached.state.teammates[0].cursor, 2, "attaching reads no journal line");
+	});
+
+	it("refuses a Teammate it doesn't know, or one with no short id to attach to yet", () => {
+		assert.match(refusal(opened, { kind: "attach", teammate: "qa-1", at: "2026-11-02T11:40:00.000Z" }), /no Teammate `qa-1`/);
+		assert.match(refusal(started, { kind: "attach", teammate: "dev-1", at: "2026-11-02T11:40:00.000Z" }), /`dev-1` has no short id yet/);
 	});
 });

@@ -18,6 +18,9 @@ an Effort and runs its intake up to the human approving its Brief. Planning and 
 /team setup <team>   Team setup: agree the Team's Playbook with the Lead, then adopt it
 /team pending        answer what waits on you: approve, send back with a note, or later
 /team resume         adopt an Effort no pi session leads (pick one, or name it)
+/team report         ask the Lead for a Report on everything since the last one
+/team reports        pick a Report, newest first, and read it in an overlay
+/team attach [id]    attach to a Teammate's session (pick one, or name it); also just `/team`
 ```
 
 `/team start` warns when `claude --version` is older than 2.1.316, the version this extension was
@@ -67,8 +70,8 @@ From then on the Effort reads only those copies, so editing your Team or Playboo
 in it; a copy whose sha no longer matches its approval is reported and never used. A Brief can't
 be approved once its Playbook has been adopted again: start a new Effort.
 
-`team_plan`, `team_handoff` and `team_review` are switched on with the Effort, and refuse until
-the Brief is approved.
+`team_plan`, `team_handoff`, `team_review` and `team_report` are switched on with the Effort, and
+refuse until the Brief is approved.
 
 ### Planning and handing off
 
@@ -162,6 +165,39 @@ already on record.
 `plan.md` shows each Task as planned, running, in review, sent back or accepted, with its
 Teammate, its folder and how often it was sent back.
 
+### Reports
+
+The Lead writes a Report with `team_report`: a headline, Brief coverage by criterion id, and any
+work it found outside the Brief, which is kept as a suggestion and never started. The extension
+adds the logged sections from `effort.jsonl`, leaving out any with nothing in them:
+
+- **Since the last Report**: what was asked, approved, planned, handed off, finished, sent back,
+  accepted or denied, with the time (UTC);
+- **Plan**: each Task's status, when the plan or a Task moved, and why the Lead re-planned
+  (`team_plan`'s `reason`);
+- **Waiting on you**: what `/team pending` holds;
+- **Decided for you**: what the extension answered on your behalf;
+- **Teammate modes**: every Role's mode in the plan Report, then a Teammate's mode only when it
+  changes;
+- **Found work**: the running count, and the items new since the last Report.
+
+The first Report, written once the plan is, is the plan Report. Each is saved as
+`reports/<nnn>.md` in the Effort directory, numbered from 001 and never overwritten, and shows in
+chat collapsed to its headline; the Lead gets back only where it went. The Team block counts them.
+
+## Attaching to a Teammate
+
+`/team` (or `/team attach [id]`) lists the Teammates with a session, then offers:
+
+- **Attach here**: pi's TUI stops, `claude attach <short id>` runs in the terminal until you leave
+  it (Ctrl+Z), then pi redraws and says you are back.
+- **Open in a tmux window**: only inside tmux; `tmux new-window` runs the same command.
+- **Copy the command**: copies `claude attach <short id>`.
+
+Attaching only views the session: it is never a Takeover, and tmux is only a viewer (ADR-0006).
+Outside the TUI, `/team attach` answers with the command. The Team block marks a short id that
+changed since you last attached with `(new)`; effort.jsonl records the last one attached.
+
 ## Leading an Effort across pi sessions
 
 An Effort has one Lead, the pi session `lead.json` names with its pid, bridge and session file. A
@@ -243,7 +279,8 @@ intake.ts        what the Lead is asked at intake, and the Brief's approval dial
 records.ts       the Effort folder: Brief validation, approved records and their shas
 repo.ts          the git root an Effort works on
 setup.ts         Team setup: seeding the draft, validating and adopting it, its warnings
-claude.ts        the only module that runs claude (version check)
+claude.ts        the only module that runs claude (version check, attach)
+attach.ts        the /team attach menu: attach here, tmux window, copy the command
 teams/software/  the bundled software Team: architect, dev and qa, and its default Playbook
 tests/           offline suite, fake claude, temp-root harness
 ```
