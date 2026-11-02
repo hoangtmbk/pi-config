@@ -163,3 +163,142 @@ describe("the human's answer", () => {
 		assert.match(refusal(approved, request("d".repeat(64))), /already approved/);
 	});
 });
+
+describe("planning", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const ROLES = ["architect", "dev", "qa"];
+	const CRITERIA = ["AC1", "AC2"];
+
+	function plan(tasks: Extract<EffortInput, { kind: "plan" }>["tasks"], at = "2026-11-02T11:10:00.000Z"): Extract<EffortInput, { kind: "plan" }> {
+		return { kind: "plan", tasks, criteria: CRITERIA, roles: ROLES, at };
+	}
+
+	const DESIGN = { slug: "design", role: "architect", goal: "Design the rename.", criteria: ["AC2"] };
+	const RENAME = { slug: "rename", role: "dev", goal: "Rename the key.", dependsOn: ["design"], criteria: ["AC1", "AC2"] };
+
+	it("refuses a plan before the Brief is approved", () => {
+		assert.match(refusal([OPENED], plan([DESIGN, RENAME])), /before the human approves the Brief/);
+	});
+
+	it("refuses a plan that leaves an acceptance criterion uncovered, naming it", () => {
+		const text = refusal(approved, plan([DESIGN]));
+
+		assert.match(text, /`AC1`/);
+		assert.doesNotMatch(text, /`AC2`/);
+	});
+
+	it("refuses a Role the Team snapshot lacks, naming the Roles it has", () => {
+		const text = refusal(approved, plan([DESIGN, { ...RENAME, role: "devops" }]));
+
+		assert.match(text, /`devops`/);
+		assert.match(text, /`architect`, `dev`, `qa`/);
+	});
+
+	it("refuses a criterion the Brief doesn't have, a repeated or non-kebab slug, and a dependency on no planned Task", () => {
+		const text = refusal(approved, plan([DESIGN, { ...RENAME, criteria: ["AC1", "AC2", "AC9"], dependsOn: ["desing"] }, { ...DESIGN, slug: "design" }, { ...DESIGN, slug: "Big Task" }]));
+
+		assert.match(text, /`AC9`/);
+		assert.match(text, /`desing`/);
+		assert.match(text, /`design` is used more than once/);
+		assert.match(text, /`Big Task`/);
+	});
+
+	it("takes a plan covering every criterion with known Roles, as the whole Task list", () => {
+		const result = run(approved, plan([DESIGN, RENAME]));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.state.plan, [
+			{ slug: "design", role: "architect", goal: "Design the rename.", dependsOn: [], criteria: ["AC2"] },
+			{ slug: "rename", role: "dev", goal: "Rename the key.", dependsOn: ["design"], criteria: ["AC1", "AC2"] },
+		]);
+		assert.deepEqual(result.actions, [{ kind: "write-plan" }]);
+	});
+
+	it("replaces the plan when the Lead plans again while the Brief is unchanged", () => {
+		const planned = applied(approved, plan([DESIGN, RENAME]));
+
+		const result = run(planned, plan([{ ...RENAME, dependsOn: [] }], "2026-11-02T11:20:00.000Z"));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(
+			result.state.plan?.map((task) => task.slug),
+			["rename"],
+		);
+	});
+});
+
+describe("handing off", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "design", role: "architect", goal: "Design the rename.", criteria: ["AC2"] },
+			{ slug: "rename", role: "dev", goal: "Rename the key.", dependsOn: ["design"], criteria: ["AC1"] },
+		],
+		criteria: ["AC1", "AC2"],
+		roles: ["architect", "dev", "qa"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+
+	function handoff(slug: string): Extract<EffortInput, { kind: "handoff" }> {
+		return { kind: "handoff", slug, at: "2026-11-02T11:30:00.000Z" };
+	}
+
+	it("refuses a Task that isn't planned, naming the planned ones", () => {
+		const text = refusal(planned, handoff("deploy"));
+
+		assert.match(text, /`deploy`/);
+		assert.match(text, /`design`, `rename`/);
+	});
+
+	it("starts a fresh Teammate in the Task's Role, numbering the Task folder and the Teammate, and refreshes plan.md", () => {
+		const result = run(planned, handoff("design"));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.actions, [
+			{
+				kind: "launch-teammate",
+				teammate: { id: "architect-1", role: "architect", name: "team-software-2026-11-02-architect-1" },
+				task: { slug: "design", folder: "001-architect-design" },
+			},
+			{ kind: "write-plan" },
+		]);
+		assert.match(result.reply ?? "", /^started architect-1/);
+		assert.deepEqual(result.state.teammates, [
+			{ id: "architect-1", role: "architect", name: "team-software-2026-11-02-architect-1", task: "design", startedAt: "2026-11-02T11:30:00.000Z" },
+		]);
+	});
+
+	it("numbers the next Task folder and the next Teammate of a Role on from the last", () => {
+		const designed = applied(planned, handoff("design"));
+
+		const result = run(designed, handoff("rename"));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const [launch] = result.actions;
+		assert.deepEqual(launch.kind === "launch-teammate" ? [launch.teammate.id, launch.task.folder] : [], ["dev-1", "002-dev-rename"]);
+	});
+
+	it("refuses a Task that is already running", () => {
+		const designed = applied(planned, handoff("design"));
+
+		assert.match(refusal(designed, handoff("design")), /`design` is already running.*`architect-1`/);
+	});
+
+	it("refuses a re-plan that drops a handed-off Task or gives it another Role", () => {
+		const designed = applied(planned, handoff("design"));
+		const replan = (tasks: Extract<EffortInput, { kind: "plan" }>["tasks"]) => ({
+			kind: "plan" as const,
+			tasks,
+			criteria: ["AC1", "AC2"],
+			roles: ["architect", "dev", "qa"],
+			at: "2026-11-02T11:40:00.000Z",
+		});
+
+		assert.match(refusal(designed, replan([{ slug: "rename", role: "dev", goal: "Rename.", criteria: ["AC1", "AC2"] }])), /`design`.*handed off/);
+		assert.match(
+			refusal(designed, replan([{ slug: "design", role: "dev", goal: "Design.", criteria: ["AC1", "AC2"] }])),
+			/`design`.*`architect`/,
+		);
+	});
+});

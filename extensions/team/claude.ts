@@ -11,8 +11,10 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { PermissionMode, Role } from "./definitions.ts";
 
 /** The Claude Code version this extension was built and tried against. */
 export const MIN_CLAUDE_VERSION = "2.1.316";
@@ -99,4 +101,130 @@ export function trustFolder(configPath: string, repo: string): { error: string }
 
 function isObject(value: unknown): value is Record<string, unknown> & { projects?: Record<string, unknown> } {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Long enough for `claude --bg` to hand the session to its daemon and return. */
+const LAUNCH_TIMEOUT_MS = 60_000;
+
+/**
+ * Run a `claude --bg` launch in `cwd`, which returns once the background
+ * session is started. `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` is
+ * removed from its environment, so the Effort directory added with
+ * `--add-dir` never contributes a CLAUDE.md. Returns an error to show the
+ * Lead when the launch fails.
+ */
+export function launchBackground(claudePath: string, cwd: string, args: string[]): Promise<{ error: string } | undefined> {
+	const env = { ...process.env };
+	delete env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD;
+	return new Promise((resolve) => {
+		execFile(claudePath, args, { cwd, env, timeout: LAUNCH_TIMEOUT_MS, encoding: "utf8" }, (error, _stdout, stderr) => {
+			resolve(error ? { error: (stderr.trim() || error.message).split("\n")[0] } : undefined);
+		});
+	});
+}
+
+/** What a Teammate's `claude --bg` launch is made from. */
+export interface TeammateLaunch {
+	/** `--name`, `team-<effort-id>-<teammate-id>`, which is how `claude agents --json` finds it. */
+	name: string;
+	role: Role;
+	/** The `--permission-mode` in force, always passed so the human's default never decides it. */
+	mode: PermissionMode;
+	/** Added with `--add-dir`, so reading the Brief and writing the Task folder never prompts. */
+	effortDir: string;
+	/** The Teammate's own folder, which the launch files are written to. */
+	dir: string;
+	/** The `--settings` file's object, added to the human's own settings. */
+	settings: Record<string, unknown>;
+	/** The `--append-system-prompt-file` text. */
+	prompt: string;
+	/** The first handoff pointer, run as the first turn. */
+	pointer: string;
+}
+
+/**
+ * Write the launch files into `launch.dir` and return the `claude` argv.
+ * `--name` and the prompt come last: `--add-dir`, `--allowedTools`,
+ * `--disallowedTools`, `--mcp-config` and `--plugin-dir` each take any number
+ * of values, and would otherwise swallow the prompt as one more.
+ */
+export function teammateArgs(launch: TeammateLaunch): string[] {
+	const { role } = launch;
+	mkdirSync(launch.dir, { recursive: true });
+	const settings = join(launch.dir, "settings.json");
+	const prompt = join(launch.dir, "prompt.md");
+	writeFileSync(settings, `${JSON.stringify(launch.settings, null, 2)}\n`);
+	writeFileSync(prompt, launch.prompt);
+	const args = ["--bg"];
+	if (role.model !== undefined) args.push("--model", role.model);
+	if (role.effort !== undefined) args.push("--effort", role.effort);
+	args.push("--permission-mode", launch.mode, "--settings", settings, "--append-system-prompt-file", prompt, "--add-dir", launch.effortDir);
+	if (role.allowedTools.length > 0) args.push("--allowedTools", ...role.allowedTools);
+	args.push("--disallowedTools", ...role.disallowedTools.filter((tool) => tool !== "EnterPlanMode"), "EnterPlanMode");
+	if (Object.keys(role.mcpServers).length > 0) {
+		// Never `--strict-mcp-config`: the Role's servers add to the human's own.
+		const mcp = join(launch.dir, "mcp.json");
+		writeFileSync(mcp, `${JSON.stringify({ mcpServers: role.mcpServers }, null, 2)}\n`);
+		args.push("--mcp-config", mcp);
+	}
+	for (const plugin of role.plugins) args.push("--plugin-dir", plugin);
+	args.push("--name", launch.name, launch.pointer);
+	return args;
+}
+
+/**
+ * The hook script every Teammate hook runs, which writes the Teammate's
+ * journal. Claude Code runs hook commands with a shell, outside pi, so the
+ * command names the Node that runs pi.
+ */
+export const HOOK_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "hook.mjs");
+
+/** The hook events a Teammate reports, each to {@link HOOK_SCRIPT}. */
+const HOOK_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure", "PermissionRequest", "PermissionDenied", "Notification", "PostToolUse", "PreToolUse"];
+
+/** A `PermissionRequest` holds the request open while the Lead or the human answers it. */
+const PERMISSION_REQUEST_TIMEOUT_S = 3600;
+
+/** What a Teammate's `--settings` are made from. */
+export interface SettingsFrom {
+	effortDir: string;
+	teammateId: string;
+	/** Added as `permissions.allow` and `permissions.deny`: the Playbook's rules for the Teammate's Role, then for every Role. */
+	allow: readonly string[];
+	deny: readonly string[];
+	/** Added as `permissions.ask`: every rule of the Playbook's `escalate` entries. */
+	ask: readonly string[];
+	/** Absolute paths (a folder as `<folder>/**`) the Teammate may never edit: the Effort's records. */
+	records: readonly string[];
+}
+
+/**
+ * A Teammate's `--settings`. Claude Code adds these to the human's own
+ * settings, merging `permissions` and `hooks`, so they hold only keys that
+ * add: the hooks, the permission rules and `crossSessionInbound`, which lets
+ * the Lead's messages in.
+ */
+export function teammateSettings(from: SettingsFrom): Record<string, unknown> {
+	const command = [process.execPath, HOOK_SCRIPT, from.effortDir, from.teammateId].map(shellQuote).join(" ");
+	const hooks: Record<string, unknown[]> = {};
+	for (const event of HOOK_EVENTS) {
+		const hook = event === "PermissionRequest" ? { type: "command", command, timeout: PERMISSION_REQUEST_TIMEOUT_S } : { type: "command", command };
+		// The floor is about commands, so only `Bash` reaches the `PreToolUse` hook.
+		hooks[event] = [event === "PreToolUse" ? { matcher: "Bash", hooks: [hook] } : { hooks: [hook] }];
+	}
+	const unique = (rules: readonly string[]) => [...new Set(rules)];
+	return {
+		permissions: {
+			allow: unique(from.allow),
+			// `Edit(//abs/path)` is how Claude Code spells an absolute path in a rule.
+			deny: unique([...from.deny, ...from.records.map((record) => `Edit(/${record})`)]),
+			ask: unique(from.ask),
+		},
+		crossSessionInbound: "accept",
+		hooks,
+	};
+}
+
+function shellQuote(text: string): string {
+	return `'${text.replaceAll("'", `'\\''`)}'`;
 }

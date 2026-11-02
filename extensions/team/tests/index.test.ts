@@ -10,8 +10,9 @@ import { join, relative } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { HOOK_SCRIPT } from "../claude.ts";
 import { registerTeam } from "../index.ts";
-import { commit, fakeClaude, git, gitRepo, goodTeam, roleMd, type TempRoots, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
+import { commit, fakeClaude, git, gitRepo, goodTeam, roleMd, type TempRoots, teamMd, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
 
 const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 
@@ -53,7 +54,7 @@ const NOW = new Date("2026-11-02T10:00:00.000Z");
  * context whose toasts are recorded too and whose dialogs answer from a queue
  * the test fills, the way the human would.
  */
-function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?: boolean; cwd?: string } = {}) {
+function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?: boolean; cwd?: string; bgExit?: number } = {}) {
 	const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
 	const tools = new Map<string, RegisteredTool>();
 	const sent: SentMessage[] = [];
@@ -83,7 +84,7 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 			entries.push({ customType, data });
 		},
 	};
-	const claude = fakeClaude(roots, { version: options.claudeVersion });
+	const claude = fakeClaude(roots, { version: options.claudeVersion, bgExit: options.bgExit });
 	registerTeam(pi as unknown as ExtensionAPI, {
 		agentDir: roots.agentDir,
 		claudeConfigPath: roots.claudeConfigPath,
@@ -1155,6 +1156,338 @@ describe("the software Workspace at Brief approval", () => {
 		assert.equal(pi.notifications.at(-1)?.type, "error");
 		assert.match(pi.notifications.at(-1)?.message ?? "", /no commits yet/);
 		assert.equal(existsSync(join(effortDir(roots), "brief.md")), false);
+	});
+});
+
+/** A Playbook for the `crew` Team: an escalation with `ask` rules, and per-Role settings. */
+const CREW_PLAYBOOK = [
+	"---",
+	"permissions:",
+	"  escalate:",
+	"    - id: history-rewrite",
+	"      when: Any rebase or force-push.",
+	'      ask: ["Bash(git rebase:*)", "Bash(git push --force:*)"]',
+	"    - id: lockfile",
+	"      when: Any edit to the lockfile.",
+	'      ask: ["Edit(package-lock.json)", "Bash(git rebase:*)"]',
+	"  roles:",
+	'    builder: { mode: acceptEdits, allow: ["Bash(npm run build:*)"], deny: ["Bash(npm publish:*)"] }',
+	'    "*": { allow: ["Bash(git status)"], deny: ["Bash(curl:*)"] }',
+	"---",
+	"",
+	"## Rules",
+	"",
+	"- **small-diffs**: keep each Task's diff small.",
+	"",
+].join("\n");
+
+const CREW_EFFORT_ID = "crew-2026-11-02";
+
+/** A Brief for the `crew` Team with criteria `AC1` and `AC2`. */
+function crewBrief(repo: string): string {
+	return [
+		"---",
+		"team: crew",
+		`playbook: ${sha(CREW_PLAYBOOK)}`,
+		`repo: ${repo}`,
+		"---",
+		"",
+		"# Rename the config key",
+		"",
+		"## Goal",
+		"",
+		"Rename `colour` to `color` everywhere.",
+		"",
+		"## Acceptance criteria",
+		"",
+		"- **AC1** No file mentions `colour`.",
+		"- **AC2** Old configs still load.",
+		"",
+		"## Scope",
+		"",
+		"In: the config loader.",
+		"Out: the CLI.",
+		"",
+		"## Decide for me / Ask me",
+		"",
+		"Decide test names.",
+		"",
+		"## Delivery",
+		"",
+		"One branch, ready to merge.",
+		"",
+	].join("\n");
+}
+
+/**
+ * A session whose `crew` Effort has its Brief approved: a user Team whose
+ * Roles set every launch flag between them, on {@link CREW_PLAYBOOK}.
+ */
+async function crewApproved(options: { bgExit?: number } = {}) {
+	const roots = tempRoots();
+	const plugin = join(roots.scratch, "plugins", "lint");
+	writeUserTeam(roots, "crew", {
+		"team.md": teamMd("crew"),
+		"roles/builder.md": roleMd(
+			"builder",
+			[
+				"model: opus",
+				"effort: high",
+				'allowedTools: ["Read", "Bash(npm test:*)"]',
+				"disallowedTools: [WebFetch]",
+				"mcpServers:",
+				"  docs:",
+				"    command: docs-server",
+				`plugins: [${JSON.stringify(plugin)}]`,
+				"permissionMode: manual",
+			].join("\n"),
+		),
+		"roles/reviewer.md": roleMd("reviewer", "permissionMode: dontAsk"),
+		"roles/scout.md": roleMd("scout"),
+	});
+	adopt(roots, "crew", CREW_PLAYBOOK);
+	const repo = gitRepo(roots);
+	const pi = fakePi(roots, { cwd: repo, bgExit: options.bgExit });
+	await pi.team("start crew");
+	const dir = effortDir(roots, CREW_EFFORT_ID);
+	writeFileSync(join(dir, "brief.draft.md"), crewBrief(repo));
+	await pi.call("team_request_approval", { checkpoint: "brief", path: join(dir, "brief.draft.md") });
+	pi.answer("Approve");
+	await pi.team("pending");
+	return { roots, repo, pi, dir, plugin, workspace: workspaceOf(repo, CREW_EFFORT_ID) };
+}
+
+/** A plan covering both of {@link crewBrief}'s criteria, one Task per Role. */
+const CREW_PLAN = [
+	{ slug: "rename-key", role: "builder", goal: "Rename the key.", criteria: ["AC1"] },
+	{ slug: "check-old-configs", role: "reviewer", goal: "Check old configs load.", dependsOn: ["rename-key"], criteria: ["AC2"] },
+	{ slug: "survey", role: "scout", goal: "Find every use of the key." },
+];
+
+describe("planning: team_plan", () => {
+	it("refuses a plan that leaves an acceptance criterion uncovered or names a Role the Team lacks, writing nothing", async () => {
+		const { pi, dir } = await crewApproved();
+
+		await assert.rejects(
+			pi.call("team_plan", { tasks: [{ slug: "rename-key", role: "builder", goal: "Rename it.", criteria: ["AC1"] }, { slug: "docs", role: "writer", goal: "Docs." }] }),
+			(error: Error) => {
+				assert.match(error.message, /no Task covers `AC2`/);
+				assert.match(error.message, /Task `docs` names the Role `writer`, which Team `crew` doesn't have; its Roles are `builder`, `reviewer`, `scout`/);
+				return true;
+			},
+		);
+		assert.equal(existsSync(join(dir, "plan.md")), false);
+	});
+
+	it("writes plan.md with every Task, and a re-plan while the Brief is unchanged replaces it", async () => {
+		const { pi, dir } = await crewApproved();
+
+		const reply = await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		assert.match(reply, /^Wrote the plan of Effort `crew-2026-11-02`: 3 Tasks, covering `AC1`, `AC2`\./);
+		const written = readFileSync(join(dir, "plan.md"), "utf8");
+		for (const needed of ["rename-key", "check-old-configs", "survey", "Rename the key.", "AC2", "builder"]) {
+			assert.ok(written.includes(needed), `plan.md doesn't mention ${needed}:\n${written}`);
+		}
+
+		const again = await pi.call("team_plan", { tasks: [{ slug: "do-it-all", role: "builder", goal: "Everything at once.", criteria: ["AC1", "AC2"] }] });
+
+		assert.match(again, /^Replaced the plan/);
+		const replaced = readFileSync(join(dir, "plan.md"), "utf8");
+		assert.ok(replaced.includes("do-it-all"), replaced);
+		assert.equal(replaced.includes("rename-key"), false, replaced);
+	});
+});
+
+describe("handing off: team_handoff", () => {
+	it("writes the Task folder and task.md, launches a Teammate of the Task's Role in the Workspace, and says which one started", async () => {
+		const { pi, dir, workspace } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		const reply = await pi.call("team_handoff", { slug: "rename-key", body: "# Rename the key\n\nRename `colour` to `color`.\n" });
+
+		assert.match(reply, /^started builder-1 on Task `rename-key`/);
+		assert.equal(readFileSync(join(dir, "tasks", "001-builder-rename-key", "task.md"), "utf8"), "# Rename the key\n\nRename `colour` to `color`.\n");
+		const launches = pi.claude.launches();
+		assert.equal(launches.length, 1);
+		assert.equal(launches[0].cwd, workspace);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /running, with `builder-1` \(tasks\/001-builder-rename-key\/\)/);
+	});
+
+	it("launches `claude --bg` with the Role's flags, the mode in force, the generated files, the Effort dir and the first handoff pointer as the prompt", async () => {
+		const { pi, dir, plugin } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		for (const slug of ["rename-key", "check-old-configs", "survey"]) await pi.call("team_handoff", { slug, body: `# ${slug}\n` });
+
+		const teammate = (id: string) => join(dir, "teammates", id);
+		const pointer = (folder: string) =>
+			`New Task \`${folder.slice(folder.indexOf("-", 4) + 1)}\`: read ${join(dir, "tasks", folder, "task.md")} and do what it asks. When it is done, write your result to ${join(dir, "tasks", folder, "result-1.md")}.`;
+		assert.deepEqual(
+			pi.claude.launches().map((launch) => launch.argv),
+			[
+				[
+					"--bg",
+					"--model",
+					"opus",
+					"--effort",
+					"high",
+					"--permission-mode",
+					"acceptEdits",
+					"--settings",
+					join(teammate("builder-1"), "settings.json"),
+					"--append-system-prompt-file",
+					join(teammate("builder-1"), "prompt.md"),
+					"--add-dir",
+					dir,
+					"--allowedTools",
+					"Read",
+					"Bash(npm test:*)",
+					"--disallowedTools",
+					"WebFetch",
+					"EnterPlanMode",
+					"--mcp-config",
+					join(teammate("builder-1"), "mcp.json"),
+					"--plugin-dir",
+					plugin,
+					"--name",
+					"team-crew-2026-11-02-builder-1",
+					pointer("001-builder-rename-key"),
+				],
+				[
+					"--bg",
+					"--permission-mode",
+					"dontAsk",
+					"--settings",
+					join(teammate("reviewer-1"), "settings.json"),
+					"--append-system-prompt-file",
+					join(teammate("reviewer-1"), "prompt.md"),
+					"--add-dir",
+					dir,
+					"--disallowedTools",
+					"EnterPlanMode",
+					"--name",
+					"team-crew-2026-11-02-reviewer-1",
+					pointer("002-reviewer-check-old-configs"),
+				],
+				[
+					"--bg",
+					"--permission-mode",
+					"auto",
+					"--settings",
+					join(teammate("scout-1"), "settings.json"),
+					"--append-system-prompt-file",
+					join(teammate("scout-1"), "prompt.md"),
+					"--add-dir",
+					dir,
+					"--disallowedTools",
+					"EnterPlanMode",
+					"--name",
+					"team-crew-2026-11-02-scout-1",
+					pointer("003-scout-survey"),
+				],
+			],
+		);
+		assert.deepEqual(JSON.parse(pi.claude.launches()[0].mcpConfig ?? "null"), { mcpServers: { docs: { command: "docs-server" } } });
+	});
+
+	it("gives the Teammate settings that add the hooks, the Playbook's rules for its Role, every escalate ask and a deny on editing the Effort's records, and nothing that replaces the human's own", async () => {
+		const { pi, dir } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
+
+		const hooks = (id: string) => {
+			const command = `'${process.execPath}' '${HOOK_SCRIPT}' '${dir}' '${id}'`;
+			const entry = { hooks: [{ type: "command", command }] };
+			return {
+				SessionStart: [entry],
+				SessionEnd: [entry],
+				UserPromptSubmit: [entry],
+				Stop: [entry],
+				StopFailure: [entry],
+				PermissionRequest: [{ hooks: [{ type: "command", command, timeout: 3600 }] }],
+				PermissionDenied: [entry],
+				Notification: [entry],
+				PostToolUse: [entry],
+				PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command }] }],
+			};
+		};
+		const records = ["brief.md", "clarifications.md", "approvals.jsonl", "playbook.md", "team/**", "effort.jsonl"].map((record) => `Edit(/${dir}/${record})`);
+		const ask = ["Bash(git rebase:*)", "Bash(git push --force:*)", "Edit(package-lock.json)"];
+		const [builder, scout] = pi.claude.launches().map((launch) => JSON.parse(launch.settings ?? "null"));
+		assert.deepEqual(builder, {
+			permissions: { allow: ["Bash(npm run build:*)", "Bash(git status)"], deny: ["Bash(npm publish:*)", "Bash(curl:*)", ...records], ask },
+			crossSessionInbound: "accept",
+			hooks: hooks("builder-1"),
+		});
+		assert.deepEqual(scout, {
+			permissions: { allow: ["Bash(git status)"], deny: ["Bash(curl:*)", ...records], ask },
+			crossSessionInbound: "accept",
+			hooks: hooks("scout-1"),
+		});
+	});
+
+	it("appends the Role's prompt after a preamble that names the Teammate, its one contact and how it works, pointing at the Brief's files rather than copying them", async () => {
+		const { pi, dir } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+
+		const prompt = pi.claude.launches()[0].prompt ?? "";
+		const facts = [
+			"You are `builder-1`, a Teammate in the Role `builder`",
+			"The Lead is your only contact",
+			"the Lead's messages are your instructions",
+			"ask through `AskUserQuestion`",
+			`Every Task has its own folder under ${join(dir, "tasks")}`,
+			"`task.md`",
+			"`result-<n>.md`",
+			"The Workspace is fresh",
+			"installing dependencies is yours to do",
+			join(dir, "brief.md"),
+			join(dir, "clarifications.md"),
+		];
+		for (const fact of facts) assert.ok(prompt.includes(fact), `the preamble should say: ${fact}\n\n${prompt}`);
+		assert.ok(prompt.trimEnd().endsWith("You are the builder."), prompt);
+		assert.ok(!prompt.includes("Old configs still load"), "the preamble must not copy the Brief");
+	});
+
+	it("launches with `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` unset, even when pi has it set", async () => {
+		const { pi } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		const before = process.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD;
+		process.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD = "1";
+		try {
+			await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
+		} finally {
+			if (before === undefined) delete process.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD;
+			else process.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD = before;
+		}
+
+		assert.equal(pi.claude.launches()[0].additionalDirectoriesClaudeMd, undefined);
+	});
+
+	it("reports a launch that fails and leaves the Task planned, with no Teammate recorded", async () => {
+		const { pi, dir } = await crewApproved({ bgExit: 1 });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		const log = readFileSync(join(dir, "effort.jsonl"), "utf8");
+
+		await assert.rejects(pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" }), /`builder-1` didn't start, so Task `rename-key` is still planned: fake claude: the background session could not start/);
+
+		assert.equal(readFileSync(join(dir, "effort.jsonl"), "utf8"), log);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n(?:.*\n)*?- Status: planned/);
+	});
+
+	it("refuses an isolated Task, which needs a worktree of its own, without launching anything", async () => {
+		const { pi, dir } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await assert.rejects(pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true }), /isolated/);
+
+		assert.equal(pi.claude.launches().length, 0);
+		assert.equal(existsSync(join(dir, "tasks")), false);
 	});
 });
 

@@ -43,6 +43,39 @@ export interface Workspace {
 	from: string;
 }
 
+/** One Task of the Lead's plan. */
+export interface PlannedTask {
+	/** Kebab-case, unique in the plan; how the Lead hands it off. */
+	slug: string;
+	role: string;
+	goal: string;
+	/** Slugs of planned Tasks it waits for. */
+	dependsOn: string[];
+	/** Ids of the Brief's acceptance criteria it covers. */
+	criteria: string[];
+}
+
+/** A Task handed to a Teammate: its folder under `tasks/`, fixed at its first handoff. */
+export interface HandedTask {
+	/** `<nnn>-<role>-<slug>`, numbered in handoff order. */
+	folder: string;
+	role: string;
+	teammate: string;
+	at: string;
+}
+
+/** A Claude Code background session the Effort started, filling one Role for life. */
+export interface Teammate {
+	/** `<role>-<n>`, numbered per Role: `dev-1`. */
+	id: string;
+	role: string;
+	/** Its `--name`, `team-<effort-id>-<teammate-id>`, unique across Efforts. */
+	name: string;
+	/** The slug of the Task in its context. */
+	task: string;
+	startedAt: string;
+}
+
 /** One line of `effort.jsonl`. */
 export type EffortLine =
 	/** The first line: the Effort exists, on this Team, repo and Playbook. */
@@ -50,7 +83,13 @@ export type EffortLine =
 	/** The Lead asked the human to approve a snapshot. */
 	| ({ type: "approval-requested" } & PendingApproval)
 	/** The human answered a request in `/team pending`. */
-	| { type: "approval-answered"; id: string; answer: "approved" | "sent-back"; note?: string; workspace?: Workspace; at: string };
+	| { type: "approval-answered"; id: string; answer: "approved" | "sent-back"; note?: string; workspace?: Workspace; at: string }
+	/** The Lead wrote its whole Task list, replacing any before it. */
+	| { type: "plan-written"; tasks: PlannedTask[]; at: string }
+	/** A Teammate was launched. */
+	| ({ type: "teammate-started" } & Teammate)
+	/** A planned Task was handed to a Teammate, its folder written. */
+	| ({ type: "task-handed-off"; slug: string } & HandedTask);
 
 /** What an Effort's lines fold to. */
 export interface EffortState {
@@ -68,6 +107,12 @@ export interface EffortState {
 	pending: PendingApproval[];
 	/** How many approvals have been requested, which numbers the next one. */
 	requests: number;
+	/** The Lead's latest Task list; absent until it first plans. */
+	plan?: PlannedTask[];
+	/** Every Task handed off, by slug, in handoff order. */
+	tasks: Record<string, HandedTask>;
+	/** Every Teammate started, oldest first. */
+	teammates: Teammate[];
 }
 
 /** A new input to the core. */
@@ -77,14 +122,31 @@ export type EffortInput =
 	/** The human's answer to a pending item, with the Workspace the shell added for an approved Brief. */
 	| { kind: "answer"; id: string; answer: "approved" | "sent-back"; note?: string; workspace?: Workspace; at: string }
 	/** A Lead tool that would start a Teammate. */
-	| { kind: "start-teammate"; tool: "team_plan" | "team_handoff" };
+	| { kind: "start-teammate"; tool: "team_plan" | "team_handoff" }
+	/**
+	 * `team_plan`: the whole Task list, checked against the approved Brief's
+	 * criterion ids and the Roles of the Team snapshot, which the shell reads.
+	 */
+	| {
+			kind: "plan";
+			tasks: { slug: string; role: string; goal: string; dependsOn?: string[]; criteria?: string[] }[];
+			criteria: readonly string[];
+			roles: readonly string[];
+			at: string;
+	  }
+	/** `team_handoff` of a planned Task. */
+	| { kind: "handoff"; slug: string; at: string };
 
 /** Work the core leaves to the shell. */
 export type EffortAction =
 	/** Write the approved Brief as `brief.md`, snapshot the Team and the Playbook, and record the act. */
 	| { kind: "promote-brief"; approval: PendingApproval; at: string }
 	/** Start a turn of the Lead's model with this text. */
-	| { kind: "wake-lead"; text: string };
+	| { kind: "wake-lead"; text: string }
+	/** Write `plan.md` as a view of the state's plan. */
+	| { kind: "write-plan" }
+	/** Write the Task's folder and `task.md`, then launch the Teammate on it. */
+	| { kind: "launch-teammate"; teammate: Omit<Teammate, "task" | "startedAt">; task: { slug: string; folder: string } };
 
 export type Step =
 	| { ok: true; state: EffortState; append: EffortLine[]; actions: EffortAction[]; reply?: string }
@@ -122,6 +184,16 @@ function apply(state: EffortState, line: EffortLine): EffortState {
 			}
 			return { ...state, pending };
 		}
+		case "plan-written":
+			return { ...state, plan: line.tasks };
+		case "teammate-started": {
+			const { type: _type, ...teammate } = line;
+			return { ...state, teammates: [...state.teammates, teammate] };
+		}
+		case "task-handed-off": {
+			const { type: _type, slug, ...handed } = line;
+			return { ...state, tasks: { ...state.tasks, [slug]: handed } };
+		}
 	}
 }
 
@@ -132,20 +204,21 @@ export function fold(lines: readonly EffortLine[]): EffortState {
 		throw new Error(`effort.jsonl must start with an \`effort-opened\` line, not ${first ? `\`${first.type}\`` : "nothing"}`);
 	}
 	const { type: _type, at: _at, ...opened } = first;
-	return rest.reduce(apply, { ...opened, pending: [], requests: 0 });
+	return rest.reduce(apply, { ...opened, pending: [], requests: 0, tasks: {}, teammates: [] });
 }
 
 /** Take one input: the lines it appends and what the shell must do, or why it is refused. */
 export function step(state: EffortState, input: EffortInput): Step {
 	switch (input.kind) {
-		case "start-teammate":
-			if (!state.brief) {
-				return {
-					ok: false,
-					refusal: `No Teammate starts before the human approves the Brief of Effort \`${state.effortId}\`, so \`${input.tool}\` can't run yet. Draft the Brief, ask for it with \`team_request_approval\` at checkpoint \`${BRIEF}\`, and wait for the human to approve it in \`/team pending\`.`,
-				};
-			}
+		case "start-teammate": {
+			const refusal = beforeBrief(state, input.tool);
+			if (refusal !== undefined) return { ok: false, refusal };
 			return { ok: true, state, append: [], actions: [] };
+		}
+		case "plan":
+			return plan(state, input);
+		case "handoff":
+			return handoff(state, input);
 		case "request-approval":
 			return requestApproval(state, input);
 		case "answer":
@@ -230,4 +303,102 @@ function answer(state: EffortState, input: Extract<EffortInput, { kind: "answer"
 			text: `The human sent back the Brief of Effort \`${state.effortId}\` (request \`${item.id}\`) with this note:\n\n${input.note ?? ""}\n\nRevise ${item.path} with them, then ask again with \`team_request_approval\` at checkpoint \`${BRIEF}\`.`,
 		},
 	]);
+}
+
+/** Why `tool` can't start a Teammate yet, or undefined once the Brief is approved. */
+function beforeBrief(state: EffortState, tool: string): string | undefined {
+	if (state.brief) return undefined;
+	return `No Teammate starts before the human approves the Brief of Effort \`${state.effortId}\`, so \`${tool}\` can't run yet. Draft the Brief, ask for it with \`team_request_approval\` at checkpoint \`${BRIEF}\`, and wait for the human to approve it in \`/team pending\`.`;
+}
+
+const KEBAB = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+function quoted(items: readonly string[]): string {
+	return items.map((item) => `\`${item}\``).join(", ");
+}
+
+/**
+ * The Lead's whole Task list. Every criterion of the Brief must be covered,
+ * since dropping one is a Brief change, and only the snapshot's Roles staff
+ * Tasks. A Task already handed off keeps its slug and Role: its folder is
+ * named by both, and its Teammate fills that Role for life.
+ */
+function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>): Step {
+	const early = beforeBrief(state, "team_plan");
+	if (early !== undefined) return { ok: false, refusal: early };
+	const tasks: PlannedTask[] = input.tasks.map((task) => ({
+		slug: task.slug,
+		role: task.role,
+		goal: task.goal,
+		dependsOn: task.dependsOn ?? [],
+		criteria: task.criteria ?? [],
+	}));
+	const problems: string[] = [];
+	if (tasks.length === 0) problems.push("the plan has no Tasks; list every Task the Effort needs");
+	const slugs = tasks.map((task) => task.slug);
+	for (const slug of new Set(slugs)) {
+		if (!KEBAB.test(slug)) problems.push(`the slug \`${slug}\` must be kebab-case, such as \`rename-config-key\``);
+		if (slugs.filter((other) => other === slug).length > 1) problems.push(`the slug \`${slug}\` is used more than once; each Task's slug must be unique`);
+	}
+	for (const task of tasks) {
+		if (!input.roles.includes(task.role)) {
+			problems.push(`Task \`${task.slug}\` names the Role \`${task.role}\`, which Team \`${state.team}\` doesn't have; its Roles are ${quoted(input.roles)}`);
+		}
+		for (const id of task.criteria) {
+			if (!input.criteria.includes(id)) problems.push(`Task \`${task.slug}\` covers \`${id}\`, which the Brief doesn't have; its criteria are ${quoted(input.criteria)}`);
+		}
+		for (const slug of task.dependsOn) {
+			if (slug === task.slug) problems.push(`Task \`${task.slug}\` depends on itself`);
+			else if (!slugs.includes(slug)) problems.push(`Task \`${task.slug}\` depends on \`${slug}\`, which isn't in the plan`);
+		}
+	}
+	const uncovered = input.criteria.filter((id) => !tasks.some((task) => task.criteria.includes(id)));
+	if (uncovered.length > 0) {
+		problems.push(`no Task covers ${quoted(uncovered)}; every acceptance criterion of the Brief must be covered, and dropping one is a Brief change for the human`);
+	}
+	for (const [slug, handed] of Object.entries(state.tasks)) {
+		const kept = tasks.find((task) => task.slug === slug);
+		if (!kept) problems.push(`Task \`${slug}\` was handed off to \`${handed.teammate}\`, so it stays in the plan`);
+		else if (kept.role !== handed.role) problems.push(`Task \`${slug}\` was handed off to \`${handed.teammate}\` in Role \`${handed.role}\`, so it keeps that Role`);
+	}
+	if (problems.length > 0) {
+		return { ok: false, refusal: `The plan for Effort \`${state.effortId}\` can't be taken until these are fixed:\n${problems.map((problem) => `- ${problem}`).join("\n")}` };
+	}
+	const reply = `${state.plan ? "Replaced" : "Wrote"} the plan of Effort \`${state.effortId}\`: ${tasks.length} Task${tasks.length === 1 ? "" : "s"}, covering ${quoted(input.criteria)}. Hand each off with \`team_handoff\` when it is ready.`;
+	return took(state, [{ type: "plan-written", tasks, at: input.at }], [{ kind: "write-plan" }], reply);
+}
+
+/**
+ * Hand a planned Task to a fresh Teammate of its Role. The Task folder is
+ * numbered in handoff order and named `<nnn>-<role>-<slug>`; the Teammate is
+ * the next of its Role, `dev-1`, `dev-2`, …
+ */
+function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handoff" }>): Step {
+	const early = beforeBrief(state, "team_handoff");
+	if (early !== undefined) return { ok: false, refusal: early };
+	const task = state.plan?.find((planned) => planned.slug === input.slug);
+	if (!task) {
+		const planned = state.plan?.map((each) => each.slug) ?? [];
+		return {
+			ok: false,
+			refusal: `Effort \`${state.effortId}\` has no planned Task \`${input.slug}\`; ${planned.length > 0 ? `the planned ones are ${quoted(planned)}` : "write the plan with `team_plan` first"}.`,
+		};
+	}
+	const handed = state.tasks[input.slug];
+	if (handed) {
+		return { ok: false, refusal: `Task \`${input.slug}\` is already running, with \`${handed.teammate}\`; a Task is handed off once until its result is reviewed.` };
+	}
+	const n = state.teammates.filter((teammate) => teammate.role === task.role).length + 1;
+	const id = `${task.role}-${n}`;
+	const name = `team-${state.effortId}-${id}`;
+	const folder = `${String(Object.keys(state.tasks).length + 1).padStart(3, "0")}-${task.role}-${task.slug}`;
+	return took(
+		state,
+		[
+			{ type: "teammate-started", id, role: task.role, name, task: task.slug, startedAt: input.at },
+			{ type: "task-handed-off", slug: task.slug, folder, role: task.role, teammate: id, at: input.at },
+		],
+		[{ kind: "launch-teammate", teammate: { id, role: task.role, name }, task: { slug: task.slug, folder } }, { kind: "write-plan" }],
+		`started ${id} on Task \`${task.slug}\` (tasks/${folder}/task.md).`,
+	);
 }

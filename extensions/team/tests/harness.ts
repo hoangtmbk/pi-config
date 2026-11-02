@@ -105,6 +105,23 @@ export function goodTeam(name: string, extra: TeamFiles = {}): TeamFiles {
 export interface FakeClaudeOptions {
 	/** What `--version` prints. */
 	version?: string;
+	/** The exit code of a `--bg` launch; 0 when unset. */
+	bgExit?: number;
+}
+
+/** One `claude --bg` launch, as the fake saw it. */
+export interface FakeLaunch {
+	argv: string[];
+	/** The folder it ran in. */
+	cwd: string;
+	/** `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` as it was set, absent when unset. */
+	additionalDirectoriesClaudeMd?: string;
+	/** The contents of the `--settings` file, read at launch. */
+	settings?: string;
+	/** The contents of the `--append-system-prompt-file`, read at launch. */
+	prompt?: string;
+	/** The contents of the `--mcp-config` file, read at launch. */
+	mcpConfig?: string;
 }
 
 /** A fake `claude` on disk, and what it recorded. */
@@ -113,6 +130,8 @@ export interface FakeClaude {
 	path: string;
 	/** Every invocation's argv, oldest first. */
 	calls(): string[][];
+	/** Every `--bg` launch, oldest first. */
+	launches(): FakeLaunch[];
 }
 
 const FAKE_CLAUDE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "fake-claude.ts");
@@ -127,22 +146,28 @@ const FAKE_CLAUDE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "fake-c
 export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): FakeClaude {
 	const dir = mkdtempSync(join(roots.scratch, "fake-claude-"));
 	const argvOut = join(dir, "argv.jsonl");
-	const env: Record<string, string | undefined> = { FAKE_CLAUDE_ARGV_OUT: argvOut, FAKE_CLAUDE_VERSION: options.version };
+	const launchOut = join(dir, "launches.jsonl");
+	const env: Record<string, string | undefined> = {
+		FAKE_CLAUDE_ARGV_OUT: argvOut,
+		FAKE_CLAUDE_LAUNCH_OUT: launchOut,
+		FAKE_CLAUDE_VERSION: options.version,
+		FAKE_CLAUDE_BG_EXIT: options.bgExit === undefined ? undefined : String(options.bgExit),
+	};
 	const exports = Object.entries(env)
 		.filter((entry): entry is [string, string] => entry[1] !== undefined)
 		.map(([name, value]) => `export ${name}=${shellQuote(value)}`);
 	const path = join(dir, "claude");
 	writeFileSync(path, ["#!/bin/sh", ...exports, `exec ${shellQuote(process.execPath)} ${shellQuote(FAKE_CLAUDE_SCRIPT)} "$@"`, ""].join("\n"), { mode: 0o755 });
-	return {
-		path,
-		calls: () =>
-			existsSync(argvOut)
-				? readFileSync(argvOut, "utf8")
-						.split("\n")
-						.filter(Boolean)
-						.map((line) => JSON.parse(line) as string[])
-				: [],
-	};
+	return { path, calls: () => jsonLines<string[]>(argvOut), launches: () => jsonLines<FakeLaunch>(launchOut) };
+}
+
+function jsonLines<T>(file: string): T[] {
+	return existsSync(file)
+		? readFileSync(file, "utf8")
+				.split("\n")
+				.filter(Boolean)
+				.map((line) => JSON.parse(line) as T)
+		: [];
 }
 
 function shellQuote(text: string): string {
