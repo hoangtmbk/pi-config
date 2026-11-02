@@ -34,6 +34,11 @@
  *   session plays each time an authorized user message lands in its inbox,
  *   with that message as its pointer. A `UserPromptSubmit` without a payload
  *   reports the message as its prompt.
+ * - `FAKE_CLAUDE_ATTACH_OUT`: a file each `attach` appends one JSON line to:
+ *   its argv and the device and inode its stdin, stdout and stderr are open
+ *   on, so a test can tell whether it was handed the terminal pi runs on.
+ * - `FAKE_CLAUDE_ATTACH_EXIT`: the exit code of an `attach`, `0` when unset.
+ *   It prints nothing, since the terminal it inherits is the test runner's.
  *
  * Anything else it is asked to do exits 1 with a message saying so, so a test
  * that reaches further than the fake goes is loud about it.
@@ -41,7 +46,7 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, fstatSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 
@@ -99,6 +104,16 @@ async function main(): Promise<void> {
 			process.stdout.write("fake claude: background session started\n");
 		}
 		process.exit(exit);
+	}
+
+	if (argv[0] === "attach") {
+		const attachOut = process.env.FAKE_CLAUDE_ATTACH_OUT;
+		const stdio = [0, 1, 2].map((fd) => {
+			const stat = fstatSync(fd);
+			return `${stat.dev}:${stat.ino}`;
+		});
+		if (attachOut) appendFileSync(attachOut, `${JSON.stringify({ argv, stdio })}\n`);
+		process.exit(Number(process.env.FAKE_CLAUDE_ATTACH_EXIT ?? "0"));
 	}
 
 	process.stderr.write(`fake claude: no scripted behaviour for ${JSON.stringify(argv)}\n`);

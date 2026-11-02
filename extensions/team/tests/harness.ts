@@ -6,7 +6,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -114,6 +114,8 @@ export interface FakeClaudeOptions {
 	hooks?: FakeHookStep[];
 	/** What a session does each time an authorized user message lands in its inbox, that message being its pointer. */
 	replies?: FakeHookStep[];
+	/** The exit code of a `claude attach`; 0 when unset. */
+	attachExit?: number;
 }
 
 /**
@@ -148,6 +150,8 @@ export interface FakeClaude {
 	launches(): FakeLaunch[];
 	/** Every connection to a session's inbox socket, oldest first. */
 	inbox(): FakeInboxConnection[];
+	/** Every `claude attach`, oldest first. */
+	attaches(): FakeAttach[];
 }
 
 /** One connection to a fake session's inbox socket. */
@@ -158,6 +162,21 @@ export interface FakeInboxConnection {
 	authorized: boolean;
 	/** Every line received, verbatim, the auth line first. */
 	lines: string[];
+}
+
+/** One `claude attach`, as the fake saw it. */
+export interface FakeAttach {
+	argv: string[];
+	/** The `<device>:<inode>` of its stdin, stdout and stderr: the same as the test process's when inherited. */
+	stdio: string[];
+}
+
+/** The `<device>:<inode>` of this process's stdin, stdout and stderr, to compare a fake's against. */
+export function ownStdio(): string[] {
+	return [0, 1, 2].map((fd) => {
+		const stat = fstatSync(fd);
+		return `${stat.dev}:${stat.ino}`;
+	});
 }
 
 const FAKE_CLAUDE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "fake-claude.ts");
@@ -174,6 +193,7 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 	const argvOut = join(dir, "argv.jsonl");
 	const launchOut = join(dir, "launches.jsonl");
 	const inboxOut = join(dir, "inbox.jsonl");
+	const attachOut = join(dir, "attaches.jsonl");
 	const hooks = join(dir, "hooks.json");
 	const replies = join(dir, "replies.json");
 	if (options.hooks) writeFileSync(hooks, JSON.stringify(options.hooks));
@@ -190,6 +210,8 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 		FAKE_CLAUDE_SOCKETS: sockets,
 		FAKE_CLAUDE_INBOX_OUT: inboxOut,
 		FAKE_CLAUDE_OWNER: String(process.pid),
+		FAKE_CLAUDE_ATTACH_OUT: attachOut,
+		FAKE_CLAUDE_ATTACH_EXIT: options.attachExit === undefined ? undefined : String(options.attachExit),
 	};
 	const exports = Object.entries(env)
 		.filter((entry): entry is [string, string] => entry[1] !== undefined)
@@ -201,7 +223,24 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 		calls: () => jsonLines<string[]>(argvOut),
 		launches: () => jsonLines<FakeLaunch>(launchOut),
 		inbox: () => jsonLines<FakeInboxConnection>(inboxOut),
+		attaches: () => jsonLines<FakeAttach>(attachOut),
 	};
+}
+
+/** A fake `tmux` on disk, and the argv of every call to it. */
+export interface FakeTmux {
+	path: string;
+	calls(): string[][];
+}
+
+/** Write an executable standing in for `tmux`, which records its argv and exits with `exit` (0 unless set). */
+export function fakeTmux(roots: TempRoots, exit = 0): FakeTmux {
+	const dir = mkdtempSync(join(roots.scratch, "fake-tmux-"));
+	const argvOut = join(dir, "argv.jsonl");
+	const record = `require("node:fs").appendFileSync(${JSON.stringify(argvOut)}, JSON.stringify(process.argv.slice(1)) + "\\n")`;
+	const path = join(dir, "tmux");
+	writeFileSync(path, ["#!/bin/sh", `${shellQuote(process.execPath)} -e ${shellQuote(record)} -- "$@"`, `exit ${exit}`, ""].join("\n"), { mode: 0o755 });
+	return { path, calls: () => jsonLines<string[]>(argvOut) };
 }
 
 function jsonLines<T>(file: string): T[] {

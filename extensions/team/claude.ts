@@ -10,7 +10,7 @@
  * Teammate's `claude` would otherwise stop on with nobody there to answer.
  */
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { basename, dirname, join } from "node:path";
@@ -151,6 +151,29 @@ export function sendToInbox(inbox: Inbox, content: string): Promise<{ error: str
 				`${JSON.stringify({ type: "auth", token: inbox.token })}\n${JSON.stringify({ type: "user", message: { role: "user", content } })}\n`,
 			);
 		});
+	});
+}
+
+/**
+ * The command that attaches a terminal to a Teammate's session, as the human
+ * types it: `claude attach <short id>`, the executable quoted only when it
+ * needs to be.
+ */
+export function attachCommand(claudePath: string, shortId: string): string {
+	const claude = /^[\w@%+=:,./-]+$/.test(claudePath) ? claudePath : shellQuote(claudePath);
+	return `${claude} attach ${shortId}`;
+}
+
+/**
+ * Run `claude attach <short id>` on pi's own terminal, its stdio inherited,
+ * until the human leaves it. Resolves with its exit code, or an error when it
+ * couldn't start.
+ */
+export function attachHere(claudePath: string, shortId: string): Promise<{ code: number | null } | { error: string }> {
+	return new Promise((resolve) => {
+		const child = spawn(claudePath, ["attach", shortId], { stdio: "inherit" });
+		child.on("error", (error) => resolve({ error: error.message }));
+		child.on("exit", (code) => resolve({ code }));
 	});
 }
 
