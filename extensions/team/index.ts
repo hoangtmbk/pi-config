@@ -19,7 +19,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type Bridge, openBridge } from "./bridge.ts";
-import { launchBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
+import { launchBackground, sendToInbox, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
 import { currentResult, type EffortAction, type EffortState, fold, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace } from "./core.ts";
 import { EVERY_ROLE, listTeams, loadTeam, type Playbook, readSnapshot, type Role, sha256, type Team, type TeamRoots } from "./definitions.ts";
 import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
@@ -35,6 +35,7 @@ import {
 	readLines,
 	validateBrief,
 	writeLead,
+	writeFeedback,
 	writePlan,
 	writeTask,
 } from "./records.ts";
@@ -58,12 +59,12 @@ import {
 	type TeamSetup,
 } from "./setup.ts";
 import { pickTeam, proposeTeam, type StartOutcome } from "./start.ts";
-import { handoffPointer, teammatePrompt } from "./teammate.ts";
+import { handoffPointer, sendBackPointer, teammatePrompt } from "./teammate.ts";
 
 /** The Lead's tools while this session runs Team setup. */
 const SETUP_TOOLS = ["team_request_approval"];
 /** The Lead's tools while this session holds an Effort. */
-const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff"];
+const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff", "team_review"];
 /** Every Lead tool: registered at load, and switched on only by what the session runs. */
 const LEAD_TOOLS = [...new Set([...SETUP_TOOLS, ...EFFORT_TOOLS])];
 
@@ -89,6 +90,17 @@ const HandoffParams = Type.Object({
 	slug: Type.String({ description: "The planned Task to hand off." }),
 	body: Type.String({ description: "The `task.md` body the Teammate works from." }),
 	isolated: Type.Optional(Type.Boolean({ description: "Whether the Task needs a worktree of its own." })),
+});
+
+/** What `team_review` can decide about a round's result. */
+const VERDICTS = ["accept", "send_back"] as const;
+
+const ReviewParams = Type.Object({
+	slug: Type.String({ description: "The handed-off Task whose newest result was reviewed." }),
+	verdict: Type.String({ description: "`accept` to accept the result, or `send_back` to send the Task back to its Teammate with `feedback`." }),
+	feedback: Type.Optional(
+		Type.String({ description: "For `send_back`: what is wrong with the result and what would make it acceptable. It is written to the Task's `feedback-<n>.md`." }),
+	),
 });
 
 /** Where the extension finds everything outside itself. Each defaults to the real thing. */
@@ -393,7 +405,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * The Effort a Lead tool that leads to a Teammate works on: refused before
 	 * the Brief is approved, and on any record changed since.
 	 */
-	function approvedEffort(tool: "team_plan" | "team_handoff", ctx: ExtensionContext): { held: HeldEffort; state: EffortState } {
+	function approvedEffort(tool: "team_plan" | "team_handoff" | "team_review", ctx: ExtensionContext): { held: HeldEffort; state: EffortState } {
 		if (!effort) throw new Error(`No Effort is open in this session, so \`${tool}\` has nothing to work on; the human opens one with \`/team start <team>\`.`);
 		const state = effortState(effort);
 		const result = step(state, { kind: "start-teammate", tool });
@@ -545,7 +557,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		description: [
 			"Hand a planned Task to a new Teammate of its Role, launched as a Claude Code background session in the Effort's Workspace.",
 			"`body` becomes the Task's `task.md`: make it self-contained, listing the Effort's `brief.md` and `clarifications.md` among its inputs, since the Teammate has no earlier conversation.",
-			"Returns which Teammate started. Refused until the human approves the Brief, for a Task that isn't planned or is already running, and for `isolated`, which isn't built yet.",
+			"Returns which Teammate started. Refused until the human approves the Brief, for a Task already handed off (running, in review, sent back or accepted), and for `isolated`, which isn't built yet.",
 		].join(" "),
 		promptSnippet: "Hand a planned Task to a Teammate once the Brief is approved",
 		parameters: HandoffParams,
@@ -590,6 +602,56 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			});
 			// Its hooks can ring before it is recorded as started, so its journal is read once it is.
 			wakeAboutTeammates(applyJournals(held));
+			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
+		},
+	});
+
+	pi.registerTool({
+		name: "team_review",
+		label: "Review",
+		description: [
+			"Decide on the newest result of a handed-off Task, once its Teammate has written it and you were woken about it.",
+			"`accept` marks the Task accepted in plan.md.",
+			"`send_back` writes `feedback` to the Task's `feedback-<n>.md` and sends its Teammate a pointer to it; the Teammate writes `result-<n+1>.md` and you are woken again.",
+			"Refused while the round's result isn't written, for an accepted Task, and for a send-back past the Playbook's `sendBackLimit`, when you escalate to the human instead.",
+		].join(" "),
+		promptSnippet: "Accept a Task's result, or send it back to its Teammate with feedback",
+		parameters: ReviewParams,
+		defaultActive: false,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const { held, state } = approvedEffort("team_review", ctx);
+			const verdict = VERDICTS.find((each) => each === params.verdict);
+			if (verdict === undefined) throw new Error(`\`verdict\` is \`accept\` or \`send_back\`, not \`${params.verdict}\`.`);
+			const due = state.tasks[params.slug];
+			const path = due ? join(held.paths.tasks, due.folder, `result-${due.round}.md`) : "";
+			const result = step(state, {
+				kind: "review",
+				slug: params.slug,
+				verdict,
+				feedback: params.feedback,
+				result: { path, written: path !== "" && existsSync(path) },
+				sendBackLimit: snapshotOf(held).playbook.sendBackLimit,
+				at: now().toISOString(),
+			});
+			if (!result.ok) throw new Error(result.refusal);
+			const sends: Extract<EffortAction, { kind: "send-back" }>[] = [];
+			for (const action of result.actions) {
+				if (action.kind === "send-back") {
+					writeFeedback(held.paths, action.folder, action.round, action.feedback);
+					sends.push(action);
+				} else if (action.kind === "write-plan") writePlan(held.paths, result.state);
+			}
+			// The send-back is on record before the pointer goes, since the Teammate can answer before the send returns.
+			appendLines(held.paths, result.append);
+			for (const send of sends) {
+				const pointer = sendBackPointer(send.slug, join(held.paths.tasks, send.folder), send.round);
+				const failed = await sendToInbox(send.inbox, pointer);
+				if (failed) {
+					throw new Error(
+						`Task \`${send.slug}\` is sent back and its feedback-${send.round}.md is written, but the pointer couldn't reach \`${send.teammate}\`'s inbox (${failed.error}), so it isn't working on round ${send.round + 1}. Stop and tell the human.`,
+					);
+				}
+			}
 			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
 		},
 	});

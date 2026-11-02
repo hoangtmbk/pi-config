@@ -66,7 +66,14 @@ export interface HandedTask {
 	round: number;
 	/** The last round whose result was reported to the Lead as done. */
 	reported?: number;
+	/** When the Lead accepted it, which ends the Task; absent until then. */
+	accepted?: string;
+	/** How many times the Lead sent it back; absent before the first. */
+	sendBacks?: number;
 }
+
+/** Where a Task of the plan stands, as `plan.md` shows it. */
+export type TaskStatus = "planned" | "running" | "in review" | "sent back" | "accepted";
 
 /** A Claude Code background session the Effort started, filling one Role for life. */
 export interface Teammate {
@@ -122,7 +129,11 @@ export type EffortLine =
 	/** A Teammate was launched. */
 	| ({ type: "teammate-started" } & Teammate)
 	/** A planned Task was handed to a Teammate, its folder written. */
-	| ({ type: "task-handed-off"; slug: string } & Omit<HandedTask, "reported">)
+	| ({ type: "task-handed-off"; slug: string } & Omit<HandedTask, "reported" | "accepted" | "sendBacks">)
+	/** The Lead sent round `round` of a Task back with feedback, which starts round `round + 1` with the same Teammate. */
+	| { type: "task-sent-back"; slug: string; round: number; at: string }
+	/** The Lead accepted round `round` of a Task, which ends it. */
+	| { type: "task-accepted"; slug: string; round: number; at: string }
 	/**
 	 * The lines below each apply one journal line of `teammate`, and carry the
 	 * `cursor` it was read at, so it is never applied twice.
@@ -169,7 +180,7 @@ export type EffortInput =
 	/** The human's answer to a pending item, with the Workspace the shell added for an approved Brief. */
 	| { kind: "answer"; id: string; answer: "approved" | "sent-back"; note?: string; workspace?: Workspace; at: string }
 	/** A Lead tool that would start a Teammate. */
-	| { kind: "start-teammate"; tool: "team_plan" | "team_handoff" }
+	| { kind: "start-teammate"; tool: "team_plan" | "team_handoff" | "team_review" }
 	/**
 	 * `team_plan`: the whole Task list, checked against the approved Brief's
 	 * criterion ids and the Roles of the Team snapshot, which the shell reads.
@@ -187,7 +198,20 @@ export type EffortInput =
 	 * Line `cursor` of `teammate`'s journal (counted from 1), with whether the
 	 * result its current Task is due to write ({@link currentResult}) is on disk.
 	 */
-	| { kind: "journal"; teammate: string; cursor: number; line: JournalLine; result: { path: string; written: boolean } };
+	| { kind: "journal"; teammate: string; cursor: number; line: JournalLine; result: { path: string; written: boolean } }
+	/**
+	 * `team_review` of a handed-off Task, with whether its current round's
+	 * result is on disk and the Playbook's `sendBackLimit`, which the shell reads.
+	 */
+	| {
+			kind: "review";
+			slug: string;
+			verdict: "accept" | "send_back";
+			feedback?: string;
+			result: { path: string; written: boolean };
+			sendBackLimit: number;
+			at: string;
+	  };
 
 /** Work the core leaves to the shell. */
 export type EffortAction =
@@ -198,7 +222,13 @@ export type EffortAction =
 	/** Write `plan.md` as a view of the state's plan. */
 	| { kind: "write-plan" }
 	/** Write the Task's folder and `task.md`, then launch the Teammate on it. */
-	| { kind: "launch-teammate"; teammate: Omit<Teammate, "task" | "startedAt">; task: { slug: string; folder: string } };
+	| { kind: "launch-teammate"; teammate: Omit<Teammate, "task" | "startedAt">; task: { slug: string; folder: string } }
+	/**
+	 * Write `feedback` as `feedback-<round>.md` in the Task's folder, then send
+	 * the Teammate a pointer to it over its inbox, with no clear: it keeps its
+	 * own reasoning, and writes `result-<round + 1>.md` next.
+	 */
+	| { kind: "send-back"; teammate: string; inbox: Inbox; slug: string; folder: string; round: number; feedback: string };
 
 export type Step =
 	| { ok: true; state: EffortState; append: EffortLine[]; actions: EffortAction[]; reply?: string }
@@ -256,12 +286,24 @@ function apply(state: EffortState, line: EffortLine): EffortState {
 		case "permission-denied":
 		case "teammate-stopped":
 			return withTeammate(state, line, {});
+		case "task-sent-back": {
+			const task = state.tasks[line.slug];
+			return task ? withTask(state, line.slug, { round: line.round + 1, sendBacks: (task.sendBacks ?? 0) + 1 }) : state;
+		}
+		case "task-accepted":
+			return withTask(state, line.slug, { accepted: line.at });
 		case "task-done": {
 			const advanced = withTeammate(state, line, {});
 			const task = advanced.tasks[line.slug];
 			return task ? { ...advanced, tasks: { ...advanced.tasks, [line.slug]: { ...task, reported: line.round } } } : advanced;
 		}
 	}
+}
+
+/** The state with handed-off Task `slug` changed by `change`. */
+function withTask(state: EffortState, slug: string, change: Partial<HandedTask>): EffortState {
+	const task = state.tasks[slug];
+	return task ? { ...state, tasks: { ...state.tasks, [slug]: { ...task, ...change } } } : state;
 }
 
 /** The state with `line.teammate` changed by `change`, its cursor moved to the line's. */
@@ -300,6 +342,8 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return answer(state, input);
 		case "journal":
 			return journal(state, input);
+		case "review":
+			return review(state, input);
 	}
 }
 
@@ -463,7 +507,14 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 	}
 	const handed = state.tasks[input.slug];
 	if (handed) {
-		return { ok: false, refusal: `Task \`${input.slug}\` is already running, with \`${handed.teammate}\`; a Task is handed off once until its result is reviewed.` };
+		const status = taskStatus(state, input.slug);
+		if (status === "accepted") {
+			return { ok: false, refusal: `Task \`${input.slug}\` is accepted (round ${handed.round}, with \`${handed.teammate}\`), and an accepted Task is never handed off again.` };
+		}
+		return {
+			ok: false,
+			refusal: `Task \`${input.slug}\` is already ${status}, with \`${handed.teammate}\`; a Task is handed off once, and \`team_review\` sends it back for another round once its result is written.`,
+		};
 	}
 	const n = state.teammates.filter((teammate) => teammate.role === task.role).length + 1;
 	const id = `${task.role}-${n}`;
@@ -556,4 +607,83 @@ function stopped(state: EffortState, teammate: Teammate, input: Extract<EffortIn
 			},
 		],
 	);
+}
+
+/**
+ * The Lead's verdict on a Task's current round, taken only once that round's
+ * `result-<round>.md` is written: a round is reviewed once, since accepting
+ * ends the Task and a send-back starts the next round.
+ */
+function review(state: EffortState, input: Extract<EffortInput, { kind: "review" }>): Step {
+	const task = state.tasks[input.slug];
+	if (!task) {
+		const handed = Object.keys(state.tasks);
+		return {
+			ok: false,
+			refusal: `Task \`${input.slug}\` hasn't been handed off, so it has no result to review; ${handed.length > 0 ? `the handed-off Tasks are ${quoted(handed)}` : "no Task has been handed off yet"}.`,
+		};
+	}
+	if (task.accepted !== undefined) {
+		return { ok: false, refusal: `Task \`${input.slug}\` is already accepted (round ${task.round}), and an accepted Task is never reviewed again.` };
+	}
+	if (!input.result.written) {
+		return {
+			ok: false,
+			refusal: `Task \`${input.slug}\` has no new result to review: round ${task.round}'s ${input.result.path} isn't written yet. Wait for \`${task.teammate}\` to finish; you are woken when it does.`,
+		};
+	}
+	if (task.reported !== task.round) {
+		return {
+			ok: false,
+			refusal: `Task \`${input.slug}\` has no new result to review: \`${task.teammate}\` hasn't finished round ${task.round} yet, though ${input.result.path} is on disk. Wait for it to stop; you are woken when it does.`,
+		};
+	}
+	if (input.verdict === "accept") {
+		return took(
+			state,
+			[{ type: "task-accepted", slug: input.slug, round: task.round, at: input.at }],
+			[{ kind: "write-plan" }],
+			`Accepted Task \`${input.slug}\` at round ${task.round} (${input.result.path}). plan.md shows it accepted.`,
+		);
+	}
+	const feedback = input.feedback?.trim() ?? "";
+	if (feedback === "") {
+		return { ok: false, refusal: `A send-back of Task \`${input.slug}\` needs feedback: say specifically what is wrong with round ${task.round}'s result and what would make it acceptable.` };
+	}
+	const sendBacks = task.sendBacks ?? 0;
+	if (sendBacks >= input.sendBackLimit) {
+		return {
+			ok: false,
+			refusal: `Task \`${input.slug}\` was sent back ${sendBacks} time${sendBacks === 1 ? "" : "s"}, the Playbook's \`sendBackLimit\` of ${input.sendBackLimit}, so it can't be sent back again. Escalate to the human instead: stop and tell them what is still wrong with ${input.result.path} and ask how to go on. You can still accept it.`,
+		};
+	}
+	const inbox = state.teammates.find((each) => each.id === task.teammate)?.inbox;
+	if (!inbox) {
+		return {
+			ok: false,
+			refusal: `Task \`${input.slug}\` can't be sent back yet: \`${task.teammate}\` has no inbox socket on record, since its session hasn't reported a \`SessionStart\`. Stop and tell the human.`,
+		};
+	}
+	return took(
+		state,
+		[{ type: "task-sent-back", slug: input.slug, round: task.round, at: input.at }],
+		[
+			{ kind: "send-back", teammate: task.teammate, inbox, slug: input.slug, folder: task.folder, round: task.round, feedback },
+			{ kind: "write-plan" },
+		],
+		`Sent Task \`${input.slug}\` back to \`${task.teammate}\` (send-back ${sendBacks + 1} of ${input.sendBackLimit}) with feedback-${task.round}.md; it writes result-${task.round + 1}.md next, and you are woken when it does.`,
+	);
+}
+
+/**
+ * Where Task `slug` stands: planned until handed off; then running, in review
+ * once its round's result is reported, sent back while a later round is
+ * worked, and accepted for good.
+ */
+export function taskStatus(state: EffortState, slug: string): TaskStatus {
+	const task = state.tasks[slug];
+	if (!task) return "planned";
+	if (task.accepted !== undefined) return "accepted";
+	if (task.reported === task.round) return "in review";
+	return task.round > 1 ? "sent back" : "running";
 }
