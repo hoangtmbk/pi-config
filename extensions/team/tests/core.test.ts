@@ -127,6 +127,7 @@ describe("the human's answer", () => {
 		assert.deepEqual(result.actions[0], { kind: "promote-brief", approval: fold(asked).pending[0], at: "2026-11-02T11:00:00.000Z" });
 		assert.equal(result.actions[1].kind, "wake-lead");
 		assert.match(result.actions[1].kind === "wake-lead" ? result.actions[1].text : "", /approved the Brief/);
+		assert.match(result.actions[1].kind === "wake-lead" ? result.actions[1].text : "", /`team_plan`.*the plan Report with `team_report`/);
 	});
 
 	it("lets Teammates start once the Brief is approved", () => {
@@ -598,6 +599,143 @@ describe("a Teammate's permission mode", () => {
 		const result = run(started, hook(1, "SessionStart", "default"));
 		assert.ok(result.ok);
 		assert.deepEqual(result.append[0], { type: "teammate-mode", teammate: "dev-1", cursor: 1, mode: "manual", at: "2026-11-02T11:41:00.000Z" });
+	});
+});
+
+describe("reporting", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "design", role: "architect", goal: "Design the rename.", criteria: ["AC2"] },
+			{ slug: "rename", role: "dev", goal: "Rename the key.", dependsOn: ["design"], criteria: ["AC1"] },
+		],
+		criteria: ["AC1", "AC2"],
+		roles: ["architect", "dev"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+	const MODES = [
+		{ role: "architect", mode: "auto" },
+		{ role: "dev", mode: "acceptEdits" },
+	];
+
+	function report(at: string, extra: Partial<Extract<EffortInput, { kind: "report" }>> = {}): Extract<EffortInput, { kind: "report" }> {
+		return { kind: "report", headline: "On track.", criteria: ["AC1", "AC2"], modes: MODES, at, ...extra };
+	}
+
+	/** The Report a successful step asks the shell to write. */
+	function written(result: Step) {
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "write-report");
+		assert.ok(action?.kind === "write-report", "expected a write-report action");
+		return action.report;
+	}
+
+	function section(result: Step, title: string): string[] | undefined {
+		return written(result).sections.find((each) => each.title === title)?.lines;
+	}
+
+	it("numbers Reports consecutively, keeping the last number in effort.jsonl", () => {
+		const first = run(planned, report("2026-11-02T11:15:00.000Z"));
+		assert.equal(written(first).n, 1);
+		assert.ok(first.ok);
+		assert.deepEqual(first.append, [{ type: "report-written", n: 1, at: "2026-11-02T11:15:00.000Z" }]);
+		assert.equal(first.state.reports, 1);
+
+		const second = run([...planned, ...first.append], report("2026-11-02T12:00:00.000Z"));
+		assert.equal(written(second).n, 2);
+		assert.equal(fold([...planned, ...first.append, ...(second.ok ? second.append : [])]).reports, 2);
+	});
+
+	it("covers only what happened since the last Report", () => {
+		const first = applied(planned, report("2026-11-02T11:15:00.000Z"));
+		const handed = applied(first, { kind: "handoff", slug: "design", at: "2026-11-02T11:30:00.000Z", mode: "auto" });
+
+		const firstSince = section(run(planned, report("2026-11-02T11:15:00.000Z")), "Since the last Report");
+		assert.ok(firstSince?.some((line) => /approved the Brief/.test(line)));
+		assert.ok(firstSince?.some((line) => /planned 2 Tasks/.test(line)));
+
+		const since = section(run(handed, report("2026-11-02T12:00:00.000Z")), "Since the last Report");
+		assert.deepEqual(since, ["11:30 handed Task `design` to architect-1"]);
+	});
+
+	it("refuses a Report before the Brief is approved, and coverage of a criterion the Brief doesn't have", () => {
+		assert.match(refusal([OPENED], report("2026-11-02T10:30:00.000Z")), /plan Report/);
+		assert.match(refusal(planned, report("2026-11-02T11:15:00.000Z", { coverage: [{ criterion: "AC9", note: "done" }] })), /`AC9`.*`AC1`, `AC2`/);
+		assert.match(refusal(planned, report("2026-11-02T11:15:00.000Z", { headline: "  " })), /headline/);
+	});
+
+	it("gives the plan Report the plan, the Role modes and what waits on the human, and later Reports only the sections with something new", () => {
+		const first = run(planned, report("2026-11-02T11:15:00.000Z", { coverage: [{ criterion: "AC1", note: "planned in `rename`" }] }));
+		assert.deepEqual(written(first).coverage, [{ criterion: "AC1", note: "planned in `rename`" }]);
+		assert.deepEqual(section(first, "Plan"), ["`design` (architect): planned", "`rename` (dev): planned"]);
+		assert.deepEqual(section(first, "Teammate modes"), ["architect: auto", "dev: acceptEdits"]);
+		assert.equal(section(first, "Waiting on you"), undefined);
+		assert.equal(section(first, "Decided for you"), undefined);
+		assert.equal(section(first, "Found work"), undefined);
+
+		const reported = [...planned, ...(first.ok ? first.append : [])];
+		const quiet = run(reported, report("2026-11-02T11:20:00.000Z"));
+		assert.deepEqual(
+			written(quiet).sections.map((each) => each.title),
+			[],
+		);
+	});
+
+	it("shows re-plan reasons and plan statuses once the plan changes", () => {
+		const first = applied(planned, report("2026-11-02T11:15:00.000Z"));
+		const replanned = applied(first, {
+			kind: "plan",
+			tasks: [{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1", "AC2"] }],
+			criteria: ["AC1", "AC2"],
+			roles: ["architect", "dev"],
+			reason: "The design is a one-liner.",
+			at: "2026-11-02T11:20:00.000Z",
+		});
+
+		const result = run(replanned, report("2026-11-02T11:25:00.000Z"));
+		assert.deepEqual(section(result, "Since the last Report"), ["11:20 re-planned 1 Task"]);
+		assert.deepEqual(section(result, "Plan"), ["`rename` (dev): planned", "re-planned at 11:20: The design is a one-liner."]);
+		assert.equal(section(result, "Teammate modes"), undefined);
+	});
+
+	it("lists what was decided for the human since the last Report, and mode drift only on change", () => {
+		const first = applied(planned, report("2026-11-02T11:15:00.000Z"));
+		const handed = applied(first, { kind: "handoff", slug: "design", at: "2026-11-02T11:30:00.000Z", mode: "auto" });
+		const logged: EffortLine[] = [
+			...handed,
+			{ type: "decided-for-you", what: "allowed `npm test` for architect-1", task: "design", at: "2026-11-02T11:35:00.000Z" },
+			{ type: "teammate-mode", teammate: "architect-1", cursor: 1, mode: "manual", at: "2026-11-02T11:36:00.000Z" },
+		];
+
+		const result = run(logged, report("2026-11-02T12:00:00.000Z"));
+		assert.deepEqual(section(result, "Decided for you"), ["11:35 allowed `npm test` for architect-1 (Task `design`)"]);
+		assert.deepEqual(section(result, "Teammate modes"), ["architect-1: manual, launched in auto (11:36)"]);
+
+		const next = run(applied(logged, report("2026-11-02T12:00:00.000Z")), report("2026-11-02T12:30:00.000Z"));
+		assert.equal(section(next, "Decided for you"), undefined);
+		assert.equal(section(next, "Teammate modes"), undefined);
+	});
+
+	it("keeps found work in the core's log, showing a running count and the new items", () => {
+		const first = applied(planned, report("2026-11-02T11:15:00.000Z", { found: ["The cache key is also misspelt in docs."] }));
+		assert.deepEqual(fold(first).found, [{ what: "The cache key is also misspelt in docs.", at: "2026-11-02T11:15:00.000Z" }]);
+
+		const second = run(first, report("2026-11-02T12:00:00.000Z", { found: ["`old-config` has no tests."] }));
+		assert.deepEqual(section(second, "Found work"), [
+			"2 found so far outside the Brief, kept as suggestions for the final Report; new since the last Report:",
+			"`old-config` has no tests.",
+		]);
+	});
+
+	it("lists what waits on the human whenever something does", () => {
+		const asked = applied([OPENED], request("b".repeat(64)));
+		const approved2 = applied(asked, { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+		const waiting: EffortLine[] = [...approved2, { type: "approval-requested", id: "r2", checkpoint: "brief", path: DRAFT, sha256: "c".repeat(64), snapshot: "x", at: "2026-11-02T11:05:00.000Z" }];
+
+		assert.deepEqual(section(run(waiting, report("2026-11-02T11:15:00.000Z")), "Waiting on you"), [
+			`\`r2\`: approve the Brief, ${DRAFT} (sha256 ${"c".repeat(64)}), in \`/team pending\``,
+		]);
 	});
 });
 
