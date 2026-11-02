@@ -30,12 +30,37 @@ export function tempRoots(): TempRoots {
 	return { agentDir, claudeConfigPath: join(home, ".claude.json"), scratch };
 }
 
-/** An empty git repo under the scratch folder, by its real path, as `git` reports a repo's root. */
-export function gitRepo(roots: TempRoots, name = "repo"): string {
+/**
+ * A git repo under the scratch folder, by its real path, as `git` reports a
+ * repo's root: branch `main` with one commit holding a `README.md`, unless
+ * `empty` asks for a repo with no commits at all.
+ */
+export function gitRepo(roots: TempRoots, name = "repo", options: { empty?: boolean } = {}): string {
 	const dir = join(roots.scratch, name);
 	mkdirSync(dir, { recursive: true });
-	execFileSync("git", ["init", "-q", dir]);
-	return realpathSync(dir);
+	execFileSync("git", ["init", "-q", "-b", "main", dir]);
+	const root = realpathSync(dir);
+	// The repo's own identity, and no signing, so the human's global git config never changes what a test does.
+	git(root, "config", "user.name", "Test");
+	git(root, "config", "user.email", "test@example.com");
+	git(root, "config", "commit.gpgsign", "false");
+	// Nor the human's global excludes: whether `.claude/` is ignored is the test's to say.
+	git(root, "config", "core.excludesFile", join(roots.scratch, "no-global-excludes"));
+	if (!options.empty) commit(root, { "README.md": "# repo\n" }, "first commit");
+	return root;
+}
+
+/** Run `git` in `dir`, returning what it printed, trimmed. */
+export function git(dir: string, ...args: string[]): string {
+	return execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+}
+
+/** Write `files` in the repo at `dir` and commit them on the branch checked out, returning the new commit. */
+export function commit(dir: string, files: TeamFiles, message: string): string {
+	writeFiles(dir, files);
+	git(dir, "add", "--", ...Object.keys(files));
+	git(dir, "commit", "-q", "-m", message);
+	return git(dir, "rev-parse", "HEAD");
 }
 
 /** A Team folder's files, by path relative to the folder. */

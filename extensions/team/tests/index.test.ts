@@ -5,13 +5,13 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { registerTeam } from "../index.ts";
-import { fakeClaude, gitRepo, goodTeam, roleMd, type TempRoots, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
+import { commit, fakeClaude, git, gitRepo, goodTeam, roleMd, type TempRoots, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
 
 const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 
@@ -962,6 +962,198 @@ describe("intake: the human's answer to the Brief", () => {
 
 		assert.equal(pi.notifications.at(-1)?.type, "error");
 		assert.match(pi.notifications.at(-1)?.message ?? "", /can't be approved: the `software` Playbook .* is now [0-9a-f]{64}/);
+		assert.equal(existsSync(join(effortDir(roots), "brief.md")), false);
+	});
+});
+
+/** Where the software Team's Workspace for {@link EFFORT_ID} goes in `repo`. */
+function workspaceOf(repo: string, effortId = EFFORT_ID): string {
+	return join(repo, ".claude", "worktrees", `team-${effortId}`);
+}
+
+describe("the software Workspace at Brief approval", () => {
+	it("cuts `team/<effort-id>` from the local default branch's tip into a worktree under `.claude/worktrees/`, leaving the human's checkout as it was", async () => {
+		const { repo, pi } = await briefAsked();
+		const base = git(repo, "rev-parse", "main");
+		git(repo, "switch", "-q", "-c", "feature");
+		commit(repo, { "feature.txt": "mine\n" }, "work in progress");
+		writeFileSync(join(repo, "README.md"), "# edited, not committed\n");
+		writeFileSync(join(repo, "notes.txt"), "untracked\n");
+		const statusBefore = git(repo, "status", "--porcelain");
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		const workspace = workspaceOf(repo);
+		assert.equal(git(repo, "rev-parse", `team/${EFFORT_ID}`), base);
+		assert.equal(git(workspace, "rev-parse", "--abbrev-ref", "HEAD"), `team/${EFFORT_ID}`);
+		assert.equal(git(workspace, "status", "--porcelain"), "");
+		assert.equal(readFileSync(join(workspace, "README.md"), "utf8"), "# repo\n");
+		assert.equal(existsSync(join(workspace, "feature.txt")), false);
+		assert.equal(git(repo, "rev-parse", "--abbrev-ref", "HEAD"), "feature");
+		assert.equal(git(repo, "status", "--porcelain"), statusBefore);
+		assert.equal(readFileSync(join(repo, "README.md"), "utf8"), "# edited, not committed\n");
+	});
+
+	it("records the commit the Effort starts from with the Brief approval, and tells the Lead and the human where the Workspace is", async () => {
+		const { roots, repo, pi } = await briefAsked();
+		const base = git(repo, "rev-parse", "main");
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		const workspace = { kind: "git-worktree", path: workspaceOf(repo), branch: `team/${EFFORT_ID}`, base, from: "main" };
+		const dir = effortDir(roots);
+		const record = JSON.parse(readFileSync(join(dir, "approvals.jsonl"), "utf8").trim()) as { workspace?: unknown };
+		assert.deepEqual(record.workspace, workspace);
+		const approved = readFileSync(join(dir, "effort.jsonl"), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as { type: string; answer?: string; workspace?: unknown })
+			.find((line) => line.type === "approval-answered" && line.answer === "approved");
+		assert.deepEqual(approved?.workspace, workspace);
+		for (const told of [pi.sent.at(-1)?.content ?? "", pi.notifications.at(-1)?.message ?? ""]) {
+			for (const needed of [workspaceOf(repo), `team/${EFFORT_ID}`, base]) assert.ok(told.includes(needed), `${needed} missing from:\n${told}`);
+		}
+	});
+
+	it("cuts from the branch `origin/HEAD` names when the repo has a remote", async () => {
+		const { repo, pi } = await briefAsked();
+		git(repo, "switch", "-q", "-c", "trunk");
+		const base = commit(repo, { "trunk.txt": "shipped\n" }, "on trunk");
+		git(repo, "switch", "-q", "main");
+		git(repo, "update-ref", "refs/remotes/origin/trunk", base);
+		git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk");
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		assert.equal(git(repo, "rev-parse", `team/${EFFORT_ID}`), base);
+		assert.equal(readFileSync(join(workspaceOf(repo), "trunk.txt"), "utf8"), "shipped\n");
+	});
+
+	it("adds `.claude/worktrees/` to the repo's local exclude when nothing ignores it yet, so the worktree never shows in `git status`", async () => {
+		const { repo, pi } = await briefAsked();
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		assert.match(readFileSync(join(repo, ".git", "info", "exclude"), "utf8"), /^\.claude\/worktrees\/$/m);
+		assert.equal(git(repo, "status", "--porcelain", "--untracked-files=all"), "");
+	});
+
+	it("leaves the local exclude alone when the repo already ignores the worktrees folder", async () => {
+		const { repo, pi } = await briefAsked();
+		commit(repo, { ".gitignore": ".claude/\n" }, "ignore .claude");
+		const exclude = join(repo, ".git", "info", "exclude");
+		const before = existsSync(exclude) ? readFileSync(exclude, "utf8") : undefined;
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		assert.equal(existsSync(exclude) ? readFileSync(exclude, "utf8") : undefined, before);
+		assert.equal(git(repo, "status", "--porcelain", "--untracked-files=all"), "");
+		assert.equal(existsSync(workspaceOf(repo)), true);
+	});
+
+	it("copies what `.worktreeinclude` lists into the worktree, as Claude Code does: only files git ignores, never tracked or merely untracked ones", async () => {
+		const { repo, pi } = await briefAsked();
+		commit(repo, { ".gitignore": ".env\nsecrets/\nbuild/\n", ".worktreeinclude": ".env\nsecrets/\nloose.txt\nconfig.json\n", "config.json": "{}\n" }, "ignores");
+		writeFileSync(join(repo, ".env"), "TOKEN=1\n");
+		mkdirSync(join(repo, "secrets", "deep"), { recursive: true });
+		writeFileSync(join(repo, "secrets", "deep", "key.pem"), "key\n");
+		mkdirSync(join(repo, "build"));
+		writeFileSync(join(repo, "build", "out.js"), "built\n");
+		writeFileSync(join(repo, "loose.txt"), "untracked, not ignored\n");
+		writeFileSync(join(repo, "config.json"), "{ \"edited\": true }\n");
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		const workspace = workspaceOf(repo);
+		assert.equal(readFileSync(join(workspace, ".env"), "utf8"), "TOKEN=1\n");
+		assert.equal(readFileSync(join(workspace, "secrets", "deep", "key.pem"), "utf8"), "key\n");
+		assert.equal(existsSync(join(workspace, "build")), false);
+		assert.equal(existsSync(join(workspace, "loose.txt")), false);
+		assert.equal(readFileSync(join(workspace, "config.json"), "utf8"), "{}\n");
+		assert.equal(git(workspace, "status", "--porcelain"), "");
+	});
+
+	it("trusts the repo's folder in Claude Code's config, keeping everything already in it", async () => {
+		const { roots, repo, pi } = await briefAsked();
+		const config = {
+			numStartups: 7,
+			projects: { "/elsewhere": { hasTrustDialogAccepted: false, allowedTools: ["Bash"] }, [repo]: { lastCost: 1.5 } },
+			oauthAccount: { emailAddress: "someone@example.com" },
+		};
+		writeFileSync(roots.claudeConfigPath, `${JSON.stringify(config, null, 2)}\n`);
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		const written = JSON.parse(readFileSync(roots.claudeConfigPath, "utf8")) as unknown;
+		assert.deepEqual(written, { ...config, projects: { ...config.projects, [repo]: { lastCost: 1.5, hasTrustDialogAccepted: true } } });
+	});
+
+	it("creates Claude Code's config with the trust when there is none yet", async () => {
+		const { roots, repo, pi } = await briefAsked();
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		assert.deepEqual(JSON.parse(readFileSync(roots.claudeConfigPath, "utf8")), { projects: { [repo]: { hasTrustDialogAccepted: true } } });
+	});
+
+	it("approves nothing and cuts no branch when Claude Code's config can't be read, naming the file", async () => {
+		const { roots, repo, pi } = await briefAsked();
+		writeFileSync(roots.claudeConfigPath, "{ not json");
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		assert.equal(pi.notifications.at(-1)?.type, "error");
+		assert.ok(pi.notifications.at(-1)?.message.includes(roots.claudeConfigPath), pi.notifications.at(-1)?.message);
+		assert.equal(readFileSync(roots.claudeConfigPath, "utf8"), "{ not json");
+		assert.equal(existsSync(join(effortDir(roots), "brief.md")), false);
+		assert.equal(git(repo, "branch", "--list", `team/${EFFORT_ID}`), "");
+		assert.equal(existsSync(workspaceOf(repo)), false);
+	});
+
+	it("approves nothing while the Effort's branch already exists, and approves once it is gone", async () => {
+		const { roots, repo, pi } = await briefAsked();
+		git(repo, "branch", `team/${EFFORT_ID}`);
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		assert.equal(pi.notifications.at(-1)?.type, "error");
+		assert.match(pi.notifications.at(-1)?.message ?? "", new RegExp(`branch \`team/${EFFORT_ID}\` already exists`));
+		assert.equal(existsSync(join(effortDir(roots), "brief.md")), false);
+		assert.equal(existsSync(workspaceOf(repo)), false);
+
+		git(repo, "branch", "-D", `team/${EFFORT_ID}`);
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		assert.equal(existsSync(join(effortDir(roots), "brief.md")), true);
+		assert.equal(git(workspaceOf(repo), "rev-parse", "--abbrev-ref", "HEAD"), `team/${EFFORT_ID}`);
+	});
+
+	it("approves nothing in a repo with no commits to cut the Effort's branch from", async () => {
+		const roots = tempRoots();
+		adopt(roots, "software", INTAKE_PLAYBOOK);
+		const repo = gitRepo(roots, "repo", { empty: true });
+		const pi = fakePi(roots, { cwd: repo });
+		await pi.team("start software");
+		const draft = join(effortDir(roots), "brief.draft.md");
+		writeFileSync(draft, brief(repo));
+		await pi.call("team_request_approval", { checkpoint: "brief", path: draft });
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		assert.equal(pi.notifications.at(-1)?.type, "error");
+		assert.match(pi.notifications.at(-1)?.message ?? "", /no commits yet/);
 		assert.equal(existsSync(join(effortDir(roots), "brief.md")), false);
 	});
 });
