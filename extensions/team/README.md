@@ -5,8 +5,28 @@ the repo's, defined in the Teams section of [`CONTEXT.md`](../../CONTEXT.md): a 
 folder of markdown, a **Role** is one position on it, a **Playbook** is the Team's standing rules,
 and a **Workspace** is where its Teammates work.
 
-So far the extension knows its Teams, runs Team setup to adopt a Playbook, and `/team start` opens
-an Effort and runs its intake up to the human approving its Brief. Planning and Teammates come later.
+`/team start` opens an Effort on a Team, runs its intake up to the human approving a Brief, then the
+Lead plans, hands Tasks to Teammates (background `claude --bg` sessions), reviews them and writes
+Reports. The Team block above pi's editor shows where it stands.
+
+## Setup and limits
+
+- Pinned to pi 1.4.0 (the dev dependency this was built against) and Claude Code 2.1.316
+  (`MIN_CLAUDE_VERSION`). `/team start` warns on an older `claude`; the warning never stops it.
+- Teammates run `claude --bg`, so `claude` must be on the PATH and signed in. The extension adds the
+  Effort's folder to `~/.claude.json` as trusted so a Teammate does not stop at the trust dialog.
+- **Best effort, not a security boundary.** The floor hook (it makes a push, a force or a destructive
+  command ask) and a Role's deny rules reduce what a Teammate does unprompted. They match commands by
+  text and can be bypassed; do not rely on them to contain a hostile or confused session.
+- **Use another provider for the Lead.** A Lead on the same Anthropic subscription as its Teammates
+  shares their usage limits, so the Effort stalls at a limit, Lead included. Run pi's Lead on a
+  different provider where you can.
+- **`maxTeammates`** is a pi setting (default 3) read from pi's settings; a change takes effect after
+  `/reload`.
+- Observations the code does not act on, so not guaranteed: `/model` typed inside a Teammate's
+  terminal may save as your default model; background sessions may auto-compact their context; and
+  `claude` may show a "Teach auto mode" dialog. The extension handles none of the three. `npm run
+  live:team` prints them as things to check by hand.
 
 ## Usage
 
@@ -25,6 +45,8 @@ an Effort and runs its intake up to the human approving its Brief. Planning and 
 /team cancel         end the held Effort without sign-off, once you confirm: every Teammate stops,
                      clean worktrees are removed, branches are kept
 /team attach [id]    attach to a Teammate's session (pick one, or name it); also just `/team`
+/team handback <teammate> [note]
+                     hand a Teammate you took over back to the Lead, with an optional note
 ```
 
 `/team start` warns when `claude --version` is older than 2.1.316, the version this extension was
@@ -255,6 +277,45 @@ staffing ladder; lifting your pause also tells the Lead what started. The Team b
 paused` with a line for each pause, who set it, since when and why, and the next Report says who
 paused and resumed.
 
+## The Team block
+
+While an Effort is held, a framed block shows, top to bottom:
+
+- the title (Team, Effort id, live Teammate count) and a status line: `running` or `paused`, the
+  phase (intake, planning or working) and Tasks accepted of planned;
+- a line per pause (who set it, since when, why) and per model hold (the Roles held, on an Opus or
+  Sonnet limit or a usage-credit confirm, until when);
+- the account's usage: the 5-hour and weekly windows with their resets, the source and its age;
+- a row per Teammate: id, short id (`?` when unconfirmed after a restart, `(new)` when it changed),
+  starting, busy or idle, its Task, what it did when idle, `ctx N%`, and its mode (`mode≠launch`
+  when it drifted from the launch mode); a Takeover shows `YOURS`, its age and what triggered it,
+  with `/team handback <id>`;
+- the queued Tasks and `+N more Teammates` past `maxTeammates`;
+- a footer: `N waiting on you  /team pending`, `reports N  /team reports`, `attach  /team`.
+
+## Taking over a Teammate
+
+A Takeover starts when you type a prompt or run a command that is not read-only in a Teammate's
+terminal, interrupt a turn, or answer No to its permission prompt. What the Lead sent and attaching
+never count. During one, sends to that Teammate are held and dropped at the hand-back, its
+permission prompts are yours, and review and answer are refused. End it with `/team handback`, the
+`/handback` command in the Teammate, or "Hand back" in the attach menu; the Lead is woken once.
+
+## Restarting pi
+
+An Effort survives pi restarting. On start the extension draws the block, listens on the bridge,
+recovers unfinished intents, replays the Teammates' journals, reconciles with `claude agents`,
+ticks, and wakes the Lead once. Teammates not heard from since show `?` until they are. Only Brief
+approvals are recovered; a sign-off promoted when pi died is not.
+
+## Usage limits
+
+`limits.ts` is the only place that reads a limit message. Hitting a usage limit pauses the Effort
+(and a model-family limit holds only that family's Roles) until the reset, or the next ordinary
+Stop; `continue` is sent about two minutes after the reset. A usage-credit confirm holds the Roles
+and tells the Lead never to confirm it: that is yours. A Role's `model` or `effort` set in the
+Brief's `roles:` frontmatter, once changed, gives a fresh session at the next Task.
+
 ## Attaching to a Teammate
 
 `/team` (or `/team attach [id]`) lists the Teammates with a session, then offers:
@@ -331,12 +392,27 @@ config error naming the file. A Team with any config error is still listed, with
 ```bash
 npm test             # offline suite: no network, no real claude
 npm run typecheck
+npm run live:team    # manual, real claude --bg: spends usage, never run by npm test
 ```
 
 Every path root (pi's agent dir, `~/.claude.json`, the `claude` executable, the bundled Teams) is
 injected through `registerTeam(pi, deps)`, so tests run against temp folders and
 [`tests/fake-claude.ts`](tests/fake-claude.ts), a scripted stand-in for `claude`. `/team` is driven
 through a recording fake pi in `tests/index.test.ts`.
+
+## Live runner
+
+`npm run live:team` drives real `claude --bg` in a temp git repo, one case after another, and
+prints `ok` or `FAIL` for each. It reaps every session it launched, even when a case fails. It
+spends your usage and adds a trust entry to `~/.claude.json`. Cases: `inbox` (the socket format
+and that a launch prompt is not a composer one), `clear` (the bundled mod's `__TEAM_CLEAR__` and its
+journal), `ask` (an `AskUserQuestion` answered through the hook), `floor` (the floor hook's `ask`
+reaching `PermissionRequest` in `auto`), `statusline` (the wrapper writing `statusline.json`
+unattached), `wake` (a resume after `claude stop`) and `fragile` (version, `get_usage`, the agents
+listing). `--only a,b`, `--model <id>`, `--list` and `CLAUDE_PATH` select what runs. It ends with
+a checklist of what needs a person or a real pi: a composer prompt journalling in the mod, env and
+`process.run` there, `/handback`, Esc, a restart across pi, and the real limit wording. It lives in
+`test.ts` outside the `tests/` glob so `npm test` never reaches it.
 
 ## Layout
 
@@ -349,7 +425,15 @@ intake.ts        what the Lead is asked at intake, and the Brief's approval dial
 records.ts       the Effort folder: Brief validation, approved records and their shas
 repo.ts          the git root an Effort works on
 setup.ts         Team setup: seeding the draft, validating and adopting it, its warnings
-claude.ts        the only module that runs claude (version check, attach)
+claude.ts        the only module that runs claude (launch, stop, inbox, usage, version, attach)
+bridge.ts        the Lead's local socket the hooks ring and hold permission requests on
+block.ts         the Team block and `team_status`
+limits.ts        the only parser of usage-limit messages
+hook.mjs         the Teammate hook: journals events, rings the Lead, holds permissions
+floor.mjs        the floor hook (best effort)
+statusline.mjs   the status line wrapper that writes statusline.json
+mod/             the mod bundled into Teammates: clear, /handback, Takeover journalling
+test.ts          the manual live runner (`npm run live:team`)
 attach.ts        the /team attach menu: attach here, tmux window, copy the command
 teams/software/  the bundled software Team: architect, dev and qa, and its default Playbook
 tests/           offline suite, fake claude, temp-root harness
