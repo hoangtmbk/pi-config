@@ -146,7 +146,7 @@ export type EffortLine =
 	/** The human answered a request in `/team pending`. */
 	| { type: "approval-answered"; id: string; answer: "approved" | "sent-back"; note?: string; workspace?: Workspace; at: string }
 	/** The Lead wrote its whole Task list, replacing any before it. */
-	| { type: "plan-written"; tasks: PlannedTask[]; at: string }
+	| { type: "plan-written"; tasks: PlannedTask[]; reason?: string; at: string }
 	/** A Teammate was launched. */
 	| ({ type: "teammate-started" } & Teammate)
 	/** A planned Task was handed to a Teammate, its folder written. */
@@ -180,7 +180,37 @@ export type EffortLine =
 	/** A re-plan left out a handed-off Task, or gave it another Role: this handoff of it is over. */
 	| { type: "task-dropped"; slug: string; at: string }
 	/** The extension stopped a Teammate with `claude stop`, since its Task was dropped. Reads no journal line. */
-	| { type: "teammate-ended"; teammate: string; how: "stopped"; at: string };
+	| { type: "teammate-ended"; teammate: string; how: "stopped"; at: string }
+	/** Something decided for the human on their behalf, for the next Report: a permission answer, a rule, a grant used, a limit pause. */
+	| ({ type: "decided-for-you" } & Logged)
+	/** Work found outside the Brief (scope creep), kept for the final Report as a suggestion. */
+	| ({ type: "found-work" } & Logged)
+	/** Report `n` was written as `reports/<nnn>.md`; the next one covers what comes after this line. */
+	| { type: "report-written"; n: number; at: string };
+
+/** One entry of the decided-for-you or found-work log. */
+export interface Logged {
+	what: string;
+	/** The Task it came up in, when it did. */
+	task?: string;
+	at: string;
+}
+
+/** One logged section of a Report, which is left out when it has no lines. */
+export interface ReportSection {
+	title: string;
+	lines: string[];
+}
+
+/** A Report: the Lead's narrative and the sections the extension adds from the log. */
+export interface Report {
+	n: number;
+	at: string;
+	headline: string;
+	/** Brief coverage by criterion id, as the Lead tells it. */
+	coverage: { criterion: string; note: string }[];
+	sections: ReportSection[];
+}
 
 /** What an Effort's lines fold to. */
 export interface EffortState {
@@ -204,6 +234,14 @@ export interface EffortState {
 	tasks: Record<string, HandedTask>;
 	/** Every Teammate started, oldest first. */
 	teammates: Teammate[];
+	/** The last Report's number; 0 before the first. */
+	reports: number;
+	/** The lines a Report tells of since the last one, oldest first. */
+	sinceReport: EffortLine[];
+	/** The decided-for-you log, oldest first. */
+	decided: Logged[];
+	/** The found-work (scope-creep) log, oldest first. */
+	found: Logged[];
 }
 
 /** A new input to the core. */
@@ -223,6 +261,22 @@ export type EffortInput =
 			tasks: { slug: string; role: string; goal: string; dependsOn?: string[]; criteria?: string[] }[];
 			criteria: readonly string[];
 			roles: readonly string[];
+			/** Why the Lead re-planned, for the next Report. */
+			reason?: string;
+			at: string;
+	  }
+	/**
+	 * `team_report`: the Lead's narrative, with the approved Brief's criterion
+	 * ids and the mode each Role launches in, which the shell reads, and any
+	 * work the Lead found outside the Brief since the last Report.
+	 */
+	| {
+			kind: "report";
+			headline: string;
+			coverage?: { criterion: string; note: string }[];
+			found?: string[];
+			criteria: readonly string[];
+			modes: readonly { role: string; mode: string }[];
 			at: string;
 	  }
 	/** `team_handoff` of a planned Task, with the permission mode the Teammate launches in. */
@@ -273,7 +327,9 @@ export type EffortAction =
 	 */
 	| { kind: "restaff-teammate"; teammate: Omit<Teammate, "task" | "startedAt">; slug: string; folder: string; round: number; feedback: string }
 	/** Stop the Teammate's background session, `claude stop <short id>`, which keeps its conversation; its `--name` before it has a short id. */
-	| { kind: "stop-teammate"; teammate: string; shortId: string };
+	| { kind: "stop-teammate"; teammate: string; shortId: string }
+	/** Write the Report as `reports/<nnn>.md`. */
+	| { kind: "write-report"; report: Report };
 
 export type Step =
 	| { ok: true; state: EffortState; append: EffortLine[]; actions: EffortAction[]; reply?: string }
@@ -284,8 +340,17 @@ export function openEffort(opened: { effortId: string; team: string; repo: strin
 	return { type: "effort-opened", ...opened };
 }
 
-/** Fold one line into the state. */
+/** Lines a Report doesn't tell of: they only carry what other lines say. */
+const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached"]);
+
+/** Fold one line into the state, keeping what the next Report tells of. */
 function apply(state: EffortState, line: EffortLine): EffortState {
+	const next = applyLine(state, line);
+	if (line.type === "report-written") return { ...next, reports: line.n, sinceReport: [] };
+	return UNREPORTED.has(line.type) ? next : { ...next, sinceReport: [...next.sinceReport, line] };
+}
+
+function applyLine(state: EffortState, line: EffortLine): EffortState {
 	switch (line.type) {
 		case "effort-opened":
 			throw new Error(`effort.jsonl opens Effort \`${state.effortId}\` a second time, as \`${line.effortId}\``);
@@ -362,6 +427,13 @@ function apply(state: EffortState, line: EffortLine): EffortState {
 			return { ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, ended: { how: line.how, at: line.at } } : teammate)) };
 		case "teammate-crashed":
 			return withTeammate(state, line, { ended: { how: "crashed", at: line.at } });
+		case "decided-for-you":
+		case "found-work": {
+			const { type, ...logged } = line;
+			return type === "decided-for-you" ? { ...state, decided: [...state.decided, logged] } : { ...state, found: [...state.found, logged] };
+		}
+		case "report-written":
+			return state;
 		case "task-done": {
 			const advanced = withTeammate(state, line, { activity: "idle", doing: `round ${line.round} done` });
 			const task = advanced.tasks[line.slug];
@@ -391,7 +463,7 @@ export function fold(lines: readonly EffortLine[]): EffortState {
 		throw new Error(`effort.jsonl must start with an \`effort-opened\` line, not ${first ? `\`${first.type}\`` : "nothing"}`);
 	}
 	const { type: _type, at: _at, ...opened } = first;
-	return rest.reduce(apply, { ...opened, pending: [], requests: 0, tasks: {}, teammates: [] });
+	return rest.reduce(apply, { ...opened, pending: [], requests: 0, tasks: {}, teammates: [], reports: 0, sinceReport: [], decided: [], found: [] });
 }
 
 /** Take one input: the lines it appends and what the shell must do, or why it is refused. */
@@ -414,6 +486,8 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return journal(state, input);
 		case "review":
 			return review(state, input);
+		case "report":
+			return report(state, input);
 		case "attach":
 			return attach(state, input);
 	}
@@ -493,7 +567,7 @@ function answer(state: EffortState, input: Extract<EffortInput, { kind: "answer"
 					input.workspace
 						? `The Workspace is ${input.workspace.path}, on branch \`${input.workspace.branch}\` cut from \`${input.workspace.from}\` at ${input.workspace.base}.`
 						: undefined,
-					"Teammates may start once planning is available.",
+					"Plan the Tasks with `team_plan`, then write the plan Report with `team_report` before handing any off.",
 				]
 					.filter((part) => part !== undefined)
 					.join(" "),
@@ -572,7 +646,8 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 	if (problems.length > 0) {
 		return { ok: false, refusal: `The plan for Effort \`${state.effortId}\` can't be taken until these are fixed:\n${problems.map((problem) => `- ${problem}`).join("\n")}` };
 	}
-	const append: EffortLine[] = [{ type: "plan-written", tasks, at: input.at }];
+	const reason = input.reason?.trim();
+	const append: EffortLine[] = [{ type: "plan-written", tasks, ...(reason ? { reason } : {}), at: input.at }];
 	const actions: EffortAction[] = [];
 	const notes: string[] = [];
 	for (const slug of dropping) {
@@ -862,4 +937,105 @@ export function taskStatus(state: EffortState, slug: string): TaskStatus {
 	if (task.accepted !== undefined) return "accepted";
 	if (task.reported === task.round) return "in review";
 	return task.round > 1 ? "sent back" : "running";
+}
+
+/** `HH:MM` of an ISO time, as Reports show it. */
+function clock(at: string): string {
+	return at.slice(11, 16);
+}
+
+/** What a Report says of one line since the last Report, or undefined for a line its own section tells of. */
+function told(line: EffortLine): string | undefined {
+	switch (line.type) {
+		case "approval-requested":
+			return `asked you to approve the Brief (\`${line.id}\`)`;
+		case "approval-answered":
+			return line.answer === "approved" ? `you approved the Brief (\`${line.id}\`)` : `you sent back \`${line.id}\`: ${line.note ?? ""}`;
+		case "plan-written":
+			return `${line.reason === undefined ? "planned" : "re-planned"} ${line.tasks.length} Task${line.tasks.length === 1 ? "" : "s"}`;
+		case "task-handed-off":
+			return `handed Task \`${line.slug}\` to ${line.teammate}`;
+		case "task-done":
+			return `${line.teammate} finished round ${line.round} of Task \`${line.slug}\``;
+		case "teammate-stopped":
+			return `${line.teammate} stopped short on Task \`${line.slug}\``;
+		case "task-sent-back":
+			return `sent Task \`${line.slug}\` back after round ${line.round}`;
+		case "task-accepted":
+			return `accepted Task \`${line.slug}\` at round ${line.round}`;
+		case "permission-denied":
+			return `${line.teammate} was denied \`${line.tool}\`${line.reason === undefined ? "" : `: ${line.reason}`}`;
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * The Lead's Report: its narrative, with the logged sections added from what
+ * happened since the last one. Each section is left out when it has nothing
+ * new. Work the Lead found outside the Brief joins the found-work log first.
+ */
+function report(state: EffortState, input: Extract<EffortInput, { kind: "report" }>): Step {
+	if (!state.brief) {
+		return {
+			ok: false,
+			refusal: `Effort \`${state.effortId}\` has no approved Brief yet, so there is nothing to report against; the first Report is the plan Report, written once the human approves the Brief and you have planned.`,
+		};
+	}
+	const headline = input.headline.trim();
+	const coverage = input.coverage ?? [];
+	const problems: string[] = [];
+	if (headline === "") problems.push("the headline is empty; say in a sentence where the Effort stands");
+	for (const { criterion } of coverage) {
+		if (!input.criteria.includes(criterion)) problems.push(`coverage names \`${criterion}\`, which the Brief doesn't have; its criteria are ${quoted(input.criteria)}`);
+	}
+	if (problems.length > 0) {
+		return { ok: false, refusal: `The Report for Effort \`${state.effortId}\` can't be written until these are fixed:\n${problems.map((problem) => `- ${problem}`).join("\n")}` };
+	}
+	const found: EffortLine[] = (input.found ?? []).map((what) => what.trim()).filter((what) => what !== "").map((what) => ({ type: "found-work", what, at: input.at }));
+	const now = found.reduce(apply, state);
+	const n = state.reports + 1;
+	const sections = reportSections(now, n === 1 ? input.modes : undefined).filter((each) => each.lines.length > 0);
+	const written: Report = { n, at: input.at, headline, coverage, sections };
+	const file = `reports/${String(n).padStart(3, "0")}.md`;
+	return took(
+		state,
+		[...found, { type: "report-written", n, at: input.at }],
+		[{ kind: "write-report", report: written }],
+		`Report ${n} of Effort \`${state.effortId}\` is written as ${file}. The human sees it in chat, so don't repeat it.`,
+	);
+}
+
+/** The logged sections, from `since` the last Report; the plan Report passes each Role's mode. */
+function reportSections(state: EffortState, modes: readonly { role: string; mode: string }[] | undefined): ReportSection[] {
+	const since = state.sinceReport;
+	const of = <T extends EffortLine["type"]>(type: T) => since.filter((line): line is Extract<EffortLine, { type: T }> => line.type === type);
+	const planChanged = modes !== undefined || since.some((line) => ["plan-written", "task-handed-off", "task-done", "task-sent-back", "task-accepted"].includes(line.type));
+	const plan = state.plan && planChanged ? state.plan.map((task) => `\`${task.slug}\` (${task.role}): ${taskStatus(state, task.slug)}`) : [];
+	const reasons = of("plan-written").flatMap((line) => (line.reason === undefined ? [] : [`re-planned at ${clock(line.at)}: ${line.reason}`]));
+	const newFound = of("found-work");
+	const launched = (id: string) => state.teammates.find((each) => each.id === id)?.mode;
+	return [
+		{ title: "Since the last Report", lines: since.flatMap((line) => { const text = told(line); return text === undefined || !("at" in line) ? [] : [`${clock(line.at)} ${text}`]; }) },
+		{ title: "Plan", lines: [...plan, ...reasons] },
+		{ title: "Waiting on you", lines: state.pending.map((item) => `\`${item.id}\`: approve the Brief, ${item.path} (sha256 ${item.sha256}), in \`/team pending\``) },
+		{ title: "Decided for you", lines: of("decided-for-you").map((line) => `${clock(line.at)} ${line.what}${line.task === undefined ? "" : ` (Task \`${line.task}\`)`}`) },
+		{
+			title: "Teammate modes",
+			lines: [
+				...(modes ?? []).map(({ role, mode }) => `${role}: ${mode}`),
+				...of("teammate-mode").map((line) => `${line.teammate}: ${line.mode}${launched(line.teammate) === undefined ? "" : `, launched in ${launched(line.teammate)}`} (${clock(line.at)})`),
+			],
+		},
+		{
+			title: "Found work",
+			lines:
+				newFound.length === 0
+					? []
+					: [
+							`${state.found.length} found so far outside the Brief, kept as suggestions for the final Report; new since the last Report:`,
+							...newFound.map((line) => `${line.what}${line.task === undefined ? "" : ` (Task \`${line.task}\`)`}`),
+						],
+		},
+	];
 }

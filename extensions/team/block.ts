@@ -118,7 +118,7 @@ export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockD
 		teammates: state.teammates.filter((teammate) => teammate.ended === undefined).map((teammate) => teammateRow(state, teammate)),
 		queued: [],
 		waitingOnYou: state.pending.length + extras.adoptionsPending,
-		reports: 0,
+		reports: state.reports,
 	};
 }
 
@@ -198,9 +198,11 @@ function queuedLines(data: TeamBlockData): string[] {
 
 function footerLine(data: TeamBlockData): string[] {
 	const waiting = data.waitingOnYou > 0 ? `▲ ${data.waitingOnYou} waiting on you  /team pending` : "nothing waiting on you";
+	// Where to read them, once there are any.
+	const reports = data.reports > 0 ? `reports ${data.reports}  /team reports` : `reports ${data.reports}`;
 	// Attaching needs a short id, so the hint shows once a Teammate's session has started.
 	const attach = data.teammates.some((row) => row.shortId !== undefined) ? "   attach  /team" : "";
-	return [`${waiting}   reports ${data.reports}${attach}`];
+	return [`${waiting}   ${reports}${attach}`];
 }
 
 /** Each cell padded to the widest in the column. */

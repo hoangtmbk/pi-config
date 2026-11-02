@@ -13,7 +13,7 @@
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import { type EffortLine, type EffortState, type JournalLine, type PendingApproval, taskStatus, type Workspace } from "./core.ts";
+import { type EffortLine, type EffortState, type JournalLine, type PendingApproval, type Report, taskStatus, type Workspace } from "./core.ts";
 import { BRIEF_SKELETON, isKebabCase, type Playbook, sha256 } from "./definitions.ts";
 
 /** The files of one Effort, all under `<agent dir>/team/efforts/<effort-id>/`. */
@@ -41,6 +41,8 @@ export interface EffortPaths {
 	teammates: string;
 	/** Where the Lead bridge listens, for the hook script's doorbell: {@link LeadRecord}. */
 	lead: string;
+	/** One file per Report, `reports/<nnn>.md`, numbered from 001 and never overwritten. */
+	reports: string;
 }
 
 export function effortsDir(agentDir: string): string {
@@ -62,6 +64,7 @@ export function effortPaths(agentDir: string, effortId: string): EffortPaths {
 		tasks: join(dir, "tasks"),
 		teammates: join(dir, "teammates"),
 		lead: join(dir, "lead.json"),
+		reports: join(dir, "reports"),
 	};
 }
 
@@ -510,4 +513,56 @@ function journalLine(text: string): JournalLine {
 		// Kept as a line with no event below.
 	}
 	return { from: "unreadable", at: "" };
+}
+
+/** A Report as the human reads it, in chat and in `reports/<nnn>.md`. */
+export function reportMarkdown(effortId: string, report: Report): string {
+	const parts = [`# Report ${report.n} · Effort \`${effortId}\``, `_${report.at.slice(0, 10)} ${report.at.slice(11, 16)} UTC_`, report.headline];
+	if (report.coverage.length > 0) parts.push(`## Brief coverage\n\n${report.coverage.map(({ criterion, note }) => `- ${criterion}: ${note.trim()}`).join("\n")}`);
+	for (const section of report.sections) parts.push(`## ${section.title}\n\n${section.lines.map((line) => `- ${line}`).join("\n")}`);
+	return `${parts.join("\n\n")}\n`;
+}
+
+/** The file Report `n` is written to. */
+export function reportFile(paths: EffortPaths, n: number): string {
+	return join(paths.reports, `${String(n).padStart(3, "0")}.md`);
+}
+
+/** Write a Report to its own file, which is never overwritten; returns its path. */
+export function writeReport(paths: EffortPaths, markdown: string, n: number): string {
+	const path = reportFile(paths, n);
+	mkdirSync(paths.reports, { recursive: true });
+	try {
+		writeFileSync(path, markdown, { flag: "wx" });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		throw new Error(`${path} is already there, and a Report is never overwritten, so Report ${n} wasn't written. Stop and tell the human.`);
+	}
+	return path;
+}
+
+/** A Report on disk, as `/team reports` lists it. */
+export interface WrittenReport {
+	n: number;
+	path: string;
+	/** `HH:MM` UTC, when the file says. */
+	time: string | undefined;
+	headline: string;
+	markdown: string;
+}
+
+/** The Effort's Reports, newest first, read from `reports/`. */
+export function readReports(paths: EffortPaths): WrittenReport[] {
+	if (!existsSync(paths.reports)) return [];
+	return readdirSync(paths.reports)
+		.filter((name) => /^\d{3,}\.md$/.test(name))
+		.map((name) => {
+			const path = join(paths.reports, name);
+			const markdown = readFileSync(path, "utf8");
+			const lines = markdown.split("\n").map((line) => line.trim());
+			const stamp = lines.findIndex((line) => /^_\d{4}-\d\d-\d\d \d\d:\d\d UTC_$/.test(line));
+			const headline = lines.slice(stamp + 1).find((line) => line !== "" && !line.startsWith("#")) ?? "";
+			return { n: Number.parseInt(name, 10), path, time: stamp >= 0 ? lines[stamp].slice(12, 17) : undefined, headline, markdown };
+		})
+		.sort((a, b) => b.n - a.n);
 }

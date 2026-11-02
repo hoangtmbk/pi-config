@@ -53,7 +53,7 @@ describe("the Team block", () => {
 			"│ ● running  ·  working · 1/4 Tasks accepted                                                  │",
 			"│ architect-1  a1b2c3d4  idle  001-architect-design · round 1 done  ctx 18%  auto             │",
 			"│ dev-1        d4e5f6a7  busy  002-dev-ttl                          ctx —    acceptEdits≠auto │",
-			"│ ▲ 1 waiting on you  /team pending   reports 2   attach  /team                               │",
+			"│ ▲ 1 waiting on you  /team pending   reports 2  /team reports   attach  /team                │",
 			"╰─────────────────────────────────────────────────────────────────────────────────────────────╯",
 		]);
 	});
@@ -229,6 +229,13 @@ describe("team_status data", () => {
 		);
 
 		assert.deepEqual(teamStatus(state, { adoptionsPending: 0 }).tasks, { accepted: 1, planned: 2 });
+	});
+
+	it("counts the Reports written", () => {
+		const report = (at: string): EffortInput => ({ kind: "report", headline: "On track.", criteria: ["AC1"], modes: [], at });
+
+		assert.equal(teamStatus(fold(through([REQUEST, APPROVE, PLAN])), { adoptionsPending: 0 }).reports, 0);
+		assert.equal(teamStatus(fold(through([REQUEST, APPROVE, PLAN, report("2026-11-02T10:20:00.000Z"), report("2026-11-02T10:25:00.000Z")])), { adoptionsPending: 0 }).reports, 2);
 	});
 
 	it("rows a Teammate whose new session gave it a new short id as new, until the human attaches to it through pi", () => {
