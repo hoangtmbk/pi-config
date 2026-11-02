@@ -891,6 +891,25 @@ describe("a Run that cannot start", () => {
 		assert.match(result, /could not be started/);
 		assert.deepEqual(sent, []);
 	});
+
+	it("reports a pi that dies before taking its task as a failed Run, however slow it is to die", async () => {
+		// Slower than `RpcClient.start`'s own wait for an early exit, so the child
+		// is still up when `start` resolves and dies while its task is being sent.
+		// That is still a Run that never started, and it is said once, here.
+		const { subagent, sent } = fakeSession(ROSTER, {
+			FAKE_RPC_SILENT: "1",
+			FAKE_RPC_EXIT_CODE: "1",
+			FAKE_RPC_EXIT_DELAY_MS: "300",
+			FAKE_RPC_STDERR: "pi: cannot read its settings",
+		});
+
+		const result = await call(subagent, { agent: "scout", task: "look around" });
+
+		assert.match(result, /Run `scout` \(agent `scout`\) failed/);
+		assert.match(result, /could not be started/);
+		assert.match(result, /cannot read its settings/);
+		assert.deepEqual(sent, [], "the failure is this tool call's own result, so it is not also delivered");
+	});
 });
 
 /** The name the `index`th Run of a `scout` fan-out gets, given the auto-suffixing. */
