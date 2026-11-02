@@ -3715,9 +3715,11 @@ function reportSections(state: EffortState, modes: readonly { role: string; mode
 		{
 			title: "Found work",
 			lines:
-				newFound.length === 0
+				state.found.length === 0
 					? []
-					: [
+					: newFound.length === 0
+						? [`${state.found.length} found so far outside the Brief, kept as suggestions for the final Report; none new since the last Report.`]
+						: [
 							`${state.found.length} found so far outside the Brief, kept as suggestions for the final Report; new since the last Report:`,
 							...newFound.map((line) => `${line.what}${line.task === undefined ? "" : ` (Task \`${line.task}\`)`}`),
 						],

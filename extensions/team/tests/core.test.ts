@@ -1677,6 +1677,9 @@ describe("reporting", () => {
 			"2 found so far outside the Brief, kept as suggestions for the final Report; new since the last Report:",
 			"`old-config` has no tests.",
 		]);
+
+		const third = run(applied(first, report("2026-11-02T12:00:00.000Z", { found: ["`old-config` has no tests."] })), report("2026-11-02T12:30:00.000Z"));
+		assert.deepEqual(section(third, "Found work"), ["2 found so far outside the Brief, kept as suggestions for the final Report; none new since the last Report."], "the running count stays in a Report with nothing new");
 	});
 
 	it("lists what waits on the human whenever something does", () => {

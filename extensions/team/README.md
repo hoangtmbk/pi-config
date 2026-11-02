@@ -249,7 +249,8 @@ adds the logged sections from `effort.jsonl`, leaving out any with nothing in th
 - **Decided for you**: what the extension answered on your behalf;
 - **Teammate modes**: every Role's mode in the plan Report, then a Teammate's mode only when it
   changes;
-- **Found work**: the running count, and the items new since the last Report.
+- **Found work**: the running count, in every Report once anything is found, and the items new
+  since the last Report.
 
 The first Report, written once the plan is, is the plan Report. Each is saved as
 `reports/<nnn>.md` in the Effort directory, numbered from 001 and never overwritten, and shows in
