@@ -12,7 +12,7 @@
  */
 
 import { CONSENT_FAMILY, classify, type Family, familyOf, LIMIT_FAMILY, type LimitKind, type TransientWhy } from "./limits.ts";
-import { answersText, askedText, askText, closedText, type HeldRequest, type HookDecision, isCallOf, isQuestion, type RequestAnswer, requestKind, settledText, takeAnswer, terminalText } from "./requests.ts";
+import { answersText, askedText, askText, closedText, type HeldRequest, type HookDecision, isCallOf, isQuestion, type RequestAnswer, requestKind, settledText, type TakenAnswer, takeAnswer, terminalText } from "./requests.ts";
 
 /** The one checkpoint an Effort has before its Brief is approved. */
 export const BRIEF = "brief";
@@ -1427,7 +1427,13 @@ function answerEscalated(state: EffortState, escalation: Escalation, input: Omit
 	const held = state.teammateRequests[escalation.id];
 	if (!held) return { ok: false, refusal: noRequestText(state, escalation.id) };
 	if (held.state !== "held") return { ok: false, refusal: closedText(held) };
-	const taken = takeAnswer(held, { request: held.request, ...input });
+	// The Lead's floor and `escalate` checks are what bring a permission to the human, so the human's own allow passes them.
+	const humanAllows = escalation.kind === "permission" && via === "pending" && input.decision === "allow" && input.answers === undefined;
+	const taken: TakenAnswer | string = humanAllows
+		? input.reason?.trim()
+			? { decision: { behavior: "allow" }, logged: [] }
+			: `An answer to \`${held.request}\` needs a reason.`
+		: takeAnswer(held, { request: held.request, ...input });
 	if (typeof taken === "string") return { ok: false, refusal: taken };
 	const behavior = taken.decision.behavior;
 	const reason = input.reason?.trim() ?? "";
@@ -2067,6 +2073,7 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 				tool: text(payload.tool_name) ?? "",
 				input: typeof toolInput === "object" && toolInput !== null && !Array.isArray(toolInput) ? (toolInput as Record<string, unknown>) : {},
 				...(toolUseId === undefined ? {} : { toolUseId }),
+				...(text(payload.cwd) === undefined ? {} : { cwd: text(payload.cwd) }),
 				at,
 				state: "held",
 			};

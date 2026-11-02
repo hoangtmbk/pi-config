@@ -1331,6 +1331,17 @@ describe("a Teammate's held requests", () => {
 			assert.match(refusal(escalated, escalate({ teammate: "dev-1", question: "And the docs?" })), /`q1`/);
 		});
 
+		it("takes the human's allow of an escalated floor action, which the Lead could not allow", () => {
+			const force = applied(session, asked(2, "req-0000000c", "Bash", { command: "git push --force origin HEAD" }));
+			assert.match(refusal(force, answer("req-0000000c", { decision: "allow", reason: "ok" })), /team_escalate/);
+			const escalated = applied(force, escalate({ request: "req-0000000c", summary: "A force push rewrites history." }));
+
+			const result = run(escalated, human("req-0000000c", { decision: "allow", reason: "Rewriting it is fine this once." }));
+
+			assert.deepEqual(decision(result), { behavior: "allow" });
+			assert.match(wake(result), /The human allowed `req-0000000c`/);
+		});
+
 		it("lets an escalated prompt go once the Teammate's turn ends or its hook gives up, so nothing counts twice", () => {
 			const escalated = applied(prompt, escalate({ request: "req-0000000a" }));
 			const expired = applied(escalated, line(3, "hold-expired", { request: "req-0000000a" } as Partial<JournalLine>));
@@ -1376,6 +1387,77 @@ describe("a Teammate's held requests", () => {
 			assert.match(refusal(crashed, send("dev-1", "hi")), /ended/);
 			assert.match(refusal(session, send("dev-1", "  ")), /empty/);
 			assert.match(refusal(session, send("dev-1", "x".repeat(2001))), /2000/);
+		});
+	});
+
+	describe("the floor guard", () => {
+		const TERMS = {
+			workspace: "/work/app-ws",
+			grants: [
+				{ id: "push-effort-branch", allow: "Push the Effort's branch to origin.", from: "Playbook" as const },
+				{ id: "open-pr", allow: "Open the PR the Delivery asks for.", from: "Brief" as const },
+			],
+			delivery: "One PR against main.",
+			escalate: [{ id: "history-rewrite", ask: ["Bash(git rebase:*)", "Bash(git push --force:*)"] }],
+		};
+		const bash = (cursor: number, request: string, command: string) => applied(started, asked(cursor, request, "Bash", { command }));
+		const pushing = bash(1, "req-0000000c", "git -C . push origin HEAD");
+
+		function logged(result: Step): string[] {
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			return result.append.flatMap((each) => (each.type === "decided-for-you" ? [each.what] : []));
+		}
+
+		it("refuses an uncited allow of a floor action, naming its kind and what the Lead may cite instead", () => {
+			const text = refusal(pushing, answer("req-0000000c", { decision: "allow", reason: "the Brief wants a PR", terms: TERMS }));
+
+			assert.match(text, /floor push/);
+			assert.match(text, /`git -C \. push origin HEAD`/);
+			assert.match(text, /`push-effort-branch`/);
+			assert.match(text, /`open-pr`/);
+			assert.match(text, /`delivery`/);
+			assert.match(text, /team_escalate/);
+		});
+
+		it("refuses a grant neither the Playbook nor the Brief has, and the Delivery when the Brief has none", () => {
+			assert.match(refusal(pushing, answer("req-0000000c", { decision: "allow", reason: "ok", grant: "push-anything", terms: TERMS })), /no grant `push-anything`/);
+			assert.match(refusal(pushing, answer("req-0000000c", { decision: "allow", reason: "ok", grant: "delivery", terms: { ...TERMS, delivery: undefined } })), /no grant `delivery`/);
+		});
+
+		it("takes an allow citing a Playbook grant, a Brief override grant or the Brief's Delivery, and logs what it relied on", () => {
+			assert.deepEqual(logged(run(pushing, answer("req-0000000c", { decision: "allow", reason: "the Effort's branch", grant: "push-effort-branch", terms: TERMS }))), [
+				"allowed dev-1's `Bash` `git -C . push origin HEAD`: the Effort's branch",
+				"used grant `push-effort-branch` (Playbook: Push the Effort's branch to origin.) for dev-1's floor push `git -C . push origin HEAD`",
+			]);
+			assert.deepEqual(logged(run(pushing, answer("req-0000000c", { decision: "allow", reason: "the PR", grant: "open-pr", terms: TERMS })))[1], "used grant `open-pr` (Brief override: Open the PR the Delivery asks for.) for dev-1's floor push `git -C . push origin HEAD`");
+			assert.deepEqual(logged(run(pushing, answer("req-0000000c", { decision: "allow", reason: "the PR", grant: "delivery", terms: TERMS })))[1], "used the Brief's Delivery (One PR against main.) for dev-1's floor push `git -C . push origin HEAD`");
+			assert.deepEqual(decision(run(pushing, answer("req-0000000c", { decision: "allow", reason: "the PR", grant: "delivery", terms: TERMS }))), { behavior: "allow" });
+		});
+
+		it("adds no session rule for a floor action, so each one comes back to be answered", () => {
+			assert.match(refusal(pushing, answer("req-0000000c", { decision: "allow", reason: "ok", grant: "push-effort-branch", rule: "Bash(git push:*)", terms: TERMS })), /no session `rule`/);
+		});
+
+		it("lets a deny through uncited, and fails closed without the Brief's terms", () => {
+			assert.deepEqual(decision(run(pushing, answer("req-0000000c", { decision: "deny", reason: "not yet" }))), { behavior: "deny", message: "not yet" });
+			assert.match(refusal(pushing, answer("req-0000000c", { decision: "allow", reason: "ok", grant: "push-effort-branch" })), /no grant `push-effort-branch`/);
+		});
+
+		it("judges a delete against the folder the Teammate works in", () => {
+			assert.deepEqual(decision(run(bash(1, "req-0000000d", "rm -rf build"), answer("req-0000000d", { decision: "allow", reason: "a build folder", terms: TERMS }))), { behavior: "allow" });
+			assert.match(refusal(bash(1, "req-0000000d", "rm -rf /work/app"), answer("req-0000000d", { decision: "allow", reason: "ok", terms: TERMS })), /floor delete/);
+			const inSub = (command: string) => applied(started, line(1, "PermissionRequest", { request: "req-0000000d" } as Partial<JournalLine>, { tool_name: "Bash", tool_input: { command }, cwd: "/work/app-ws/sub" }));
+			assert.deepEqual(decision(run(inSub("rm -rf ../build"), answer("req-0000000d", { decision: "allow", reason: "a build folder", terms: TERMS }))), { behavior: "allow" });
+			assert.match(refusal(inSub("rm -rf ../../app"), answer("req-0000000d", { decision: "allow", reason: "ok", terms: TERMS })), /floor delete/);
+		});
+
+		it("keeps a request an escalate entry asks about from the Lead's allow, cited or not, sending it to team_escalate", () => {
+			const rebasing = bash(1, "req-0000000e", "git rebase main");
+			const text = refusal(rebasing, answer("req-0000000e", { decision: "allow", reason: "a tidy history", grant: "push-effort-branch", terms: TERMS }));
+			assert.match(text, /`history-rewrite`/);
+			assert.match(text, /team_escalate/);
+			assert.match(refusal(bash(1, "req-0000000f", "sh -c 'git push --force origin HEAD'"), answer("req-0000000f", { decision: "allow", reason: "ok", grant: "push-effort-branch", terms: TERMS })), /`history-rewrite`/);
+			assert.deepEqual(decision(run(rebasing, answer("req-0000000e", { decision: "deny", reason: "the human decides history" }))), { behavior: "deny", message: "the human decides history" });
 		});
 	});
 });

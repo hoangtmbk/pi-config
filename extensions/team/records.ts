@@ -15,6 +15,7 @@ import { join, relative, sep } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { type Clarification, type EffortLine, type EffortState, type JournalLine, type PendingApproval, type Report, taskStatus, type Workspace } from "./core.ts";
 import { BRIEF_SKELETON, isKebabCase, type Playbook, sha256 } from "./definitions.ts";
+import type { AnswerTerms, CitableGrant } from "./requests.ts";
 
 /** The files of one Effort, all under `<agent dir>/team/efforts/<effort-id>/`. */
 export interface EffortPaths {
@@ -394,6 +395,29 @@ export function briefCriteria(text: string): string[] {
 		const id = CRITERION.exec(line)?.[1];
 		return id === undefined ? [] : [id];
 	});
+}
+
+/**
+ * What an approved Brief and its Playbook let the Lead allow, for
+ * `team_answer`'s guard: the Playbook's grants and those the Brief's overrides
+ * add, less those it skips; its Delivery text; and the `escalate` entries it
+ * doesn't skip. `workspace` is where the requesting Teammate works.
+ */
+export function answerTerms(playbook: Playbook, text: string, workspace: string): AnswerTerms {
+	const { frontmatter, body } = parseFrontmatter(text);
+	const overrides = isMapping(frontmatter) && Array.isArray(frontmatter.overrides) ? frontmatter.overrides.filter(isMapping) : [];
+	const skipped = new Set(overrides.flatMap((each) => (typeof each.rule === "string" && typeof each.change === "string" && each.change.trim() === SKIP ? [each.rule] : [])));
+	const added = overrides.flatMap((each): CitableGrant[] => {
+		const change = typeof each.change === "string" ? each.change.trim() : "";
+		return typeof each.rule === "string" && change.startsWith(ADD_GRANT) ? [{ id: each.rule, allow: change.slice(ADD_GRANT.length).trim(), from: "Brief" }] : [];
+	});
+	const delivery = (sections(body).get("delivery") ?? []).join("\n").trim().replace(/\s+/g, " ");
+	return {
+		workspace,
+		grants: [...playbook.grants.filter(({ id }) => !skipped.has(id)).map(({ id, allow }): CitableGrant => ({ id, allow, from: "Playbook" })), ...added],
+		...(delivery === "" ? {} : { delivery }),
+		escalate: playbook.escalate.filter(({ id }) => !skipped.has(id)).map(({ id, ask }) => ({ id, ask })),
+	};
 }
 
 /**

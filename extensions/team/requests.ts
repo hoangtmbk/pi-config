@@ -7,7 +7,15 @@
  * This module decides what the Lead is told of a request, whether its
  * `team_answer` can be taken, and the hook decision it becomes. The core keeps
  * each request's state in the Effort's lines.
+ *
+ * Two kinds of request are past what the Lead may allow alone. A floor action
+ * (an irreversible outward one, as `floor.mjs` judges a Bash command) takes an
+ * allow only citing what covers it: a Playbook grant, a grant a Brief override
+ * adds, or the Brief's Delivery. A request an `escalate` entry's `ask:` rules
+ * match takes no allow at all: it goes to the human through `team_escalate`.
  */
+
+import { type FloorAction, floorAction, simpleCommands } from "./floor.mjs";
 
 /** Where a held request stands. */
 export type RequestState =
@@ -35,6 +43,8 @@ export interface HeldRequest {
 	input: Record<string, unknown>;
 	/** Claude Code's id of the tool call, when the payload carried one. */
 	toolUseId?: string;
+	/** The folder Claude Code ran the call from, when the payload said: relative deletes are read from it. */
+	cwd?: string;
 	at: string;
 	state: RequestState;
 }
@@ -62,7 +72,31 @@ export interface RequestAnswer {
 	answers?: Record<string, string | string[]>;
 	/** The human's free-text answer to an escalated prose question, relayed from chat. */
 	text?: string;
+	/** What the approved Playbook and Brief let the Lead allow. Without them, no floor action can be allowed. */
+	terms?: AnswerTerms;
 }
+
+/** A grant the Lead may cite to allow a floor action, and where it comes from. */
+export interface CitableGrant {
+	id: string;
+	allow: string;
+	from: "Playbook" | "Brief";
+}
+
+/** What the approved Playbook and Brief let the Lead allow, read when it answers. */
+export interface AnswerTerms {
+	/** Where the requesting Teammate works: a delete inside it isn't on the floor. */
+	workspace: string;
+	/** The Playbook's grants and those the Brief's overrides add, less those it skips. */
+	grants: CitableGrant[];
+	/** The Brief's Delivery section, which the Lead cites as `delivery`; undefined when it says nothing. */
+	delivery?: string;
+	/** The Playbook's `escalate` entries the Brief doesn't skip, with their `ask:` rules. */
+	escalate: { id: string; ask: string[] }[];
+}
+
+/** What a `grant` names to cite the Brief's Delivery. */
+export const DELIVERY = "delivery";
 
 /** An answer taken: the decision for the hook, the rule to keep, and what the decided-for-you log says of it. */
 export interface TakenAnswer {
@@ -239,6 +273,13 @@ export function takeAnswer(held: HeldRequest, answer: RequestAnswer): TakenAnswe
 		if (answer.rule !== undefined) return `A \`rule\` goes only with an allow; ${about} is being denied.`;
 		return { decision: { behavior: "deny", message: reason }, logged: [`denied ${call}: ${reason}`] };
 	}
+	const terms = answer.terms ?? { workspace: NO_WORKSPACE, grants: [], escalate: [] };
+	const escalation = terms.escalate.find((entry) => entry.ask.some((rule) => matchesRule(rule, held.tool, held.input)));
+	if (escalation) {
+		return `${about} is what the Playbook's \`escalate\` entry \`${escalation.id}\` brings to the human even when you would allow it: move it to their pending items with \`team_escalate\`, or deny it with a reason.`;
+	}
+	const floor = held.tool === "Bash" && typeof held.input.command === "string" ? floorAction(held.input.command, { workspace: terms.workspace, ...(held.cwd === undefined ? {} : { cwd: held.cwd }) }) : undefined;
+	if (floor) return takeFloorAnswer(held, answer, reason, terms, floor);
 	const logged = [`allowed ${call}: ${reason}`];
 	let updatedPermissions: SessionRule[] | undefined;
 	if (answer.rule !== undefined) {
@@ -255,6 +296,56 @@ export function takeAnswer(held: HeldRequest, answer: RequestAnswer): TakenAnswe
 		...(updatedPermissions === undefined ? {} : { rule: answer.rule?.trim() }),
 		logged,
 	};
+}
+
+/** A Workspace nothing is inside, for an answer without the Brief's terms: every delete is then on the floor. */
+const NO_WORKSPACE = "/\u0000no-workspace";
+
+/**
+ * An allow of a floor action: taken only citing a grant or the Brief's
+ * Delivery, and never with a session rule, so each one is answered on its own.
+ */
+function takeFloorAnswer(held: HeldRequest, answer: RequestAnswer, reason: string, terms: AnswerTerms, floor: FloorAction): TakenAnswer | string {
+	const about = `\`${held.request}\``;
+	const action = `floor ${floor.kind} \`${floor.command}\``;
+	const citable = [...terms.grants.map(({ id }) => id), ...(terms.delivery === undefined ? [] : [DELIVERY])];
+	const options =
+		citable.length === 0
+			? "The Playbook and the Brief cover no floor action"
+			: `Cite what covers it as \`grant\`: ${backticked(citable)}${terms.delivery === undefined ? "" : ` (\`${DELIVERY}\` is the Brief's Delivery)`}`;
+	const otherwise = "If none does, move it to the human with `team_escalate`, deny it with a reason, or leave it to the human in the terminal.";
+	const grant = answer.grant?.trim() ?? "";
+	if (grant === "") return `${about} is a ${action}: an irreversible outward action, which you allow only citing what covers it. ${options}. ${otherwise}`;
+	const found = terms.grants.find(({ id }) => id === grant);
+	if (!found && !(grant === DELIVERY && terms.delivery !== undefined)) return `There is no grant \`${grant}\` to cite for ${about}, a ${action}. ${options}. ${otherwise}`;
+	if (answer.rule !== undefined) return `${about} is a ${action}, so its allow adds no session \`rule\`: each floor action comes to you on its own. Answer again without the \`rule\`.`;
+	const relied = found ? `grant \`${found.id}\` (${found.from === "Playbook" ? "Playbook" : "Brief override"}: ${found.allow})` : `the Brief's Delivery (${terms.delivery})`;
+	return {
+		decision: { behavior: "allow" },
+		logged: [`allowed ${held.teammate}'s \`${held.tool}\` \`${gist(held.input)}\`: ${reason}`, `used ${relied} for ${held.teammate}'s ${action}`],
+	};
+}
+
+/**
+ * Whether a permission rule, as an `ask:` list writes it, matches a call:
+ * \`Tool\`, \`Tool(content)\` or \`Tool(prefix:*)\`. A Bash rule matches any simple
+ * command in the command, wrappers and \`sh -c\` read through; another tool's
+ * matches the path or text the call is read by. Best effort, like the floor.
+ */
+export function matchesRule(rule: string, tool: string, input: Record<string, unknown>): boolean {
+	const parsed = RULE.exec(rule.trim());
+	if (!parsed || parsed[1] !== tool) return false;
+	const content = parsed[2]?.trim();
+	if (content === undefined || content === "*") return true;
+	const prefix = content.endsWith(":*") ? content.slice(0, -2).trim() : undefined;
+	const fits = (text: string): boolean => (prefix === undefined ? text === content : text === prefix || text.startsWith(`${prefix} `));
+	if (tool === "Bash") {
+		const command = typeof input.command === "string" ? input.command : "";
+		return fits(command.trim()) || simpleCommands(command).some((words) => fits(words.join(" ")));
+	}
+	const read = gist(input);
+	if (prefix !== undefined) return read.startsWith(prefix);
+	return read === content || read.endsWith(`/${content}`);
 }
 
 function takeQuestionAnswer(held: HeldRequest, answer: RequestAnswer, reason: string): TakenAnswer | string {
