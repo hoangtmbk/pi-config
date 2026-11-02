@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { awayText, currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openEscalations, openMerges, type Step, step, taskStatus, type UsageReading, waitingInTerminal, workdir } from "../core.ts";
+import { awayText, currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openEscalations, openMerges, type Step, step, taskStatus, type UsageItem, type UsageReading, usageText, waitingInTerminal, workdir } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -2669,9 +2669,24 @@ describe("usage limits", () => {
 		assert.ok(cancel.actions.some((action) => action.kind === "end-effort" && action.how === "cancelled"));
 		assert.deepEqual(cancel.state.usageItems, []);
 
-		// A reset Claude Code didn't give asks too: nobody knows when it lifts.
+	});
+
+	it("waits out a limit Claude Code gave no reset for, and asks the human to stay or cancel only once the pause has held a day", () => {
+		const lines = running(running(planned, "rename"), "tests");
 		const unsaid = journalStep(lines, "dev-1", failure("dev-1", "You've hit your session limit"));
-		assert.deepEqual(unsaid.ok && unsaid.state.usageItems?.map((item) => [item.why, item.reset]), [["far-reset", undefined]]);
+		assert.ok(unsaid.ok, unsaid.ok ? "" : unsaid.refusal);
+		assert.equal(heldPauses(unsaid.state)[0]?.kind, "session");
+		assert.deepEqual(unsaid.state.usageItems ?? [], [], "the reset may be minutes away, so nothing asks to cancel yet");
+		const paused = [...lines, ...unsaid.append];
+
+		assert.deepEqual(tick(paused, "2026-11-03T12:09:00.000Z").append, [], "a day hasn't passed");
+		const dayOn = tick(paused, "2026-11-03T12:11:00.000Z");
+		assert.deepEqual(dayOn.ok && dayOn.state.usageItems?.map((item) => [item.why, item.reset]), [["far-reset", undefined]]);
+		assert.match(dayOn.ok ? usageText(dayOn.state.usageItems?.[0] as UsageItem) : "", /held for more than a day, and Claude Code didn't say when it lifts: stay paused, or cancel the Effort/);
+
+		const stay = run([...paused, ...dayOn.append], { kind: "answer-usage", id: "u1", choice: "stay", at: "2026-11-03T12:12:00.000Z" });
+		assert.ok(stay.ok);
+		assert.deepEqual(tick([...paused, ...dayOn.append, ...stay.append], "2026-11-03T13:00:00.000Z").append, [], "staying asks no more");
 	});
 
 	it("lifts the usage pause at its reset and sends continue ~2 min later to each still-idle limited Teammate, never while its auto-wait is armed", () => {

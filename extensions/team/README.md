@@ -317,7 +317,9 @@ recorded stays pending, to answer again.
 
 `limits.ts` is the only place that reads a limit message. Hitting a usage limit pauses the Effort
 (and a model-family limit holds only that family's Roles) until the reset, or the next ordinary
-Stop; `continue` is sent about two minutes after the reset. A usage-credit confirm holds the Roles
+Stop; `continue` is sent about two minutes after the reset. A reset more than a day away asks you
+in `/team pending` to stay paused or cancel; one Claude Code gave no time for waits for its
+auto-resume or the next ordinary Stop, and asks the same only once the pause has held a day. A usage-credit confirm holds the Roles
 on that family and tells the Lead never to confirm it: that is yours. It counts as waiting on you,
 shows in the Report's Waiting on you, and `/team pending` offers to attach to the Teammate's
 terminal, where only you answer it. A Role's `model` or `effort` set in the

@@ -569,6 +569,8 @@ export interface Pause {
 	kind?: "session" | "weekly";
 	/** For the usage pause: when it lifts, when Claude Code said. */
 	reset?: string;
+	/** For the usage pause: the human was asked to stay paused or cancel, so nothing asks again while it holds. */
+	asked?: true;
 	/** When it started. */
 	at: string;
 }
@@ -1181,7 +1183,9 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		}
 		case "usage-escalated": {
 			const { type: _type, ...item } = line;
-			return { ...state, usageItems: [...(state.usageItems ?? []), item], usageAsked: (state.usageAsked ?? 0) + 1 };
+			const usage = state.pauses?.usage;
+			const pauses = line.why === "far-reset" && usage ? { ...state.pauses, usage: { ...usage, asked: true as const } } : state.pauses;
+			return { ...state, ...(pauses ? { pauses } : {}), usageItems: [...(state.usageItems ?? []), item], usageAsked: (state.usageAsked ?? 0) + 1 };
 		}
 		case "usage-answered":
 			return { ...state, usageItems: (state.usageItems ?? []).filter((item) => item.id !== line.id) };
@@ -1499,7 +1503,8 @@ function heldWhy(hold: ModelHold): string {
 /** A usage item, as `/team pending` and the Report name it. */
 export function usageText(item: UsageItem, teammates: readonly Teammate[] = []): string {
 	if (item.why === "far-reset") {
-		return `the usage pause on a ${item.kind} limit lifts ${item.reset === undefined ? "at a time Claude Code didn't say" : `${untilText(item.reset, item.at).replace(/^until /, "at ")}, more than a day away`}: stay paused, or cancel the Effort`;
+		if (item.reset === undefined) return `the usage pause on a ${item.kind} limit has held for more than a day, and Claude Code didn't say when it lifts: stay paused, or cancel the Effort`;
+		return `the usage pause on a ${item.kind} limit lifts ${untilText(item.reset, item.at).replace(/^until /, "at ")}, more than a day away: stay paused, or cancel the Effort`;
 	}
 	const task = teammates.find((each) => each.id === item.teammate)?.task;
 	return `${item.teammate ?? "a Teammate"} still fails with ${item.kind.replace("_", " ")} after ${RETRY_MS.length} retries${task === undefined ? "" : ` on Task \`${task}\``}: retry again, or leave it to the Lead`;
@@ -2878,7 +2883,8 @@ function limitHit(state: EffortState, teammate: Teammate, input: Extract<EffortI
 			}
 			if (!later(failure.reset, state.pauses?.usage)) return took(state, [limited(limit)], []);
 			const kind = failure.limit as "session" | "weekly";
-			const far = failure.reset === undefined || Date.parse(failure.reset) - Date.parse(at) > FAR_RESET_MS;
+			// A reset Claude Code didn't give may be minutes away: the pause waits for the auto-resume or the next ordinary Stop, and asks only once it has held a day (`tick`).
+			const far = failure.reset !== undefined && Date.parse(failure.reset) - Date.parse(at) > FAR_RESET_MS;
 			const asked = state.usageItems?.some((item) => item.why === "far-reset");
 			return took(
 				state,
@@ -2976,6 +2982,9 @@ function tick(state: EffortState, input: Extract<EffortInput, { kind: "tick" }>)
 	const lifts: EffortLine[] = [];
 	const usage = state.pauses?.usage;
 	if (usage?.reset !== undefined && Date.parse(usage.reset) <= now) lifts.push({ type: "resumed", by: "usage", at });
+	// A usage pause Claude Code gave no reset for, held a day with nothing lifting it: the human decides whether to stay or cancel.
+	const unsaid = usage !== undefined && usage.reset === undefined && !usage.asked && now - Date.parse(usage.at) > FAR_RESET_MS ? usage.kind : undefined;
+	if (unsaid && !state.usageItems?.some((item) => item.why === "far-reset")) lifts.push({ type: "usage-escalated", id: usageId(state), why: "far-reset", kind: unsaid, at });
 	for (const hold of Object.values(state.holds ?? {})) {
 		if (hold?.reset !== undefined && Date.parse(hold.reset) <= now) lifts.push({ type: "model-released", family: hold.family, at });
 	}

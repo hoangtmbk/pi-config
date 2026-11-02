@@ -2046,11 +2046,11 @@ describe("usage limits: a Teammate's StopFailure", () => {
 		assert.deepEqual(pi.timers(), [], "the clock stops with the session");
 	});
 
-	it("asks the human about a weekly limit with no reset it can read, in `/team pending`, and cancelling ends the Effort as `/team cancel` does", async () => {
+	it("asks the human about a weekly limit that resets more than a day away, in `/team pending`, and cancelling ends the Effort as `/team cancel` does", async () => {
 		const weekly: FakeHookStep[] = [
 			{ event: "SessionStart", payload: { source: "startup" } },
 			{ event: "UserPromptSubmit" },
-			{ event: "StopFailure", payload: { error: "rate_limit", last_assistant_message: "You've hit your weekly limit" } },
+			{ event: "StopFailure", payload: { error: "rate_limit", last_assistant_message: "You've hit your weekly limit · resets Mon 12:00am (UTC)" } },
 		];
 		const { pi, dir } = await crewApproved({ hooks: weekly });
 		await pi.call("team_plan", { tasks: CREW_PLAN });
