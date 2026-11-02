@@ -2562,7 +2562,7 @@ function takeoverEvent(state: EffortState, teammate: Teammate, input: Extract<Ef
 	const at = line.at;
 	const mod = line.from === "mod";
 	if (teammate.ended !== undefined || teammate.retiredAt !== undefined) return mod ? took(state, [], []) : undefined;
-	// Until its fresh session starts, what the human types reaches only the old one, which is being stopped (#112).
+	// Until its fresh session starts, what the human types reaches only the old one, which is being stopped for a Brief change's fresh start.
 	if (teammate.relaunching && teammate.takeover === undefined) return mod ? took(state, [], []) : undefined;
 	if (teammate.takeover === undefined && teammate.denied !== undefined && (mod ? line.event !== "handback" : AFTER_A_NO.has(line.event ?? ""))) {
 		const start = takeoverStart(teammate, cursor, { kind: "deny", request: teammate.denied }, mod ? humanInput(line, input.sent) : undefined, at);

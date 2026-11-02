@@ -174,7 +174,7 @@ journal, `teammates/<id>/events.jsonl`, then rings the Lead's doorbell: a localh
 the Lead writes to `lead.json` before its first launch. The doorbell only says "read this journal";
 the Lead applies each line once, from the Teammate's cursor, and every `effort.jsonl` line it adds
 for one carries that cursor. A doorbell without the token is ignored, and whatever a journal holds
-is also read when the Lead's run settles, so a lost doorbell loses nothing.
+is also read when the Lead's prompt settles, so a lost doorbell loses nothing.
 
 - `SessionStart` records the Teammate's session id, short id and inbox socket;
 - `UserPromptSubmit` is logged as a message having landed, and `PermissionDenied` is logged;
@@ -183,7 +183,7 @@ is also read when the Lead's run settles, so a lost doorbell loses nothing.
   Lead with the Task and the result's path. A `Stop` without a new result is "stopped short", and
   wakes the Lead with the Teammate's last message.
 
-Wakes that come while the Lead is busy are sent together as one follow-up once its run settles.
+Wakes that come while the Lead is busy are sent together as one follow-up once its prompt settles.
 
 ### Usage
 

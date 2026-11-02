@@ -3019,10 +3019,11 @@ describe("the Team block", () => {
 		await pi.call("team_plan", { tasks: CREW_PLAN });
 
 		const block = teamBlock(pi) ?? [];
-		assert.equal(block.length, 6, block.join("\n"));
+		assert.equal(block.length, 7, block.join("\n"));
 		assert.match(block[0], / 3 live ─╮$/);
-		assert.match(block[2], /^│ builder-1 /);
-		assert.match(block[3], /^│ \+2 more Teammates +│$/);
+		assert.match(block[2], /no reading yet/);
+		assert.match(block[3], /^│ builder-1 /);
+		assert.match(block[4], /^│ \+2 more Teammates +│$/);
 	});
 });
 

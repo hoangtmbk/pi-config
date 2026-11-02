@@ -242,8 +242,6 @@ interface ReportDetails {
 /** The Team block's key among pi's widgets. */
 const BLOCK_KEY = "team";
 
-/** The cap on live Teammates when pi's settings name none. */
-
 const HandoffParams = Type.Object({
 	slug: Type.String({ description: "The planned Task to hand off." }),
 	body: Type.String({ description: "The `task.md` body the Teammate works from." }),
@@ -353,7 +351,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	let bridge: Promise<Bridge> | undefined;
 	/** The Teammates being stopped and launched afresh right now, whose journals aren't read until that is on record. */
 	const relaunching = new Set<string>();
-	// Whether the Lead's model is in a run, and what wakes about Teammates wait for it to settle.
+	// Whether the Lead's model is working on a prompt, and what wakes about Teammates wait for it to settle.
 	let busy = false;
 	let waiting: string[] = [];
 	// While the Effort is picked up again after a restart: what it has to tell the Lead, said once at the end.
@@ -872,7 +870,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		ctx.ui.notify(result.reply ?? `Handed \`${teammate}\` back.`, "info");
 	}
 
-	/** Wake the Lead about its Teammates now, or with everything else once its run settles. */
+	/** Wake the Lead about its Teammates now, or with everything else once its prompt settles. */
 	function wakeAboutTeammates(texts: string[]): void {
 		if (recovering) recovering.push(...texts);
 		else if (busy) waiting.push(...texts);
@@ -2000,11 +1998,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		name: "team_request_approval",
 		label: "Request approval",
 		description: [
-			"Ask the human to approve a draft at one of the Team's checkpoints: the Effort's Brief at `brief`, or a Playbook at `adopt-playbook` during Team setup.",
+			"Ask the human to approve a draft at one of the Team's checkpoints: the Effort's Brief at `brief`; a change to the approved Brief at `brief-change`, with `affects` naming the planned Tasks it holds until the answer (every other Task goes on); once the Brief is approved, the file a Playbook checkpoint id or `escalate` id asks about, recorded with its sha256 when approved; or a Playbook at `adopt-playbook` during Team setup.",
 			"Validates the draft, snapshots it with its sha256 and adds a pending item the human answers in `/team pending`; returns at once without waiting for the answer.",
 			"Agreement in chat never counts: only the human's approval in `/team pending` does.",
 		].join(" "),
-		promptSnippet: "Ask the human to approve a draft, such as the Effort's Brief or a Playbook to adopt, from `/team pending`",
+		promptSnippet: "Ask the human to approve a draft from `/team pending`: the Effort's Brief, a Brief change (holding the Tasks in `affects`), a file at a Playbook checkpoint or `escalate` id, or a Playbook to adopt",
 		parameters: RequestApprovalParams,
 		defaultActive: false,
 

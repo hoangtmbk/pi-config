@@ -51,6 +51,7 @@ describe("the Team block", () => {
 		assert.deepEqual(lines, [
 			"╭─ Team · software · flaky-cache ──────────────────────────────────────────────────── 2 live ─╮",
 			"│ ● running  ·  working · 1/4 Tasks accepted                                                  │",
+			"│ 5h n/a · week n/a  · no reading yet                                                         │",
 			"│ architect-1  a1b2c3d4  idle  001-architect-design · round 1 done  ctx 18%  auto             │",
 			"│ dev-1        d4e5f6a7  busy  002-dev-ttl                          ctx —    acceptEdits≠auto │",
 			"│ ▲ 1 waiting on you  /team pending   reports 2  /team reports   attach  /team                │",
@@ -74,6 +75,7 @@ describe("the Team block", () => {
 		assert.deepEqual(lines, [
 			"╭─ Team · software · flaky-cache ──────────────────────── 0 live ─╮",
 			"│ ● running  ·  intake                                            │",
+			"│ 5h n/a · week n/a  · no reading yet                             │",
 			"│ queued  004-qa-cache (qa): cap 3 reached; waits for 002 and 003 │",
 			"│         +2 more queued                                          │",
 			"│ nothing waiting on you   reports 0                              │",
@@ -93,12 +95,13 @@ describe("the Team block", () => {
 		assert.deepEqual(lines, [
 			"╭─ Team · software · flaky-cache ─────────── 3 live ─╮",
 			"│ ● running  ·  working · 0/3 Tasks accepted         │",
+			"│ 5h n/a · week n/a  · no reading yet                │",
 			"│ dev-1  a1b2c3d4  idle  001-dev-1-design  ctx —     │",
 			"│ +2 more Teammates                                  │",
 			"│ nothing waiting on you   reports 0   attach  /team │",
 			"╰────────────────────────────────────────────────────╯",
 		]);
-		assert.deepEqual(render(data({ teammates: [mate("dev-3", { shortId: undefined, activity: "starting", task: "003-dev-3-design" })] }))[2], "│ dev-3  —  starting  003-dev-3-design  ctx — │");
+		assert.deepEqual(render(data({ teammates: [mate("dev-3", { shortId: undefined, activity: "starting", task: "003-dev-3-design" })] }))[3], "│ dev-3  —  starting  003-dev-3-design  ctx — │");
 	});
 
 	it("marks a short id the human hasn't attached to through pi `(new)`, and says how to attach once a Teammate has one", () => {
@@ -107,6 +110,7 @@ describe("the Team block", () => {
 		assert.deepEqual(lines, [
 			"╭─ Team · software · flaky-cache ───────────── 2 live ─╮",
 			"│ ● running  ·  working · 1/4 Tasks accepted           │",
+			"│ 5h n/a · week n/a  · no reading yet                  │",
 			"│ dev-1  a1b2c3d4        idle  001-dev-1-design  ctx — │",
 			"│ dev-2  k3l4m5n6 (new)  busy  003-dev-ttl       ctx — │",
 			"│ nothing waiting on you   reports 0   attach  /team   │",
@@ -117,7 +121,7 @@ describe("the Team block", () => {
 	it("marks with `?` a short id nothing has confirmed since pi came back, the row drawn from saved state alone", () => {
 		const lines = render(data({ teammates: [mate("dev-1", { unconfirmed: true }), mate("dev-2", { shortId: "k3l4m5n6", activity: "busy", task: "003-dev-ttl" })] }));
 
-		assert.deepEqual(lines.slice(2, 4), ["│ dev-1  a1b2c3d4?  idle  001-dev-1-design  ctx —    │", "│ dev-2  k3l4m5n6   busy  003-dev-ttl       ctx —    │"]);
+		assert.deepEqual(lines.slice(3, 5), ["│ dev-1  a1b2c3d4?  idle  001-dev-1-design  ctx —    │", "│ dev-2  k3l4m5n6   busy  003-dev-ttl       ctx —    │"]);
 	});
 
 	it("shows each pause that holds on a line of its own, with who set it, since when and why, and how the human lifts theirs", () => {
@@ -138,6 +142,7 @@ describe("the Team block", () => {
 			"│   by you since 12:00 UTC: lunch   /team resume  │",
 			"│   by the Lead since 12:05 UTC: checking the API │",
 			"│   by a usage limit since 12:10 UTC              │",
+			"│ 5h n/a · week n/a  · no reading yet             │",
 			"│ queued  002-qa-tests (qa): paused               │",
 			"│ nothing waiting on you   reports 0              │",
 			"╰─────────────────────────────────────────────────╯",
@@ -162,6 +167,7 @@ describe("the Team block", () => {
 			"│   by a usage limit since 12:10 UTC: weekly limit, resets 2026-11-09 00:00 UTC │",
 			"│ held  architect, reviewer on an Opus limit until 15:45 UTC                    │",
 			"│ held  dev on a usage-credit confirm in dev-1's terminal                       │",
+			"│ 5h n/a · week n/a  · no reading yet                                           │",
 			"│ ▲ 1 waiting on you  /team pending   reports 0                                 │",
 			"╰───────────────────────────────────────────────────────────────────────────────╯",
 		]);
@@ -194,6 +200,11 @@ describe("the Team block", () => {
 		assert.match(stale[2], /^│ 5h n\/a · week n\/a  · get_usage, 2h 15m ago +│$/);
 	});
 
+	it("shows the usage line before the first reading, with each window n/a and no reading yet", () => {
+		const lines = render(data({}));
+		assert.match(lines[2], /^│ 5h n\/a · week n\/a  · no reading yet +│$/);
+	});
+
 	it("shows a Teammate the human holds as ✋ YOURS with its age, what started the Takeover and how to hand it back", () => {
 		const lines = render(
 			data({
@@ -204,12 +215,12 @@ describe("the Team block", () => {
 			}),
 		);
 
-		assert.deepEqual(lines.slice(2, 4), [
+		assert.deepEqual(lines.slice(3, 5), [
 			"│ architect-1  a1b2c3d4  idle          001-architect-design  ctx 18%  auto       │",
 			"│ dev-1        d4e5f6a7  ✋ YOURS 23m  you typed a prompt · /team handback dev-1 │",
 		]);
 		const narrow = renderTeamBlock(data({ teammates: [mate("dev-1", { takeover: { since: "2026-11-02T09:37:00.000Z", trigger: "you typed a prompt" } })] }), NOW, { maxTeammates: 3, width: 56 });
-		assert.equal(narrow[2], "│ dev-1  a1b2c3d4  ✋ YOURS 23m  …/team handback dev-1 │");
+		assert.equal(narrow[3], "│ dev-1  a1b2c3d4  ✋ YOURS 23m  …/team handback dev-1 │");
 	});
 
 	it("never gets wider than 96 columns, clipping every cell and flattening newlines, wide characters included, in plain lines RPC can take", () => {
@@ -228,9 +239,9 @@ describe("the Team block", () => {
 		for (const line of lines) assert.equal(visibleWidth(line), 96, line);
 		assert.ok(lines.every((line) => !line.includes("\n") && !line.includes("\u001b")));
 		assert.match(lines[0], /^╭─ Team · software · effort-x+… ─+ 2 live ─╮$/);
-		assert.match(lines[2], /^│ architect-with-…  a1b2c3d4  idle  001-deeply\/nested\/.*…  ctx —  acceptEdits≠auto │$/);
-		assert.match(lines[3], /^│ dev-1 +a1b2c3d4  idle  002-キャッシュ.*… +ctx — +│$/);
-		assert.match(lines[4], /^│ queued  004-deeply\/nested\/.*… │$/);
+		assert.match(lines[3], /^│ architect-with-…  a1b2c3d4  idle  001-deeply\/nested\/.*…  ctx —  acceptEdits≠auto │$/);
+		assert.match(lines[4], /^│ dev-1 +a1b2c3d4  idle  002-キャッシュ.*… +ctx — +│$/);
+		assert.match(lines[5], /^│ queued  004-deeply\/nested\/.*… │$/);
 	});
 });
 

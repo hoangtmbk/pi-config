@@ -151,8 +151,7 @@ export interface StatusExtras {
 /**
  * The Effort's status, as the block shows it and `team_status` returns it:
  * live Teammates only, since one stopped to make room under the cap is gone,
- * and the queued Tasks by folder. Nothing yet writes a Report, so that is 0
- * until the ticket that adds them fills it in here.
+ * and the queued Tasks by folder.
  */
 export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockData {
 	const handed = Object.keys(state.tasks).length > 0 || state.queue.length > 0;
@@ -308,11 +307,12 @@ function clockAt(at: string, now: number): string {
  * The account's usage, shown whether or not a Teammate is live: each window,
  * or `n/a` when the reading doesn't give it, and when it resets, as a time
  * today or a weekday and time otherwise, in UTC like the pause lines; then
- * where the reading came from and how old it is.
+ * where the reading came from and how old it is. Before the first reading,
+ * each window is `n/a` and the line says there is no reading yet.
  */
 function usageLine(data: TeamBlockData, now: number): string[] {
 	const usage = data.usage;
-	if (!usage) return [];
+	if (!usage) return ["5h n/a · week n/a  · no reading yet"];
 	const windows = [usageWindow("5h", usage.fiveHour, now), usageWindow("week", usage.sevenDay, now)].join(" · ");
 	return [`${windows}  · ${oneLine(usage.source)}, ${age(now - Date.parse(usage.at))} ago`];
 }

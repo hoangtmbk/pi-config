@@ -612,17 +612,19 @@ function readAdoption(agentDir: string, team: string, roleNames: readonly string
 }
 
 function directories(dir: string): string[] {
-	let found: Dirent[];
-	try {
-		found = readdirSync(dir, { withFileTypes: true });
-	} catch {
-		// No folder means no Teams there: the normal case for a human who has written none.
-		return [];
-	}
-	return found
+	return entriesOf(dir)
 		.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
 		.map((entry) => entry.name)
 		.sort(byCodepoint);
+}
+
+/** The entries of `dir`; none when it can't be read. No folder means nothing there: the normal case for a human who has written no Team or Role. */
+function entriesOf(dir: string): Dirent[] {
+	try {
+		return readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return [];
+	}
 }
 
 function readTeam(dir: string, name: string, source: TeamSource, agentDir: string): Team {
@@ -684,11 +686,7 @@ function readTeam(dir: string, name: string, source: TeamSource, agentDir: strin
 }
 
 function readdirSafe(dir: string): string[] {
-	try {
-		return readdirSync(dir);
-	} catch {
-		return [];
-	}
+	return entriesOf(dir).map((entry) => entry.name);
 }
 
 /**
