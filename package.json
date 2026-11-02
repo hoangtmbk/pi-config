@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "description": "hoangtmbk's pi package: extensions, skills, prompts and themes, synced across machines via `pi install`",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "repository": "github:hoangtmbk/pi-config",
   "pi": {
     "extensions": [
@@ -13,9 +15,15 @@
       "./extensions/web-fetch/index.ts",
       "./extensions/web-search/index.ts"
     ],
-    "skills": ["./skills"],
-    "prompts": ["./prompts"],
-    "themes": ["./themes"]
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./prompts"
+    ],
+    "themes": [
+      "./themes"
+    ]
   },
   "scripts": {
     "check": "npm run typecheck && npm run check:imports && npm test",
@@ -25,7 +33,8 @@
     "live:compaction": "tsx extensions/compaction/test.ts",
     "live:subagents": "tsx extensions/subagents/test.ts",
     "live:web-fetch": "tsx extensions/web-fetch/test.ts",
-    "live:web-search": "tsx extensions/web-search/test.ts"
+    "live:web-search": "tsx extensions/web-search/test.ts",
+    "proto:team-view": "pi -e extensions/team/prototype-pi-view.ts"
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
