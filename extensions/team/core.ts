@@ -11,7 +11,7 @@
  * is one appended line and the state is only ever what the lines fold to.
  */
 
-import { askText, closedText, type HeldRequest, type HookDecision, isCallOf, type RequestAnswer, settledText, takeAnswer, terminalText } from "./requests.ts";
+import { answersText, askedText, askText, closedText, type HeldRequest, type HookDecision, isCallOf, isQuestion, type RequestAnswer, requestKind, settledText, takeAnswer, terminalText } from "./requests.ts";
 
 /** The one checkpoint an Effort has before its Brief is approved. */
 export const BRIEF = "brief";
@@ -282,7 +282,52 @@ export type EffortLine =
 	/** The Lead answered a held request through its hook, adding `rule` for the Teammate's session. Reads no journal line. */
 	| { type: "request-answered"; teammate: string; request: string; task?: string; decision: HookDecision; rule?: string; at: string }
 	/** The Effort is over: the human signed off its final Report, or cancelled it. Nothing more is taken. */
-	| { type: "effort-ended"; how: Ended["how"]; at: string };
+	| { type: "effort-ended"; how: Ended["how"]; at: string }
+	/** The Lead moved a held request, or a stopped-short Teammate's prose question, to the human's pending items. */
+	| ({ type: "escalated" } & Omit<Escalation, "answered">)
+	/** The human answered an escalated item: in `/team pending`, or in chat with the Lead relaying it. */
+	| ({ type: "escalation-answered"; id: string } & NonNullable<Escalation["answered"]>)
+	/** The Lead sent a Teammate a prose message with `team_send`. */
+	| { type: "message-sent"; teammate: string; message: string; at: string };
+
+/**
+ * A held request or a prose question the Lead escalated with
+ * `team_escalate`: it waits on the human, and only its Task waits with it.
+ * An escalated permission takes only the human's answer in `/team pending`;
+ * an escalated question also takes the human's answer relayed from chat.
+ */
+export interface Escalation {
+	/** The held request's id, or `q<n>` for a prose question. */
+	id: string;
+	teammate: string;
+	/** The Task in the Teammate's context when it asked. */
+	task?: string;
+	/** A permission prompt or an `AskUserQuestion` its hook holds, or a question in a stopped-short Teammate's last message. */
+	kind: "permission" | "question" | "prose";
+	/** What is asked, as the human reads it. */
+	question: string;
+	/** The Lead's summary for the human: what is asked and why the Brief doesn't settle it. */
+	summary: string;
+	/** What the Brief says on it, as the Lead read it. */
+	brief?: string;
+	at: string;
+	/** Set once the human answered it. */
+	answered?: { answer: string; decision?: "allow" | "deny"; via: "pending" | "lead"; at: string };
+}
+
+/** An entry of `clarifications.md`: the human's answer to an escalated question, which counts as part of the Brief. */
+export interface Clarification {
+	id: string;
+	teammate: string;
+	task?: string;
+	question: string;
+	summary: string;
+	brief?: string;
+	answer: string;
+	/** Where the human answered: `/team pending`, or in chat with the Lead relaying it. */
+	via: "pending" | "lead";
+	at: string;
+}
 
 /** The human's answer to a pending item: a Playbook change is approved (adopted) or declined, the rest approved or sent back. */
 export type Answer = "approved" | "sent-back" | "declined";
@@ -388,6 +433,8 @@ export interface EffortState {
 	pauses?: Partial<Record<PauseSetter, Pause>>;
 	/** Every request a Teammate's hook held for an answer, by request id, oldest first. */
 	teammateRequests: Record<string, HeldRequest>;
+	/** Everything the Lead escalated to the human, by id, oldest first; absent before the first. */
+	escalations?: Record<string, Escalation>;
 	/** Every approval requested, oldest first, with how it was answered; absent before the first. */
 	asked?: Asked[];
 	/** The number of the last Report while it is the final one, which sign-off is asked for. */
@@ -483,7 +530,13 @@ export type EffortInput =
 	/** `/team resume` from the human in a session holding the Effort, or `team_resume` from the Lead: each lifts only its own pause. */
 	| { kind: "resume"; by: "human" | "lead"; at: string }
 	/** `team_answer` of a held request. */
-	| ({ kind: "answer-request"; at: string } & RequestAnswer);
+	| ({ kind: "answer-request"; at: string } & RequestAnswer)
+	/** `team_escalate`: a held `request`, or a stopped-short `teammate`'s prose `question`, moved to the human with the Lead's summary. */
+	| { kind: "escalate"; request?: string; teammate?: string; question?: string; summary: string; brief?: string; at: string }
+	/** The human's answer to an escalated item in `/team pending`. */
+	| { kind: "answer-escalation"; id: string; decision?: "allow" | "deny"; reason?: string; answers?: Record<string, string | string[]>; text?: string; at: string }
+	/** `team_send`: a short prose message to a Teammate. */
+	| { kind: "send"; teammate: string; message: string; at: string };
 
 /** Work the core leaves to the shell. */
 export type EffortAction =
@@ -540,7 +593,11 @@ export type EffortAction =
 	/** Apply the approved change to the Team's adopted Playbook, for the next Effort, and record the act. */
 	| { kind: "adopt-playbook-change"; approval: PendingApproval & { change: PlaybookChange }; at: string }
 	/** The Effort is over: clean up its worktrees, keep every branch, and let go of it in this session. */
-	| { kind: "end-effort"; how: Ended["how"] };
+	| { kind: "end-effort"; how: Ended["how"] }
+	/** Append the human's answer to an escalated question to `clarifications.md`. */
+	| { kind: "append-clarification"; entry: Clarification }
+	/** Get `message` to the Teammate as its next turn: through its inbox, or by resuming its session. */
+	| { kind: "send-message"; teammate: string; inbox: Inbox; message: string };
 
 export type Step =
 	| { ok: true; state: EffortState; append: EffortLine[]; actions: EffortAction[]; reply?: string }
@@ -714,6 +771,17 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 				teammates: answered.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, rules: [...(teammate.rules ?? []), rule] } : teammate)),
 			};
 		}
+		case "escalated": {
+			const { type: _type, ...escalation } = line;
+			return { ...state, escalations: { ...state.escalations, [line.id]: escalation } };
+		}
+		case "escalation-answered": {
+			const { type: _type, id, ...answered } = line;
+			const escalation = state.escalations?.[id];
+			return escalation ? { ...state, escalations: { ...state.escalations, [id]: { ...escalation, answered } } } : state;
+		}
+		case "message-sent":
+			return state;
 		case "task-done": {
 			const advanced = endRequests(withTeammate(state, line, { activity: "idle", doing: `round ${line.round} done` }), line.teammate);
 			const task = advanced.tasks[line.slug];
@@ -819,6 +887,12 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return resume(state, input);
 		case "answer-request":
 			return answerRequest(state, input);
+		case "escalate":
+			return escalate(state, input);
+		case "answer-escalation":
+			return answerEscalation(state, input);
+		case "send":
+			return send(state, input);
 	}
 }
 
@@ -889,14 +963,11 @@ function resume(state: EffortState, input: Extract<EffortInput, { kind: "resume"
  * the decided-for-you log with the request's Task.
  */
 function answerRequest(state: EffortState, input: Extract<EffortInput, { kind: "answer-request" }>): Step {
+	// An escalated item is the human's to answer: the Lead only relays what they said in chat.
+	const escalation = state.escalations?.[input.request];
+	if (escalation) return answerEscalated(state, escalation, input, "lead");
 	const held = state.teammateRequests[input.request];
-	if (!held) {
-		const open = Object.values(state.teammateRequests).filter((each) => each.state === "held").map((each) => each.request);
-		return {
-			ok: false,
-			refusal: `No request \`${input.request}\` waits on you: ${open.length === 0 ? "no request is held right now" : `the requests held now are ${quoted(open)}`}.`,
-		};
-	}
+	if (!held) return { ok: false, refusal: noRequestText(state, input.request) };
 	if (held.state !== "held") return { ok: false, refusal: closedText(held) };
 	const taken = takeAnswer(held, input);
 	if (typeof taken === "string") return { ok: false, refusal: taken };
@@ -909,6 +980,177 @@ function answerRequest(state: EffortState, input: Extract<EffortInput, { kind: "
 		],
 		[{ kind: "answer-hook", request: held.request, teammate: held.teammate, decision: taken.decision }],
 		`Answered \`${held.request}\`: ${held.teammate}'s hook has your ${taken.decision.behavior}, and the next Report logs it.`,
+	);
+}
+
+/** The escalated items the human can still answer, oldest first: a held request still held, or a prose question whose Teammate is still on. */
+export function openEscalations(state: EffortState): Escalation[] {
+	return Object.values(state.escalations ?? {}).filter((escalation) => {
+		if (escalation.answered) return false;
+		if (escalation.kind === "prose") return !state.teammates.find((each) => each.id === escalation.teammate)?.ended;
+		return state.teammateRequests[escalation.id]?.state === "held";
+	});
+}
+
+/** How an escalated item reads to the human: `dev-1's \`Bash\` prompt on Task \`rename\``. */
+export function escalationText(escalation: Escalation, state: EffortState, withTask = true): string {
+	const held = state.teammateRequests[escalation.id];
+	const what = escalation.kind === "prose" || !held ? "question" : requestKind(held);
+	return `${escalation.teammate}'s ${what}${!withTask || escalation.task === undefined ? "" : ` on Task \`${escalation.task}\``}`;
+}
+
+/** Why no Teammate `id` can be messaged or asked about, or the Teammate. */
+function teammateOf(state: EffortState, id: string): Teammate | string {
+	const teammate = state.teammates.find((each) => each.id === id);
+	if (teammate) return teammate;
+	const known = state.teammates.map((each) => each.id);
+	return `Effort \`${state.effortId}\` has no Teammate \`${id}\`: ${known.length === 0 ? "it has no Teammates yet" : `its Teammates are ${quoted(known)}`}.`;
+}
+
+function noRequestText(state: EffortState, request: string): string {
+	const open = Object.values(state.teammateRequests).filter((each) => each.state === "held").map((each) => each.request);
+	return `No request \`${request}\` waits on you: ${open.length === 0 ? "no request is held right now" : `the requests held now are ${quoted(open)}`}.`;
+}
+
+/**
+ * `team_escalate`: move a held request, or a stopped-short Teammate's prose
+ * question, to the human's pending items with the Lead's summary. Only the
+ * Task that asked waits on it; the rest of the Effort goes on.
+ */
+function escalate(state: EffortState, input: Extract<EffortInput, { kind: "escalate" }>): Step {
+	if ((input.request === undefined) === (input.teammate === undefined)) {
+		return { ok: false, refusal: "Escalate either a held `request` by its id, or a stopped-short `teammate` with its `question`; not both, and not neither." };
+	}
+	const summary = input.summary.trim();
+	if (summary === "") return { ok: false, refusal: "An escalation needs a `summary` for the human: what is asked, and why the Brief doesn't settle it." };
+	const brief = input.brief?.trim() ? { brief: input.brief.trim() } : {};
+	if (input.request !== undefined) {
+		const held = state.teammateRequests[input.request];
+		if (!held) return { ok: false, refusal: noRequestText(state, input.request) };
+		if (state.escalations?.[held.request]) return { ok: false, refusal: `Request \`${held.request}\` is already escalated: it waits on the human in \`/team pending\`.` };
+		if (held.state !== "held") return { ok: false, refusal: closedText(held) };
+		const kind = isQuestion(held) ? "question" : "permission";
+		const task = held.task === undefined ? {} : { task: held.task };
+		const line: EffortLine = { type: "escalated", id: held.request, teammate: held.teammate, ...task, kind, question: askedText(held), summary, ...brief, at: input.at };
+		const after =
+			kind === "question"
+				? "If the human answers it to you in chat instead, pass their answer on with `team_answer`: it goes to clarifications.md as theirs."
+				: "Only the human's answer in `/team pending` counts for it, so don't answer it yourself.";
+		return took(state, [line], [], `Escalated \`${held.request}\` to the human's \`/team pending\`, with your summary. ${waitsText(held.task)} ${after}`);
+	}
+	const teammate = teammateOf(state, input.teammate ?? "");
+	if (typeof teammate === "string") return { ok: false, refusal: teammate };
+	if (teammate.ended) return { ok: false, refusal: `Teammate \`${teammate.id}\` has ended, so there is nobody to take the human's answer.` };
+	if (teammate.doing !== "stopped short") {
+		return { ok: false, refusal: `Teammate \`${teammate.id}\` hasn't stopped short on a question: escalate a prose question only from a Teammate whose turn stopped short asking one; a held request is escalated by its \`request\` id.` };
+	}
+	const question = input.question?.trim() ?? "";
+	if (question === "") return { ok: false, refusal: `Escalating ${teammate.id}'s prose question needs the \`question\`, as its last message asked it.` };
+	const open = openEscalations(state).find((each) => each.kind === "prose" && each.teammate === teammate.id);
+	if (open) return { ok: false, refusal: `${teammate.id}'s question \`${open.id}\` already waits on the human: one prose question per Teammate at a time.` };
+	const id = `q${Object.values(state.escalations ?? {}).filter((each) => each.kind === "prose").length + 1}`;
+	const line: EffortLine = { type: "escalated", id, teammate: teammate.id, task: teammate.task, kind: "prose", question, summary, ...brief, at: input.at };
+	return took(
+		state,
+		[line],
+		[],
+		`Escalated ${teammate.id}'s question to the human's \`/team pending\` as \`${id}\`, with your summary. ${waitsText(teammate.task)} If the human answers it to you in chat instead, pass their words on with \`team_answer\` and \`text\`.`,
+	);
+}
+
+function waitsText(task: string | undefined): string {
+	return `${task === undefined ? "Only the Teammate that asked" : `Only Task \`${task}\``} waits on it; the rest of the Effort goes on.`;
+}
+
+/** The human's answer to an escalated item, in `/team pending`. */
+function answerEscalation(state: EffortState, input: Extract<EffortInput, { kind: "answer-escalation" }>): Step {
+	const escalation = state.escalations?.[input.id];
+	if (!escalation) {
+		const open = openEscalations(state).map((each) => each.id);
+		return { ok: false, refusal: `No escalated item \`${input.id}\` waits on the human: ${open.length === 0 ? "nothing is escalated right now" : `the escalated items now are ${quoted(open)}`}.` };
+	}
+	const { id: _id, kind: _kind, at, ...answer } = input;
+	return answerEscalated(state, escalation, { ...answer, at }, "pending");
+}
+
+/**
+ * The human's answer to `escalation`: given in `/team pending`, or in chat and
+ * relayed by the Lead with `team_answer`. A permission takes only the former.
+ * A question's answer goes to clarifications.md, as part of the Brief.
+ */
+function answerEscalated(state: EffortState, escalation: Escalation, input: Omit<RequestAnswer, "request"> & { at: string }, via: "pending" | "lead"): Step {
+	const about = `\`${escalation.id}\``;
+	if (escalation.answered) return { ok: false, refusal: `${about} is already answered: the human answered it at ${clock(escalation.answered.at)}.` };
+	if (via === "lead" && escalation.kind === "permission") {
+		return { ok: false, refusal: `${about} is escalated, so only the human can answer it, in \`/team pending\`; an escalated permission takes no answer relayed from chat.` };
+	}
+	const what = escalationText(escalation, state);
+	const task = escalation.task === undefined ? {} : { task: escalation.task };
+	const clarification = (answer: string): EffortAction => ({
+		kind: "append-clarification",
+		entry: { id: escalation.id, teammate: escalation.teammate, ...task, question: escalation.question, summary: escalation.summary, ...(escalation.brief === undefined ? {} : { brief: escalation.brief }), answer, via, at: input.at },
+	});
+	const wake = (text: string): EffortAction[] => (via === "pending" ? [{ kind: "wake-lead", text }] : []);
+	const noted = "it is in clarifications.md, next to brief.md, and counts as part of the Brief";
+	if (escalation.kind === "prose") {
+		const text = input.text?.trim() ?? "";
+		if (input.decision !== undefined || input.answers !== undefined) return { ok: false, refusal: `${about} is a prose question: answer it with \`text\`, the human's own words.` };
+		if (text === "") return { ok: false, refusal: `${about} needs an answer: the human's own words, as text.` };
+		const teammate = state.teammates.find((each) => each.id === escalation.teammate);
+		if (!teammate || teammate.ended || !teammate.inbox) return { ok: false, refusal: `${escalation.teammate} has ended, so nobody can take the answer to ${about}.` };
+		const message = `The human answered your question (\`${escalation.id}\`): ${text}\n\nIt is in clarifications.md, next to brief.md, and counts as part of the Brief.${escalation.task === undefined ? "" : ` Go on with Task \`${escalation.task}\`.`}`;
+		return took(
+			state,
+			[{ type: "escalation-answered", id: escalation.id, answer: text, via, at: input.at }],
+			[clarification(text), { kind: "send-message", teammate: teammate.id, inbox: teammate.inbox, message }, ...wake(`The human answered \`${escalation.id}\` (${what}) in \`/team pending\`: ${text}. ${teammate.id} has it, and ${noted}.`)],
+			`Sent the human's answer to \`${escalation.id}\` to ${teammate.id}; ${noted}.`,
+		);
+	}
+	const held = state.teammateRequests[escalation.id];
+	if (!held) return { ok: false, refusal: noRequestText(state, escalation.id) };
+	if (held.state !== "held") return { ok: false, refusal: closedText(held) };
+	const taken = takeAnswer(held, { request: held.request, ...input });
+	if (typeof taken === "string") return { ok: false, refusal: taken };
+	const behavior = taken.decision.behavior;
+	const reason = input.reason?.trim() ?? "";
+	const answer = escalation.kind === "question" && behavior === "allow" && input.answers ? answersText(held, input.answers) : reason;
+	const decision = escalation.kind === "permission" || behavior === "deny" ? { decision: behavior } : {};
+	const lines: EffortLine[] = [
+		{ type: "request-answered", teammate: held.teammate, request: held.request, ...task, decision: taken.decision, ...(taken.rule === undefined ? {} : { rule: taken.rule }), at: input.at },
+		{ type: "escalation-answered", id: escalation.id, answer, ...decision, via, at: input.at },
+	];
+	const hook: EffortAction = { kind: "answer-hook", request: held.request, teammate: held.teammate, decision: taken.decision };
+	if (escalation.kind === "permission") {
+		const verb = behavior === "allow" ? "allowed" : "denied";
+		return took(state, lines, [hook, ...wake(`The human ${verb} \`${escalation.id}\` (${what}) in \`/team pending\`: ${reason} ${held.teammate}'s hook has it.`)]);
+	}
+	const said = behavior === "deny" ? `declined it: ${reason}` : `answered it: ${answer}`;
+	return took(
+		state,
+		lines,
+		[hook, clarification(behavior === "deny" ? `declined: ${reason}` : answer), ...wake(`The human answered \`${escalation.id}\` (${what}) in \`/team pending\`: ${behavior === "deny" ? `declined: ${reason}` : answer}. ${held.teammate}'s hook has it, and ${noted}.`)],
+		`Passed on the human's answer to \`${escalation.id}\`: they ${said}. ${held.teammate}'s hook has it, and ${noted}.`,
+	);
+}
+
+/** Messages longer than this belong in a Task, not a send. */
+const SEND_LIMIT = 2000;
+
+/** `team_send`: a short prose message to a Teammate, as its next turn. */
+function send(state: EffortState, input: Extract<EffortInput, { kind: "send" }>): Step {
+	const teammate = teammateOf(state, input.teammate);
+	if (typeof teammate === "string") return { ok: false, refusal: teammate };
+	if (teammate.ended) return { ok: false, refusal: `Teammate \`${teammate.id}\` has ended (${teammate.ended.how}), so it takes no more messages.` };
+	if (teammate.retiredAt !== undefined) return { ok: false, refusal: `Teammate \`${teammate.id}\` was stopped to make room under the cap, so it takes no more messages.` };
+	if (!teammate.inbox) return { ok: false, refusal: `Teammate \`${teammate.id}\` has no session yet, so there is nowhere to send to; wait for it to start.` };
+	const message = input.message.trim();
+	if (message === "") return { ok: false, refusal: "The message is empty: say what the Teammate should know." };
+	if (message.length > SEND_LIMIT) return { ok: false, refusal: `A message is at most ${SEND_LIMIT} characters, and this one is ${message.length}: put longer instructions in a Task.` };
+	return took(
+		state,
+		[{ type: "message-sent", teammate: teammate.id, message, at: input.at }],
+		[{ kind: "send-message", teammate: teammate.id, inbox: teammate.inbox, message }],
+		`Sent ${teammate.id} your message; it reads it as its next turn.`,
 	);
 }
 
@@ -1776,6 +2018,19 @@ function told(line: EffortLine, state: EffortState): string | undefined {
 			return `${line.teammate} finished round ${line.round} of Task \`${line.slug}\``;
 		case "teammate-stopped":
 			return `${line.teammate} stopped short on Task \`${line.slug}\``;
+		case "escalated":
+			return `escalated ${escalationText(line, state, false)} (\`${line.id}\`) to you: ${line.summary}`;
+		case "escalation-answered": {
+			const relayed = line.via === "lead" ? " (in chat, relayed by the Lead)" : "";
+			if (line.decision === "allow" || line.decision === "deny") {
+				const permission = state.escalations?.[line.id]?.kind === "permission";
+				const verb = permission ? (line.decision === "allow" ? "allowed" : "denied") : "declined";
+				return `you ${verb} \`${line.id}\`: ${line.answer}${relayed}`;
+			}
+			return `you answered \`${line.id}\`: ${line.answer}${relayed}`;
+		}
+		case "message-sent":
+			return `sent ${line.teammate} a message`;
 		case "task-sent-back":
 			return `sent Task \`${line.slug}\` back after round ${line.round}`;
 		case "task-accepted":
@@ -1929,6 +2184,7 @@ function reportSections(state: EffortState, modes: readonly { role: string; mode
 							: `\`${item.id}\`: approve the Brief, ${item.path} (sha256 ${item.sha256}), in \`/team pending\``,
 				),
 				...waitingInTerminal(state).map((held) => `\`${held.request}\`: ${terminalText(held)}`),
+				...openEscalations(state).map((escalation) => `\`${escalation.id}\`: ${escalationText(escalation, state)}, escalated: ${escalation.summary} Answer it in \`/team pending\``),
 			],
 		},
 		{ title: "Decided for you", lines: of("decided-for-you").map((line) => `${clock(line.at)} ${line.what}${line.task === undefined ? "" : ` (Task \`${line.task}\`)`}`) },

@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { openEffort, type PendingApproval } from "../core.ts";
 import type { Playbook } from "../definitions.ts";
-import { appendLines, checkRecords, createEffort, promoteBrief, readLines, validateBrief } from "../records.ts";
+import { appendClarification, appendLines, checkRecords, createEffort, promoteBrief, readLines, validateBrief } from "../records.ts";
 import { goodTeam, tempRoots, writeFiles } from "./harness.ts";
 
 const SHA = "a".repeat(64);
@@ -256,5 +256,23 @@ describe("approving the Brief", () => {
 		const { paths } = asked();
 
 		assert.match(checkRecords(paths)[0] ?? "", /approvals\.jsonl/);
+	});
+});
+
+describe("clarifications.md", () => {
+	it("keeps each answer the human gave to an escalated question, with who asked, the Task and what the Brief said", () => {
+		const { paths } = createEffort(tempRoots().agentDir, "software", NOW);
+		const asked = { teammate: "dev-1", task: "rename", question: "Keep the old key?", summary: "Deprecation isn't in the Brief.", at: "2026-11-02T11:55:00.000Z" };
+
+		appendClarification(paths, { id: "q1", ...asked, brief: "AC1 only says the key is renamed.", answer: "Yes, for one release.", via: "pending" });
+		const { task: _task, ...untasked } = asked;
+		appendClarification(paths, { id: "q2", ...untasked, answer: "No docs change.", via: "lead" });
+
+		const text = readFileSync(paths.clarifications, "utf8");
+		assert.match(text, /^# Clarifications\n/);
+		assert.match(text, /## `q1`: dev-1, Task `rename`, 2026-11-02 11:55\n/);
+		assert.match(text, /- Asked: Keep the old key\?\n- Lead's summary: Deprecation isn't in the Brief\.\n- The Brief says: AC1 only says the key is renamed\.\n- The human's answer \(in `\/team pending`\): Yes, for one release\.\n/);
+		assert.match(text, /## `q2`: dev-1, 2026-11-02 11:55\n[\s\S]*- The human's answer \(in chat, relayed by the Lead\): No docs change\.\n$/);
+		assert.ok(text.indexOf("`q1`") < text.indexOf("`q2`"));
 	});
 });

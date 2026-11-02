@@ -786,7 +786,7 @@ describe("/team start on a Team with no adopted Playbook", () => {
 
 		assert.match(pi.notifications.at(-1)?.message ?? "", /^Team `software` picked: .*Playbook: adopted 2026-11-02T10:00:00\.000Z.* Effort `software-2026-11-02` opened/);
 		assert.equal(pi.sent.at(-1)?.customType, "team-intake");
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer", "team_escalate", "team_send"]);
 	});
 
 	it("goes back through setup when the adopted Playbook was edited by hand", async () => {
@@ -869,7 +869,7 @@ describe("intake: `/team start` on a Team with an adopted Playbook", () => {
 		for (const needed of [join(dir, "brief.draft.md"), sha(INTAKE_PLAYBOOK), `repo: ${repo}`, "Constraints", "small-diffs", "**AC1**", "`team_request_approval`", "`brief`"]) {
 			assert.ok(woken?.content.includes(needed), `the intake prompt doesn't mention ${needed}:\n${woken?.content}`);
 		}
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer", "team_escalate", "team_send"]);
 	});
 
 	it("gives each Effort its own id, so a second one the same day is numbered", async () => {
@@ -2042,6 +2042,139 @@ describe("a Teammate's held requests: team_answer", () => {
 	});
 });
 
+describe("escalating to the human: team_escalate and /team pending", () => {
+	afterEach(() => {
+		for (const fake of holding.splice(0)) fake.release();
+	});
+
+	it("moves a held permission to /team pending, where only the human's answer reaches the hook, and wakes the Lead with it", async () => {
+		const { pi, request, hook } = await asking(PUBLISH);
+
+		const reply = await pi.call("team_escalate", { request, summary: "Publishing is outside the Brief." });
+
+		assert.match(reply, /Only Task `rename-key` waits on it/);
+		assert.equal(JSON.parse(await pi.call("team_status", {})).waitingOnYou, 1);
+		await assert.rejects(pi.call("team_answer", { request, decision: "allow", reason: "The human said so." }), /only the human can answer it, in `\/team pending`/);
+		assert.equal(hook.exitCode(), undefined, "the hook still holds");
+
+		pi.answer("Deny", "Not this release.");
+		await pi.team("pending");
+
+		const [asked, why] = pi.dialogs.slice(-2);
+		assert.deepEqual([asked.kind, asked.options, why.kind], ["select", ["Allow", "Deny", "Later"], "input"]);
+		for (const needed of [request, "builder-1's `Bash` prompt on Task `rename-key`", "npm publish --dry-run", "Publishing is outside the Brief."]) assert.ok(asked.title.includes(needed), asked.title);
+		assert.deepEqual(await printed(hook), { hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Not this release." } } });
+		const woken = pi.sent.at(-1);
+		assert.equal(woken?.customType, "team-pending");
+		assert.match(woken?.content ?? "", new RegExp(`The human denied \`${request}\`.*Not this release\\.`));
+		assert.equal(JSON.parse(await pi.call("team_status", {})).waitingOnYou, 0);
+	});
+
+	it("asks the human an escalated AskUserQuestion's own options, and keeps the answer in clarifications.md beside an unchanged brief.md", async () => {
+		const { pi, dir, request, hook } = await asking(FORMAT_QUESTIONS);
+		const brief = sha(readFileSync(join(dir, "brief.md")));
+		await pi.call("team_escalate", { request, summary: "The Brief names no format.", brief: "AC1 only says the key is renamed." });
+
+		pi.answer("YAML", "test", "lint", "Done");
+		await pi.team("pending");
+
+		assert.deepEqual(
+			pi.dialogs.slice(-4).map((dialog) => dialog.options),
+			[
+				["YAML", "JSON", "Later"],
+				["lint", "test", "build", "Later"],
+				["lint", "build", "Done", "Later"],
+				["build", "Done", "Later"],
+			],
+		);
+		const answers = { "Which format should old configs load from?": "YAML", "Which checks should run?": ["lint", "test"] };
+		assert.deepEqual(await printed(hook), { hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedInput: { ...FORMAT_QUESTIONS.tool_input, answers } } } });
+		const clarifications = readFileSync(join(dir, "clarifications.md"), "utf8");
+		for (const needed of [
+			`## \`${request}\`: builder-1, Task \`rename-key\``,
+			"- Lead's summary: The Brief names no format.",
+			"- The Brief says: AC1 only says the key is renamed.",
+			`- The human's answer (in \`/team pending\`): "Which format should old configs load from?": YAML; "Which checks should run?": lint, test`,
+		]) {
+			assert.ok(clarifications.includes(needed), clarifications);
+		}
+		assert.equal(sha(readFileSync(join(dir, "brief.md"))), brief);
+		assert.equal(pi.sent.at(-1)?.customType, "team-pending");
+	});
+
+	it("takes the human's answer to an escalated question from chat through team_answer, as theirs in clarifications.md", async () => {
+		const { pi, dir, request, hook } = await asking(FORMAT_QUESTIONS);
+		await pi.call("team_escalate", { request, summary: "The Brief names no format." });
+
+		const reply = await pi.call("team_answer", { request, answers: { "Which format should old configs load from?": "JSON", "Which checks should run?": ["build"] } });
+
+		assert.match(reply, /clarifications\.md/);
+		assert.equal(((await printed(hook)) as { hookSpecificOutput: { decision: { behavior: string } } }).hookSpecificOutput.decision.behavior, "allow");
+		assert.ok(readFileSync(join(dir, "clarifications.md"), "utf8").includes("- The human's answer (in chat, relayed by the Lead): "));
+	});
+
+	it("leaves an escalated item for later, still waiting on the human", async () => {
+		const { pi, request, hook } = await asking(PUBLISH);
+		await pi.call("team_escalate", { request, summary: "Publishing is outside the Brief." });
+
+		pi.answer("Later");
+		await pi.team("pending");
+
+		assert.equal(hook.exitCode(), undefined);
+		assert.equal(JSON.parse(await pi.call("team_status", {})).waitingOnYou, 1);
+	});
+
+	it("escalates a stopped-short Teammate's prose question: the human's words go to its inbox and into clarifications.md", async () => {
+		const { pi, dir } = await crewApproved({
+			hooks: [
+				{ event: "SessionStart", payload: { source: "startup" } },
+				{ event: "Stop", payload: { last_assistant_message: "Should the old key keep working for a release?" } },
+			],
+			replies: [],
+		});
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await until(() => effortLines(dir).some((line) => line.type === "teammate-stopped"), "builder-1 stops short");
+
+		const reply = await pi.call("team_escalate", { teammate: "builder-1", question: "Should the old key keep working for a release?", summary: "Deprecation isn't in the Brief." });
+		assert.match(reply, /`q1`/);
+
+		pi.answer("Yes, for one release.");
+		await pi.team("pending");
+
+		const asked = pi.dialogs.at(-1);
+		assert.equal(asked?.kind, "input");
+		assert.ok(asked?.title.includes("Should the old key keep working for a release?"), asked?.title);
+		await until(() => pi.claude.inbox().length > 0, "the answer reached builder-1's inbox");
+		const message = JSON.parse(pi.claude.inbox()[0].lines[1]) as { message: { content: string } };
+		assert.match(message.message.content, /Yes, for one release\./);
+		assert.match(message.message.content, /clarifications\.md/);
+		assert.ok(readFileSync(join(dir, "clarifications.md"), "utf8").includes("## `q1`: builder-1, Task `rename-key`"));
+		assert.equal(JSON.parse(await pi.call("team_status", {})).waitingOnYou, 0);
+	});
+});
+
+describe("messaging a Teammate: team_send", () => {
+	it("sends a short prose message to a Teammate's inbox, on record", async () => {
+		const { pi, dir } = await renameReported({ replies: [] });
+
+		const reply = await pi.call("team_send", { teammate: "builder-1", message: "Rename it in docs/config.md too." });
+
+		assert.match(reply, /Sent builder-1/);
+		await until(() => pi.claude.inbox().length > 0, "the message reached the inbox");
+		const [connection] = pi.claude.inbox();
+		assert.equal(connection.lines[1], JSON.stringify({ type: "user", message: { role: "user", content: "Rename it in docs/config.md too." } }));
+		assert.equal(effortLines(dir).filter((line) => line.type === "message-sent").length, 1);
+	});
+
+	it("refuses a Teammate the Effort doesn't have, sending nothing", async () => {
+		const { pi } = await renameReported({ replies: [] });
+
+		await assert.rejects(pi.call("team_send", { teammate: "qa-1", message: "hi" }), /no Teammate `qa-1`/);
+		assert.deepEqual(pi.claude.inbox(), []);
+	});
+});
+
 describe("reviewing: team_review", () => {
 	it("refuses a review while there is no new result for the round, and changes nothing", async () => {
 		const { pi, dir } = await renameReported({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
@@ -2863,7 +2996,7 @@ describe("re-attaching: `pi -c`, `/resume` back and `/reload`", () => {
 			assert.equal(lead.stoppedAt, undefined);
 			assert.equal(typeof lead.port, "number");
 			assert.equal(lead.sessionFile, join(roots.scratch, "session.jsonl"));
-			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer"]);
+			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer", "team_escalate", "team_send"]);
 			assert.deepEqual(again.entries, []);
 			assert.deepEqual(again.notifications, [{ message: `This session leads Effort \`${EFFORT_ID}\` (${dir}) again.`, type: "info" }]);
 			assert.deepEqual(again.sent, []);

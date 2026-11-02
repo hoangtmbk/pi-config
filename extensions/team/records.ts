@@ -13,7 +13,7 @@
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import { type EffortLine, type EffortState, type JournalLine, type PendingApproval, type Report, taskStatus, type Workspace } from "./core.ts";
+import { type Clarification, type EffortLine, type EffortState, type JournalLine, type PendingApproval, type Report, taskStatus, type Workspace } from "./core.ts";
 import { BRIEF_SKELETON, isKebabCase, type Playbook, sha256 } from "./definitions.ts";
 
 /** The files of one Effort, all under `<agent dir>/team/efforts/<effort-id>/`. */
@@ -442,9 +442,31 @@ export function writeTask(paths: EffortPaths, folder: string, body: string): str
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "task.md"), body);
 	if (!existsSync(paths.clarifications)) {
-		writeFileSync(paths.clarifications, "# Clarifications\n\nAnswers to questions the human was asked during this Effort. They count as part of the Brief.\n");
+		writeFileSync(paths.clarifications, CLARIFICATIONS_HEADER);
 	}
 	return dir;
+}
+
+const CLARIFICATIONS_HEADER = "# Clarifications\n\nAnswers to questions the human was asked during this Effort. They count as part of the Brief.\n";
+
+/**
+ * Append the human's answer to an escalated question to `clarifications.md`,
+ * with who asked, on which Task, and what the Brief says of it. The file is
+ * only ever appended to, so `brief.md` and its sha stay as approved.
+ */
+export function appendClarification(paths: EffortPaths, entry: Clarification): void {
+	if (!existsSync(paths.clarifications)) writeFileSync(paths.clarifications, CLARIFICATIONS_HEADER);
+	const when = `${entry.at.slice(0, 10)} ${entry.at.slice(11, 16)}`;
+	const lines = [
+		"",
+		`## \`${entry.id}\`: ${entry.teammate}${entry.task === undefined ? "" : `, Task \`${entry.task}\``}, ${when}`,
+		"",
+		`- Asked: ${entry.question}`,
+		`- Lead's summary: ${entry.summary}`,
+		...(entry.brief === undefined ? [] : [`- The Brief says: ${entry.brief}`]),
+		`- The human's answer (${entry.via === "pending" ? "in `/team pending`" : "in chat, relayed by the Lead"}): ${entry.answer}`,
+	];
+	appendFileSync(paths.clarifications, `${lines.join("\n")}\n`);
 }
 
 /**
