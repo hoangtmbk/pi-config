@@ -17,6 +17,7 @@ an Effort and runs its intake up to the human approving its Brief. Planning and 
 /team start          the Lead proposes a Team from each Team's description
 /team setup <team>   Team setup: agree the Team's Playbook with the Lead, then adopt it
 /team pending        answer what waits on you: approve, send back with a note, or later
+/team resume         adopt an Effort no pi session leads (pick one, or name it)
 ```
 
 `/team start` warns when `claude --version` is older than 2.1.316, the version this extension was
@@ -131,6 +132,21 @@ already on record.
 
 `plan.md` shows each Task as planned, running, in review, sent back or accepted, with its
 Teammate, its folder and how often it was sent back.
+
+## Leading an Effort across pi sessions
+
+An Effort has one Lead, the pi session `lead.json` names with its pid, bridge and session file. A
+second session trying to lead it is refused, naming the session that does; `lead.lock`, created
+only while a session takes or leaves the Lead, keeps two from winning at once, and one left by a
+pid that has died is taken over. The session records the Effort it leads as a `team-effort` entry.
+
+- `pi -c`, `/resume` back to the session and `/reload` lead the Effort again on their own, while
+  `lead.json` still names the session's file.
+- `/new` or `/resume` to another session asks first; "no" stays.
+- `/fork` and `/clone` move the Effort: `lead.json` names the new session's file, which leads it.
+- Leaving the session marks `lead.json` with `stoppedAt`: no live Lead, until `/team resume`
+  adopts the Effort in a session holding none.
+- `/tree` keeps the Effort, and tells the Lead where it stands on its next turn.
 
 ## Defining a Team
 
