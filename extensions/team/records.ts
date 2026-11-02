@@ -10,11 +10,11 @@
  * reported and never used.
  */
 
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { type Clarification, type EffortLine, type EffortState, type JournalLine, type PendingApproval, type Report, taskStatus, type Workspace } from "./core.ts";
-import { BRIEF_SKELETON, isKebabCase, type Playbook, type Role, sha256 } from "./definitions.ts";
+import { BRIEF_SKELETON, isKebabCase, type Playbook, type Role, readSnapshot, type Snapshot, sha256 } from "./definitions.ts";
 import type { AnswerTerms, CitableGrant } from "./requests.ts";
 
 /** The files of one Effort, all under `<agent dir>/team/efforts/<effort-id>/`. */
@@ -131,6 +131,10 @@ export interface BriefChangeRecord {
 	brief: string;
 	/** The planned Tasks it held until the answer. */
 	affects: string[];
+	/** The Roles whose launch options it changed, whose Teammates start afresh at their next Task. */
+	refresh?: string[];
+	/** Set when it changed what the Lead answers under, so Teammates holding session rules start afresh at their next Task. */
+	terms?: true;
 	at: string;
 }
 
@@ -148,21 +152,50 @@ export interface CheckpointRecord {
 }
 
 /**
- * Make an approved Brief change the Effort's `brief.md` and record it. Only
+ * Record an approved Brief change and make it the Effort's `brief.md`. Only
  * the Brief moves: the Playbook and Team stay the snapshots taken at Brief
- * approval, which the change was checked against.
+ * approval, which the change was checked against. The record goes first, so
+ * a restart in between finds it and finishes the write (`recordedApprovals`).
  */
-export function promoteBriefChange(paths: EffortPaths, promotion: { approval: PendingApproval; at: string }): BriefChangeRecord {
-	writeFileSync(paths.brief, promotion.approval.snapshot);
+export function promoteBriefChange(paths: EffortPaths, promotion: { approval: PendingApproval; refresh?: readonly string[]; terms?: boolean; at: string }): BriefChangeRecord {
+	const refresh = promotion.refresh ?? [];
 	const record: BriefChangeRecord = {
 		act: "brief-change",
 		request: promotion.approval.id,
 		brief: sha256(promotion.approval.snapshot),
 		affects: [...(promotion.approval.affects ?? [])],
+		...(refresh.length > 0 ? { refresh: [...refresh] } : {}),
+		...(promotion.terms ? { terms: true as const } : {}),
 		at: promotion.at,
 	};
 	recordApproval(paths, record);
+	writeFileSync(paths.brief, promotion.approval.snapshot);
 	return record;
+}
+
+/**
+ * The approvals `approvals.jsonl` records, as recovery reads them: the Brief
+ * promotions, then every other approval by request and the sha the human
+ * approved. A Brief change on record whose `brief.md` a restart cut short
+ * of the approved snapshot is written now, from the pending request.
+ */
+export function recordedApprovals(paths: EffortPaths, state: EffortState): {
+	promoted: { request: string; brief: string; workspace?: Workspace }[];
+	recorded: { request: string; sha256: string; refresh?: string[]; terms?: true }[];
+} {
+	const records = readApprovals(paths);
+	const promoted = records.flatMap((record) => (record.act === "brief" ? [{ request: record.request, brief: record.brief, ...(record.workspace === undefined ? {} : { workspace: record.workspace }) }] : []));
+	const recorded = records.flatMap((record) => {
+		if (record.act === "brief-change") {
+			const item = state.pending.find((pending) => pending.id === record.request && sha256(pending.snapshot) === record.brief);
+			if (item && (!existsSync(paths.brief) || sha256(readFileSync(paths.brief)) !== record.brief)) writeFileSync(paths.brief, item.snapshot);
+			return [{ request: record.request, sha256: item?.sha256 ?? record.brief, ...(record.refresh ? { refresh: record.refresh } : {}), ...(record.terms ? { terms: record.terms } : {}) }];
+		}
+		if (record.act === "playbook-change") return [{ request: record.request, sha256: record.sha256 }];
+		if (record.act === "sign-off") return [{ request: record.request, sha256: record.report }];
+		return [];
+	});
+	return { promoted, recorded };
 }
 
 /** The human's sign-off of the final Report, which ends the Effort. */
@@ -276,6 +309,59 @@ export function checkRecords(paths: EffortPaths): string[] {
 	return problems;
 }
 
+/** What an Effort reads of its approved records, each checked against its approval first. */
+export interface Approved extends Snapshot {
+	/** `brief.md` as approved; `roles` already has the launch options it sets applied. */
+	brief: string;
+	/** The Roles as the Team snapshot has them, before the Brief's `roles`. */
+	teamRoles: Role[];
+}
+
+/**
+ * Read the Effort's approved Brief and its Team and Playbook snapshot, after
+ * checking each against `approvals.jsonl`. Every reader of them goes through
+ * here, so a record changed since approval is reported and never used: the
+ * error names each one with both shas.
+ */
+export function readApproved(paths: EffortPaths, effortId: string): Approved {
+	const problems = checkRecords(paths);
+	if (problems.length > 0) throw new Error(`Effort \`${effortId}\` has records that changed since the human approved them, so they are not used:\n${bulletList(problems)}`);
+	const found = readSnapshot(paths.team, paths.playbook);
+	if ("problems" in found) {
+		const listed = found.problems.map((problem) => `${problem.filePath}: ${problem.reason}`);
+		throw new Error(`The Team snapshot of Effort \`${effortId}\` can't be read, so no Teammate starts:\n${bulletList(listed)}`);
+	}
+	const brief = readFileSync(paths.brief, "utf8");
+	return { brief, playbook: found.playbook, teamRoles: found.roles, roles: briefRoles(brief, found.roles) };
+}
+
+/**
+ * What keeps a Brief change from being asked about or approved: the Brief
+ * skeleton and frontmatter against the Effort's Playbook snapshot, with
+ * each override naming an id that Playbook has; and a change at all.
+ */
+export function briefChangeProblems(text: string, current: Approved, effort: { team: string; repo: string }): string[] {
+	const problems = validateBrief(text, { team: effort.team, repo: effort.repo, playbook: current.playbook, roles: current.teamRoles.map((role) => role.name) });
+	if (sha256(text) === sha256(current.brief)) problems.push("it is the approved Brief as it stands, so there is no change to approve");
+	return problems;
+}
+
+/** The Roles whose launch options (`model`, `effort`) the Brief change `after` sets differently from the approved Brief. */
+export function changedLaunch(current: Approved, after: string): string[] {
+	const next = briefRoles(after, current.teamRoles);
+	return current.roles.flatMap((role, index) => (role.model !== next[index]?.model || role.effort !== next[index]?.effort ? [role.name] : []));
+}
+
+/**
+ * Whether a Brief change alters what the Lead answers a Teammate's request
+ * under: the grants, Delivery text or unskipped \`escalate\` entries of
+ * \`answerTerms\`. A session rule the Lead added under the old terms would
+ * outlive them, so its Teammate starts afresh at its next Task.
+ */
+export function changedTerms(current: Approved, after: string): boolean {
+	return JSON.stringify(answerTerms(current.playbook, current.brief, "")) !== JSON.stringify(answerTerms(current.playbook, after, ""));
+}
+
 /** What a Brief's frontmatter must agree with: the Effort it belongs to. */
 export interface BriefExpectations {
 	team: string;
@@ -357,15 +443,16 @@ function checkRoles(roles: unknown, known: readonly string[] | undefined): strin
 
 /**
  * The Team's Roles with the launch options a Brief's `roles` sets for this
- * Effort applied: `model` and `effort`, as written. A Brief without them, or
- * one that doesn't parse, leaves the Roles as they are.
+ * Effort applied: `model` and `effort`, as written. A Brief without them
+ * leaves the Roles as they are; one whose frontmatter doesn't parse throws,
+ * since its overrides can't be told.
  */
 export function briefRoles(text: string, roles: readonly Role[]): Role[] {
 	let fields: unknown;
 	try {
 		fields = parseFrontmatter(text).frontmatter;
-	} catch {
-		return [...roles];
+	} catch (error) {
+		throw new Error(`The Brief's frontmatter isn't valid YAML, so the launch options it sets per Role can't be read: ${(error instanceof Error ? error.message : String(error)).split("\n")[0]}`);
 	}
 	const set = isMapping(fields) && isMapping(fields.roles) ? fields.roles : {};
 	return roles.map((role) => {
@@ -615,6 +702,10 @@ function isMapping(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function bulletList(lines: readonly string[]): string {
+	return lines.map((line) => `- ${line}`).join("\n");
+}
+
 function quoteList(items: readonly string[]): string {
 	return items.map((item) => `\`${item}\``).join(", ");
 }
@@ -663,6 +754,52 @@ export function readLead(paths: EffortPaths): LeadRecord | NoLiveLead | undefine
 		throw new Error(`${paths.lead} isn't a Lead record of \`{ pid, port, token, sessionFile, startedAt }\`; only the extension writes it. Move it aside once no pi session leads the Effort, and lead it again.`);
 	}
 	return lead as unknown as LeadRecord | NoLiveLead;
+}
+
+/** Whether the file at `path` is still there with sha256 `sha`: what was asked about is what is answered. */
+export function unchangedSince(path: string, sha: string): boolean {
+	return existsSync(path) && sha256(readFileSync(path)) === sha;
+}
+
+/** The result file of a Task's round, `tasks/<folder>/result-<round>.md`, or "" when no round is due. */
+export function resultFile(paths: EffortPaths, due: { folder: string; round: number } | undefined): string {
+	return due ? join(paths.tasks, due.folder, `result-${due.round}.md`) : "";
+}
+
+/** Take back a send-back's `feedback-<round>.md`, written ahead of a send-back that never got on record. */
+export function discardFeedback(paths: EffortPaths, folder: string, round: number): void {
+	rmSync(join(paths.tasks, folder, `feedback-${round}.md`), { force: true });
+}
+
+/** Write (`on`) or remove the `teammates/<id>/takeover` marker, which tells the hook script a human holds the Teammate. */
+export function markTakeover(paths: EffortPaths, teammate: string, on: boolean, at: string): void {
+	const dir = join(paths.teammates, teammate);
+	if (!on) {
+		rmSync(join(dir, "takeover"), { force: true });
+		return;
+	}
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "takeover"), `${at}\n`);
+}
+
+/** Whether Teammate `teammate`'s takeover marker is on disk. */
+export function takeoverMarked(paths: EffortPaths, teammate: string): boolean {
+	return existsSync(join(paths.teammates, teammate, "takeover"));
+}
+
+/**
+ * Teammate `teammate`'s `statusline.json` as its wrapper last wrote it, with
+ * the file's modification time, which is when it was taken; undefined before
+ * Claude Code first runs it, once the session's footer draws.
+ */
+export function readStatusLine(paths: EffortPaths, teammate: string): { text: string; at: string } | undefined {
+	const file = join(paths.teammates, teammate, "statusline.json");
+	try {
+		return { text: readFileSync(file, "utf8"), at: statSync(file).mtime.toISOString() };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
 }
 
 /** A Teammate's journal, `teammates/<id>/events.jsonl`, which the hook script appends to. */

@@ -319,6 +319,8 @@ export type EffortLine =
 			workspace?: Workspace;
 			/** For an approved Brief change, the Roles whose launch options it alters: their Teammates get a fresh session at their next Task boundary. */
 			refresh?: string[];
+			/** For an approved Brief change that alters what the Lead answers under, the Teammates holding session rules added under the old terms: each gets a fresh session at its next Task boundary. */
+			renew?: string[];
 			at: string;
 	  }
 	/** The Lead wrote its whole Task list, replacing any before it. */
@@ -567,6 +569,8 @@ export interface Pause {
 	kind?: "session" | "weekly";
 	/** For the usage pause: when it lifts, when Claude Code said. */
 	reset?: string;
+	/** For the usage pause: the human was asked to stay paused or cancel, so nothing asks again while it holds. */
+	asked?: true;
 	/** When it started. */
 	at: string;
 }
@@ -676,7 +680,7 @@ export type EffortInput =
 	 * for an approved Brief, and for an approved Brief change the Roles whose
 	 * launch options it alters.
 	 */
-	| { kind: "answer"; id: string; answer: Answer; note?: string; workspace?: Workspace; refresh?: string[]; at: string }
+	| { kind: "answer"; id: string; answer: Answer; note?: string; workspace?: Workspace; refresh?: string[]; terms?: boolean; at: string }
 	/** A Lead tool that would start a Teammate. */
 	| { kind: "start-teammate"; tool: "team_plan" | "team_handoff" | "team_review" }
 	/**
@@ -721,9 +725,10 @@ export type EffortInput =
 	/**
 	 * `team_handoff` of a planned Task, with the permission mode a Teammate
 	 * started for it launches in and the cap of live Teammates (pi's
-	 * `maxTeammates` setting, {@link DEFAULT_MAX_TEAMMATES} by default).
+	 * `maxTeammates` setting, {@link DEFAULT_MAX_TEAMMATES} by default), and
+	 * the `--name`s `claude agents --json` lists (undefined when it couldn't be read).
 	 */
-	| { kind: "handoff"; slug: string; at: string; mode?: string; maxTeammates?: number; isolated?: boolean }
+	| { kind: "handoff"; slug: string; at: string; mode?: string; maxTeammates?: number; isolated?: boolean; agents?: readonly string[] }
 	/** What the merge an accept intended came to: merge commit `commit` (absent when there was nothing to merge), or why git refused it, nothing half-done. */
 	| { kind: "merge-result"; slug: string; commit?: string; error?: string; at: string }
 	/**
@@ -756,15 +761,18 @@ export type EffortInput =
 			sendBackLimit: number;
 			/** The permission mode a new Teammate of the Task's Role launches in, should a send-back need one. */
 			mode?: string;
+			/** The cap of live Teammates, for a send-back whose Teammate has ended and goes through the staffing ladder. */
+			maxTeammates?: number;
 			at: string;
 	  }
 	/**
 	 * Start the first queued Task the staffing ladder can staff now, with the
 	 * cap of live Teammates. The shell asks after each acceptance, once the
 	 * acceptance is on record, and again while one starts: each start is its
-	 * own step, so a launch that fails leaves only its own Task queued.
+	 * own step, so a launch that fails leaves only its own Task queued. With
+	 * `agents` as for a handoff.
 	 */
-	| { kind: "drain"; at: string; maxTeammates?: number }
+	| { kind: "drain"; at: string; maxTeammates?: number; agents?: readonly string[] }
 	/** The human used the `/team` menu on a Teammate: attached here, in a tmux window, or took the command. */
 	| { kind: "attach"; teammate: string; at: string }
 	/** `/team pause` from the human, or `team_pause` from the Lead, which must give a reason. */
@@ -799,6 +807,12 @@ export type EffortInput =
 			merges?: Record<string, MergeEvidence>;
 			/** The Brief promotions `approvals.jsonl` records. */
 			promoted?: readonly { request: string; brief: string; workspace?: Workspace }[];
+			/**
+			 * The other approvals `approvals.jsonl` records, in its order: a Brief
+			 * change (with the Roles it refreshed), a Playbook change or a
+			 * sign-off, by request id and the sha of what the human approved.
+			 */
+			recorded?: readonly { request: string; sha256: string; refresh?: readonly string[]; terms?: boolean }[];
 			at: string;
 	  }
 	/**
@@ -848,11 +862,11 @@ export type EffortAction =
 	 */
 	| { kind: "send-back"; teammate: string; inbox: Inbox; slug: string; folder: string; round: number; feedback: string }
 	/**
-	 * Write `feedback` as `feedback-<round>.md` in the Task's folder, then
-	 * launch a new Teammate on the Task, since its own has ended: its pointer
-	 * names `task.md`, the results and feedback so far, and `result-<round + 1>.md`.
+	 * Write `feedback` as `feedback-<round>.md` in the Task's folder, for a
+	 * send-back whose Teammate has ended: the Teammate the staffing ladder gives
+	 * it, now or once queued, launches with a pointer to the rounds so far.
 	 */
-	| { kind: "restaff-teammate"; teammate: Omit<Teammate, "task" | "startedAt">; slug: string; folder: string; round: number; feedback: string }
+	| { kind: "write-feedback"; folder: string; round: number; feedback: string }
 	/** Stop the Teammate's background session, `claude stop <short id>`, which keeps its conversation; its `--name` before it has a short id. */
 	| { kind: "stop-teammate"; teammate: string; shortId: string }
 	/** Write the Report as `reports/<nnn>.md`. */
@@ -887,7 +901,9 @@ export type EffortAction =
 	/** Remove `feedback-<round>.md` from the Task's folder: the send-back that wrote it never launched its Teammate. */
 	| { kind: "discard-feedback"; slug: string; folder: string; round: number }
 	/** Write (`on`) or remove the Teammate's `takeover` marker, which its hook reads to leave permission prompts to the human. */
-	| { kind: "mark-takeover"; teammate: string; on: boolean };
+	| { kind: "mark-takeover"; teammate: string; on: boolean }
+	/** Room opened for queued Tasks: a usage pause or a model hold lifted, or a Teammate crashed. Drain the queue. */
+	| { kind: "start-queued" };
 
 export type Step =
 	| { ok: true; state: EffortState; append: EffortLine[]; actions: EffortAction[]; reply?: string }
@@ -951,13 +967,16 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			if (line.answer === "approved" && answered?.checkpoint === BRIEF_CHANGE) {
 				const { briefHold: _briefHold, ...rest } = state;
 				const refresh = line.refresh ?? [];
+				const renew = line.renew ?? [];
 				return {
 					...rest,
 					pending,
 					asked,
 					brief: { sha256: answered.sha256, approvedAt: line.at, request: answered.id },
-					// Each live Teammate of a Role whose launch options changed gets a fresh session at its next Task boundary.
-					teammates: state.teammates.map((teammate) => (refresh.includes(teammate.role) && teammate.retiredAt === undefined && !teammate.ended ? { ...teammate, freshDue: true } : teammate)),
+					// Each live Teammate of a Role whose launch options changed, or holding session rules the change outdates, gets a fresh session at its next Task boundary.
+					teammates: state.teammates.map((teammate) =>
+						(refresh.includes(teammate.role) || renew.includes(teammate.id)) && isLive(teammate) ? { ...teammate, freshDue: true } : teammate,
+					),
 				};
 			}
 			return { ...state, pending, asked };
@@ -1068,8 +1087,8 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "task-dropped":
 			return { ...withTask(state, line.slug, { dropped: line.at }), queue: state.queue.filter((queued) => queued.slug !== line.slug) };
 		case "task-reassigned":
-			// Its new Teammate's launch carries the pointer.
-			return owe(withTask(state, line.slug, { teammate: line.teammate }), line.slug, undefined);
+			// Its new Teammate's launch carries the pointer. A sent-back Task queued for one leaves the queue.
+			return { ...owe(withTask(state, line.slug, { teammate: line.teammate }), line.slug, undefined), queue: state.queue.filter((queued) => queued.slug !== line.slug) };
 		case "teammate-ended":
 			return endRequests({ ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, ended: { how: line.how, at: line.at } } : teammate)) }, line.teammate);
 		case "teammate-crashed":
@@ -1164,7 +1183,9 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		}
 		case "usage-escalated": {
 			const { type: _type, ...item } = line;
-			return { ...state, usageItems: [...(state.usageItems ?? []), item], usageAsked: (state.usageAsked ?? 0) + 1 };
+			const usage = state.pauses?.usage;
+			const pauses = line.why === "far-reset" && usage ? { ...state.pauses, usage: { ...usage, asked: true as const } } : state.pauses;
+			return { ...state, ...(pauses ? { pauses } : {}), usageItems: [...(state.usageItems ?? []), item], usageAsked: (state.usageAsked ?? 0) + 1 };
 		}
 		case "usage-answered":
 			return { ...state, usageItems: (state.usageItems ?? []).filter((item) => item.id !== line.id) };
@@ -1341,6 +1362,12 @@ export function waitingInTerminal(state: EffortState): HeldRequest[] {
 	return Object.values(state.teammateRequests).filter((held) => held.state === "expired");
 }
 
+/** The usage-credit confirm waiting in a Teammate's terminal, which only the human answers there; undefined when none waits. */
+export function waitingConfirm(state: EffortState): (ModelHold & { teammate: string }) | undefined {
+	const hold = state.holds?.[CONSENT_FAMILY];
+	return hold?.kind === "consent" && hold.teammate !== undefined ? { ...hold, teammate: hold.teammate } : undefined;
+}
+
 /** The state an Effort's lines fold to. The first line must open the Effort. */
 export function fold(lines: readonly EffortLine[]): EffortState {
 	const [first, ...rest] = lines;
@@ -1353,6 +1380,17 @@ export function fold(lines: readonly EffortLine[]): EffortState {
 
 /** Take one input: the lines it appends and what the shell must do, or why it is refused. */
 export function step(state: EffortState, input: EffortInput): Step {
+	const result = stepOnce(state, input);
+	if (result.ok && result.append.some(freesRoom)) return { ...result, actions: [...result.actions, { kind: "start-queued" }] };
+	return result;
+}
+
+/** A line after which a queued Task may start: a usage pause or a model hold lifted, or a Teammate crashed, freeing room under the cap. */
+function freesRoom(line: EffortLine): boolean {
+	return (line.type === "resumed" && line.by === "usage") || line.type === "model-released" || line.type === "teammate-crashed";
+}
+
+function stepOnce(state: EffortState, input: EffortInput): Step {
 	if (state.ended) {
 		// A Teammate's last journal lines can still arrive after the end; there is nothing left for them to change.
 		if (input.kind === "journal") return took(state, [], []);
@@ -1465,7 +1503,8 @@ function heldWhy(hold: ModelHold): string {
 /** A usage item, as `/team pending` and the Report name it. */
 export function usageText(item: UsageItem, teammates: readonly Teammate[] = []): string {
 	if (item.why === "far-reset") {
-		return `the usage pause on a ${item.kind} limit lifts ${item.reset === undefined ? "at a time Claude Code didn't say" : `${untilText(item.reset, item.at).replace(/^until /, "at ")}, more than a day away`}: stay paused, or cancel the Effort`;
+		if (item.reset === undefined) return `the usage pause on a ${item.kind} limit has held for more than a day, and Claude Code didn't say when it lifts: stay paused, or cancel the Effort`;
+		return `the usage pause on a ${item.kind} limit lifts ${untilText(item.reset, item.at).replace(/^until /, "at ")}, more than a day away: stay paused, or cancel the Effort`;
 	}
 	const task = teammates.find((each) => each.id === item.teammate)?.task;
 	return `${item.teammate ?? "a Teammate"} still fails with ${item.kind.replace("_", " ")} after ${RETRY_MS.length} retries${task === undefined ? "" : ` on Task \`${task}\``}: retry again, or leave it to the Lead`;
@@ -1874,18 +1913,28 @@ function answer(state: EffortState, input: Extract<EffortInput, { kind: "answer"
  * A Brief change. Approving it makes the snapshot the Brief, releases the
  * Tasks it held, and marks each live Teammate of a Role in `refresh` (whose
  * launch options it changed) for a fresh session at its next Task boundary.
+ * When `terms` says the change alters what the Lead answers under (grants,
+ * Delivery, skipped escalates), each other live Teammate holding session rules
+ * the Lead added gets the same fresh start, so no rule outlives its terms.
  * A send-back wakes the Lead with the note and keeps the Tasks held, since
  * the change they wait on is still unsettled.
  */
 function answerBriefChange(state: EffortState, item: PendingApproval, input: Extract<EffortInput, { kind: "answer" }>): Step {
 	const holds = item.affects ?? [];
 	const refresh = input.answer === "approved" ? (input.refresh ?? []) : [];
+	const renew =
+		input.answer === "approved" && input.terms
+			? live(state)
+					.filter((teammate) => !refresh.includes(teammate.role) && (teammate.rules?.length ?? 0) > 0)
+					.map((teammate) => teammate.id)
+			: [];
 	const line: EffortLine = {
 		type: "approval-answered",
 		id: item.id,
 		answer: input.answer,
 		...(input.note === undefined ? {} : { note: input.note }),
 		...(refresh.length > 0 ? { refresh: [...refresh] } : {}),
+		...(renew.length > 0 ? { renew } : {}),
 		at: input.at,
 	};
 	const tasks = holds.length === 0 ? undefined : `Task${holds.length === 1 ? "" : "s"} ${quoted(holds)}`;
@@ -1900,6 +1949,10 @@ function answerBriefChange(state: EffortState, item: PendingApproval, input: Ext
 							? "their next Teammates start with the new ones"
 							: `${quoted(renewed)} ${renewed.length === 1 ? "starts" : "each start"} in a fresh session at its next Task, never mid-Task, keeping ${renewed.length === 1 ? "its" : "their"} id`
 					}.`;
+		const ruled =
+			renew.length === 0
+				? undefined
+				: `${quoted(renew)} ${renew.length === 1 ? "holds" : "hold"} session rules you added under the old terms, so ${renew.length === 1 ? "it starts" : "each starts"} in a fresh session at its next Task, never mid-Task, keeping ${renew.length === 1 ? "its" : "their"} id.`;
 		return took(state, [line], [
 			{ kind: "promote-brief-change", approval: item, at: input.at },
 			{
@@ -1908,6 +1961,7 @@ function answerBriefChange(state: EffortState, item: PendingApproval, input: Ext
 					`The human approved the Brief change of Effort \`${state.effortId}\` (request \`${item.id}\`, sha256 ${item.sha256}). It is now brief.md in the Effort's directory.`,
 					tasks ? `${tasks} ${one ? "is" : "are"} released: a queued one starts by itself.` : undefined,
 					fresh,
+					ruled,
 				]
 					.filter((part) => part !== undefined)
 					.join(" "),
@@ -2122,6 +2176,8 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 			append.push({ type: "teammate-ended", teammate: teammate.id, how: "stopped", at: input.at });
 			actions.push({ kind: "stop-teammate", teammate: teammate.id, shortId: teammate.shortId ?? teammate.name });
 		}
+		// Its worktree goes once its Teammate is stopped; the shell keeps one with uncommitted changes or unmerged commits.
+		if (handed?.worktree) actions.push({ kind: "remove-task-workspace", slug, ...handed.worktree });
 		const stopped = live ? `, and stopped \`${teammate.id}\` with \`claude stop\`, which keeps its conversation` : "";
 		notes.push(
 			replanned
@@ -2147,6 +2203,15 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 
 /** How many Teammates may be live at once when pi's `maxTeammates` setting is absent. */
 export const DEFAULT_MAX_TEAMMATES = 3;
+
+/** The cap pi's `maxTeammates` setting `set` gives: a whole number of 1 or more, else the default with what is wrong with it. */
+export function maxTeammatesSetting(set: unknown): { max: number; problem?: string } {
+	if (set === undefined || (typeof set === "number" && Number.isInteger(set) && set >= 1)) return { max: (set as number | undefined) ?? DEFAULT_MAX_TEAMMATES };
+	return {
+		max: DEFAULT_MAX_TEAMMATES,
+		problem: `pi's \`maxTeammates\` setting is ${JSON.stringify(set)}, which isn't a whole number of 1 or more, so the default of ${DEFAULT_MAX_TEAMMATES} live Teammates is used. Fix it in pi's settings and \`/reload\`.`,
+	};
+}
 
 /** The least time between two Teammate launches, so a burst of handoffs doesn't start them all at once. */
 export const STAGGER_MS = 5000;
@@ -2230,7 +2295,7 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 			`queued ${pointer}: Role \`${task.role}\` is held by ${holdText(hold)}, while other Roles go on. It starts by itself once the hold lifts.`,
 		);
 	}
-	const staffed = staff(state, wanted, max);
+	const staffed = staff(state, wanted, max, input.agents);
 	if (staffed) {
 		return took(
 			state,
@@ -2253,9 +2318,14 @@ function nextFolder(state: EffortState): number {
 	return Math.max(0, ...[...Object.values(state.tasks), ...state.queue].map((task) => Number.parseInt(task.folder, 10) || 0)) + 1;
 }
 
-/** Live Teammates: started, not stopped to make room, and not ended by a drop or a crash. */
+/** Whether `teammate` is live: started, not stopped to make room, and not ended by a drop or a crash. */
+export function isLive(teammate: Teammate): boolean {
+	return teammate.retiredAt === undefined && teammate.ended === undefined;
+}
+
+/** Live Teammates, as {@link isLive} has it. */
 function live(state: EffortState): Teammate[] {
-	return state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined);
+	return state.teammates.filter(isLive);
 }
 
 /** Whether `teammate` is between Tasks: its Task is accepted and it hasn't been given another. */
@@ -2270,16 +2340,25 @@ function free(state: EffortState, teammate: Teammate): boolean {
  * a new one under the cap; else, at the cap, stop a free Teammate of a Role
  * with no Task queued and start one in its place. Undefined when none applies,
  * and the Task queues. A queued Task taken here leaves the queue.
+ *
+ * A reused Teammate `agents` doesn't list has idle-stopped: its inbox is
+ * closed, and a clear only reaches an inbox, so it starts afresh instead,
+ * which leaves it in the same fresh context a clear would.
+ *
+ * A sent-back Task whose Teammate ended goes up the same ladder, in its own
+ * folder (and worktree): a Teammate reused for it starts afresh, since its
+ * launch is what carries the pointer to the rounds so far.
  */
-function staff(state: EffortState, task: QueuedTask, max: number): { append: EffortLine[]; actions: EffortAction[]; who: string; note?: string } | undefined {
-	const handed = { type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, at: task.at, round: 1 } as const;
+function staff(state: EffortState, task: QueuedTask, max: number, agents?: readonly string[]): { append: EffortLine[]; actions: EffortAction[]; who: string; note?: string } | undefined {
 	// An isolated Task needs a Teammate launched in its own worktree, so it never reuses one.
 	const reused = task.isolated ? undefined : live(state).find((teammate) => teammate.role === task.role && teammate.inbox !== undefined && free(state, teammate));
-	if (reused?.freshDue && reused.shortId) return relaunch(state, reused, task);
+	if (reused?.freshDue && reused.shortId) return relaunch(state, reused, task, freshForBrief(reused.role));
+	if (reused && agents !== undefined && !agents.includes(reused.name)) return relaunch(state, reused, task, FRESH_FOR_IDLE);
+	if (reused && sentBack(state, task.slug)) return relaunch(state, reused, task, FRESH_FOR_SENT_BACK);
 	if (reused?.inbox) {
 		return {
 			append: [
-				{ ...handed, teammate: reused.id },
+				takenBy(state, task, reused.id),
 				{ type: "clear-requested", teammate: reused.id, slug: task.slug, at: task.at },
 			],
 			actions: [{ kind: "clear-then-send", teammate: reused.id, inbox: reused.inbox, slug: task.slug, folder: task.folder }],
@@ -2301,18 +2380,41 @@ function staff(state: EffortState, task: QueuedTask, max: number): { append: Eff
 	};
 }
 
+/** Why a Teammate starts afresh when an approved Brief change altered its Role's launch options. */
+function freshForBrief(role: string): string {
+	return `An approved Brief change altered Role \`${role}\`'s launch options, so its old session is stopped (its conversation kept) and a new one starts with them; it keeps its id, with a new short id.`;
+}
+
+/** Whether `slug` is a sent-back Task waiting for a new Teammate, rather than one handed off for the first time. */
+function sentBack(state: EffortState, slug: string): boolean {
+	const task = state.tasks[slug];
+	return task !== undefined && task.dropped === undefined;
+}
+
+/** The line that gives `task` to `teammate`: its handoff, or for a sent-back Task, its reassignment. */
+function takenBy(state: EffortState, task: QueuedTask, teammate: string, worktree?: TaskWorktree): EffortLine {
+	if (sentBack(state, task.slug)) return { type: "task-reassigned", slug: task.slug, teammate, at: task.at };
+	return { type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate, at: task.at, round: 1, ...(worktree ? { worktree } : {}) };
+}
+
+/** Why an idle Teammate given a sent-back Task starts afresh rather than being cleared. */
+const FRESH_FOR_SENT_BACK = "It was idle, its own Task accepted, so a new session starts on this one (the old conversation is kept), launched with the pointer to the rounds so far; it keeps its id, with a new short id.";
+
+/** Why an idle-stopped Teammate starts afresh rather than being cleared. */
+const FRESH_FOR_IDLE =
+	"It had idle-stopped, and a clear only reaches a running session, so a new session starts in the fresh context a clear would leave (the old conversation is kept); it keeps its id, with a new short id.";
+
 /**
- * Start a free Teammate afresh on the Task, since an approved Brief change
- * altered its Role's launch options: its old session is stopped (its
- * conversation kept), and a new one launched under the same id and name, at
- * a Task boundary, never mid-Task.
+ * Start a free Teammate afresh on the Task, for `note`'s reason: its old
+ * session is stopped (its conversation kept), and a new one launched under
+ * the same id and name, at a Task boundary, never mid-Task.
  */
-function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask): { append: EffortLine[]; actions: EffortAction[]; who: string; note: string } {
+function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask, note: string): { append: EffortLine[]; actions: EffortAction[]; who: string; note: string } {
 	const last = Math.max(...state.teammates.map((each) => Date.parse(each.startedAt)));
 	const at = new Date(Math.max(Date.parse(task.at), last + STAGGER_MS)).toISOString();
 	return {
 		append: [
-			{ type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate: teammate.id, at: task.at, round: 1 },
+			takenBy(state, task, teammate.id),
 			{ type: "teammate-relaunched", teammate: teammate.id, task: task.slug, ...(task.mode === undefined ? {} : { mode: task.mode }), at },
 		],
 		actions: [
@@ -2320,7 +2422,7 @@ function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask): { a
 			{ kind: "launch-teammate", teammate: { id: teammate.id, role: teammate.role, name: teammate.name }, task: { slug: task.slug, folder: task.folder }, at },
 		],
 		who: `started ${teammate.id} afresh`,
-		note: `An approved Brief change altered Role \`${teammate.role}\`'s launch options, so its old session is stopped (its conversation kept) and a new one starts with them; it keeps its id, with a new short id.`,
+		note,
 	};
 }
 
@@ -2335,7 +2437,7 @@ function start(state: EffortState, task: QueuedTask): { append: EffortLine[]; ac
 	return {
 		append: [
 			{ type: "teammate-started", id, role: task.role, name, task: task.slug, startedAt: at, ...(task.mode === undefined ? {} : { mode: task.mode }) },
-			{ type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate: id, at: task.at, round: 1, ...(worktree ? { worktree } : {}) },
+			takenBy(state, task, id, worktree),
 		],
 		actions: worktree && state.workspace ? [{ kind: "add-task-workspace", slug: task.slug, from: state.workspace.branch, ...worktree }, launch] : [launch],
 		who: worktree
@@ -2366,7 +2468,7 @@ function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }
 	for (const queued of state.queue) {
 		if (holdOn(state, queued.role) || briefHeld(state, queued.slug)) continue;
 		// It starts now, whenever it was queued.
-		const staffed = staff(state, { ...queued, at: input.at }, max);
+		const staffed = staff(state, { ...queued, at: input.at }, max, input.agents);
 		if (!staffed) continue;
 		return took(
 			state,
@@ -2499,8 +2601,8 @@ function takeoverEvent(state: EffortState, teammate: Teammate, input: Extract<Ef
 	const { cursor, line } = input;
 	const at = line.at;
 	const mod = line.from === "mod";
-	if (teammate.ended !== undefined || teammate.retiredAt !== undefined) return mod ? took(state, [], []) : undefined;
-	// Until its fresh session starts, what the human types reaches only the old one, which is being stopped (#112).
+	if (!isLive(teammate)) return mod ? took(state, [], []) : undefined;
+	// Until its fresh session starts, what the human types reaches only the old one, which is being stopped for a Brief change's fresh start.
 	if (teammate.relaunching && teammate.takeover === undefined) return mod ? took(state, [], []) : undefined;
 	if (teammate.takeover === undefined && teammate.denied !== undefined && (mod ? line.event !== "handback" : AFTER_A_NO.has(line.event ?? ""))) {
 		const start = takeoverStart(teammate, cursor, { kind: "deny", request: teammate.denied }, mod ? humanInput(line, input.sent) : undefined, at);
@@ -2663,7 +2765,9 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 		case "PostToolUse":
 		case "PostToolUseFailure": {
 			// A call a held request asked for ran: the human answered it in the terminal first.
-			// A hook killed by the terminal looks like a deny until the call runs.
+			// A hook killed by the terminal looks like a deny until the call runs, and a call
+			// that ran and failed (PostToolUseFailure) was allowed all the same, so the No
+			// that started no Takeover yet is known for the Yes it was.
 			const tool = text(payload.tool_name);
 			const toolUseId = text(payload.tool_use_id);
 			const open = new Set<HeldRequest["state"]>(["held", "expired", "denied-in-terminal"]);
@@ -2795,7 +2899,8 @@ function limitHit(state: EffortState, teammate: Teammate, input: Extract<EffortI
 			}
 			if (!later(failure.reset, state.pauses?.usage)) return took(state, [limited(limit)], []);
 			const kind = failure.limit as "session" | "weekly";
-			const far = failure.reset === undefined || Date.parse(failure.reset) - Date.parse(at) > FAR_RESET_MS;
+			// A reset Claude Code didn't give may be minutes away: the pause waits for the auto-resume or the next ordinary Stop, and asks only once it has held a day (`tick`).
+			const far = failure.reset !== undefined && Date.parse(failure.reset) - Date.parse(at) > FAR_RESET_MS;
 			const asked = state.usageItems?.some((item) => item.why === "far-reset");
 			return took(
 				state,
@@ -2893,6 +2998,9 @@ function tick(state: EffortState, input: Extract<EffortInput, { kind: "tick" }>)
 	const lifts: EffortLine[] = [];
 	const usage = state.pauses?.usage;
 	if (usage?.reset !== undefined && Date.parse(usage.reset) <= now) lifts.push({ type: "resumed", by: "usage", at });
+	// A usage pause Claude Code gave no reset for, held a day with nothing lifting it: the human decides whether to stay or cancel.
+	const unsaid = usage !== undefined && usage.reset === undefined && !usage.asked && now - Date.parse(usage.at) > FAR_RESET_MS ? usage.kind : undefined;
+	if (unsaid && !state.usageItems?.some((item) => item.why === "far-reset")) lifts.push({ type: "usage-escalated", id: usageId(state), why: "far-reset", kind: unsaid, at });
 	for (const hold of Object.values(state.holds ?? {})) {
 		if (hold?.reset !== undefined && Date.parse(hold.reset) <= now) lifts.push({ type: "model-released", family: hold.family, at });
 	}
@@ -3090,26 +3198,38 @@ function review(state: EffortState, input: Extract<EffortInput, { kind: "review"
 }
 
 /**
- * A send-back of a Task whose Teammate has ended: a new Teammate of its Role
- * takes the next round in the same folder, where the Task, its results and
- * the feedback are.
+ * A send-back of a Task whose Teammate has ended: the staffing ladder gives
+ * the next round, in the same folder where the Task, its results and the
+ * feedback are, to another Teammate of its Role, reused, started under the
+ * cap or in a free one's place. While none can take it, or a pause or a hold
+ * on its Role stands, it queues, and starts by itself like any queued Task.
  */
 function restaff(state: EffortState, input: Extract<EffortInput, { kind: "review" }>, task: HandedTask, feedback: string, count: string): Step {
-	const n = state.teammates.filter((teammate) => teammate.role === task.role).length + 1;
-	const id = `${task.role}-${n}`;
-	const name = `team-${state.effortId}-${id}`;
+	const back: EffortLine = { type: "task-sent-back", slug: input.slug, round: task.round, at: input.at };
+	const after = apply(state, back);
+	const wanted: QueuedTask = { slug: input.slug, folder: task.folder, role: task.role, why: "", at: input.at, ...(input.mode === undefined ? {} : { mode: input.mode }) };
+	const write: EffortAction = { kind: "write-feedback", folder: task.folder, round: task.round, feedback };
+	const sent = `Sent Task \`${input.slug}\` back (${count}) with feedback-${task.round}.md. \`${task.teammate}\` has ended`;
+	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
+	const pauses = heldPauses(after);
+	const hold = holdOn(after, task.role);
+	const staffed = pauses.length > 0 || hold ? undefined : staff(after, wanted, max);
+	if (staffed) {
+		const id = staffed.append.flatMap((line) => (line.type === "task-reassigned" ? [line.teammate] : []))[0] ?? "";
+		return took(
+			state,
+			[back, ...staffed.append],
+			[write, ...staffed.actions, { kind: "write-plan" }],
+			`${sent}, so this ${staffed.who.replace(id, `\`${id}\``)} on it, pointed at the Task's folder; it writes result-${task.round + 1}.md next, and you are woken when it does.${staffed.note ? ` ${staffed.note}` : ""}`,
+		);
+	}
+	const why = pauses.length > 0 ? "paused" : hold ? heldWhy(hold) : waitReason(after, max);
+	const waits = pauses.length > 0 ? pauses.map(pauseText).join(", and ") : hold ? `Role \`${task.role}\` is held by ${holdText(hold)}` : why;
 	return took(
 		state,
-		[
-			{ type: "teammate-started", id, role: task.role, name, task: input.slug, startedAt: input.at, ...(input.mode === undefined ? {} : { mode: input.mode }) },
-			{ type: "task-sent-back", slug: input.slug, round: task.round, at: input.at },
-			{ type: "task-reassigned", slug: input.slug, teammate: id, at: input.at },
-		],
-		[
-			{ kind: "restaff-teammate", teammate: { id, role: task.role, name }, slug: input.slug, folder: task.folder, round: task.round, feedback },
-			{ kind: "write-plan" },
-		],
-		`Sent Task \`${input.slug}\` back (${count}) with feedback-${task.round}.md. \`${task.teammate}\` has ended, so this started \`${id}\` on it, pointed at the Task's folder; it writes result-${task.round + 1}.md next, and you are woken when it does.`,
+		[back, { type: "task-queued", ...wanted, why }],
+		[write, { kind: "write-plan" }],
+		`${sent}, and no Teammate can take it now (${waits}), so it is queued: it starts by itself once one can, pointed at the Task's folder, and writes result-${task.round + 1}.md.`,
 	);
 }
 
@@ -3136,7 +3256,7 @@ function mergeResult(state: EffortState, input: Extract<EffortInput, { kind: "me
 		);
 	}
 	const teammate = state.teammates.find((each) => each.id === task.teammate);
-	const ending = teammate && teammate.ended === undefined && teammate.retiredAt === undefined ? teammate : undefined;
+	const ending = teammate && isLive(teammate) ? teammate : undefined;
 	return took(
 		state,
 		[
@@ -3172,16 +3292,23 @@ export function openMerges(state: EffortState): { slug: string; branch: string; 
 	);
 }
 
+/** The checkpoints whose approval `approvals.jsonl` records ahead of the line, besides the Brief's. */
+const RECORDED: ReadonlySet<string> = new Set([BRIEF_CHANGE, PLAYBOOK_CHANGE, SIGN_OFF]);
+/** What an approval's shell does that is done once it is on record. */
+const ON_RECORD: ReadonlySet<EffortAction["kind"]> = new Set(["promote-brief-change", "adopt-playbook-change", "record-sign-off"]);
+
 /**
  * After a restart, before the journals are replayed: finish each intent left
  * open from the evidence the shell gathered. A launch is in when `claude
  * agents --json` lists its `--name` or the Teammate wrote to its journal, and
  * abandoned when neither; a merge already in the Effort branch is recorded,
- * one cut short is aborted and merged again, one not begun is merged; a Brief
- * promotion `approvals.jsonl` records with the approved sha is recorded as
- * answered. Nothing done is done twice. What the evidence can't settle stays
- * open, and the Lead is told.
+ * one cut short is aborted and merged again, one not begun is merged; an
+ * approval `approvals.jsonl` records with the approved sha (a Brief, a Brief
+ * change, a Playbook change, a sign-off) is recorded as answered, and a
+ * sign-off ends the Effort. Nothing done is done twice. What the evidence
+ * can't settle stays open, and the Lead is told.
  */
+
 function recover(state: EffortState, input: Extract<EffortInput, { kind: "recover" }>): Step {
 	let next = state;
 	const append: EffortLine[] = [];
@@ -3200,6 +3327,15 @@ function recover(state: EffortState, input: Extract<EffortInput, { kind: "recove
 		const answered = answer(next, { kind: "answer", id: item.id, answer: "approved", ...(record.workspace === undefined ? {} : { workspace: record.workspace }), at: input.at });
 		// brief.md, the snapshots and the record are written already.
 		add(answered.ok ? { ...answered, actions: answered.actions.filter((action) => action.kind !== "promote-brief") } : answered);
+	}
+	for (const record of input.recorded ?? []) {
+		const item = next.pending.find((pending) => RECORDED.has(pending.checkpoint) && pending.id === record.request && pending.sha256 === record.sha256);
+		if (!item) continue;
+		const refresh = item.checkpoint === BRIEF_CHANGE && record.refresh && record.refresh.length > 0 ? { refresh: [...record.refresh] } : {};
+		const terms = item.checkpoint === BRIEF_CHANGE && record.terms ? { terms: true } : {};
+		const answered = answer(next, { kind: "answer", id: item.id, answer: "approved", ...refresh, ...terms, at: input.at });
+		// The record is written ahead of the line: brief.md (which the shell finishes first), the adopted Playbook or the sign-off are on disk already.
+		add(answered.ok ? { ...answered, actions: answered.actions.filter((action) => !ON_RECORD.has(action.kind)) } : answered);
 	}
 	const plan = actions.some((action) => action.kind === "write-plan");
 	return { ok: true, state: next, append, actions: [...actions.filter((action) => action.kind !== "write-plan"), ...(plan ? [{ kind: "write-plan" } as const] : [])] };
@@ -3280,7 +3416,7 @@ function reconcile(state: EffortState, input: Extract<EffortInput, { kind: "reco
 		const task = state.tasks[slug];
 		const teammate = state.teammates.find((each) => each.id === task?.teammate);
 		// A Teammate the human holds gets what it is owed at the hand-back.
-		if (!task || !teammate || teammate.ended || teammate.retiredAt !== undefined || teammate.takeover !== undefined || teammate.clearing === slug || input.sent?.includes(slug)) continue;
+		if (!task || !teammate || !isLive(teammate) || teammate.takeover !== undefined || teammate.clearing === slug || input.sent?.includes(slug)) continue;
 		actions.push({ kind: "redeliver", teammate: teammate.id, slug, folder: task.folder, round });
 	}
 	const reply = unstarted
@@ -3320,6 +3456,8 @@ export function taskStatus(state: EffortState, slug: string): TaskStatus {
 		return "dropped";
 	}
 	if (task.accepted !== undefined) return "accepted";
+	// A send-back whose Teammate ended waits in the queue for another.
+	if (state.queue.some((queued) => queued.slug === slug)) return "queued";
 	if (task.reported === task.round) return "in review";
 	return task.round > 1 ? "sent back" : "running";
 }
@@ -3424,9 +3562,11 @@ function report(state: EffortState, input: Extract<EffortInput, { kind: "report"
 	const found: EffortLine[] = (input.found ?? []).map((what) => what.trim()).filter((what) => what !== "").map((what) => ({ type: "found-work", what, at: input.at }));
 	const now = found.reduce(apply, state);
 	const n = state.reports + 1;
-	const logged = [...reportSections(now, n === 1 ? input.modes : undefined), { title: "Usage", lines: usageLines(now, input.leadCostUsd) }].filter((each) => each.lines.length > 0);
-	// The final Report tells all found work, not only what is new, so its own section replaces the logged one.
-	const sections = input.final ? [...logged.filter((each) => each.title !== "Found work"), ...finalSections(now, input.final)] : logged;
+	const usage = { title: "Usage", lines: usageLines(now, input.leadCostUsd) };
+	// The final Report tells all found work, not only what is new, so its own section replaces the logged one; usage stays last, as in every Report.
+	const kept = reportSections(now, n === 1 ? input.modes : undefined);
+	const logged = input.final ? [...kept.filter((each) => each.title !== "Found work"), ...finalSections(now, input.final)] : kept;
+	const sections = [...logged, usage].filter((each) => each.lines.length > 0);
 	const written: Report = { n, at: input.at, headline, coverage, sections, ...(input.final ? { final: true as const } : {}) };
 	const file = `reports/${String(n).padStart(3, "0")}.md`;
 	return took(
@@ -3593,6 +3733,7 @@ function reportSections(state: EffortState, modes: readonly { role: string; mode
 								: `\`${item.id}\`: approve ${requestName(item)}, ${item.path} (sha256 ${item.sha256})${item.affects && item.affects.length > 0 ? `, holding ${quoted(item.affects)}` : ""}, in \`/team pending\``,
 				),
 				...waitingInTerminal(state).map((held) => `\`${held.request}\`: ${terminalText(held)}`),
+				...[waitingConfirm(state)].flatMap((hold) => (hold ? [`\`${hold.teammate}\`: a usage-credit confirm waits in its terminal, which only you answer: attach to it from \`/team pending\` or \`/team\``] : [])),
 				...openEscalations(state).map((escalation) => `\`${escalation.id}\`: ${escalationText(escalation, state)}, escalated: ${escalation.summary} Answer it in \`/team pending\``),
 				...(state.usageItems ?? []).map((item) => `\`${item.id}\`: ${usageText(item, state.teammates)}, in \`/team pending\``),
 			],
@@ -3608,9 +3749,11 @@ function reportSections(state: EffortState, modes: readonly { role: string; mode
 		{
 			title: "Found work",
 			lines:
-				newFound.length === 0
+				state.found.length === 0
 					? []
-					: [
+					: newFound.length === 0
+						? [`${state.found.length} found so far outside the Brief, kept as suggestions for the final Report; none new since the last Report.`]
+						: [
 							`${state.found.length} found so far outside the Brief, kept as suggestions for the final Report; new since the last Report:`,
 							...newFound.map((line) => `${line.what}${line.task === undefined ? "" : ` (Task \`${line.task}\`)`}`),
 						],

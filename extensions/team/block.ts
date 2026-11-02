@@ -25,7 +25,7 @@
  */
 
 import { sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
-import { type EffortState, heldPauses, openEscalations, type PauseSetter, type TakeoverTrigger, type Teammate, type UsageWindow, usageSource, waitingInTerminal } from "./core.ts";
+import { type EffortState, heldPauses, isLive, openEscalations, type PauseSetter, type TakeoverTrigger, type Teammate, type UsageWindow, usageSource, waitingConfirm, waitingInTerminal } from "./core.ts";
 
 /** The widest the frame may get, borders included. */
 export const MAX_WIDTH = 96;
@@ -151,12 +151,11 @@ export interface StatusExtras {
 /**
  * The Effort's status, as the block shows it and `team_status` returns it:
  * live Teammates only, since one stopped to make room under the cap is gone,
- * and the queued Tasks by folder. Nothing yet writes a Report, so that is 0
- * until the ticket that adds them fills it in here.
+ * and the queued Tasks by folder.
  */
 export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockData {
 	const handed = Object.keys(state.tasks).length > 0 || state.queue.length > 0;
-	const teammates = state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined).map((teammate) => {
+	const teammates = state.teammates.filter(isLive).map((teammate) => {
 		const row = teammateRow(state, teammate);
 		return extras.confirmed === undefined || extras.confirmed.has(teammate.id) ? row : { ...row, unconfirmed: true };
 	});
@@ -168,7 +167,7 @@ export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockD
 		// A Teammate stopped to make room, or that ended (stopped with its dropped Task, or crashed), is gone for this Effort.
 		teammates,
 		queued: state.queue.map((queued) => ({ task: queued.folder, role: queued.role, why: queued.why })),
-		waitingOnYou: state.pending.length + waitingInTerminal(state).length + openEscalations(state).length + extras.adoptionsPending + (state.usageItems?.length ?? 0),
+		waitingOnYou: state.pending.length + waitingInTerminal(state).length + openEscalations(state).length + extras.adoptionsPending + (state.usageItems?.length ?? 0) + (waitingConfirm(state) ? 1 : 0),
 		reports: state.reports,
 		...pauseRows(state),
 		...usageRow(state, teammates.length),
@@ -308,11 +307,12 @@ function clockAt(at: string, now: number): string {
  * The account's usage, shown whether or not a Teammate is live: each window,
  * or `n/a` when the reading doesn't give it, and when it resets, as a time
  * today or a weekday and time otherwise, in UTC like the pause lines; then
- * where the reading came from and how old it is.
+ * where the reading came from and how old it is. Before the first reading,
+ * each window is `n/a` and the line says there is no reading yet.
  */
 function usageLine(data: TeamBlockData, now: number): string[] {
 	const usage = data.usage;
-	if (!usage) return [];
+	if (!usage) return ["5h n/a · week n/a  · no reading yet"];
 	const windows = [usageWindow("5h", usage.fiveHour, now), usageWindow("week", usage.sevenDay, now)].join(" · ");
 	return [`${windows}  · ${oneLine(usage.source)}, ${age(now - Date.parse(usage.at))} ago`];
 }

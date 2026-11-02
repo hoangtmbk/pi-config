@@ -116,7 +116,8 @@ Task with no judgment from the Lead, down a ladder:
 3. **Swap**: at the cap, stop (`claude stop`) an idle Teammate whose Task is accepted and whose
    Role has no queued Task, and start one in its place.
 4. **Queue** the Task, saying why (`cap 3 reached; waits for 001, 002 and 003`). `team_review`
-   starts queued Tasks, in handoff order, when an acceptance frees a Teammate.
+   starts queued Tasks, in handoff order, when an acceptance frees a Teammate; a Teammate's crash
+   frees room under the cap the same way.
 
 Every live Teammate counts toward the cap, working or idle. `maxTeammates` is a pi setting
 (default 3), read after `/reload`. Starts are at least 5 s apart. The reply says which Teammate
@@ -154,6 +155,11 @@ stopped, and its worktree and branch removed. The merge is refused, with a `merg
 while the Workspace or the Task's worktree has uncommitted changes, or when it would conflict
 (the merge is aborted): nothing is merged, and the Task stays in review with its branch intact.
 
+A re-plan that drops an isolated Task stops its Teammate, then removes its worktree and deletes
+its branch without forcing either: a worktree with uncommitted changes, or a branch with commits
+the Effort branch lacks, is left in place and the Lead is told. Cancelling the Effort ends it, so
+its worktrees go as at any end (below).
+
 ### Clearing between Tasks
 
 A Teammate is cleared exactly when it is handed a different Task from the one in its context:
@@ -174,7 +180,7 @@ journal, `teammates/<id>/events.jsonl`, then rings the Lead's doorbell: a localh
 the Lead writes to `lead.json` before its first launch. The doorbell only says "read this journal";
 the Lead applies each line once, from the Teammate's cursor, and every `effort.jsonl` line it adds
 for one carries that cursor. A doorbell without the token is ignored, and whatever a journal holds
-is also read when the Lead's run settles, so a lost doorbell loses nothing.
+is also read when the Lead's prompt settles, so a lost doorbell loses nothing.
 
 - `SessionStart` records the Teammate's session id, short id and inbox socket;
 - `UserPromptSubmit` is logged as a message having landed, and `PermissionDenied` is logged;
@@ -183,7 +189,7 @@ is also read when the Lead's run settles, so a lost doorbell loses nothing.
   Lead with the Task and the result's path. A `Stop` without a new result is "stopped short", and
   wakes the Lead with the Teammate's last message.
 
-Wakes that come while the Lead is busy are sent together as one follow-up once its run settles.
+Wakes that come while the Lead is busy are sent together as one follow-up once its prompt settles.
 
 ### Usage
 
@@ -207,8 +213,9 @@ Teammate's terminal meanwhile, and the first answer wins. Nothing is allowed by 
   may add a session `rule` for the same tool, such as `Bash(npm test:*)`, and name the `grant` it
   relies on. An `AskUserQuestion` is answered with `answers`, keyed by each question's exact text.
 - The human answering in the terminal kills the hook, journalled as denied in the terminal; a
-  `PostToolUse` for the call after it shows it was allowed. Either way the Lead's answer is then
-  refused as already answered.
+  `PostToolUse` for the call after it shows it was allowed, and so does a `PostToolUseFailure`:
+  a call that ran and failed was still allowed, so a No in the terminal that was really a Yes
+  doesn't start a Takeover. Either way the Lead's answer is then refused as already answered.
 - A hook that holds 3570 s without an answer gives the prompt back to the terminal. It waits in
   `/team pending` as an item that attaches to the Teammate, and in the Report's Waiting on you.
 
@@ -247,7 +254,8 @@ adds the logged sections from `effort.jsonl`, leaving out any with nothing in th
 - **Decided for you**: what the extension answered on your behalf;
 - **Teammate modes**: every Role's mode in the plan Report, then a Teammate's mode only when it
   changes;
-- **Found work**: the running count, and the items new since the last Report.
+- **Found work**: the running count, in every Report once anything is found, and the items new
+  since the last Report.
 
 The first Report, written once the plan is, is the plan Report. Each is saved as
 `reports/<nnn>.md` in the Effort directory, numbered from 001 and never overwritten, and shows in
@@ -305,16 +313,28 @@ permission prompts are yours, and review and answer are refused. End it with `/t
 
 An Effort survives pi restarting. On start the extension draws the block, listens on the bridge,
 recovers unfinished intents, replays the Teammates' journals, reconciles with `claude agents`,
-ticks, and wakes the Lead once. Teammates not heard from since show `?` until they are. Only Brief
-approvals are recovered; a sign-off promoted when pi died is not.
+ticks, and wakes the Lead once. Teammates not heard from since show `?` until they are. An
+approval on record in `approvals.jsonl` but not yet in `effort.jsonl` (a Brief, a Brief change, a
+Playbook change or a sign-off) is finished as answered; a Playbook change adopted but not yet
+recorded stays pending, to answer again.
 
 ## Usage limits
 
 `limits.ts` is the only place that reads a limit message. Hitting a usage limit pauses the Effort
 (and a model-family limit holds only that family's Roles) until the reset, or the next ordinary
-Stop; `continue` is sent about two minutes after the reset. A usage-credit confirm holds the Roles
-and tells the Lead never to confirm it: that is yours. A Role's `model` or `effort` set in the
+Stop; `continue` is sent about two minutes after the reset. A reset more than a day away asks you
+in `/team pending` to stay paused or cancel; one Claude Code gave no time for waits for its
+auto-resume or the next ordinary Stop, and asks the same only once the pause has held a day. A usage-credit confirm holds the Roles
+on that family and tells the Lead never to confirm it: that is yours. It counts as waiting on you,
+shows in the Report's Waiting on you, and `/team pending` offers to attach to the Teammate's
+terminal, where only you answer it. A Role's `model` or `effort` set in the
 Brief's `roles:` frontmatter, once changed, gives a fresh session at the next Task.
+
+A Brief change that alters what the Lead answers under (its grants, Delivery text or the `escalate`
+entries it skips) does the same for each Teammate holding a session rule the Lead added with
+`team_answer`, so no rule outlives the terms it was added under. Skipping an `escalate` entry
+needs no fresh start for the rest: a Teammate's settings `ask` every `escalate` entry of the
+Playbook whatever the Brief skips, and the skip only changes what `team_answer` may allow.
 
 ## Attaching to a Teammate
 

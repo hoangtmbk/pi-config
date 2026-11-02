@@ -3,7 +3,7 @@
  *
  * Attaching only ever views a Teammate's session: it is never a Takeover, and
  * tmux is only a viewer, never a host (ADR-0006). The menu is a table, so the
- * Takeover's "Hand back" (#113) is one more row, shown only while the human
+ * Takeover's "Hand back" is one more row, shown only while the human
  * holds the Teammate; it isn't an attach, so it records none.
  */
 

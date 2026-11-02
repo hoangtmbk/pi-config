@@ -181,6 +181,14 @@ export interface AgentStatus {
 const AGENTS_TIMEOUT_MS = 10_000;
 
 /**
+ * Whether a session named `name` may still be live, by an `agentsList`
+ * reading: listed in it, or the list couldn't be read, so nothing says it is gone.
+ */
+export function stillListed(agents: Map<string, AgentStatus> | { error: string }, name: string | undefined): boolean {
+	return !(agents instanceof Map) || (name !== undefined && agents.has(name));
+}
+
+/**
  * The live background sessions, from `claude agents --json`, by `--name`: a
  * session missing from it was stopped, idle or not. Its shape is read
  * leniently, as a list of sessions or an object holding one, since Claude
@@ -442,7 +450,13 @@ function usageReply(reply: Record<string, unknown>, at: string): UsageReading {
 	return given<UsageReading>({ source: "get-usage", at, rateLimits: limits !== undefined && reply.rate_limits_available !== false, fiveHour: window("five_hour"), sevenDay: window("seven_day") });
 }
 
-/** The hook events a Teammate reports, each to {@link HOOK_SCRIPT}. */
+/**
+ * The hook events a Teammate reports, each to {@link HOOK_SCRIPT}. Beyond the
+ * spec's list, `PostToolUseFailure` is here too: a call that ran and then
+ * failed was still allowed, so it settles a held request as answered in the
+ * terminal, as `PostToolUse` does, and a killed hook that looked like a No
+ * is known for the Yes it was rather than starting a Takeover.
+ */
 const HOOK_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure", "PermissionRequest", "PermissionDenied", "Notification", "PostToolUse", "PostToolUseFailure", "PreToolUse"];
 
 /** A `PermissionRequest` holds the request open while the Lead or the human answers it. */

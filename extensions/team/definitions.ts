@@ -612,17 +612,19 @@ function readAdoption(agentDir: string, team: string, roleNames: readonly string
 }
 
 function directories(dir: string): string[] {
-	let found: Dirent[];
-	try {
-		found = readdirSync(dir, { withFileTypes: true });
-	} catch {
-		// No folder means no Teams there: the normal case for a human who has written none.
-		return [];
-	}
-	return found
+	return entriesOf(dir)
 		.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
 		.map((entry) => entry.name)
 		.sort(byCodepoint);
+}
+
+/** The entries of `dir`; none when it can't be read. No folder means nothing there: the normal case for a human who has written no Team or Role. */
+function entriesOf(dir: string): Dirent[] {
+	try {
+		return readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return [];
+	}
 }
 
 function readTeam(dir: string, name: string, source: TeamSource, agentDir: string): Team {
@@ -684,11 +686,7 @@ function readTeam(dir: string, name: string, source: TeamSource, agentDir: strin
 }
 
 function readdirSafe(dir: string): string[] {
-	try {
-		return readdirSync(dir);
-	} catch {
-		return [];
-	}
+	return entriesOf(dir).map((entry) => entry.name);
 }
 
 /**
@@ -710,13 +708,19 @@ export function listTeams(roots: TeamRoots): Team[] {
 		.map(([name, { dir, source }]) => readTeam(dir, name, source, roots.agentDir));
 }
 
+/** The Roles and Playbook an Effort snapshotted at Brief approval, which is all it staffs from. */
+export interface Snapshot {
+	roles: Role[];
+	playbook: Playbook;
+}
+
 /**
  * The Roles and Playbook an Effort snapshotted at Brief approval: its
  * `team/roles/*.md` and its `playbook.md`. Both were validated before they
  * were approved, and a bundled Team's limits were applied then, so the
  * copies are read as the human's own.
  */
-export function readSnapshot(teamDir: string, playbookFile: string): { roles: Role[]; playbook: Playbook } | { problems: ConfigError[] } {
+export function readSnapshot(teamDir: string, playbookFile: string): Snapshot | { problems: ConfigError[] } {
 	const rolesDir = join(teamDir, "roles");
 	const problems: ConfigError[] = [];
 	const roles: Role[] = [];
@@ -732,6 +736,24 @@ export function readSnapshot(teamDir: string, playbookFile: string): { roles: Ro
 	problems.push(...parsed.problems);
 	if (problems.length > 0 || !parsed.playbook) return { problems };
 	return { roles, playbook: parsed.playbook };
+}
+
+/**
+ * The Team and Playbook an Effort runs on, until its Brief is approved and
+ * snapshots them: Team `name` as it is now, on the Playbook adopted when the
+ * Effort opened (`playbookSha`). A Playbook adopted again or edited since is
+ * refused, since the Brief records the one it was agreed under.
+ */
+export function teamInForce(roots: TeamRoots, name: string, playbookSha: string, effortId: string): { team: Team; playbook: Playbook } | { error: string } {
+	const team = loadTeam(roots, name);
+	if (!team) return { error: `Team \`${name}\` of Effort \`${effortId}\` no longer exists` };
+	if (team.adoption.state !== "adopted" || team.adoption.playbook.sha256 !== playbookSha) {
+		const now = team.adoption.state === "adopted" ? `is now ${team.adoption.playbook.sha256}` : `is ${team.adoption.state}`;
+		return {
+			error: `the \`${name}\` Playbook Effort \`${effortId}\` opened on (sha256 ${playbookSha}) ${now}, so its Brief can no longer be checked against it; start a new Effort on the Playbook in force`,
+		};
+	}
+	return { team, playbook: team.adoption.playbook };
 }
 
 /** One Team by name, or undefined when there is none by that name. */

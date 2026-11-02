@@ -5,7 +5,9 @@
  *
  * A Teammate reused for a new Task starts it in a fresh context: the Lead
  * sends the clear marker over the Teammate's inbox, and this turns it into a
- * `/clear` instead of a turn. Clear-then-send, step by step, is in spec #93.
+ * `/clear` instead of a turn. The Lead sends the Task's pointer only once the
+ * clear's own `SessionStart` is journaled, so the pointer lands in the fresh
+ * context.
  *
  * It also journals what the human does in the Teammate's own terminal, which
  * starts a Takeover: a prompt they type, a slash command they run, a turn they

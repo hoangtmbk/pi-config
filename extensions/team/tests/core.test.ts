@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { awayText, currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openEscalations, openMerges, type Step, step, taskStatus, type UsageReading, waitingInTerminal, workdir } from "../core.ts";
+import { awayText, currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openEscalations, openMerges, type Step, step, taskStatus, type UsageItem, type UsageReading, usageText, waitingInTerminal, workdir } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -1017,6 +1017,27 @@ describe("clearing between Tasks", () => {
 		assert.ok(result.ok, result.ok ? "" : result.refusal);
 		assert.match(result.reply ?? "", /^reused dev-1 on Task `docs`/);
 	});
+
+	it("starts afresh at its next Task a Teammate holding a session rule once an approved Brief change alters what the Lead answers under; one without a rule is cleared as before", () => {
+		const ruled: EffortLine = { type: "request-answered", teammate: "dev-1", request: "p1", task: "rename", decision: { behavior: "allow" }, rule: "Bash(npm test:*)", at: "2026-11-02T12:05:00.000Z" };
+		const done_ = applied([...running, ruled], hook(2, "Stop", { session_id: FIRST }, true));
+		const ask: EffortInput = { kind: "request-approval", checkpoint: "brief-change", path: "/agent/team/efforts/software-2026-11-02/brief.draft.md", sha256: "c".repeat(64), snapshot: "---\n---\n", affects: [], at: "2026-11-02T12:10:00.000Z" };
+		const asked = applied(done_, ask);
+
+		const answered = run(asked, { kind: "answer", id: "r2", answer: "approved", terms: true, at: "2026-11-02T12:11:00.000Z" });
+		assert.ok(answered.ok, answered.ok ? "" : answered.refusal);
+		const wake = answered.actions.find((action) => action.kind === "wake-lead");
+		assert.match(wake?.kind === "wake-lead" ? wake.text : "", /`dev-1` holds session rules .* fresh session at its next Task/);
+		const result = run(applied([...asked, ...answered.append], review("accept")), { kind: "handoff", slug: "docs", at: "2026-11-02T14:00:00.000Z" });
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.match(result.reply ?? "", /^started dev-1 afresh on Task `docs`/);
+
+		const unruled = applied(applied(running, hook(2, "Stop", { session_id: FIRST }, true)), ask);
+		const plain = run(unruled, { kind: "answer", id: "r2", answer: "approved", terms: true, at: "2026-11-02T12:11:00.000Z" });
+		assert.ok(plain.ok);
+		const next = run(applied([...unruled, ...plain.append], review("accept")), { kind: "handoff", slug: "docs", at: "2026-11-02T14:00:00.000Z" });
+		assert.match(next.ok ? (next.reply ?? "") : "", /^reused dev-1 on Task `docs`/);
+	});
 });
 
 describe("a Teammate's held requests", () => {
@@ -1656,6 +1677,9 @@ describe("reporting", () => {
 			"2 found so far outside the Brief, kept as suggestions for the final Report; new since the last Report:",
 			"`old-config` has no tests.",
 		]);
+
+		const third = run(applied(first, report("2026-11-02T12:00:00.000Z", { found: ["`old-config` has no tests."] })), report("2026-11-02T12:30:00.000Z"));
+		assert.deepEqual(section(third, "Found work"), ["2 found so far outside the Brief, kept as suggestions for the final Report; none new since the last Report."], "the running count stays in a Report with nothing new");
 	});
 
 	it("lists what waits on the human whenever something does", () => {
@@ -1953,8 +1977,7 @@ describe("a Teammate's lifecycle", () => {
 
 		assert.ok(crash.ok, crash.ok ? "" : crash.refusal);
 		assert.deepEqual(crash.append, [{ type: "teammate-crashed", teammate: "dev-1", cursor: 2, reason: "other", at: "2026-11-02T12:02:00.000Z" }]);
-		assert.equal(crash.actions.length, 1);
-		assert.equal(crash.actions[0].kind, "wake-lead");
+		assert.deepEqual(crash.actions.map((action) => action.kind), ["wake-lead", "start-queued"], "the crash frees room under the cap, so the queue drains");
 		assert.match(crash.actions[0].kind === "wake-lead" ? crash.actions[0].text : "", /`dev-1`'s session ended \(other\).*Task `rename`.*send-back/s);
 		assert.deepEqual(crash.state.teammates[0].ended, { how: "crashed", at: "2026-11-02T12:02:00.000Z" });
 
@@ -1997,18 +2020,17 @@ describe("a Teammate's lifecycle", () => {
 
 		assert.ok(result.ok, result.ok ? "" : result.refusal);
 		assert.deepEqual(result.append, [
-			{ type: "teammate-started", id: "dev-2", role: "dev", name: "team-software-2026-11-02-dev-2", task: "rename", startedAt: "2026-11-02T13:00:00.000Z", mode: "auto" },
 			{ type: "task-sent-back", slug: "rename", round: 1, at: "2026-11-02T13:00:00.000Z" },
+			{ type: "teammate-started", id: "dev-2", role: "dev", name: "team-software-2026-11-02-dev-2", task: "rename", startedAt: "2026-11-02T13:00:00.000Z", mode: "auto" },
 			{ type: "task-reassigned", slug: "rename", teammate: "dev-2", at: "2026-11-02T13:00:00.000Z" },
 		]);
 		assert.deepEqual(result.actions, [
+			{ kind: "write-feedback", folder: "001-dev-rename", round: 1, feedback: "The loader still reads `colour`." },
 			{
-				kind: "restaff-teammate",
+				kind: "launch-teammate",
 				teammate: { id: "dev-2", role: "dev", name: "team-software-2026-11-02-dev-2" },
-				slug: "rename",
-				folder: "001-dev-rename",
-				round: 1,
-				feedback: "The loader still reads `colour`.",
+				task: { slug: "rename", folder: "001-dev-rename" },
+				at: "2026-11-02T13:00:00.000Z",
 			},
 			{ kind: "write-plan" },
 		]);
@@ -2102,6 +2124,12 @@ describe("the final Report and sign-off", () => {
 		]);
 	});
 
+	it("orders the final Report's sections as the spec lists them, found work before usage, the sign-off's own after the logged ones", () => {
+		const report = written(run(running, finalReport("2026-11-02T12:00:00.000Z", { leadCostUsd: 1.5 })));
+		const titles = report.sections.map((each) => each.title);
+		assert.deepEqual(titles.slice(titles.indexOf("Checkpoints")), ["Checkpoints", "Found work", "Proposed Playbook changes", "Worktrees", "Usage"]);
+	});
+
 	it("asks for sign-off and for each proposed Playbook change separately", () => {
 		const state = fold(asked);
 		assert.deepEqual(
@@ -2148,6 +2176,28 @@ describe("the final Report and sign-off", () => {
 		assert.deepEqual(result.state.ended, { how: "signed-off", at: "2026-11-02T12:10:00.000Z" });
 		assert.ok(result.state.teammates.every((teammate) => teammate.ended?.how === "stopped"));
 		assert.deepEqual(result.state.pending, []);
+	});
+
+	it("a sign-off and a Playbook change `approvals.jsonl` records but the log doesn't are finished after a restart, without recording or adopting again", () => {
+		const recorded = [
+			{ request: "r3", sha256: "e".repeat(64) },
+			{ request: "r2", sha256: "d".repeat(64) },
+		];
+		const result = run(asked, { kind: "recover", recorded, at: "2026-11-02T15:00:00.000Z" });
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(
+			result.actions.map((action) => action.kind),
+			["wake-lead", "stop-teammate", "stop-teammate", "end-effort", "wake-lead"],
+		);
+		assert.deepEqual(result.state.ended, { how: "signed-off", at: "2026-11-02T15:00:00.000Z" });
+		assert.deepEqual(result.state.pending, []);
+		assert.equal(fold([...asked, ...result.append]).ended?.how, "signed-off");
+
+		for (const stale of [[{ request: "r2", sha256: "f".repeat(64) }], [{ request: "r9", sha256: "d".repeat(64) }], []]) {
+			const none = run(asked, { kind: "recover", recorded: stale, at: "2026-11-02T15:00:00.000Z" });
+			assert.ok(none.ok);
+			assert.deepEqual([none.append, none.actions, none.state.pending.length], [[], [], 2]);
+		}
 	});
 
 	it("a send-back at sign-off wakes the Lead with the note, keeps the Teammates and drops the proposed changes", () => {
@@ -2534,6 +2584,7 @@ describe("usage limits", () => {
 		const lifted = tick(queued, RESET);
 		assert.deepEqual(lifted.append.map((line) => line.type), ["model-released"]);
 		assert.deepEqual(lifted.ok && lifted.state.holds, {});
+		assert.ok(lifted.ok && lifted.actions.some((action) => action.kind === "start-queued"), "the lifted hold drains the queue");
 		const drained = run([...queued, ...lifted.append], { kind: "drain", at: RESET });
 		assert.match(drained.ok ? (drained.reply ?? "") : "", /^Queued Task `review` started architect-2/);
 	});
@@ -2624,9 +2675,24 @@ describe("usage limits", () => {
 		assert.ok(cancel.actions.some((action) => action.kind === "end-effort" && action.how === "cancelled"));
 		assert.deepEqual(cancel.state.usageItems, []);
 
-		// A reset Claude Code didn't give asks too: nobody knows when it lifts.
+	});
+
+	it("waits out a limit Claude Code gave no reset for, and asks the human to stay or cancel only once the pause has held a day", () => {
+		const lines = running(running(planned, "rename"), "tests");
 		const unsaid = journalStep(lines, "dev-1", failure("dev-1", "You've hit your session limit"));
-		assert.deepEqual(unsaid.ok && unsaid.state.usageItems?.map((item) => [item.why, item.reset]), [["far-reset", undefined]]);
+		assert.ok(unsaid.ok, unsaid.ok ? "" : unsaid.refusal);
+		assert.equal(heldPauses(unsaid.state)[0]?.kind, "session");
+		assert.deepEqual(unsaid.state.usageItems ?? [], [], "the reset may be minutes away, so nothing asks to cancel yet");
+		const paused = [...lines, ...unsaid.append];
+
+		assert.deepEqual(tick(paused, "2026-11-03T12:09:00.000Z").append, [], "a day hasn't passed");
+		const dayOn = tick(paused, "2026-11-03T12:11:00.000Z");
+		assert.deepEqual(dayOn.ok && dayOn.state.usageItems?.map((item) => [item.why, item.reset]), [["far-reset", undefined]]);
+		assert.match(dayOn.ok ? usageText(dayOn.state.usageItems?.[0] as UsageItem) : "", /held for more than a day, and Claude Code didn't say when it lifts: stay paused, or cancel the Effort/);
+
+		const stay = run([...paused, ...dayOn.append], { kind: "answer-usage", id: "u1", choice: "stay", at: "2026-11-03T12:12:00.000Z" });
+		assert.ok(stay.ok);
+		assert.deepEqual(tick([...paused, ...dayOn.append, ...stay.append], "2026-11-03T13:00:00.000Z").append, [], "staying asks no more");
 	});
 
 	it("lifts the usage pause at its reset and sends continue ~2 min later to each still-idle limited Teammate, never while its auto-wait is armed", () => {
@@ -2683,6 +2749,11 @@ describe("usage limits", () => {
 		const woken = consent.actions.find((action) => action.kind === "wake-lead");
 		assert.match(woken?.kind === "wake-lead" ? woken.text : "", /Only the human confirms usage credits.*Never confirm them yourself/s);
 		const held = [...lines, ...consent.append];
+		const reported = run(held, { kind: "report", headline: "Held.", criteria: ["AC1"], modes: [], at: "2026-11-02T12:14:00.000Z" });
+		const written = reported.ok ? reported.actions.find((each) => each.kind === "write-report") : undefined;
+		assert.deepEqual(written?.kind === "write-report" ? written.report.sections.find((each) => each.title === "Waiting on you")?.lines : undefined, [
+			"`dev-1`: a usage-credit confirm waits in its terminal, which only you answer: attach to it from `/team pending` or `/team`",
+		]);
 		const docs = run(held, { kind: "handoff", slug: "docs", at: "2026-11-02T12:15:00.000Z" });
 		assert.equal(docs.ok && docs.state.queue[0]?.why, "held: usage-credit confirm");
 		// The human answered it in dev-1's terminal: its turn goes on, and the hold lifts.
@@ -2904,6 +2975,15 @@ describe("recovering after a restart", () => {
 		const handoff = run(accepted, { kind: "handoff", slug: "docs", at: "2026-11-02T14:00:00.000Z" });
 		assert.ok(handoff.ok, handoff.ok ? "" : handoff.refusal);
 		const intended: EffortLine[] = [...accepted, { type: "launch-intended", teammate: "dev-1", name: NAME, lines: handoff.append, at: "2026-11-02T14:00:00.000Z" }];
+
+		it("a Brief change `approvals.jsonl` records but the log doesn't is answered after a restart, with its refresh, and not promoted again", () => {
+			const result = recover(asked, { recorded: [{ request: "r2", sha256: "c".repeat(64), refresh: ["dev"] }] });
+
+			assert.deepEqual(result.append, [{ type: "approval-answered", id: "r2", answer: "approved", refresh: ["dev"], at: BACK }]);
+			assert.ok(!result.actions.some((action) => action.kind === "promote-brief-change"));
+			assert.match(wakes(result)[0]?.text ?? "", /approved the Brief change.*`dev-1` starts in a fresh session/);
+			assert.deepEqual(recover([...asked, ...result.append], { recorded: [{ request: "r2", sha256: "c".repeat(64), refresh: ["dev"] }] }).append, []);
+		});
 
 		it("that went in closes on its `teammate-relaunched` line, so a restart after it recovers nothing", () => {
 			const result = recover([...intended, ...handoff.append], { agents: [NAME], journaled: ["dev-1"] });

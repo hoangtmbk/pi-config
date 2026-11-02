@@ -2046,11 +2046,11 @@ describe("usage limits: a Teammate's StopFailure", () => {
 		assert.deepEqual(pi.timers(), [], "the clock stops with the session");
 	});
 
-	it("asks the human about a weekly limit with no reset it can read, in `/team pending`, and cancelling ends the Effort as `/team cancel` does", async () => {
+	it("asks the human about a weekly limit that resets more than a day away, in `/team pending`, and cancelling ends the Effort as `/team cancel` does", async () => {
 		const weekly: FakeHookStep[] = [
 			{ event: "SessionStart", payload: { source: "startup" } },
 			{ event: "UserPromptSubmit" },
-			{ event: "StopFailure", payload: { error: "rate_limit", last_assistant_message: "You've hit your weekly limit" } },
+			{ event: "StopFailure", payload: { error: "rate_limit", last_assistant_message: "You've hit your weekly limit · resets Mon 12:00am (UTC)" } },
 		];
 		const { pi, dir } = await crewApproved({ hooks: weekly });
 		await pi.call("team_plan", { tasks: CREW_PLAN });
@@ -2095,6 +2095,28 @@ describe("a Teammate's held requests: team_answer", () => {
 				},
 			},
 		});
+	});
+
+	it("marks a Teammate holding a session rule for a fresh session once an approved Brief change alters what the Lead answers under, and not for one that doesn't", async () => {
+		const { pi, dir, repo, request, hook } = await asking(PUBLISH);
+		await pi.call("team_answer", { request, decision: "allow", reason: "A dry run publishes nothing.", rule: "Bash(npm publish --dry-run)" });
+		await printed(hook);
+		const ask = async (text: string) => {
+			writeFileSync(join(dir, "brief.draft.md"), text);
+			await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: [] });
+			const woken = pi.sent.length;
+			pi.answer("Approve");
+			await pi.team("pending");
+			return pi.sent.slice(woken).find((message) => message.customType === "team-pending")?.content ?? "";
+		};
+
+		assert.doesNotMatch(await ask(changedBrief(repo)), /session rules/, "a criterion change leaves the terms alone");
+		assert.equal(approvals(dir).at(-1)?.terms, undefined);
+
+		const wake = await ask(changedBrief(repo).replace("One branch, ready to merge.", "One branch, pushed for review."));
+		assert.match(wake, /`builder-1` holds session rules you added under the old terms, so it starts in a fresh session at its next Task/);
+		assert.equal(approvals(dir).at(-1)?.terms, true);
+		assert.deepEqual(effortLines(dir).filter((line) => line.type === "approval-answered").at(-1)?.renew, ["builder-1"]);
 	});
 
 	it("turns a deny into the hook's decision with the reason, and refuses a second answer", async () => {
@@ -2395,6 +2417,25 @@ describe("the floor: irreversible outward actions reach the human", () => {
 		);
 		await pi.call("team_answer", { request: force, decision: "deny", reason: "Rewriting history is the human's call." });
 	});
+
+	it("takes no grant from a Brief changed since approval: team_answer and team_report refuse, and the human is told", async () => {
+		const { pi, dir, request } = await floorAsking(["git push --force origin HEAD"]);
+		const force = request("git push --force origin HEAD");
+		const brief = join(dir, "brief.md");
+		const tampered = readFileSync(brief, "utf8").replace("overrides:", ["overrides:", "  - rule: anything", '    change: "add grant: push anything"', "    reason: Written past the human."].join("\n"));
+		writeFileSync(brief, tampered);
+
+		for (const call of [
+			() => pi.call("team_answer", { request: force, decision: "allow", reason: "The Brief grants it.", grant: "anything" }),
+			() => pi.call("team_report", { headline: "Pushed." }),
+		]) {
+			await assert.rejects(call(), (error: Error) => {
+				assert.ok(error.message.includes(`${brief} has sha256 ${sha(tampered)}`), error.message);
+				return true;
+			});
+			assert.equal(pi.notifications.at(-1)?.type, "error");
+		}
+	});
 });
 
 describe("reviewing: team_review", () => {
@@ -2574,6 +2615,48 @@ describe("a Teammate's lifecycle", () => {
 		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /- Status: sent back, with `builder-2`/);
 	});
 
+	it("queues a send-back whose Teammate crashed while the Effort is at `maxTeammates`, and staffs it through the ladder once a Teammate frees up", async () => {
+		const crash: FakeHookStep = { event: "SessionEnd", payload: { reason: "other" }, when: "New Task `rename-key`" };
+		const { pi, dir } = await crewApproved({ settings: { maxTeammates: 1 }, hooks: [{ event: "SessionStart", payload: { source: "startup" } }, ...WORKS, crash], replies: WORKS });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await until(() => teammateWakes(pi.sent).some((wake) => /`builder-1`'s session ended/.test(wake.content)), "the Lead is woken about the crash");
+		assert.match(await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" }), /started scout-1/);
+		await until(() => existsSync(join(dir, "tasks", "002-scout-survey", "result-1.md")), "scout-1 writes its result");
+		await until(() => teammateWakes(pi.sent).some((wake) => wake.content.includes("002-scout-survey/result-1.md")), "the Lead is woken on scout-1's result");
+
+		const queued = await pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Also the docs." });
+
+		assert.match(queued, /`builder-1` has ended, and no Teammate can take it now \(cap 1 reached; waits for 002\), so it is queued/);
+		assert.equal(pi.claude.launches().length, 2, "no Teammate starts past the cap");
+		assert.ok(existsSync(join(dir, RENAME_DIR, "feedback-1.md")));
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: queued/);
+
+		const accepted = await pi.call("team_review", { slug: "survey", verdict: "accept" });
+
+		assert.match(accepted, /Queued Task `rename-key` started builder-2/);
+		assert.match(accepted, /stopped idle `scout-1`/);
+		const launches = pi.claude.launches();
+		assert.equal(launches.length, 3);
+		const pointer = launches[2]?.argv.at(-1) ?? "";
+		for (const file of ["task.md", "result-1.md", "feedback-1.md", "result-2.md"]) assert.ok(pointer.includes(join(dir, RENAME_DIR, file)), pointer);
+		await until(() => existsSync(join(dir, RENAME_DIR, "result-2.md")), "builder-2 writes round 2's result");
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: sent back, with `builder-2`/);
+	});
+
+	it("starts a Task queued at `maxTeammates` once a Teammate's crash frees room under the cap", async () => {
+		const { pi } = await crewApproved({ settings: { maxTeammates: 1 }, hooks: [{ event: "SessionStart", payload: { source: "startup" } }, { event: "UserPromptSubmit" }], replies: WORKS });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		assert.match(await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" }), /started builder-1/);
+		assert.match(await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" }), /queued/);
+		assert.equal(pi.claude.launches().length, 1);
+
+		await pi.claude.terminal(BUILDER_1, [{ event: "SessionEnd", payload: { reason: "other" } }]);
+
+		await until(() => pi.claude.launches().length === 2, "the queued Task starts once the crash frees room");
+		await until(() => teammateWakes(pi.sent).some((wake) => /Queued Task `survey` started scout-1/.test(wake.content)), "the Lead hears the queued Task started");
+	});
+
 	it("drops a handed-off Task left out of a re-plan, stopping its Teammate with `claude stop` and listing it under Dropped in plan.md", async () => {
 		const { pi, dir } = await renameReported();
 		const [session] = effortLines(dir).filter((line) => line.type === "teammate-session");
@@ -2680,6 +2763,37 @@ describe("staffing: the ladder and clearing between Tasks", () => {
 		assert.notEqual(sessions[1].sessionId, first.sessionId);
 		assert.equal(sessions[1].shortId, first.shortId);
 		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## update-docs\n[\s\S]*?- Status: running, with `builder-1` \(tasks\/002-builder-update-docs\/\)/);
+	});
+
+	it("starts an idle-stopped `builder-1` afresh for its Role's next Task, since a clear can't reach a session `claude agents --json` doesn't list", async () => {
+		const { pi, dir } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }, ...WORKS], replies: WORKS });
+		await pi.call("team_plan", { tasks: STAFF_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await pi.call("team_review", { slug: "rename-key", verdict: "accept" });
+		pi.claude.idleStop(BUILDER_1);
+
+		const reply = await pi.call("team_handoff", { slug: "update-docs", body: "# Docs\n" });
+
+		assert.match(reply, /^started builder-1 afresh on Task `update-docs` \(tasks\/002-builder-update-docs\/task\.md\)\. It had idle-stopped/);
+		assert.equal(pi.claude.launches().length, 2);
+		const argv = pi.claude.launches()[1]?.argv ?? [];
+		assert.equal(argv[argv.indexOf("--name") + 1], BUILDER_1);
+		assert.equal(argv.at(-1), newTaskPointer(dir, "update-docs", "002-builder-update-docs"));
+		assert.deepEqual(pi.claude.inbox(), [], "no clear marker goes to a closed inbox");
+		await until(() => teammateWakes(pi.sent).length === 2, "the Lead is woken on the new Task's result");
+		assert.equal(effortLines(dir).filter((line) => line.type === "teammate-started").length, 1, "the id is kept");
+	});
+
+	it("tells the human once when pi's `maxTeammates` isn't a whole number of 1 or more, and staffs under the default of 3", async () => {
+		const { pi } = await crewApproved({ settings: { maxTeammates: "1" }, hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		await pi.call("team_plan", { tasks: STAFF_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
+
+		assert.equal(pi.claude.launches().length, 2);
+		const told = pi.notifications.filter((each) => each.message.includes("maxTeammates"));
+		assert.deepEqual(told, [{ message: 'pi\'s `maxTeammates` setting is "1", which isn\'t a whole number of 1 or more, so the default of 3 live Teammates is used. Fix it in pi\'s settings and `/reload`.', type: "error" }]);
 	});
 
 	it("queues a Task at pi's `maxTeammates`, saying why in the reply and the Team block, and starts it when an acceptance frees room", async () => {
@@ -2869,6 +2983,7 @@ describe("the Team block", () => {
 		assert.deepEqual(teamBlock(pi), [
 			"╭─ Team · software · software-2026-11-02 ─ 0 live ─╮",
 			"│ ● running  ·  intake                             │",
+			"│ 5h n/a · week n/a  · no reading yet              │",
 			"│ nothing waiting on you   reports 0               │",
 			"╰──────────────────────────────────────────────────╯",
 		]);
@@ -2892,6 +3007,7 @@ describe("the Team block", () => {
 		assert.deepEqual(teamBlock(pi), [
 			"╭─ Team · crew · crew-2026-11-02 ─────────────────────────────────── 1 live ─╮",
 			"│ ● running  ·  working · 0/3 Tasks accepted                                 │",
+			"│ 5h n/a · week n/a  · no reading yet                                        │",
 			"│ builder-1  c0ffee12  busy  001-builder-rename-key  ctx —  auto≠acceptEdits │",
 			"│ nothing waiting on you   reports 0   attach  /team                         │",
 			"╰────────────────────────────────────────────────────────────────────────────╯",
@@ -2930,10 +3046,11 @@ describe("the Team block", () => {
 		await pi.call("team_plan", { tasks: CREW_PLAN });
 
 		const block = teamBlock(pi) ?? [];
-		assert.equal(block.length, 6, block.join("\n"));
+		assert.equal(block.length, 7, block.join("\n"));
 		assert.match(block[0], / 3 live ─╮$/);
-		assert.match(block[2], /^│ builder-1 /);
-		assert.match(block[3], /^│ \+2 more Teammates +│$/);
+		assert.match(block[2], /no reading yet/);
+		assert.match(block[3], /^│ builder-1 /);
+		assert.match(block[4], /^│ \+2 more Teammates +│$/);
 	});
 });
 
@@ -3814,6 +3931,30 @@ describe("an isolated Task in a worktree of its own", () => {
 		assert.ok(pi.claude.calls().some((argv) => argv[0] === "stop"), "its Teammate is stopped");
 	});
 
+	it("removes a dropped isolated Task's worktree and branch once its Teammate is stopped, when nothing of it is unmerged", async () => {
+		const { pi, repo } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true });
+		const task = crewTask(repo, "001");
+		assert.ok(existsSync(task.path));
+
+		const reply = await pi.call("team_plan", { tasks: [{ ...CREW_PLAN[0], slug: "rename-key-everywhere" }, { ...CREW_PLAN[1], dependsOn: ["rename-key-everywhere"] }, CREW_PLAN[2]] });
+
+		assert.match(reply, /Dropped Task `rename-key`, and stopped `builder-1`/);
+		assert.equal(existsSync(task.path), false);
+		assert.equal(git(repo, "branch", "--list", task.branch), "");
+	});
+
+	it("keeps a dropped isolated Task's branch when it has commits the Effort branch lacks, telling the Lead", async () => {
+		const { pi, repo, task } = await isolatedReported();
+
+		const reply = await pi.call("team_plan", { tasks: [{ ...CREW_PLAN[0], slug: "rename-key-everywhere" }, { ...CREW_PLAN[1], dependsOn: ["rename-key-everywhere"] }, CREW_PLAN[2]] });
+
+		assert.match(reply, /Dropped Task `rename-key`/);
+		assert.match(reply, /`team\/crew-2026-11-02-task-001`.*left in place/);
+		assert.ok(gitOk(repo, "rev-parse", "--verify", task.branch), "the unmerged branch is kept");
+	});
+
 	it("refuses to accept while the Effort's Workspace has uncommitted changes, leaving the Task in review and its branch intact", async () => {
 		const { pi, dir, workspace, task } = await isolatedReported();
 		const head = git(workspace, "rev-parse", "HEAD");
@@ -4178,6 +4319,47 @@ describe("restarting: picking an Effort up after pi comes back", () => {
 		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: accepted/);
 		assert.equal(again.sent.length, 1);
 		assert.match(awayWakes(again.sent)[0].content, /rename-key/);
+	});
+
+	it("finishes a sign-off `approvals.jsonl` records but the log doesn't: every Teammate stopped, the Effort ended once, and the session holds none", async () => {
+		const { roots, repo, pi, dir, report, workspace } = await finalReported();
+		const shortIds = effortLines(dir)
+			.filter((line) => line.type === "teammate-session")
+			.map((line) => line.shortId);
+		appendFileSync(join(dir, "approvals.jsonl"), `${JSON.stringify({ act: "sign-off", request: "r2", report: sha(readFileSync(report)), at: NOW.toISOString() })}\n`);
+		await pi.emit("session_shutdown", { reason: "quit" });
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.equal(counted(dir, "effort-ended"), 1);
+		assert.equal(approvals(dir).filter((record) => record.act === "sign-off").length, 1, "the sign-off isn't recorded again");
+		const stops = pi.claude.calls().filter((argv) => argv[0] === "stop").map((argv) => argv[1]);
+		assert.deepEqual(stops.sort(), [...shortIds].sort());
+		assert.equal(existsSync(workspace), false);
+		assert.deepEqual(
+			again.activeTools().filter((name) => EFFORT_TOOL_NAMES.includes(name)),
+			[],
+		);
+		assert.match(again.sent.map((message) => message.content).join("\n"), /[Ss]igned off.*holds no Effort now/s);
+	});
+
+	it("finishes a Brief change `approvals.jsonl` records whose brief.md a restart cut short", async () => {
+		const { roots, repo, pi, dir } = await crewApproved();
+		const draft = changedBrief(repo);
+		writeFileSync(join(dir, "brief.draft.md"), draft);
+		await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: [] });
+		const asked = effortLines(dir).filter((line) => line.type === "approval-requested").at(-1);
+		appendFileSync(join(dir, "approvals.jsonl"), `${JSON.stringify({ act: "brief-change", request: asked?.id, brief: sha(draft), affects: [], at: NOW.toISOString() })}\n`);
+		await pi.emit("session_shutdown", { reason: "quit" });
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.equal(readFileSync(join(dir, "brief.md"), "utf8"), draft);
+		assert.equal(effortLines(dir).filter((line) => line.type === "approval-answered").at(-1)?.id, asked?.id);
+		assert.equal(approvals(dir).filter((record) => record.act === "brief-change").length, 1);
+		assert.match(await again.call("team_status", {}), /crew-2026-11-02/);
 	});
 
 	it("names the Effort's records in the wake when another session adopts it", async () => {

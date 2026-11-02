@@ -41,6 +41,15 @@ export function restaffPointer(slug: string, taskDir: string, round: number): st
 	].join(" ");
 }
 
+/**
+ * The pointer a Teammate's launch carries for round `round` of a Task: the
+ * handoff's for the first, and for a later one, the rounds so far, since a
+ * Teammate launched on a sent-back Task has none of them in its context.
+ */
+export function launchPointer(slug: string, taskDir: string, round: number): string {
+	return round > 1 ? restaffPointer(slug, taskDir, round - 1) : handoffPointer(slug, taskDir, 1);
+}
+
 /** Who the preamble is for, and where the files it points at are. */
 export interface PreambleFor {
 	teammateId: string;
@@ -71,4 +80,20 @@ export function teammatePrompt(preamble: PreambleFor, rolePrompt: string): strin
 		"",
 		rolePrompt,
 	].join("\n");
+}
+
+/** The pointer of round `round` of a Task, sent again when it never landed: the handoff's for round 1, else the send-back's of the round before. */
+export function roundPointer(slug: string, taskDir: string, round: number): string {
+	return round === 1 ? handoffPointer(slug, taskDir, 1) : sendBackPointer(slug, taskDir, round - 1);
+}
+
+/** Every pointer the Effort sends Teammate `id` for its Tasks under `tasksDir`, over every round so far. */
+export function taskPointers(tasksDir: string, tasks: Readonly<Record<string, { teammate?: string; folder: string; round: number }>>, id: string): string[] {
+	const sent: string[] = [];
+	for (const [slug, task] of Object.entries(tasks)) {
+		if (task.teammate !== id) continue;
+		const dir = join(tasksDir, task.folder);
+		for (let round = 1; round <= task.round; round++) sent.push(handoffPointer(slug, dir, round), sendBackPointer(slug, dir, round), restaffPointer(slug, dir, round));
+	}
+	return sent;
 }
