@@ -16,7 +16,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync,
 import { connect } from "node:net";
 import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Inbox } from "./core.ts";
+import type { Inbox, UsageReading, UsageWindow } from "./core.ts";
 import type { PermissionMode, Role } from "./definitions.ts";
 
 /** The Claude Code version this extension was built and tried against. */
@@ -295,6 +295,153 @@ export function teammateArgs(launch: TeammateLaunch): string[] {
  */
 export const HOOK_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "hook.mjs");
 
+/**
+ * Every Teammate's status line command: it runs the human's own and keeps the
+ * JSON Claude Code gave it as the Teammate's `statusline.json`, the freshest
+ * usage reading there is.
+ */
+export const STATUSLINE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "statusline.mjs");
+
+/**
+ * The status line command Claude Code would run for the human in `workspace`:
+ * the first `statusLine.command` in its local settings, its project settings,
+ * then the human's own `<claudeDir>/settings.json`. Only read, never written.
+ * A file that is missing or isn't JSON is skipped.
+ */
+export function humanStatusLine(workspace: string, claudeDir: string): string | undefined {
+	for (const file of [join(workspace, ".claude", "settings.local.json"), join(workspace, ".claude", "settings.json"), join(claudeDir, "settings.json")]) {
+		let settings: unknown;
+		try {
+			settings = JSON.parse(readFileSync(file, "utf8"));
+		} catch {
+			continue;
+		}
+		const statusLine = (settings as { statusLine?: { command?: unknown } } | null)?.statusLine;
+		if (typeof statusLine?.command === "string" && statusLine.command.trim() !== "") return statusLine.command;
+	}
+	return undefined;
+}
+
+/** A number, or undefined for anything else, `null` included: a window not given is never 0. */
+function numberOr(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function objectOr(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+/** A window from its percent and reset, or undefined when the percent isn't given. */
+function usageWindow(percent: unknown, resetsAt: string | undefined): UsageWindow | undefined {
+	const used = numberOr(percent);
+	return used === undefined ? undefined : { percent: used, ...(resetsAt === undefined ? {} : { resetsAt }) };
+}
+
+/** Only the keys whose values are given. */
+function given<T extends object>(value: T): T {
+	return Object.fromEntries(Object.entries(value).filter(([, each]) => each !== undefined)) as T;
+}
+
+/**
+ * A Teammate's `statusline.json`, as Claude Code gave it to the status line,
+ * read `at` its modification time; undefined when it isn't a JSON object.
+ * `rate_limits` is absent with an API key (and before the first call), and
+ * `resets_at` there is in epoch seconds.
+ */
+export function statusLineReading(text: string, teammate: string, at: string): UsageReading | undefined {
+	let json: Record<string, unknown> | undefined;
+	try {
+		json = objectOr(JSON.parse(text));
+	} catch {
+		return undefined;
+	}
+	if (json === undefined) return undefined;
+	const limits = objectOr(json.rate_limits);
+	const window = (name: string): UsageWindow | undefined => {
+		const each = objectOr(limits?.[name]);
+		const resets = numberOr(each?.resets_at);
+		return usageWindow(each?.used_percentage, resets === undefined ? undefined : new Date(resets * 1000).toISOString());
+	};
+	const context = objectOr(json.context_window);
+	const input = numberOr(context?.total_input_tokens);
+	const output = numberOr(context?.total_output_tokens);
+	return given<UsageReading>({
+		source: "status-line",
+		at,
+		teammate,
+		sessionId: typeof json.session_id === "string" ? json.session_id : undefined,
+		rateLimits: limits !== undefined,
+		fiveHour: window("five_hour"),
+		sevenDay: window("seven_day"),
+		tokens: input === undefined && output === undefined ? undefined : (input ?? 0) + (output ?? 0),
+		costUsd: numberOr(objectOr(json.cost)?.total_cost_usd),
+		ctx: numberOr(context?.used_percentage),
+	});
+}
+
+/** A `claude -p` that loads in a few seconds; one that doesn't answer is given up on. */
+const GET_USAGE_TIMEOUT_MS = 15_000;
+
+/**
+ * The account's usage windows from the undocumented `get_usage` control
+ * request: `claude -p` over stream-json, sent no prompt, so it spends no
+ * usage. Read `at` when it answers. The reply is read leniently, since the
+ * request is undocumented: a window it doesn't give is left out.
+ */
+export function getUsage(claudePath: string, at: string, timeoutMs = GET_USAGE_TIMEOUT_MS): Promise<UsageReading | { error: string }> {
+	const id = `team-usage-${Math.random().toString(36).slice(2, 10)}`;
+	return new Promise((resolve) => {
+		let settled = false;
+		let buffered = "";
+		const child = spawn(claudePath, ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"], { stdio: ["pipe", "pipe", "ignore"] });
+		const finish = (result: UsageReading | { error: string }): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			child.stdin.end();
+			if (child.exitCode === null) child.kill();
+			resolve(result);
+		};
+		const timer = setTimeout(() => finish({ error: `get_usage: \`${claudePath} -p\` didn't answer in ${timeoutMs / 1000}s` }), timeoutMs);
+		child.on("error", (error) => finish({ error: `get_usage: could not run \`${claudePath}\`: ${error.message}` }));
+		child.on("close", () => finish({ error: `get_usage: \`${claudePath} -p\` ended without answering` }));
+		child.stdin.on("error", () => {});
+		child.stdout.setEncoding("utf8");
+		child.stdout.on("data", (chunk: string) => {
+			buffered += chunk;
+			const lines = buffered.split("\n");
+			buffered = lines.pop() ?? "";
+			for (const line of lines) {
+				let message: Record<string, unknown> | undefined;
+				try {
+					message = objectOr(JSON.parse(line));
+				} catch {
+					continue;
+				}
+				const response = objectOr(message?.response);
+				if (message?.type !== "control_response" || response?.request_id !== id) continue;
+				if (response.subtype !== "success") {
+					finish({ error: `get_usage failed: ${typeof response.error === "string" ? response.error : "no reason given"}` });
+					return;
+				}
+				finish(usageReply(objectOr(response.response) ?? {}, at));
+				return;
+			}
+		});
+		child.stdin.write(`${JSON.stringify({ type: "control_request", request_id: id, request: { subtype: "get_usage", skip_behaviors: true } })}\n`);
+	});
+}
+
+/** A `get_usage` reply's windows: `utilization` 0 to 100, `resets_at` ISO, either `null` when not known. */
+function usageReply(reply: Record<string, unknown>, at: string): UsageReading {
+	const limits = objectOr(reply.rate_limits);
+	const window = (name: string): UsageWindow | undefined => {
+		const each = objectOr(limits?.[name]);
+		return usageWindow(each?.utilization, typeof each?.resets_at === "string" ? each.resets_at : undefined);
+	};
+	return given<UsageReading>({ source: "get-usage", at, rateLimits: limits !== undefined && reply.rate_limits_available !== false, fiveHour: window("five_hour"), sevenDay: window("seven_day") });
+}
+
 /** The hook events a Teammate reports, each to {@link HOOK_SCRIPT}. */
 const HOOK_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure", "PermissionRequest", "PermissionDenied", "Notification", "PostToolUse", "PreToolUse"];
 
@@ -318,13 +465,17 @@ export interface SettingsFrom {
 	 * argument and judges deletes against it.
 	 */
 	workspace?: string;
+	/** The human's own status line command ({@link humanStatusLine}), which the Teammate's status line runs first. */
+	humanStatusLine?: string;
 }
 
 /**
  * A Teammate's `--settings`. Claude Code adds these to the human's own
  * settings, merging `permissions` and `hooks`, so they hold only keys that
  * add: the hooks, the permission rules and `crossSessionInbound`, which lets
- * the Lead's messages in.
+ * the Lead's messages in. The one key that replaces is `statusLine.command`
+ * (the rest of the human's `statusLine` still applies), and its command,
+ * {@link STATUSLINE_SCRIPT}, runs the human's own and prints what it prints.
  */
 export function teammateSettings(from: SettingsFrom): Record<string, unknown> {
 	const command = [process.execPath, HOOK_SCRIPT, from.effortDir, from.teammateId].map(shellQuote).join(" ");
@@ -345,6 +496,10 @@ export function teammateSettings(from: SettingsFrom): Record<string, unknown> {
 		},
 		crossSessionInbound: "accept",
 		hooks,
+		statusLine: {
+			type: "command",
+			command: [process.execPath, STATUSLINE_SCRIPT, from.effortDir, from.teammateId, ...(from.humanStatusLine === undefined ? [] : [from.humanStatusLine])].map(shellQuote).join(" "),
+		},
 	};
 }
 

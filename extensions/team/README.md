@@ -163,6 +163,17 @@ is also read when the Lead's run settles, so a lost doorbell loses nothing.
 
 Wakes that come while the Lead is busy are sent together as one follow-up once its run settles.
 
+### Usage
+
+Every Teammate's status line runs `statusline.mjs`, which runs the human's own status line
+command (local, then project, then user settings, as Claude Code picks it) and prints its output
+unchanged, then writes the JSON it got to `teammates/<id>/statusline.json`. While the Team block
+shows, the extension reads those files once a minute: the block's usage line shows the freshest
+reading, where it came from and how old it is, and each row's `ctx` comes from them. With no
+status line under a minute old it asks Claude Code's undocumented `get_usage` control request
+instead, at most once a minute. Each Report's Usage section has the freshest reading and its change
+since the Effort began, each Role's tokens and API-price estimate summed across its sessions, and
+the Lead's own cost as pi reports it.
 ### Held requests
 
 A Teammate's permission prompt, an `AskUserQuestion` included, is held by its `PermissionRequest`
