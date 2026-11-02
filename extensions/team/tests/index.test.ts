@@ -2097,6 +2097,28 @@ describe("a Teammate's held requests: team_answer", () => {
 		});
 	});
 
+	it("marks a Teammate holding a session rule for a fresh session once an approved Brief change alters what the Lead answers under, and not for one that doesn't", async () => {
+		const { pi, dir, repo, request, hook } = await asking(PUBLISH);
+		await pi.call("team_answer", { request, decision: "allow", reason: "A dry run publishes nothing.", rule: "Bash(npm publish --dry-run)" });
+		await printed(hook);
+		const ask = async (text: string) => {
+			writeFileSync(join(dir, "brief.draft.md"), text);
+			await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: [] });
+			const woken = pi.sent.length;
+			pi.answer("Approve");
+			await pi.team("pending");
+			return pi.sent.slice(woken).find((message) => message.customType === "team-pending")?.content ?? "";
+		};
+
+		assert.doesNotMatch(await ask(changedBrief(repo)), /session rules/, "a criterion change leaves the terms alone");
+		assert.equal(approvals(dir).at(-1)?.terms, undefined);
+
+		const wake = await ask(changedBrief(repo).replace("One branch, ready to merge.", "One branch, pushed for review."));
+		assert.match(wake, /`builder-1` holds session rules you added under the old terms, so it starts in a fresh session at its next Task/);
+		assert.equal(approvals(dir).at(-1)?.terms, true);
+		assert.deepEqual(effortLines(dir).filter((line) => line.type === "approval-answered").at(-1)?.renew, ["builder-1"]);
+	});
+
 	it("turns a deny into the hook's decision with the reason, and refuses a second answer", async () => {
 		const { pi, request, hook } = await asking(PUBLISH);
 

@@ -319,6 +319,8 @@ export type EffortLine =
 			workspace?: Workspace;
 			/** For an approved Brief change, the Roles whose launch options it alters: their Teammates get a fresh session at their next Task boundary. */
 			refresh?: string[];
+			/** For an approved Brief change that alters what the Lead answers under, the Teammates holding session rules added under the old terms: each gets a fresh session at its next Task boundary. */
+			renew?: string[];
 			at: string;
 	  }
 	/** The Lead wrote its whole Task list, replacing any before it. */
@@ -676,7 +678,7 @@ export type EffortInput =
 	 * for an approved Brief, and for an approved Brief change the Roles whose
 	 * launch options it alters.
 	 */
-	| { kind: "answer"; id: string; answer: Answer; note?: string; workspace?: Workspace; refresh?: string[]; at: string }
+	| { kind: "answer"; id: string; answer: Answer; note?: string; workspace?: Workspace; refresh?: string[]; terms?: boolean; at: string }
 	/** A Lead tool that would start a Teammate. */
 	| { kind: "start-teammate"; tool: "team_plan" | "team_handoff" | "team_review" }
 	/**
@@ -808,7 +810,7 @@ export type EffortInput =
 			 * change (with the Roles it refreshed), a Playbook change or a
 			 * sign-off, by request id and the sha of what the human approved.
 			 */
-			recorded?: readonly { request: string; sha256: string; refresh?: readonly string[] }[];
+			recorded?: readonly { request: string; sha256: string; refresh?: readonly string[]; terms?: boolean }[];
 			at: string;
 	  }
 	/**
@@ -961,13 +963,16 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			if (line.answer === "approved" && answered?.checkpoint === BRIEF_CHANGE) {
 				const { briefHold: _briefHold, ...rest } = state;
 				const refresh = line.refresh ?? [];
+				const renew = line.renew ?? [];
 				return {
 					...rest,
 					pending,
 					asked,
 					brief: { sha256: answered.sha256, approvedAt: line.at, request: answered.id },
-					// Each live Teammate of a Role whose launch options changed gets a fresh session at its next Task boundary.
-					teammates: state.teammates.map((teammate) => (refresh.includes(teammate.role) && teammate.retiredAt === undefined && !teammate.ended ? { ...teammate, freshDue: true } : teammate)),
+					// Each live Teammate of a Role whose launch options changed, or holding session rules the change outdates, gets a fresh session at its next Task boundary.
+					teammates: state.teammates.map((teammate) =>
+						(refresh.includes(teammate.role) || renew.includes(teammate.id)) && teammate.retiredAt === undefined && !teammate.ended ? { ...teammate, freshDue: true } : teammate,
+					),
 				};
 			}
 			return { ...state, pending, asked };
@@ -1884,18 +1889,28 @@ function answer(state: EffortState, input: Extract<EffortInput, { kind: "answer"
  * A Brief change. Approving it makes the snapshot the Brief, releases the
  * Tasks it held, and marks each live Teammate of a Role in `refresh` (whose
  * launch options it changed) for a fresh session at its next Task boundary.
+ * When `terms` says the change alters what the Lead answers under (grants,
+ * Delivery, skipped escalates), each other live Teammate holding session rules
+ * the Lead added gets the same fresh start, so no rule outlives its terms.
  * A send-back wakes the Lead with the note and keeps the Tasks held, since
  * the change they wait on is still unsettled.
  */
 function answerBriefChange(state: EffortState, item: PendingApproval, input: Extract<EffortInput, { kind: "answer" }>): Step {
 	const holds = item.affects ?? [];
 	const refresh = input.answer === "approved" ? (input.refresh ?? []) : [];
+	const renew =
+		input.answer === "approved" && input.terms
+			? live(state)
+					.filter((teammate) => !refresh.includes(teammate.role) && (teammate.rules?.length ?? 0) > 0)
+					.map((teammate) => teammate.id)
+			: [];
 	const line: EffortLine = {
 		type: "approval-answered",
 		id: item.id,
 		answer: input.answer,
 		...(input.note === undefined ? {} : { note: input.note }),
 		...(refresh.length > 0 ? { refresh: [...refresh] } : {}),
+		...(renew.length > 0 ? { renew } : {}),
 		at: input.at,
 	};
 	const tasks = holds.length === 0 ? undefined : `Task${holds.length === 1 ? "" : "s"} ${quoted(holds)}`;
@@ -1910,6 +1925,10 @@ function answerBriefChange(state: EffortState, item: PendingApproval, input: Ext
 							? "their next Teammates start with the new ones"
 							: `${quoted(renewed)} ${renewed.length === 1 ? "starts" : "each start"} in a fresh session at its next Task, never mid-Task, keeping ${renewed.length === 1 ? "its" : "their"} id`
 					}.`;
+		const ruled =
+			renew.length === 0
+				? undefined
+				: `${quoted(renew)} ${renew.length === 1 ? "holds" : "hold"} session rules you added under the old terms, so ${renew.length === 1 ? "it starts" : "each starts"} in a fresh session at its next Task, never mid-Task, keeping ${renew.length === 1 ? "its" : "their"} id.`;
 		return took(state, [line], [
 			{ kind: "promote-brief-change", approval: item, at: input.at },
 			{
@@ -1918,6 +1937,7 @@ function answerBriefChange(state: EffortState, item: PendingApproval, input: Ext
 					`The human approved the Brief change of Effort \`${state.effortId}\` (request \`${item.id}\`, sha256 ${item.sha256}). It is now brief.md in the Effort's directory.`,
 					tasks ? `${tasks} ${one ? "is" : "are"} released: a queued one starts by itself.` : undefined,
 					fresh,
+					ruled,
 				]
 					.filter((part) => part !== undefined)
 					.join(" "),
@@ -3266,7 +3286,8 @@ function recover(state: EffortState, input: Extract<EffortInput, { kind: "recove
 		const item = next.pending.find((pending) => RECORDED.has(pending.checkpoint) && pending.id === record.request && pending.sha256 === record.sha256);
 		if (!item) continue;
 		const refresh = item.checkpoint === BRIEF_CHANGE && record.refresh && record.refresh.length > 0 ? { refresh: [...record.refresh] } : {};
-		const answered = answer(next, { kind: "answer", id: item.id, answer: "approved", ...refresh, at: input.at });
+		const terms = item.checkpoint === BRIEF_CHANGE && record.terms ? { terms: true } : {};
+		const answered = answer(next, { kind: "answer", id: item.id, answer: "approved", ...refresh, ...terms, at: input.at });
 		// The record is written ahead of the line: brief.md (which the shell finishes first), the adopted Playbook or the sign-off are on disk already.
 		add(answered.ok ? { ...answered, actions: answered.actions.filter((action) => !ON_RECORD.has(action.kind)) } : answered);
 	}

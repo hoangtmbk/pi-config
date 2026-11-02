@@ -70,6 +70,7 @@ import {
 	type Approved,
 	briefChangeProblems,
 	changedLaunch,
+	changedTerms,
 	createEffort,
 	type EffortPaths,
 	effortPaths,
@@ -1615,13 +1616,14 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		}
 		const at = now().toISOString();
 		const refresh = picked.answer === "approved" ? changedLaunch(current, item.snapshot) : [];
-		const result = step(state, { kind: "answer", id: item.id, ...picked, ...(refresh.length > 0 ? { refresh } : {}), at });
+		const terms = picked.answer === "approved" && changedTerms(current, item.snapshot);
+		const result = step(state, { kind: "answer", id: item.id, ...picked, ...(refresh.length > 0 ? { refresh } : {}), ...(terms ? { terms } : {}), at });
 		if (!result.ok) {
 			ctx.ui.notify(result.refusal, "error");
 			return;
 		}
 		for (const action of result.actions) {
-			if (action.kind === "promote-brief-change") promoteBriefChange(held.paths, { approval: action.approval, refresh, at });
+			if (action.kind === "promote-brief-change") promoteBriefChange(held.paths, { approval: action.approval, refresh, terms, at });
 		}
 		appendLines(held.paths, result.append);
 		if (picked.answer === "approved") ctx.ui.notify(`Approved the Brief change of Effort \`${state.effortId}\`: ${held.paths.brief}, sha256 ${item.sha256}.`, "info");

@@ -1017,6 +1017,27 @@ describe("clearing between Tasks", () => {
 		assert.ok(result.ok, result.ok ? "" : result.refusal);
 		assert.match(result.reply ?? "", /^reused dev-1 on Task `docs`/);
 	});
+
+	it("starts afresh at its next Task a Teammate holding a session rule once an approved Brief change alters what the Lead answers under; one without a rule is cleared as before", () => {
+		const ruled: EffortLine = { type: "request-answered", teammate: "dev-1", request: "p1", task: "rename", decision: { behavior: "allow" }, rule: "Bash(npm test:*)", at: "2026-11-02T12:05:00.000Z" };
+		const done_ = applied([...running, ruled], hook(2, "Stop", { session_id: FIRST }, true));
+		const ask: EffortInput = { kind: "request-approval", checkpoint: "brief-change", path: "/agent/team/efforts/software-2026-11-02/brief.draft.md", sha256: "c".repeat(64), snapshot: "---\n---\n", affects: [], at: "2026-11-02T12:10:00.000Z" };
+		const asked = applied(done_, ask);
+
+		const answered = run(asked, { kind: "answer", id: "r2", answer: "approved", terms: true, at: "2026-11-02T12:11:00.000Z" });
+		assert.ok(answered.ok, answered.ok ? "" : answered.refusal);
+		const wake = answered.actions.find((action) => action.kind === "wake-lead");
+		assert.match(wake?.kind === "wake-lead" ? wake.text : "", /`dev-1` holds session rules .* fresh session at its next Task/);
+		const result = run(applied([...asked, ...answered.append], review("accept")), { kind: "handoff", slug: "docs", at: "2026-11-02T14:00:00.000Z" });
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.match(result.reply ?? "", /^started dev-1 afresh on Task `docs`/);
+
+		const unruled = applied(applied(running, hook(2, "Stop", { session_id: FIRST }, true)), ask);
+		const plain = run(unruled, { kind: "answer", id: "r2", answer: "approved", terms: true, at: "2026-11-02T12:11:00.000Z" });
+		assert.ok(plain.ok);
+		const next = run(applied([...unruled, ...plain.append], review("accept")), { kind: "handoff", slug: "docs", at: "2026-11-02T14:00:00.000Z" });
+		assert.match(next.ok ? (next.reply ?? "") : "", /^reused dev-1 on Task `docs`/);
+	});
 });
 
 describe("a Teammate's held requests", () => {

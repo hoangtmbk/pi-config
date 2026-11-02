@@ -133,6 +133,8 @@ export interface BriefChangeRecord {
 	affects: string[];
 	/** The Roles whose launch options it changed, whose Teammates start afresh at their next Task. */
 	refresh?: string[];
+	/** Set when it changed what the Lead answers under, so Teammates holding session rules start afresh at their next Task. */
+	terms?: true;
 	at: string;
 }
 
@@ -155,7 +157,7 @@ export interface CheckpointRecord {
  * approval, which the change was checked against. The record goes first, so
  * a restart in between finds it and finishes the write (`recordedApprovals`).
  */
-export function promoteBriefChange(paths: EffortPaths, promotion: { approval: PendingApproval; refresh?: readonly string[]; at: string }): BriefChangeRecord {
+export function promoteBriefChange(paths: EffortPaths, promotion: { approval: PendingApproval; refresh?: readonly string[]; terms?: boolean; at: string }): BriefChangeRecord {
 	const refresh = promotion.refresh ?? [];
 	const record: BriefChangeRecord = {
 		act: "brief-change",
@@ -163,6 +165,7 @@ export function promoteBriefChange(paths: EffortPaths, promotion: { approval: Pe
 		brief: sha256(promotion.approval.snapshot),
 		affects: [...(promotion.approval.affects ?? [])],
 		...(refresh.length > 0 ? { refresh: [...refresh] } : {}),
+		...(promotion.terms ? { terms: true as const } : {}),
 		at: promotion.at,
 	};
 	recordApproval(paths, record);
@@ -178,7 +181,7 @@ export function promoteBriefChange(paths: EffortPaths, promotion: { approval: Pe
  */
 export function recordedApprovals(paths: EffortPaths, state: EffortState): {
 	promoted: { request: string; brief: string; workspace?: Workspace }[];
-	recorded: { request: string; sha256: string; refresh?: string[] }[];
+	recorded: { request: string; sha256: string; refresh?: string[]; terms?: true }[];
 } {
 	const records = readApprovals(paths);
 	const promoted = records.flatMap((record) => (record.act === "brief" ? [{ request: record.request, brief: record.brief, ...(record.workspace === undefined ? {} : { workspace: record.workspace }) }] : []));
@@ -186,7 +189,7 @@ export function recordedApprovals(paths: EffortPaths, state: EffortState): {
 		if (record.act === "brief-change") {
 			const item = state.pending.find((pending) => pending.id === record.request && sha256(pending.snapshot) === record.brief);
 			if (item && (!existsSync(paths.brief) || sha256(readFileSync(paths.brief)) !== record.brief)) writeFileSync(paths.brief, item.snapshot);
-			return [{ request: record.request, sha256: item?.sha256 ?? record.brief, ...(record.refresh ? { refresh: record.refresh } : {}) }];
+			return [{ request: record.request, sha256: item?.sha256 ?? record.brief, ...(record.refresh ? { refresh: record.refresh } : {}), ...(record.terms ? { terms: record.terms } : {}) }];
 		}
 		if (record.act === "playbook-change") return [{ request: record.request, sha256: record.sha256 }];
 		if (record.act === "sign-off") return [{ request: record.request, sha256: record.report }];
@@ -347,6 +350,16 @@ export function briefChangeProblems(text: string, current: Approved, effort: { t
 export function changedLaunch(current: Approved, after: string): string[] {
 	const next = briefRoles(after, current.teamRoles);
 	return current.roles.flatMap((role, index) => (role.model !== next[index]?.model || role.effort !== next[index]?.effort ? [role.name] : []));
+}
+
+/**
+ * Whether a Brief change alters what the Lead answers a Teammate's request
+ * under: the grants, Delivery text or unskipped \`escalate\` entries of
+ * \`answerTerms\`. A session rule the Lead added under the old terms would
+ * outlive them, so its Teammate starts afresh at its next Task.
+ */
+export function changedTerms(current: Approved, after: string): boolean {
+	return JSON.stringify(answerTerms(current.playbook, current.brief, "")) !== JSON.stringify(answerTerms(current.playbook, after, ""));
 }
 
 /** What a Brief's frontmatter must agree with: the Effort it belongs to. */

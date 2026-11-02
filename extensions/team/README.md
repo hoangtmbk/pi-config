@@ -305,8 +305,10 @@ permission prompts are yours, and review and answer are refused. End it with `/t
 
 An Effort survives pi restarting. On start the extension draws the block, listens on the bridge,
 recovers unfinished intents, replays the Teammates' journals, reconciles with `claude agents`,
-ticks, and wakes the Lead once. Teammates not heard from since show `?` until they are. Only Brief
-approvals are recovered; a sign-off promoted when pi died is not.
+ticks, and wakes the Lead once. Teammates not heard from since show `?` until they are. An
+approval on record in `approvals.jsonl` but not yet in `effort.jsonl` (a Brief, a Brief change, a
+Playbook change or a sign-off) is finished as answered; a Playbook change adopted but not yet
+recorded stays pending, to answer again.
 
 ## Usage limits
 
@@ -315,6 +317,12 @@ approvals are recovered; a sign-off promoted when pi died is not.
 Stop; `continue` is sent about two minutes after the reset. A usage-credit confirm holds the Roles
 and tells the Lead never to confirm it: that is yours. A Role's `model` or `effort` set in the
 Brief's `roles:` frontmatter, once changed, gives a fresh session at the next Task.
+
+A Brief change that alters what the Lead answers under (its grants, Delivery text or the `escalate`
+entries it skips) does the same for each Teammate holding a session rule the Lead added with
+`team_answer`, so no rule outlives the terms it was added under. Skipping an `escalate` entry
+needs no fresh start for the rest: a Teammate's settings `ask` every `escalate` entry of the
+Playbook whatever the Brief skips, and the skip only changes what `team_answer` may allow.
 
 ## Attaching to a Teammate
 
