@@ -1673,16 +1673,6 @@ describe("handing off: team_handoff", () => {
 		assert.equal(readFileSync(join(dir, "effort.jsonl"), "utf8"), log);
 		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n(?:.*\n)*?- Status: planned/);
 	});
-
-	it("refuses an isolated Task, which needs a worktree of its own, without launching anything", async () => {
-		const { pi, dir } = await crewApproved();
-		await pi.call("team_plan", { tasks: CREW_PLAN });
-
-		await assert.rejects(pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true }), /isolated/);
-
-		assert.equal(pi.claude.launches().length, 0);
-		assert.equal(existsSync(join(dir, "tasks")), false);
-	});
 });
 
 /** The `effort.jsonl` lines of an Effort, parsed. */
@@ -3154,5 +3144,150 @@ describe("/team attach [id]", () => {
 			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `attach`.", type: "info" },
 		]);
 		assert.deepEqual(leading.notifications, [{ message: "There is no Teammate `qa-1` with a session to attach to. Teammates with one: `builder-1`.", type: "error" }]);
+	});
+});
+
+/** The task worktree and branch of Task `nnn` in the crew Effort's repo. */
+function crewTask(repo: string, nnn: string): { path: string; branch: string } {
+	return { path: `${workspaceOf(repo, CREW_EFFORT_ID)}-task-${nnn}`, branch: `team/${CREW_EFFORT_ID}-task-${nnn}` };
+}
+
+/** Whether `git` succeeds in `dir`. */
+function gitOk(dir: string, ...args: string[]): boolean {
+	return spawnSync("git", args, { cwd: dir, stdio: "ignore" }).status === 0;
+}
+
+/** A Teammate that commits its edit in its working directory, then writes its result and stops. */
+const COMMITS: FakeHookStep[] = [
+	{ event: "SessionStart", payload: { source: "startup" } },
+	{ event: "UserPromptSubmit" },
+	{ edit: "{task}.txt", commit: "Do the Task" },
+	{ write: "result" },
+	{ event: "Stop", payload: { last_assistant_message: "Done." } },
+];
+
+/** An approved crew Effort whose `rename-key` Task is handed off isolated to `builder-1`, who has written round 1's result. */
+async function isolatedReported(hooks: FakeHookStep[] = COMMITS) {
+	const crew = await crewApproved({ hooks });
+	await crew.pi.call("team_plan", { tasks: CREW_PLAN });
+	await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true });
+	await until(() => existsSync(join(crew.dir, RENAME_RESULT)), "builder-1 writes its result");
+	return { ...crew, task: crewTask(crew.repo, "001") };
+}
+
+describe("an isolated Task in a worktree of its own", () => {
+	it("cuts a worktree and branch beside the Workspace from the Effort branch's tip, copying `.worktreeinclude`, and launches its Teammate there", async () => {
+		const { pi, repo, workspace } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		const tip = commit(workspace, { "effort.txt": "on the Effort branch\n", ".gitignore": ".env\n" }, "Effort work");
+		commit(repo, { ".gitignore": ".env\n" }, "ignore .env");
+		writeFileSync(join(repo, ".worktreeinclude"), ".env\n");
+		writeFileSync(join(repo, ".env"), "SECRET=1\n");
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		const reply = await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true });
+
+		const task = crewTask(repo, "001");
+		assert.match(reply, /started builder-1 .*`team\/crew-2026-11-02-task-001`/);
+		assert.match(reply, /commits/);
+		assert.equal(pi.claude.launches()[0].cwd, task.path);
+		assert.ok(relative(workspace, task.path).startsWith(".."), "the task worktree is not nested in the Workspace");
+		assert.equal(git(task.path, "branch", "--show-current"), task.branch);
+		assert.equal(git(task.path, "rev-parse", "HEAD"), tip);
+		assert.equal(readFileSync(join(task.path, ".env"), "utf8"), "SECRET=1\n");
+		assert.equal(git(task.path, "status", "--porcelain"), "");
+	});
+
+	it("gives two isolated Tasks worked in parallel a worktree each, so each Teammate sees only its own uncommitted files", async () => {
+		const { pi, repo, workspace } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }, { event: "UserPromptSubmit" }, { edit: "{task}.txt" }] });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true });
+		await pi.call("team_handoff", { slug: "survey", body: "# Survey\n", isolated: true });
+
+		const [first, second] = [crewTask(repo, "001"), crewTask(repo, "002")];
+		assert.deepEqual(
+			pi.claude.launches().map((launch) => launch.cwd),
+			[first.path, second.path],
+		);
+		assert.equal(git(first.path, "status", "--porcelain"), "?? 001-builder-rename-key.txt");
+		assert.equal(git(second.path, "status", "--porcelain"), "?? 002-scout-survey.txt");
+		assert.equal(git(workspace, "status", "--porcelain"), "");
+	});
+
+	it("merges an accepted Task's branch into the Effort branch with `--no-ff`, recording the intent first, then removes its worktree and branch", async () => {
+		const { pi, repo, dir, workspace, task } = await isolatedReported();
+
+		const reply = await pi.call("team_review", { slug: "rename-key", verdict: "accept" });
+
+		assert.match(reply, /^Accepted Task `rename-key` at round 1.*merged `team\/crew-2026-11-02-task-001` into `team\/crew-2026-11-02`/);
+		const parents = git(workspace, "rev-list", "--parents", "-n", "1", "HEAD").split(" ");
+		assert.equal(parents.length, 3, "a merge commit, never a fast-forward");
+		assert.equal(readFileSync(join(workspace, "001-builder-rename-key.txt"), "utf8"), "edited for 001-builder-rename-key\n");
+		assert.equal(existsSync(task.path), false);
+		assert.equal(git(repo, "branch", "--list", task.branch), "");
+		const types = effortLines(dir).map((line) => line.type);
+		assert.ok(types.indexOf("merge-intended") !== -1 && types.indexOf("merge-intended") < types.indexOf("task-accepted"), types.join(", "));
+		assert.equal(effortLines(dir).find((line) => line.type === "task-accepted")?.merge, parents[0]);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: accepted/);
+		assert.ok(pi.claude.calls().some((argv) => argv[0] === "stop"), "its Teammate is stopped");
+	});
+
+	it("refuses to accept while the Effort's Workspace has uncommitted changes, leaving the Task in review and its branch intact", async () => {
+		const { pi, dir, workspace, task } = await isolatedReported();
+		const head = git(workspace, "rev-parse", "HEAD");
+		writeFileSync(join(workspace, "wip.txt"), "the Lead's own edit\n");
+
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /uncommitted changes/);
+
+		assert.equal(git(workspace, "rev-parse", "HEAD"), head);
+		assert.equal(gitOk(workspace, "rev-parse", "-q", "--verify", "MERGE_HEAD"), false);
+		assert.ok(gitOk(task.path, "rev-parse", "--verify", task.branch));
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: in review/);
+		assert.deepEqual(
+			effortLines(dir)
+				.map((line) => line.type)
+				.filter((type) => type === "merge-intended" || type === "merge-failed"),
+			["merge-intended", "merge-failed"],
+		);
+
+		unlinkSync(join(workspace, "wip.txt"));
+		assert.match(await pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /^Accepted Task `rename-key`/);
+	});
+
+	it("refuses a merge that conflicts, aborting it so nothing is half-merged, and leaves the Task in review with its branch intact", async () => {
+		const { pi, dir, workspace, task } = await isolatedReported();
+		const head = commit(workspace, { "001-builder-rename-key.txt": "the Effort's own\n" }, "Clash");
+		const tip = git(task.path, "rev-parse", "HEAD");
+
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /conflict.*001-builder-rename-key\.txt/);
+
+		assert.equal(git(workspace, "rev-parse", "HEAD"), head);
+		assert.equal(git(workspace, "status", "--porcelain"), "");
+		assert.equal(gitOk(workspace, "rev-parse", "-q", "--verify", "MERGE_HEAD"), false);
+		assert.equal(git(task.path, "rev-parse", task.branch), tip);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: in review/);
+	});
+
+	it("refuses to accept work its Teammate left uncommitted, which wouldn't merge, telling the Lead to send it back", async () => {
+		const { pi, task } = await isolatedReported([
+			{ event: "SessionStart", payload: { source: "startup" } },
+			{ event: "UserPromptSubmit" },
+			{ edit: "{task}.txt" },
+			{ write: "result" },
+			{ event: "Stop", payload: { last_assistant_message: "Done." } },
+		]);
+
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /uncommitted.*send it back/s);
+
+		assert.ok(existsSync(join(task.path, "001-builder-rename-key.txt")));
+	});
+
+	it("restaffs a crashed Teammate's isolated Task in the same worktree", async () => {
+		const { pi, task } = await isolatedReported([...COMMITS, { event: "SessionEnd", payload: { reason: "other" } }]);
+		await until(() => teammateWakes(pi.sent).some((wake) => wake.content.includes("ended")), "the Lead is woken about the crash");
+
+		await pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Also the docs." });
+
+		assert.equal(pi.claude.launches()[1]?.cwd, task.path);
 	});
 });
