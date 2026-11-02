@@ -20,6 +20,7 @@ an Effort and runs its intake up to the human approving its Brief. Planning and 
 /team resume         adopt an Effort no pi session leads (pick one, or name it)
 /team report         ask the Lead for a Report on everything since the last one
 /team reports        pick a Report, newest first, and read it in an overlay
+/team attach [id]    attach to a Teammate's session (pick one, or name it); also just `/team`
 ```
 
 `/team start` warns when `claude --version` is older than 2.1.316, the version this extension was
@@ -155,6 +156,19 @@ The first Report, written once the plan is, is the plan Report. Each is saved as
 `reports/<nnn>.md` in the Effort directory, numbered from 001 and never overwritten, and shows in
 chat collapsed to its headline; the Lead gets back only where it went. The Team block counts them.
 
+## Attaching to a Teammate
+
+`/team` (or `/team attach [id]`) lists the Teammates with a session, then offers:
+
+- **Attach here**: pi's TUI stops, `claude attach <short id>` runs in the terminal until you leave
+  it (Ctrl+Z), then pi redraws and says you are back.
+- **Open in a tmux window**: only inside tmux; `tmux new-window` runs the same command.
+- **Copy the command**: copies `claude attach <short id>`.
+
+Attaching only views the session: it is never a Takeover, and tmux is only a viewer (ADR-0006).
+Outside the TUI, `/team attach` answers with the command. The Team block marks a short id that
+changed since you last attached with `(new)`; effort.jsonl records the last one attached.
+
 ## Leading an Effort across pi sessions
 
 An Effort has one Lead, the pi session `lead.json` names with its pid, bridge and session file. A
@@ -236,7 +250,8 @@ intake.ts        what the Lead is asked at intake, and the Brief's approval dial
 records.ts       the Effort folder: Brief validation, approved records and their shas
 repo.ts          the git root an Effort works on
 setup.ts         Team setup: seeding the draft, validating and adopting it, its warnings
-claude.ts        the only module that runs claude (version check)
+claude.ts        the only module that runs claude (version check, attach)
+attach.ts        the /team attach menu: attach here, tmux window, copy the command
 teams/software/  the bundled software Team: architect, dev and qa, and its default Playbook
 tests/           offline suite, fake claude, temp-root harness
 ```

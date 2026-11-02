@@ -16,9 +16,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { attachTarget, chooseAttach, pickerLabel } from "./attach.ts";
 import { renderTeamBlock, teamStatus } from "./block.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
 import { launchBackground, sendToInbox, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
@@ -156,6 +157,12 @@ export interface TeamDeps {
 	now?: () => Date;
 	/** The pid this session leads an Effort as. Injected by tests standing in for another pi process, and by nothing else. */
 	pid?: number;
+	/** The environment `$TMUX` is read from, `process.env`. Injected by tests, and by nothing else. */
+	env?: Record<string, string | undefined>;
+	/** The `tmux` executable. Injected by tests, and by nothing else. */
+	tmuxPath?: string;
+	/** Put text on the clipboard, pi's `copyToClipboard`. Injected by tests, and by nothing else. */
+	copy?: (text: string) => Promise<void>;
 }
 
 /** The paths the extension runs against once defaults are filled in. */
@@ -184,6 +191,9 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	};
 	const now = deps.now ?? (() => new Date());
 	const pid = deps.pid ?? process.pid;
+	const env = deps.env ?? process.env;
+	const tmuxPath = deps.tmuxPath ?? "tmux";
+	const copy = deps.copy ?? copyToClipboard;
 
 	// What this session is running, which decides whether the Lead's tools are on.
 	let setup: TeamSetup | undefined;
@@ -756,6 +766,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				);
 			},
 		},
+		attach: {
+			async run(args, ctx) {
+				await attachTo(args[0], ctx);
+			},
+		},
 	};
 	const valid = Object.keys(subcommands)
 		.map((name) => `\`${name}\``)
@@ -975,14 +990,51 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		},
 	});
 
-	pi.registerCommand("team", {
-		description: "Run a Team on one Effort: /team start [team], /team setup <team>, /team pending, /team resume [effort], /team report, /team reports",
-		async handler(args, ctx) {
-			const [name, ...rest] = args.trim().split(/\s+/).filter(Boolean);
-			if (name === undefined) {
-				ctx.ui.notify(`\`/team\` needs a subcommand. Subcommands: ${valid}.`, "error");
+	/**
+	 * `/team` and `/team attach [id]`: pick a Teammate with a session, unless
+	 * one is named, then use the menu on it. Using the menu records the short id
+	 * attached to, which clears its `(new)` mark; backing out records nothing.
+	 */
+	async function attachTo(named: string | undefined, ctx: ExtensionCommandContext): Promise<void> {
+		const held = effort;
+		if (!held) {
+			ctx.ui.notify(`No Teammate has a session to attach to: this session holds no Effort. Subcommands: ${valid}.`, "info");
+			return;
+		}
+		const rows = teamStatus(effortState(held), { adoptionsPending: pending.length }).teammates.filter((row) => row.shortId !== undefined);
+		let row = rows.find((candidate) => candidate.id === named);
+		if (named !== undefined && !row) {
+			const ones = rows.length === 0 ? "none yet" : rows.map((candidate) => `\`${candidate.id}\``).join(", ");
+			ctx.ui.notify(`There is no Teammate \`${named}\` with a session to attach to. Teammates with one: ${ones}.`, "error");
+			return;
+		}
+		if (named === undefined) {
+			if (rows.length === 0) {
+				ctx.ui.notify(`No Teammate of Effort \`${held.effortId}\` has a session to attach to yet. Subcommands: ${valid}.`, "info");
 				return;
 			}
+			const label = await ctx.ui.select("Attach to which Teammate?", rows.map(pickerLabel));
+			row = rows.find((candidate) => pickerLabel(candidate) === label);
+		}
+		const target = row && attachTarget(row, paths.claudePath);
+		if (!target) return;
+		const run = await chooseAttach(target, { mode: ctx.mode, ui: ctx.ui, env, tmuxPath, copy });
+		if (!run) return;
+		const result = step(effortState(held), { kind: "attach", teammate: target.teammate, at: now().toISOString() });
+		if (!result.ok) {
+			ctx.ui.notify(result.refusal, "error");
+			return;
+		}
+		appendLines(held.paths, result.append);
+		paintBlock();
+		await run();
+	}
+
+	pi.registerCommand("team", {
+		description: "Run a Team on one Effort: /team start [team], /team setup <team>, /team pending, /team resume [effort], /team report, /team reports, /team attach [teammate] (or just /team)",
+		async handler(args, ctx) {
+			// Bare `/team` is the attach picker: getting to a Teammate is what it is reached for most.
+			const [name = "attach", ...rest] = args.trim().split(/\s+/).filter(Boolean);
 			const subcommand = Object.hasOwn(subcommands, name) ? subcommands[name] : undefined;
 			if (!subcommand) {
 				ctx.ui.notify(`Unknown \`/team\` subcommand \`${name}\`. Subcommands: ${valid}.`, "error");

@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { join, relative } from "node:path";
 import { describe, it } from "node:test";
@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { HOOK_SCRIPT } from "../claude.ts";
 import { registerTeam } from "../index.ts";
-import { commit, type FakeHookStep, fakeClaude, git, gitRepo, goodTeam, roleMd, type TempRoots, teamMd, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
+import { commit, type FakeHookStep, fakeClaude, fakeTmux, git, gitRepo, goodTeam, ownStdio, roleMd, type TempRoots, teamMd, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
 
 const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 
@@ -103,8 +103,12 @@ function fakePi(
 		/** The pid the extension takes the Lead as, standing in for another pi process. */
 		pid?: number;
 		hasUI?: boolean;
-		/** pi's run mode; `tui` unless set. */
-		mode?: string;
+		/** pi's mode; `tui` unless set. */
+		mode?: "tui" | "rpc" | "json" | "print";
+		/** The environment the extension reads, `$TMUX` among it; empty unless set, whatever the test runner's is. */
+		env?: Record<string, string | undefined>;
+		/** The exit code of the fake `claude attach`. */
+		attachExit?: number;
 	} = {},
 ) {
 	const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
@@ -121,6 +125,8 @@ function fakePi(
 	const widgets: Widget[] = [];
 	const overlays: Overlay[] = [];
 	const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
+	const copied: string[] = [];
+	const tuiEvents: string[] = [];
 	const pi = {
 		on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -145,14 +151,31 @@ function fakePi(
 		},
 		getSettings: () => structuredClone(options.settings ?? {}),
 	};
-	const claude = fakeClaude(roots, { version: options.claudeVersion, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies });
+	const claude = fakeClaude(roots, { version: options.claudeVersion, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies, attachExit: options.attachExit });
+	const tmux = fakeTmux(roots);
 	registerTeam(pi as unknown as ExtensionAPI, {
 		agentDir: roots.agentDir,
 		claudeConfigPath: roots.claudeConfigPath,
 		claudePath: claude.path,
 		now: () => NOW,
 		pid: options.pid,
+		env: options.env ?? {},
+		tmuxPath: tmux.path,
+		async copy(text) {
+			copied.push(text);
+		},
 	});
+	/**
+	 * pi's TUI as `ctx.ui.custom` hands it to a factory. Each call is recorded
+	 * with how many `claude attach` runs the fake had seen by then, so a test
+	 * sees what happened before and after the attach.
+	 */
+	const tui = {
+		stop: () => tuiEvents.push(`stop, ${claude.attaches().length} attached`),
+		start: () => tuiEvents.push(`start, ${claude.attaches().length} attached`),
+		requestRender: (force?: boolean) => tuiEvents.push(`requestRender(${force === true})`),
+		terminal: { rows: 40, columns: 100, write: (data: string) => tuiEvents.push(`write ${JSON.stringify(data)}`) },
+	};
 	function answer(kind: Dialog["kind"], title: string, choices?: string[]) {
 		assert.ok(answers.length > 0, `the extension opened a ${kind} dialog "${title}" the test has no answer for`);
 		const played = answers.shift();
@@ -190,14 +213,20 @@ function fakePi(
 			setWidget(key: string, lines: string[] | undefined, widgetOptions?: { placement?: string }) {
 				widgets.push({ key, lines, placement: widgetOptions?.placement });
 			},
-			custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Drawn, customOptions: unknown) {
-				return new Promise((resolve) => {
-					const tui = { terminal: { rows: 40, columns: 100 }, requestRender() {} };
+			// As pi does, the promise settles with what `done` is given; a component never shown once `done` has run.
+			custom<T>(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: T) => void) => unknown, customOptions?: unknown): Promise<T> {
+				return new Promise<T>((settle, fail) => {
 					const overlay: Overlay = { view: { render: () => [] }, options: customOptions, closed: false };
-					overlay.view = factory(tui, PLAIN_THEME, undefined, (value) => {
+					const made = factory(tui, PLAIN_THEME, {}, (result) => {
 						overlay.closed = true;
-						resolve(value);
+						settle(result);
 					});
+					if (made instanceof Promise) {
+						made.catch(fail);
+						return;
+					}
+					// A component drawn at once is an overlay a test can read and hand keys to.
+					overlay.view = made as Drawn;
 					overlays.push(overlay);
 				});
 			},
@@ -219,6 +248,11 @@ function fakePi(
 		overlays,
 		activeTools: () => [...activeTools],
 		claude,
+		tmux,
+		/** Every command the extension put on the clipboard, oldest first. */
+		copied,
+		/** What the extension did with pi's TUI, oldest first. */
+		tuiEvents,
 		/** Queue the human's answers to the next dialogs, in order. */
 		answer(...played: (string | boolean | undefined)[]) {
 			answers.push(...played);
@@ -284,15 +318,15 @@ describe("/team", () => {
 		assert.match(pi.commands.get("team")?.description ?? "", /start/);
 	});
 
-	it("names the subcommands when given one it doesn't know, or none", async () => {
+	it("names the subcommands when given one it doesn't know, or none while there is nothing to attach to", async () => {
 		const pi = fakePi(tempRoots());
 
 		await pi.team("launch software");
 		await pi.team("");
 
 		assert.deepEqual(pi.notifications, [
-			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`.", type: "error" },
-			{ message: "`/team` needs a subcommand. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`.", type: "error" },
+			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`, `attach`.", type: "error" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`, `attach`.", type: "info" },
 		]);
 	});
 });
@@ -1343,7 +1377,12 @@ function crewBrief(repo: string): string {
  * A session whose `crew` Effort has its Brief approved: a user Team whose
  * Roles set every launch flag between them, on {@link CREW_PLAYBOOK}.
  */
-async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown>; mode?: string } = {}) {
+async function crewApproved(
+	options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown> } & Pick<
+		NonNullable<Parameters<typeof fakePi>[1]>,
+		"mode" | "env" | "attachExit"
+	> = {},
+) {
 	const roots = tempRoots();
 	const plugin = join(roots.scratch, "plugins", "lint");
 	writeUserTeam(roots, "crew", {
@@ -1367,7 +1406,16 @@ async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; 
 	});
 	adopt(roots, "crew", CREW_PLAYBOOK);
 	const repo = gitRepo(roots);
-	const pi = fakePi(roots, { cwd: repo, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies, settings: options.settings, mode: options.mode });
+	const pi = fakePi(roots, {
+		cwd: repo,
+		bgExit: options.bgExit,
+		hooks: options.hooks,
+		replies: options.replies,
+		settings: options.settings,
+		mode: options.mode,
+		env: options.env,
+		attachExit: options.attachExit,
+	});
 	await pi.team("start crew");
 	const dir = effortDir(roots, CREW_EFFORT_ID);
 	writeFileSync(join(dir, "brief.draft.md"), crewBrief(repo));
@@ -1979,7 +2027,7 @@ describe("the Team block", () => {
 			"╭─ Team · crew · crew-2026-11-02 ─────────────────────────────────── 1 live ─╮",
 			"│ ● running  ·  working · 0/3 Tasks accepted                                 │",
 			"│ builder-1  c0ffee12  busy  001-builder-rename-key  ctx —  auto≠acceptEdits │",
-			"│ nothing waiting on you   reports 0                                         │",
+			"│ nothing waiting on you   reports 0   attach  /team                         │",
 			"╰────────────────────────────────────────────────────────────────────────────╯",
 		]);
 		assert.deepEqual(JSON.parse(await pi.call("team_status", {})), {
@@ -2459,5 +2507,141 @@ describe("moving in the tree: `/tree`", () => {
 		await pi.emit("session_tree", { newLeafId: "e1" });
 
 		assert.deepEqual(pi.sent, []);
+	});
+});
+
+/** The menu entry, and the picker row, of the Teammate {@link attachable} hands off. */
+const BUILDER_ROW = "builder-1  c0ffee12  busy  001-builder-rename-key";
+
+/** A crew Effort with `builder-1` handed `rename-key` and its session started as short id `c0ffee12`. */
+async function attachable(options: Pick<NonNullable<Parameters<typeof fakePi>[1]>, "mode" | "env" | "attachExit"> = {}) {
+	const approved = await crewApproved({
+		...options,
+		hooks: [
+			{ event: "SessionStart", payload: { source: "startup", session_id: "c0ffee12-0000-4000-8000-000000000001", permission_mode: "acceptEdits" } },
+			{ event: "UserPromptSubmit", payload: { prompt: "New Task `rename-key`", permission_mode: "acceptEdits" } },
+		],
+	});
+	await approved.pi.call("team_plan", { tasks: CREW_PLAN });
+	await approved.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+	approved.pi.dialogs.length = 0;
+	approved.pi.notifications.length = 0;
+	return approved;
+}
+
+function attachedLines(dir: string): Record<string, unknown>[] {
+	return effortLines(dir).filter((line) => line.type === "teammate-attached");
+}
+
+describe("/team attach [id]", () => {
+	it("picks a live Teammate, then attaches here: the TUI stops, the Ctrl+Z hint, `claude attach` on pi's own terminal, the TUI back and a toast", async () => {
+		const { pi, dir } = await attachable();
+		pi.answer(BUILDER_ROW, "Attach here");
+
+		await pi.team("");
+
+		assert.deepEqual(pi.dialogs, [
+			{ kind: "select", title: "Attach to which Teammate?", options: [BUILDER_ROW], answer: BUILDER_ROW },
+			{ kind: "select", title: "builder-1 (c0ffee12)", options: ["Attach here", "Copy the command"], answer: "Attach here" },
+		]);
+		assert.deepEqual(pi.tuiEvents, [
+			"stop, 0 attached",
+			`write ${JSON.stringify("\nAttaching to builder-1 (c0ffee12). Ctrl+Z returns to pi.\n\n")}`,
+			"start, 1 attached",
+			"requestRender(true)",
+		]);
+		assert.deepEqual(pi.claude.attaches(), [{ argv: ["attach", "c0ffee12"], stdio: ownStdio() }]);
+		assert.deepEqual(pi.notifications, [{ message: "Back in pi from `builder-1` (c0ffee12).", type: "info" }]);
+		assert.deepEqual(attachedLines(dir), [{ type: "teammate-attached", teammate: "builder-1", shortId: "c0ffee12", at: NOW.toISOString() }]);
+	});
+
+	it("skips the picker for a Teammate it is given, and says so when `claude attach` fails", async () => {
+		const { pi } = await attachable({ attachExit: 1 });
+		pi.answer("Attach here");
+
+		await pi.team("attach builder-1");
+
+		assert.deepEqual(
+			pi.dialogs.map((dialog) => dialog.title),
+			["builder-1 (c0ffee12)"],
+		);
+		assert.deepEqual(pi.tuiEvents.slice(-2), ["start, 1 attached", "requestRender(true)"]);
+		assert.deepEqual(pi.notifications, [{ message: "`claude attach c0ffee12` exited with code 1; back in pi.", type: "warning" }]);
+	});
+
+	it("opens a tmux window running `claude attach` only inside tmux, and copies the exact command", async () => {
+		const { pi, dir } = await attachable({ env: { TMUX: "/tmp/tmux-501/default,4242,0" } });
+		const command = `${pi.claude.path} attach c0ffee12`;
+		pi.answer("Open in a tmux window");
+
+		await pi.team("attach builder-1");
+
+		assert.deepEqual(pi.dialogs[0]?.options, ["Attach here", "Open in a tmux window", "Copy the command"]);
+		assert.deepEqual(pi.tmux.calls(), [["new-window", "-n", "builder-1", command]]);
+		assert.deepEqual(pi.tuiEvents, []);
+		assert.deepEqual(pi.notifications, [{ message: "Opened `builder-1` in a new tmux window.", type: "info" }]);
+
+		pi.answer(BUILDER_ROW, "Copy the command");
+		await pi.team("attach");
+
+		assert.deepEqual(pi.copied, [command]);
+		assert.deepEqual(pi.notifications.at(-1), { message: `Copied \`${command}\`.`, type: "info" });
+		assert.equal(pi.claude.attaches().length, 0);
+		// The same short id twice is one record.
+		assert.equal(attachedLines(dir).length, 1);
+	});
+
+	it("shows the command instead outside the TUI, and still records it", async () => {
+		const { pi, dir } = await attachable({ mode: "rpc" });
+
+		await pi.team("attach builder-1");
+
+		assert.deepEqual(pi.dialogs, []);
+		assert.deepEqual(pi.notifications, [{ message: `Attach to \`builder-1\` from a terminal: ${pi.claude.path} attach c0ffee12`, type: "info" }]);
+		assert.equal(pi.claude.attaches().length, 0);
+		assert.equal(attachedLines(dir).length, 1);
+	});
+
+	it("clears a Teammate's `(new)` mark once the human uses the menu on it", async () => {
+		const { pi, dir } = await attachable();
+		appendFileSync(
+			join(dir, "effort.jsonl"),
+			`${JSON.stringify({ type: "teammate-session", teammate: "builder-1", cursor: 3, source: "startup", sessionId: "k3l4m5n6-0000", shortId: "k3l4m5n6", at: NOW.toISOString() })}\n`,
+		);
+		assert.equal(JSON.parse(await pi.call("team_status", {})).teammates[0].newShortId, true);
+		pi.answer("builder-1  k3l4m5n6 (new)  busy  001-builder-rename-key", "Copy the command");
+
+		await pi.team("");
+
+		assert.deepEqual(pi.copied, [`${pi.claude.path} attach k3l4m5n6`]);
+		assert.equal(JSON.parse(await pi.call("team_status", {})).teammates[0].newShortId, undefined);
+		assert.equal(teamBlock(pi)?.some((line) => line.includes("(new)")), false);
+		assert.deepEqual(attachedLines(dir).at(-1), { type: "teammate-attached", teammate: "builder-1", shortId: "k3l4m5n6", at: NOW.toISOString() });
+	});
+
+	it("records nothing when the human backs out of the picker or the menu", async () => {
+		const { pi, dir } = await attachable();
+		pi.answer(undefined);
+		await pi.team("");
+		pi.answer(undefined);
+		await pi.team("attach builder-1");
+
+		assert.equal(attachedLines(dir).length, 0);
+		assert.deepEqual(pi.claude.attaches(), []);
+		assert.deepEqual(pi.notifications, []);
+	});
+
+	it("names what there is to attach to when there is nothing, or no such Teammate", async () => {
+		const pi = fakePi(tempRoots());
+		await pi.team("");
+		await pi.team("attach builder-1");
+		const { pi: leading } = await attachable();
+		await leading.team("attach qa-1");
+
+		assert.deepEqual(pi.notifications, [
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`, `attach`.", type: "info" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`, `attach`.", type: "info" },
+		]);
+		assert.deepEqual(leading.notifications, [{ message: "There is no Teammate `qa-1` with a session to attach to. Teammates with one: `builder-1`.", type: "error" }]);
 	});
 });

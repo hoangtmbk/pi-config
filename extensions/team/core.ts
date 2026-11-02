@@ -101,6 +101,10 @@ export interface Teammate {
 	activity?: "busy" | "idle";
 	/** How its last turn ended, while idle: `round 1 done`, `stopped short`. */
 	doing?: string;
+	/** The short id the human last attached to through pi's `/team` menu. */
+	attached?: string;
+	/** Set when a new session gave it a new short id the human hasn't attached to through pi: the block marks it `(new)`. */
+	newShortId?: boolean;
 }
 
 /** A Teammate's inbox socket, which Claude Code gives its hooks in the environment. */
@@ -158,6 +162,8 @@ export type EffortLine =
 	| { type: "teammate-stopped"; teammate: string; cursor: number; slug: string; message: string; at: string }
 	/** A hook reported a permission mode other than the one last known: the mode the Teammate actually got. */
 	| { type: "teammate-mode"; teammate: string; cursor: number; mode: string; at: string }
+	/** The human used the `/team` menu on a Teammate: the short id they were given, which clears its `(new)` mark. Reads no journal line. */
+	| { type: "teammate-attached"; teammate: string; shortId: string; at: string }
 	/** Something decided for the human on their behalf, for the next Report: a permission answer, a rule, a grant used, a limit pause. */
 	| ({ type: "decided-for-you" } & Logged)
 	/** Work found outside the Brief (scope creep), kept for the final Report as a suggestion. */
@@ -275,7 +281,9 @@ export type EffortInput =
 			result: { path: string; written: boolean };
 			sendBackLimit: number;
 			at: string;
-	  };
+	  }
+	/** The human used the `/team` menu on a Teammate: attached here, in a tmux window, or took the command. */
+	| { kind: "attach"; teammate: string; at: string };
 
 /** Work the core leaves to the shell. */
 export type EffortAction =
@@ -306,7 +314,7 @@ export function openEffort(opened: { effortId: string; team: string; repo: strin
 }
 
 /** Lines a Report doesn't tell of: they only carry what other lines say. */
-const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written"]);
+const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached"]);
 
 /** Fold one line into the state, keeping what the next Report tells of. */
 function apply(state: EffortState, line: EffortLine): EffortState {
@@ -351,12 +359,25 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			const { type: _type, slug, ...handed } = line;
 			return { ...state, tasks: { ...state.tasks, [slug]: handed } };
 		}
-		case "teammate-session":
+		case "teammate-session": {
+			const before = state.teammates.find((teammate) => teammate.id === line.teammate)?.shortId;
 			return withTeammate(state, line, {
 				sessionId: line.sessionId,
 				shortId: line.shortId,
 				...(line.inbox === undefined ? {} : { inbox: line.inbox }),
+				// A short id that replaces another is a new attach target, marked until the human attaches to it.
+				...(before !== undefined && before !== line.shortId ? { newShortId: true } : {}),
 			});
+		}
+		case "teammate-attached":
+			return {
+				...state,
+				teammates: state.teammates.map((teammate) => {
+					if (teammate.id !== line.teammate) return teammate;
+					const { newShortId: _new, ...rest } = teammate;
+					return { ...rest, attached: line.shortId };
+				}),
+			};
 		case "prompt-landed":
 			return withTeammate(state, line, { activity: "busy", doing: undefined });
 		case "permission-denied":
@@ -432,7 +453,19 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return review(state, input);
 		case "report":
 			return report(state, input);
+		case "attach":
+			return attach(state, input);
 	}
+}
+
+/** The human used the `/team` menu on a Teammate: its short id is recorded as the one last attached, once per change. */
+function attach(state: EffortState, input: Extract<EffortInput, { kind: "attach" }>): Step {
+	const teammate = state.teammates.find((each) => each.id === input.teammate);
+	if (!teammate) return { ok: false, refusal: `Effort \`${state.effortId}\` has no Teammate \`${input.teammate}\` to attach to` };
+	const { shortId } = teammate;
+	if (shortId === undefined) return { ok: false, refusal: `Teammate \`${teammate.id}\` has no short id yet: its session hasn't started, so there is nothing to attach to` };
+	if (teammate.attached === shortId && !teammate.newShortId) return took(state, [], []);
+	return took(state, [{ type: "teammate-attached", teammate: teammate.id, shortId, at: input.at }], []);
 }
 
 /** Take the step that `lines` make, checking it folds: the state is only ever what the lines fold to. */

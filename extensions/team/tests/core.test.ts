@@ -738,3 +738,58 @@ describe("reporting", () => {
 		]);
 	});
 });
+
+describe("attaching to a Teammate", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const started = applied(
+		applied(approved, {
+			kind: "plan",
+			tasks: [{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] }],
+			criteria: ["AC1"],
+			roles: ["dev"],
+			at: "2026-11-02T11:10:00.000Z",
+		}),
+		{ kind: "handoff", slug: "rename", at: "2026-11-02T11:30:00.000Z" },
+	);
+	const opened = applied(started, {
+		kind: "journal",
+		teammate: "dev-1",
+		cursor: 1,
+		line: { from: "hook", at: "2026-11-02T11:31:00.000Z", event: "SessionStart", payload: { session_id: "8f3c2a1b-0000-4000-8000-000000000001", source: "startup" } },
+		result: { path: "", written: false },
+	});
+	/** A fresh session's `SessionStart` with a new short id, as a relaunch (#112) records it. */
+	const fresh: EffortLine = { type: "teammate-session", teammate: "dev-1", cursor: 2, source: "startup", sessionId: "k3l4m5n6-0000", shortId: "k3l4m5n6", at: "2026-11-02T12:00:00.000Z" };
+
+	it("records the short id last attached through pi, once per change", () => {
+		const result = run(opened, { kind: "attach", teammate: "dev-1", at: "2026-11-02T11:40:00.000Z" });
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append, [{ type: "teammate-attached", teammate: "dev-1", shortId: "8f3c2a1b", at: "2026-11-02T11:40:00.000Z" }]);
+		assert.deepEqual(result.actions, []);
+		assert.equal(result.state.teammates[0].attached, "8f3c2a1b");
+
+		const again = run([...opened, ...result.append], { kind: "attach", teammate: "dev-1", at: "2026-11-02T11:50:00.000Z" });
+		assert.ok(again.ok);
+		assert.deepEqual(again.append, []);
+	});
+
+	it("marks a short id new when a Teammate's session gets another, until the human attaches through pi", () => {
+		assert.equal(fold(opened).teammates[0].newShortId, undefined);
+
+		const relaunched = [...opened, fresh];
+		assert.equal(fold(relaunched).teammates[0].shortId, "k3l4m5n6");
+		assert.equal(fold(relaunched).teammates[0].newShortId, true);
+
+		const attached = run(relaunched, { kind: "attach", teammate: "dev-1", at: "2026-11-02T12:10:00.000Z" });
+		assert.ok(attached.ok);
+		assert.deepEqual(attached.append, [{ type: "teammate-attached", teammate: "dev-1", shortId: "k3l4m5n6", at: "2026-11-02T12:10:00.000Z" }]);
+		assert.equal(attached.state.teammates[0].newShortId, undefined);
+		assert.equal(attached.state.teammates[0].cursor, 2, "attaching reads no journal line");
+	});
+
+	it("refuses a Teammate it doesn't know, or one with no short id to attach to yet", () => {
+		assert.match(refusal(opened, { kind: "attach", teammate: "qa-1", at: "2026-11-02T11:40:00.000Z" }), /no Teammate `qa-1`/);
+		assert.match(refusal(started, { kind: "attach", teammate: "dev-1", at: "2026-11-02T11:40:00.000Z" }), /`dev-1` has no short id yet/);
+	});
+});
