@@ -131,6 +131,8 @@ export interface BriefChangeRecord {
 	brief: string;
 	/** The planned Tasks it held until the answer. */
 	affects: string[];
+	/** The Roles whose launch options it changed, whose Teammates start afresh at their next Task. */
+	refresh?: string[];
 	at: string;
 }
 
@@ -148,21 +150,49 @@ export interface CheckpointRecord {
 }
 
 /**
- * Make an approved Brief change the Effort's `brief.md` and record it. Only
+ * Record an approved Brief change and make it the Effort's `brief.md`. Only
  * the Brief moves: the Playbook and Team stay the snapshots taken at Brief
- * approval, which the change was checked against.
+ * approval, which the change was checked against. The record goes first, so
+ * a restart in between finds it and finishes the write (`recordedApprovals`).
  */
-export function promoteBriefChange(paths: EffortPaths, promotion: { approval: PendingApproval; at: string }): BriefChangeRecord {
-	writeFileSync(paths.brief, promotion.approval.snapshot);
+export function promoteBriefChange(paths: EffortPaths, promotion: { approval: PendingApproval; refresh?: readonly string[]; at: string }): BriefChangeRecord {
+	const refresh = promotion.refresh ?? [];
 	const record: BriefChangeRecord = {
 		act: "brief-change",
 		request: promotion.approval.id,
 		brief: sha256(promotion.approval.snapshot),
 		affects: [...(promotion.approval.affects ?? [])],
+		...(refresh.length > 0 ? { refresh: [...refresh] } : {}),
 		at: promotion.at,
 	};
 	recordApproval(paths, record);
+	writeFileSync(paths.brief, promotion.approval.snapshot);
 	return record;
+}
+
+/**
+ * The approvals `approvals.jsonl` records, as recovery reads them: the Brief
+ * promotions, then every other approval by request and the sha the human
+ * approved. A Brief change on record whose `brief.md` a restart cut short
+ * of the approved snapshot is written now, from the pending request.
+ */
+export function recordedApprovals(paths: EffortPaths, state: EffortState): {
+	promoted: { request: string; brief: string; workspace?: Workspace }[];
+	recorded: { request: string; sha256: string; refresh?: string[] }[];
+} {
+	const records = readApprovals(paths);
+	const promoted = records.flatMap((record) => (record.act === "brief" ? [{ request: record.request, brief: record.brief, ...(record.workspace === undefined ? {} : { workspace: record.workspace }) }] : []));
+	const recorded = records.flatMap((record) => {
+		if (record.act === "brief-change") {
+			const item = state.pending.find((pending) => pending.id === record.request && sha256(pending.snapshot) === record.brief);
+			if (item && (!existsSync(paths.brief) || sha256(readFileSync(paths.brief)) !== record.brief)) writeFileSync(paths.brief, item.snapshot);
+			return [{ request: record.request, sha256: item?.sha256 ?? record.brief, ...(record.refresh ? { refresh: record.refresh } : {}) }];
+		}
+		if (record.act === "playbook-change") return [{ request: record.request, sha256: record.sha256 }];
+		if (record.act === "sign-off") return [{ request: record.request, sha256: record.report }];
+		return [];
+	});
+	return { promoted, recorded };
 }
 
 /** The human's sign-off of the final Report, which ends the Effort. */

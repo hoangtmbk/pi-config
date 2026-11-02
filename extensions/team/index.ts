@@ -77,6 +77,7 @@ import {
 	promoteBriefChange,
 	protectedRecords,
 	readApprovals,
+	recordedApprovals,
 	readJournal,
 	readLead,
 	readApproved,
@@ -566,6 +567,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			confirmed = new Set(effortState(held).teammates.filter((teammate) => names?.includes(teammate.name)).map((teammate) => teammate.id));
 			paintBlock();
 			away.push(...(await recoverIntents(held, names)));
+			// A sign-off on record ended the Effort: there is nothing left to pick up.
+			if (effort !== held) return;
 			const sent: string[] = [];
 			away.push(...applyJournals(held, undefined, sent));
 			away.push(...(await resend(held, sent, names)));
@@ -612,20 +615,23 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				return evidence ? [[slug, evidence] as const] : [];
 			}),
 		);
-		const promoted = readApprovals(held.paths).flatMap((record) => (record.act === "brief" ? [{ request: record.request, brief: record.brief, ...(record.workspace === undefined ? {} : { workspace: record.workspace }) }] : []));
-		const result = step(state, { kind: "recover", ...(names ? { agents: names } : {}), journaled, merges, promoted, at: now().toISOString() });
+		const result = step(state, { kind: "recover", ...(names ? { agents: names } : {}), journaled, merges, ...recordedApprovals(held.paths, state), at: now().toISOString() });
 		if (!result.ok) return [result.refusal];
 		appendLines(held.paths, result.append);
 		const texts: string[] = [];
+		const unstopped: string[] = [];
 		let stopped = true;
+		let ended = false;
 		for (const action of result.actions) {
 			if (action.kind === "wake-lead") texts.push(action.text);
+			else if (action.kind === "end-effort") ended = true;
 			else if (action.kind === "write-plan") writePlan(held.paths, effortState(held));
 			else if (action.kind === "discard-feedback") rmSync(join(held.paths.tasks, action.folder, `feedback-${action.round}.md`), { force: true });
 			else if (action.kind === "stop-teammate") {
 				const failed = await stopTeammate(result.state, action);
 				if (failed) {
 					stopped = false;
+					unstopped.push(`\`${action.teammate}\` (${failed.error})`);
 					texts.push(`\`${action.teammate}\` didn't stop (${failed.error}), so its worktree is left in place; tell the human.`);
 				}
 			} else if (action.kind === "remove-task-workspace") {
@@ -641,6 +647,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 					texts.push(error instanceof Error ? error.message : String(error));
 				}
 			}
+		}
+		// A sign-off on record before pi stopped: the Effort ends now, as it would have then, and the Lead hears it with the end.
+		if (ended && leadCtx) {
+			await endEffort(held, result.state, texts.filter(Boolean).join(" "), unstopped, leadCtx);
+			return [];
 		}
 		return texts.filter(Boolean);
 	}
@@ -1610,7 +1621,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			return;
 		}
 		for (const action of result.actions) {
-			if (action.kind === "promote-brief-change") promoteBriefChange(held.paths, { approval: action.approval, at });
+			if (action.kind === "promote-brief-change") promoteBriefChange(held.paths, { approval: action.approval, refresh, at });
 		}
 		appendLines(held.paths, result.append);
 		if (picked.answer === "approved") ctx.ui.notify(`Approved the Brief change of Effort \`${state.effortId}\`: ${held.paths.brief}, sha256 ${item.sha256}.`, "info");
@@ -1707,7 +1718,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * the session holds no Effort, so its tools are off and the block is gone.
 	 * While a Teammate didn't stop, its worktrees are all left in place.
 	 */
-	async function endEffort(held: HeldEffort, state: EffortState, said: string, unstopped: readonly string[], ctx: ExtensionCommandContext): Promise<void> {
+	async function endEffort(held: HeldEffort, state: EffortState, said: string, unstopped: readonly string[], ctx: ExtensionContext): Promise<void> {
 		const notes = [said];
 		if (unstopped.length > 0) {
 			notes.push(`These didn't stop, so every worktree is left in place: ${unstopped.join(", ")}. Stop them with \`claude stop\`.`);

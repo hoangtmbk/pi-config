@@ -2149,6 +2149,28 @@ describe("the final Report and sign-off", () => {
 		assert.deepEqual(result.state.pending, []);
 	});
 
+	it("a sign-off and a Playbook change `approvals.jsonl` records but the log doesn't are finished after a restart, without recording or adopting again", () => {
+		const recorded = [
+			{ request: "r3", sha256: "e".repeat(64) },
+			{ request: "r2", sha256: "d".repeat(64) },
+		];
+		const result = run(asked, { kind: "recover", recorded, at: "2026-11-02T15:00:00.000Z" });
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(
+			result.actions.map((action) => action.kind),
+			["wake-lead", "stop-teammate", "stop-teammate", "end-effort", "wake-lead"],
+		);
+		assert.deepEqual(result.state.ended, { how: "signed-off", at: "2026-11-02T15:00:00.000Z" });
+		assert.deepEqual(result.state.pending, []);
+		assert.equal(fold([...asked, ...result.append]).ended?.how, "signed-off");
+
+		for (const stale of [[{ request: "r2", sha256: "f".repeat(64) }], [{ request: "r9", sha256: "d".repeat(64) }], []]) {
+			const none = run(asked, { kind: "recover", recorded: stale, at: "2026-11-02T15:00:00.000Z" });
+			assert.ok(none.ok);
+			assert.deepEqual([none.append, none.actions, none.state.pending.length], [[], [], 2]);
+		}
+	});
+
 	it("a send-back at sign-off wakes the Lead with the note, keeps the Teammates and drops the proposed changes", () => {
 		const result = run(asked, { kind: "answer", id: "r2", answer: "sent-back", note: "AC1 has no test for the old key.", at: "2026-11-02T12:10:00.000Z" });
 		assert.ok(result.ok);
@@ -2903,6 +2925,15 @@ describe("recovering after a restart", () => {
 		const handoff = run(accepted, { kind: "handoff", slug: "docs", at: "2026-11-02T14:00:00.000Z" });
 		assert.ok(handoff.ok, handoff.ok ? "" : handoff.refusal);
 		const intended: EffortLine[] = [...accepted, { type: "launch-intended", teammate: "dev-1", name: NAME, lines: handoff.append, at: "2026-11-02T14:00:00.000Z" }];
+
+		it("a Brief change `approvals.jsonl` records but the log doesn't is answered after a restart, with its refresh, and not promoted again", () => {
+			const result = recover(asked, { recorded: [{ request: "r2", sha256: "c".repeat(64), refresh: ["dev"] }] });
+
+			assert.deepEqual(result.append, [{ type: "approval-answered", id: "r2", answer: "approved", refresh: ["dev"], at: BACK }]);
+			assert.ok(!result.actions.some((action) => action.kind === "promote-brief-change"));
+			assert.match(wakes(result)[0]?.text ?? "", /approved the Brief change.*`dev-1` starts in a fresh session/);
+			assert.deepEqual(recover([...asked, ...result.append], { recorded: [{ request: "r2", sha256: "c".repeat(64), refresh: ["dev"] }] }).append, []);
+		});
 
 		it("that went in closes on its `teammate-relaunched` line, so a restart after it recovers nothing", () => {
 			const result = recover([...intended, ...handoff.append], { agents: [NAME], journaled: ["dev-1"] });

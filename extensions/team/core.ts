@@ -803,6 +803,12 @@ export type EffortInput =
 			merges?: Record<string, MergeEvidence>;
 			/** The Brief promotions `approvals.jsonl` records. */
 			promoted?: readonly { request: string; brief: string; workspace?: Workspace }[];
+			/**
+			 * The other approvals `approvals.jsonl` records, in its order: a Brief
+			 * change (with the Roles it refreshed), a Playbook change or a
+			 * sign-off, by request id and the sha of what the human approved.
+			 */
+			recorded?: readonly { request: string; sha256: string; refresh?: readonly string[] }[];
 			at: string;
 	  }
 	/**
@@ -3220,16 +3226,23 @@ export function openMerges(state: EffortState): { slug: string; branch: string; 
 	);
 }
 
+/** The checkpoints whose approval `approvals.jsonl` records ahead of the line, besides the Brief's. */
+const RECORDED: ReadonlySet<string> = new Set([BRIEF_CHANGE, PLAYBOOK_CHANGE, SIGN_OFF]);
+/** What an approval's shell does that is done once it is on record. */
+const ON_RECORD: ReadonlySet<EffortAction["kind"]> = new Set(["promote-brief-change", "adopt-playbook-change", "record-sign-off"]);
+
 /**
  * After a restart, before the journals are replayed: finish each intent left
  * open from the evidence the shell gathered. A launch is in when `claude
  * agents --json` lists its `--name` or the Teammate wrote to its journal, and
  * abandoned when neither; a merge already in the Effort branch is recorded,
- * one cut short is aborted and merged again, one not begun is merged; a Brief
- * promotion `approvals.jsonl` records with the approved sha is recorded as
- * answered. Nothing done is done twice. What the evidence can't settle stays
- * open, and the Lead is told.
+ * one cut short is aborted and merged again, one not begun is merged; an
+ * approval `approvals.jsonl` records with the approved sha (a Brief, a Brief
+ * change, a Playbook change, a sign-off) is recorded as answered, and a
+ * sign-off ends the Effort. Nothing done is done twice. What the evidence
+ * can't settle stays open, and the Lead is told.
  */
+
 function recover(state: EffortState, input: Extract<EffortInput, { kind: "recover" }>): Step {
 	let next = state;
 	const append: EffortLine[] = [];
@@ -3248,6 +3261,14 @@ function recover(state: EffortState, input: Extract<EffortInput, { kind: "recove
 		const answered = answer(next, { kind: "answer", id: item.id, answer: "approved", ...(record.workspace === undefined ? {} : { workspace: record.workspace }), at: input.at });
 		// brief.md, the snapshots and the record are written already.
 		add(answered.ok ? { ...answered, actions: answered.actions.filter((action) => action.kind !== "promote-brief") } : answered);
+	}
+	for (const record of input.recorded ?? []) {
+		const item = next.pending.find((pending) => RECORDED.has(pending.checkpoint) && pending.id === record.request && pending.sha256 === record.sha256);
+		if (!item) continue;
+		const refresh = item.checkpoint === BRIEF_CHANGE && record.refresh && record.refresh.length > 0 ? { refresh: [...record.refresh] } : {};
+		const answered = answer(next, { kind: "answer", id: item.id, answer: "approved", ...refresh, at: input.at });
+		// The record is written ahead of the line: brief.md (which the shell finishes first), the adopted Playbook or the sign-off are on disk already.
+		add(answered.ok ? { ...answered, actions: answered.actions.filter((action) => !ON_RECORD.has(action.kind)) } : answered);
 	}
 	const plan = actions.some((action) => action.kind === "write-plan");
 	return { ok: true, state: next, append, actions: [...actions.filter((action) => action.kind !== "write-plan"), ...(plan ? [{ kind: "write-plan" } as const] : [])] };

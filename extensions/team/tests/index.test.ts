@@ -4247,6 +4247,47 @@ describe("restarting: picking an Effort up after pi comes back", () => {
 		assert.match(awayWakes(again.sent)[0].content, /rename-key/);
 	});
 
+	it("finishes a sign-off `approvals.jsonl` records but the log doesn't: every Teammate stopped, the Effort ended once, and the session holds none", async () => {
+		const { roots, repo, pi, dir, report, workspace } = await finalReported();
+		const shortIds = effortLines(dir)
+			.filter((line) => line.type === "teammate-session")
+			.map((line) => line.shortId);
+		appendFileSync(join(dir, "approvals.jsonl"), `${JSON.stringify({ act: "sign-off", request: "r2", report: sha(readFileSync(report)), at: NOW.toISOString() })}\n`);
+		await pi.emit("session_shutdown", { reason: "quit" });
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.equal(counted(dir, "effort-ended"), 1);
+		assert.equal(approvals(dir).filter((record) => record.act === "sign-off").length, 1, "the sign-off isn't recorded again");
+		const stops = pi.claude.calls().filter((argv) => argv[0] === "stop").map((argv) => argv[1]);
+		assert.deepEqual(stops.sort(), [...shortIds].sort());
+		assert.equal(existsSync(workspace), false);
+		assert.deepEqual(
+			again.activeTools().filter((name) => EFFORT_TOOL_NAMES.includes(name)),
+			[],
+		);
+		assert.match(again.sent.map((message) => message.content).join("\n"), /[Ss]igned off.*holds no Effort now/s);
+	});
+
+	it("finishes a Brief change `approvals.jsonl` records whose brief.md a restart cut short", async () => {
+		const { roots, repo, pi, dir } = await crewApproved();
+		const draft = changedBrief(repo);
+		writeFileSync(join(dir, "brief.draft.md"), draft);
+		await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: [] });
+		const asked = effortLines(dir).filter((line) => line.type === "approval-requested").at(-1);
+		appendFileSync(join(dir, "approvals.jsonl"), `${JSON.stringify({ act: "brief-change", request: asked?.id, brief: sha(draft), affects: [], at: NOW.toISOString() })}\n`);
+		await pi.emit("session_shutdown", { reason: "quit" });
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.equal(readFileSync(join(dir, "brief.md"), "utf8"), draft);
+		assert.equal(effortLines(dir).filter((line) => line.type === "approval-answered").at(-1)?.id, asked?.id);
+		assert.equal(approvals(dir).filter((record) => record.act === "brief-change").length, 1);
+		assert.match(await again.call("team_status", {}), /crew-2026-11-02/);
+	});
+
 	it("names the Effort's records in the wake when another session adopts it", async () => {
 		const { roots, repo, pi, dir } = await renameReported();
 		await until(() => counted(dir, "task-done") === 1, "builder-1 reports round 1");
