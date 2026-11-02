@@ -13,7 +13,7 @@
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import type { EffortLine, PendingApproval, Workspace } from "./core.ts";
+import type { EffortLine, EffortState, PendingApproval, Workspace } from "./core.ts";
 import { BRIEF_SKELETON, isKebabCase, type Playbook, sha256 } from "./definitions.ts";
 
 /** The files of one Effort, all under `<agent dir>/team/efforts/<effort-id>/`. */
@@ -31,6 +31,14 @@ export interface EffortPaths {
 	approvals: string;
 	/** The Effort's whole state, one line per change. */
 	log: string;
+	/** Answers to escalated questions, which Teammates read as part of the Brief. */
+	clarifications: string;
+	/** A view of the plan, rewritten from the state whenever the plan or a Task's staffing changes. */
+	plan: string;
+	/** One folder per Task handed off, `tasks/<nnn>-<role>-<slug>/`. */
+	tasks: string;
+	/** One folder per Teammate, `teammates/<id>/`, with its launch files. */
+	teammates: string;
 }
 
 export function effortsDir(agentDir: string): string {
@@ -47,6 +55,10 @@ export function effortPaths(agentDir: string, effortId: string): EffortPaths {
 		team: join(dir, "team"),
 		approvals: join(dir, "approvals.jsonl"),
 		log: join(dir, "effort.jsonl"),
+		clarifications: join(dir, "clarifications.md"),
+		plan: join(dir, "plan.md"),
+		tasks: join(dir, "tasks"),
+		teammates: join(dir, "teammates"),
 	};
 }
 
@@ -334,6 +346,65 @@ function checkBody(body: string, expected: BriefExpectations): string[] {
 		}
 	}
 	return problems;
+}
+
+/**
+ * The acceptance-criterion ids of an approved Brief, in the order written:
+ * what a plan must cover.
+ */
+export function briefCriteria(text: string): string[] {
+	const lines = sections(parseFrontmatter(text).body).get("acceptance criteria") ?? [];
+	return lines.flatMap((line) => {
+		const id = CRITERION.exec(line)?.[1];
+		return id === undefined ? [] : [id];
+	});
+}
+
+/**
+ * Write `plan.md`, a view of the state's plan for the human to read. It is
+ * rewritten whole from `effort.jsonl` each time, so editing it changes
+ * nothing.
+ */
+export function writePlan(paths: EffortPaths, state: EffortState): void {
+	const lines = [`# Plan of Effort \`${state.effortId}\``, "", "A view of `effort.jsonl`, rewritten by the team extension; editing it changes nothing.", ""];
+	for (const task of state.plan ?? []) {
+		const handed = state.tasks[task.slug];
+		lines.push(
+			`## ${task.slug}`,
+			"",
+			`- Role: ${task.role}`,
+			`- Goal: ${task.goal}`,
+			`- Depends on: ${task.dependsOn.length > 0 ? task.dependsOn.join(", ") : "nothing"}`,
+			`- Covers: ${task.criteria.length > 0 ? task.criteria.join(", ") : "no criterion"}`,
+			`- Status: ${handed ? `running, with \`${handed.teammate}\` (tasks/${handed.folder}/)` : "planned"}`,
+			"",
+		);
+	}
+	writeFileSync(paths.plan, lines.join("\n"));
+}
+
+/**
+ * The records a Teammate may never edit, as absolute paths (a folder as
+ * `<folder>/**`): what the human approved, and the Effort's own state.
+ */
+export function protectedRecords(paths: EffortPaths): string[] {
+	return [paths.brief, paths.clarifications, paths.approvals, paths.playbook, `${paths.team}/**`, paths.log];
+}
+
+/**
+ * Write a handed-off Task's folder and its `task.md`, the self-contained
+ * input the Teammate works from, and return the folder. `clarifications.md`
+ * is made here when missing, since a Teammate is told to read it from its
+ * first turn and answers to escalations are added to it later.
+ */
+export function writeTask(paths: EffortPaths, folder: string, body: string): string {
+	const dir = join(paths.tasks, folder);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "task.md"), body);
+	if (!existsSync(paths.clarifications)) {
+		writeFileSync(paths.clarifications, "# Clarifications\n\nAnswers to questions the human was asked during this Effort. They count as part of the Brief.\n");
+	}
+	return dir;
 }
 
 function isMapping(value: unknown): value is Record<string, unknown> {

@@ -18,11 +18,11 @@ import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { trustFolder, versionWarning } from "./claude.ts";
-import { type EffortState, fold, openEffort, type PendingApproval, refuseRequest, step, type Workspace } from "./core.ts";
-import { listTeams, loadTeam, type Playbook, sha256, type Team, type TeamRoots } from "./definitions.ts";
+import { launchBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
+import { type EffortAction, type EffortState, fold, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace } from "./core.ts";
+import { EVERY_ROLE, listTeams, loadTeam, type Playbook, readSnapshot, type Role, sha256, type Team, type TeamRoots } from "./definitions.ts";
 import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
-import { appendLines, checkRecords, createEffort, type EffortPaths, promoteBrief, readLines, validateBrief } from "./records.ts";
+import { appendLines, briefCriteria, checkRecords, createEffort, type EffortPaths, promoteBrief, protectedRecords, readLines, validateBrief, writePlan, writeTask } from "./records.ts";
 import { repoRoot } from "./repo.ts";
 import { addWorkspace } from "./workspace.ts";
 import {
@@ -33,6 +33,7 @@ import {
 	adoptPlaybook,
 	beginSetup,
 	LATER,
+	modeInForce,
 	type PendingAdoption,
 	pendingAdoptionTitle,
 	requestAdoption,
@@ -42,6 +43,7 @@ import {
 	type TeamSetup,
 } from "./setup.ts";
 import { pickTeam, proposeTeam, type StartOutcome } from "./start.ts";
+import { handoffPointer, teammatePrompt } from "./teammate.ts";
 
 /** The Lead's tools while this session runs Team setup. */
 const SETUP_TOOLS = ["team_request_approval"];
@@ -296,10 +298,14 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		return result.reply ?? "";
 	}
 
-	/** A Lead tool that would start a Teammate: refused before the Brief is approved, and on any record changed since. */
-	function startTeammate(tool: "team_plan" | "team_handoff", ctx: ExtensionContext): never {
+	/**
+	 * The Effort a Lead tool that leads to a Teammate works on: refused before
+	 * the Brief is approved, and on any record changed since.
+	 */
+	function approvedEffort(tool: "team_plan" | "team_handoff", ctx: ExtensionContext): { held: HeldEffort; state: EffortState } {
 		if (!effort) throw new Error(`No Effort is open in this session, so \`${tool}\` has nothing to work on; the human opens one with \`/team start <team>\`.`);
-		const result = step(effortState(effort), { kind: "start-teammate", tool });
+		const state = effortState(effort);
+		const result = step(state, { kind: "start-teammate", tool });
 		if (!result.ok) throw new Error(result.refusal);
 		const problems = checkRecords(effort.paths);
 		if (problems.length > 0) {
@@ -307,7 +313,26 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			ctx.ui.notify(text, "error");
 			throw new Error(`${text}\n\nStop and tell the human; \`${tool}\` runs again once the records match their approval.`);
 		}
-		throw new Error(`\`${tool}\` can't run yet: the Brief of Effort \`${effort.effortId}\` is approved, but planning and handing off are not built into this version of the team extension.`);
+		return { held: effort, state };
+	}
+
+	/** The Roles and Playbook the Effort snapshotted at Brief approval, which is all it staffs from. */
+	function snapshotOf(held: HeldEffort): { roles: Role[]; playbook: Playbook } {
+		const found = readSnapshot(held.paths.team, held.paths.playbook);
+		if ("problems" in found) {
+			const problems = found.problems.map((problem) => `${problem.filePath}: ${problem.reason}`);
+			throw new Error(`The Team snapshot of Effort \`${held.effortId}\` can't be read, so no Teammate starts:\n${bullets(problems)}\n\nStop and tell the human.`);
+		}
+		return found;
+	}
+
+	/** Carry out a step's actions in order, then append its lines: records are written before the line that claims them. */
+	async function carryOut(held: HeldEffort, result: Extract<Step, { ok: true }>, launch: (action: Extract<EffortAction, { kind: "launch-teammate" }>) => Promise<void>): Promise<void> {
+		for (const action of result.actions) {
+			if (action.kind === "write-plan") writePlan(held.paths, result.state);
+			else if (action.kind === "launch-teammate") await launch(action);
+		}
+		appendLines(held.paths, result.append);
 	}
 
 	/** One adoption in `/team pending`: approve, send back with a note, or leave it for later. */
@@ -404,25 +429,74 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	pi.registerTool({
 		name: "team_plan",
 		label: "Plan",
-		description:
-			"Write the Effort's whole Task list: each Task's slug, Role, goal, the Tasks it depends on and the acceptance-criterion ids it covers. Refused until the human approves the Brief.",
+		description: [
+			"Write the Effort's whole Task list: each Task's slug, Role, goal, the Tasks it depends on and the acceptance-criterion ids it covers.",
+			"Refused when a Brief criterion is left uncovered or a Task names a Role the Team doesn't have. Planning again replaces the list; a Task already handed off keeps its Role.",
+			"Writes `plan.md` in the Effort directory as a view. Refused until the human approves the Brief.",
+		].join(" "),
 		promptSnippet: "Write the Effort's Task list once its Brief is approved",
 		parameters: PlanParams,
 		defaultActive: false,
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			return startTeammate("team_plan", ctx);
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const { held, state } = approvedEffort("team_plan", ctx);
+			const { roles } = snapshotOf(held);
+			const criteria = briefCriteria(readFileSync(held.paths.brief, "utf8"));
+			const result = step(state, { kind: "plan", tasks: params.tasks, criteria, roles: roles.map((role) => role.name), at: now().toISOString() });
+			if (!result.ok) throw new Error(result.refusal);
+			await carryOut(held, result, async () => {});
+			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
 		},
 	});
 
 	pi.registerTool({
 		name: "team_handoff",
 		label: "Hand off",
-		description: "Hand a planned Task to a Teammate of its Role: its slug, the `task.md` body, and whether it needs its own worktree. Refused until the human approves the Brief.",
+		description: [
+			"Hand a planned Task to a new Teammate of its Role, launched as a Claude Code background session in the Effort's Workspace.",
+			"`body` becomes the Task's `task.md`: make it self-contained, listing the Effort's `brief.md` and `clarifications.md` among its inputs, since the Teammate has no earlier conversation.",
+			"Returns which Teammate started. Refused until the human approves the Brief, for a Task that isn't planned or is already running, and for `isolated`, which isn't built yet.",
+		].join(" "),
 		promptSnippet: "Hand a planned Task to a Teammate once the Brief is approved",
 		parameters: HandoffParams,
 		defaultActive: false,
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			return startTeammate("team_handoff", ctx);
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const { held, state } = approvedEffort("team_handoff", ctx);
+			if (params.isolated) {
+				throw new Error(`Task \`${params.slug}\` can't be handed off isolated yet: a Task with a worktree of its own isn't built. Hand it off without \`isolated\`, into the Effort's Workspace.`);
+			}
+			const result = step(state, { kind: "handoff", slug: params.slug, at: now().toISOString() });
+			if (!result.ok) throw new Error(result.refusal);
+			const workspace = state.workspace;
+			if (!workspace) throw new Error(`Effort \`${held.effortId}\` has no Workspace, so no Teammate starts; stop and tell the human.`);
+			const { roles, playbook } = snapshotOf(held);
+			await carryOut(held, result, async ({ teammate, task }) => {
+				const role = roles.find((each) => each.name === teammate.role);
+				if (!role) throw new Error(`The Team snapshot of Effort \`${held.effortId}\` has no Role \`${teammate.role}\`, so no Teammate starts; stop and tell the human.`);
+				const taskDir = writeTask(held.paths, task.folder, params.body);
+				const args = teammateArgs({
+					name: teammate.name,
+					role,
+					mode: modeInForce(playbook, role),
+					effortDir: held.paths.dir,
+					dir: join(held.paths.teammates, teammate.id),
+					settings: teammateSettings({
+						effortDir: held.paths.dir,
+						teammateId: teammate.id,
+						allow: [role.name, EVERY_ROLE].flatMap((key) => playbook.roles[key]?.allow ?? []),
+						deny: [role.name, EVERY_ROLE].flatMap((key) => playbook.roles[key]?.deny ?? []),
+						ask: playbook.escalate.flatMap((entry) => entry.ask),
+						records: protectedRecords(held.paths),
+					}),
+					prompt: teammatePrompt(
+						{ teammateId: teammate.id, role: role.name, brief: held.paths.brief, clarifications: held.paths.clarifications, tasks: held.paths.tasks },
+						role.prompt,
+					),
+					pointer: handoffPointer(task.slug, taskDir, 1),
+				});
+				const launched = await launchBackground(paths.claudePath, workspace.path, args);
+				if (launched) throw new Error(`Teammate \`${teammate.id}\` didn't start, so Task \`${task.slug}\` is still planned: ${launched.error}`);
+			});
+			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
 		},
 	});
 

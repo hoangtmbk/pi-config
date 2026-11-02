@@ -67,7 +67,33 @@ in it; a copy whose sha no longer matches its approval is reported and never use
 be approved once its Playbook has been adopted again: start a new Effort.
 
 `team_plan` and `team_handoff` are switched on with the Effort, and refuse until the Brief is
-approved. Planning and handing off are not built yet.
+approved.
+
+### Planning and handing off
+
+`team_plan` takes the whole Task list: each Task's slug, Role, goal, the Tasks it depends on and
+the criterion ids it covers. It refuses a list that leaves one of the Brief's criteria uncovered or
+names a Role the Team doesn't have. Planning again replaces the list, and `plan.md` in the Effort
+is rewritten as a view of it; editing `plan.md` changes nothing.
+
+`team_handoff` writes the Task's folder, `tasks/<nnn>-<role>-<slug>/task.md`, and starts a new
+Teammate of the Task's Role (`builder-1`, `builder-2`, …) as `claude --bg` in the Workspace,
+named `team-<effort-id>-<teammate-id>`. The launch passes the Role's flags, the mode in force
+(the Playbook's for the Role, then the Role's own, then `auto`) and, from `teammates/<id>/`:
+
+- `settings.json`, which adds to your own settings: the Teammate's hooks, `crossSessionInbound:
+  "accept"`, the Playbook's allow and deny rules for the Role and for `*`, every `escalate` rule
+  as `ask`, and a deny on editing `brief.md`, `clarifications.md`, `approvals.jsonl`,
+  `playbook.md`, `team/**` and `effort.jsonl`;
+- `prompt.md`, appended to the system prompt: a preamble naming the Teammate, its Role, the Lead
+  as its only contact, `AskUserQuestion` for questions, the Task-folder convention, the paths of
+  `brief.md` and `clarifications.md`, and that installing dependencies in the fresh Workspace is
+  its job, then the Role's prompt;
+- `mcp.json`, when the Role has `mcpServers`.
+
+The Effort directory is added with `--add-dir`, `EnterPlanMode` is always disallowed, and the
+first turn is a pointer to `task.md`. A launch that fails leaves the Task planned. A Task that
+needs a worktree of its own (`isolated`) is refused.
 
 ## Defining a Team
 

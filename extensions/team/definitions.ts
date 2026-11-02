@@ -710,6 +710,30 @@ export function listTeams(roots: TeamRoots): Team[] {
 		.map(([name, { dir, source }]) => readTeam(dir, name, source, roots.agentDir));
 }
 
+/**
+ * The Roles and Playbook an Effort snapshotted at Brief approval: its
+ * `team/roles/*.md` and its `playbook.md`. Both were validated before they
+ * were approved, and a bundled Team's limits were applied then, so the
+ * copies are read as the human's own.
+ */
+export function readSnapshot(teamDir: string, playbookFile: string): { roles: Role[]; playbook: Playbook } | { problems: ConfigError[] } {
+	const rolesDir = join(teamDir, "roles");
+	const problems: ConfigError[] = [];
+	const roles: Role[] = [];
+	const files = readdirSafe(rolesDir)
+		.filter((file) => file.endsWith(".md"))
+		.sort(byCodepoint);
+	for (const file of files) {
+		const parsed = parseRole(join(rolesDir, file), "user");
+		if (parsed.role) roles.push(parsed.role);
+		problems.push(...parsed.problems);
+	}
+	const parsed = parsePlaybook(playbookFile, { source: "user", roleNames: files.map((file) => basename(file, ".md")) });
+	problems.push(...parsed.problems);
+	if (problems.length > 0 || !parsed.playbook) return { problems };
+	return { roles, playbook: parsed.playbook };
+}
+
 /** One Team by name, or undefined when there is none by that name. */
 export function loadTeam(roots: TeamRoots, name: string): Team | undefined {
 	return listTeams(roots).find((team) => team.name === name);
