@@ -44,6 +44,13 @@ interface RegisteredTool {
 	execute(id: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: unknown): Promise<{ content: { type: string; text: string }[] }>;
 }
 
+/** A widget the extension set above the editor, or cleared with `lines` undefined. */
+interface Widget {
+	key: string;
+	lines: string[] | undefined;
+	placement?: string;
+}
+
 /** The tools pi itself has on before the extension changes anything. */
 const PI_TOOLS = ["read", "bash", "edit", "write"];
 
@@ -55,7 +62,10 @@ const NOW = new Date("2026-11-02T10:00:00.000Z");
  * context whose toasts are recorded too and whose dialogs answer from a queue
  * the test fills, the way the human would.
  */
-function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?: boolean; cwd?: string; bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[] } = {}) {
+function fakePi(
+	roots: TempRoots,
+	options: { claudeVersion?: string; streaming?: boolean; cwd?: string; bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown> } = {},
+) {
 	const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
 	const tools = new Map<string, RegisteredTool>();
 	const sent: SentMessage[] = [];
@@ -65,6 +75,7 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 	let activeTools = [...PI_TOOLS];
 	const activations: string[][] = [];
 	const entries: { customType: string; data: unknown }[] = [];
+	const widgets: Widget[] = [];
 	const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
 	const pi = {
 		on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
@@ -88,6 +99,7 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 		appendEntry(customType: string, data: unknown) {
 			entries.push({ customType, data });
 		},
+		getSettings: () => structuredClone(options.settings ?? {}),
 	};
 	const claude = fakeClaude(roots, { version: options.claudeVersion, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies });
 	registerTeam(pi as unknown as ExtensionAPI, {
@@ -126,6 +138,9 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 			async confirm(title: string) {
 				return answer("confirm", title);
 			},
+			setWidget(key: string, lines: string[] | undefined, widgetOptions?: { placement?: string }) {
+				widgets.push({ key, lines, placement: widgetOptions?.placement });
+			},
 		},
 	} as unknown as ExtensionCommandContext;
 
@@ -138,6 +153,8 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 		activations,
 		/** The custom entries the extension appended to the session, oldest first. */
 		entries,
+		/** Every widget the extension set or cleared, oldest first. */
+		widgets,
 		activeTools: () => [...activeTools],
 		claude,
 		/** Queue the human's answers to the next dialogs, in order. */
@@ -627,7 +644,7 @@ describe("/team start on a Team with no adopted Playbook", () => {
 
 		assert.match(pi.notifications.at(-1)?.message ?? "", /^Team `software` picked: .*Playbook: adopted 2026-11-02T10:00:00\.000Z.* Effort `software-2026-11-02` opened/);
 		assert.equal(pi.sent.at(-1)?.customType, "team-intake");
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status"]);
 	});
 
 	it("goes back through setup when the adopted Playbook was edited by hand", async () => {
@@ -710,7 +727,7 @@ describe("intake: `/team start` on a Team with an adopted Playbook", () => {
 		for (const needed of [join(dir, "brief.draft.md"), sha(INTAKE_PLAYBOOK), `repo: ${repo}`, "Constraints", "small-diffs", "**AC1**", "`team_request_approval`", "`brief`"]) {
 			assert.ok(woken?.content.includes(needed), `the intake prompt doesn't mention ${needed}:\n${woken?.content}`);
 		}
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status"]);
 	});
 
 	it("gives each Effort its own id, so a second one the same day is numbered", async () => {
@@ -1233,7 +1250,7 @@ function crewBrief(repo: string): string {
  * A session whose `crew` Effort has its Brief approved: a user Team whose
  * Roles set every launch flag between them, on {@link CREW_PLAYBOOK}.
  */
-async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[] } = {}) {
+async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown> } = {}) {
 	const roots = tempRoots();
 	const plugin = join(roots.scratch, "plugins", "lint");
 	writeUserTeam(roots, "crew", {
@@ -1257,7 +1274,7 @@ async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; 
 	});
 	adopt(roots, "crew", CREW_PLAYBOOK);
 	const repo = gitRepo(roots);
-	const pi = fakePi(roots, { cwd: repo, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies });
+	const pi = fakePi(roots, { cwd: repo, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies, settings: options.settings });
 	await pi.team("start crew");
 	const dir = effortDir(roots, CREW_EFFORT_ID);
 	writeFileSync(join(dir, "brief.draft.md"), crewBrief(repo));
@@ -1822,6 +1839,79 @@ describe("/team while the Lead is streaming", () => {
 
 		assert.equal(pi.sent[0].deliverAs, "followUp");
 		assert.equal(existsSync(join(playbooksDir(roots), "software.md")), true);
+	});
+});
+
+/** The Team block as last shown above the editor, or undefined once it was taken away. */
+function teamBlock(pi: ReturnType<typeof fakePi>): string[] | undefined {
+	const set = pi.widgets.filter((widget) => widget.key === "team");
+	assert.ok(set.length > 0, "the extension never set the `team` widget");
+	assert.ok(
+		set.every((widget) => widget.placement === "aboveEditor"),
+		"the Team block goes above the editor",
+	);
+	return set.at(-1)?.lines;
+}
+
+describe("the Team block", () => {
+	it("shows above the editor once the session holds an Effort, and goes when the session ends", async () => {
+		const { pi } = intakeSession();
+
+		await pi.team("start software");
+
+		assert.deepEqual(teamBlock(pi), [
+			"╭─ Team · software · software-2026-11-02 ─ 0 live ─╮",
+			"│ ● running  ·  intake                             │",
+			"│ nothing waiting on you   reports 0               │",
+			"╰──────────────────────────────────────────────────╯",
+		]);
+
+		await pi.emit("session_shutdown");
+
+		assert.equal(teamBlock(pi), undefined);
+	});
+
+	it("rows a handed-off Teammate with the mode it got against the one it launched in, and `team_status` returns the block's data", async () => {
+		const { pi } = await crewApproved({
+			hooks: [
+				{ event: "SessionStart", payload: { source: "startup", session_id: "c0ffee12-0000-4000-8000-000000000001", permission_mode: "acceptEdits" } },
+				{ event: "UserPromptSubmit", payload: { prompt: "New Task `rename-key`", permission_mode: "auto" } },
+			],
+		});
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+
+		assert.deepEqual(teamBlock(pi), [
+			"╭─ Team · crew · crew-2026-11-02 ─────────────────────────────────── 1 live ─╮",
+			"│ ● running  ·  working · 0/3 Tasks accepted                                 │",
+			"│ builder-1  c0ffee12  busy  001-builder-rename-key  ctx —  auto≠acceptEdits │",
+			"│ nothing waiting on you   reports 0                                         │",
+			"╰────────────────────────────────────────────────────────────────────────────╯",
+		]);
+		assert.deepEqual(JSON.parse(await pi.call("team_status", {})), {
+			effortId: "crew-2026-11-02",
+			team: "crew",
+			phase: "working",
+			tasks: { accepted: 0, planned: 3 },
+			teammates: [{ id: "builder-1", role: "builder", shortId: "c0ffee12", activity: "busy", task: "001-builder-rename-key", mode: "auto", launchMode: "acceptEdits" }],
+			queued: [],
+			waitingOnYou: 0,
+			reports: 0,
+		});
+	});
+
+	it("is never taller than pi's `maxTeammates` setting allows, counting the Teammates it has no row for", async () => {
+		const { pi } = await crewApproved({ settings: { maxTeammates: 2 } });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		for (const slug of ["rename-key", "check-old-configs", "survey"]) await pi.call("team_handoff", { slug, body: `# ${slug}\n` });
+
+		const block = teamBlock(pi) ?? [];
+		assert.equal(block.length, 6, block.join("\n"));
+		assert.match(block[0], / 3 live ─╮$/);
+		assert.match(block[2], /^│ builder-1 /);
+		assert.match(block[3], /^│ \+2 more Teammates +│$/);
 	});
 });
 
