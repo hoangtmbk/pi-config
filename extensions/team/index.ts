@@ -73,13 +73,17 @@ import { handoffPointer, restaffPointer, sendBackPointer, teammatePrompt } from 
 /** The Lead's tools while this session runs Team setup. */
 const SETUP_TOOLS = ["team_request_approval"];
 /** The Lead's tools while this session holds an Effort. */
-const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report"];
+const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume"];
 /** Every Lead tool: registered at load, and switched on only by what the session runs. */
 const LEAD_TOOLS = [...new Set([...SETUP_TOOLS, ...EFFORT_TOOLS])];
 
 const RequestApprovalParams = Type.Object({
 	checkpoint: Type.String({ description: "Which checkpoint: `brief` for an Effort's Brief, `adopt-playbook` during Team setup." }),
 	path: Type.String({ description: "The draft to approve: the Effort's `brief.draft.md`, or the Team setup's Playbook draft." }),
+});
+
+const PauseParams = Type.Object({
+	reason: Type.String({ description: "Why the Team holds, in a sentence; the human reads it in the Team block." }),
 });
 
 const PlanParams = Type.Object({
@@ -785,7 +789,12 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const said: string[] = [];
 		for (;;) {
 			const drained = step(state, { kind: "drain", at: now().toISOString(), maxTeammates: maxTeammates() });
-			if (!drained.ok || drained.reply === undefined) break;
+			if (!drained.ok) break;
+			if (drained.reply === undefined) {
+				// Nothing starts; the lines left say why each queued Task still waits, now that a pause no longer does.
+				appendLines(held.paths, drained.append);
+				break;
+			}
 			try {
 				await listenForTeammates(held, ctx);
 				await staffTask(held, drained);
@@ -798,6 +807,16 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		}
 		if (said.length > 0) wakeAboutTeammates(applyJournals(held));
 		return said;
+	}
+
+	/** Lift `by`'s own pause and start the queued Tasks it held back, saying what happened; refused while `by` holds none. */
+	async function liftPause(held: HeldEffort, by: "human" | "lead", ctx: ExtensionContext): Promise<{ ok: true; said: string } | { ok: false; refusal: string }> {
+		const result = step(effortState(held), { kind: "resume", by, at: now().toISOString() });
+		if (!result.ok) return result;
+		appendLines(held.paths, result.append);
+		const started = await startQueued(held, result.state, ctx);
+		paintBlock();
+		return { ok: true, said: [result.reply ?? "", ...started].join(" ") };
 	}
 
 	/** Launch a Teammate once its stagger is up, returning why it didn't start. */
@@ -878,11 +897,35 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				if (held) for (const item of briefs) await answerBrief(held, item, ctx);
 			},
 		},
+		pause: {
+			async run(args, ctx) {
+				if (!effort) {
+					ctx.ui.notify("This session holds no Effort, so there is nothing to pause; `/team start` opens one, and `/team resume` adopts one without a live Lead.", "error");
+					return;
+				}
+				const held = effort;
+				const result = step(effortState(held), { kind: "pause", by: "human", reason: args.join(" ") || undefined, at: now().toISOString() });
+				if (!result.ok) {
+					ctx.ui.notify(result.refusal, "info");
+					return;
+				}
+				appendLines(held.paths, result.append);
+				paintBlock();
+				ctx.ui.notify(result.reply ?? "", "info");
+			},
+		},
 		resume: {
 			async run(args, ctx) {
 				if (effort) {
 					// Only the human's pause is lifted here; adopting is for a session holding no Effort.
-					ctx.ui.notify(`Effort \`${effort.effortId}\` isn't paused by you, so there is nothing to resume.`, "info");
+					const held = effort;
+					const lifted = await liftPause(held, "human", ctx);
+					if (!lifted.ok) {
+						ctx.ui.notify(lifted.refusal, "info");
+						return;
+					}
+					ctx.ui.notify(lifted.said, "info");
+					wakeLead("team-resumed", `The human lifted their pause on Effort \`${held.effortId}\`. ${lifted.said}`);
 					return;
 				}
 				const candidates = adoptable(paths.agentDir);
@@ -1019,6 +1062,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		description: [
 			"Hand a planned Task to a Teammate of its Role, which the extension staffs: it reuses an idle Teammate of the Role (clearing its context first), else starts one as a Claude Code background session in the Effort's Workspace while under the human's `maxTeammates`, else stops an idle Teammate no queued Task needs and starts one, else queues the Task until a Teammate frees up.",
 			"`body` becomes the Task's `task.md`: make it self-contained, listing the Effort's `brief.md` and `clarifications.md` among its inputs, since the Teammate has no earlier conversation.",
+			"While the Effort is paused, by the human, by you or by a usage limit, the Task queues with `paused` and starts by itself once every pause is lifted.",
 			"Returns which Teammate was started or reused, or that the Task is queued and why. Refused until the human approves the Brief, for a Task already handed off or queued (running, in review, sent back or accepted), and for `isolated`, which isn't built yet.",
 		].join(" "),
 		promptSnippet: "Hand a planned Task to a Teammate once the Brief is approved",
@@ -1111,7 +1155,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		name: "team_status",
 		label: "Team status",
 		description: [
-			"The held Effort at a glance, as the human sees it in the Team block: the phase, Tasks accepted out of planned, each Teammate's state, Task, context use and permission mode (`acceptEdits≠auto` is drift from the mode it launched in), queued Tasks and why, and what waits on the human.",
+			"The held Effort at a glance, as the human sees it in the Team block: the phase, Tasks accepted out of planned, each Teammate's state, Task, context use and permission mode (`acceptEdits≠auto` is drift from the mode it launched in), queued Tasks and why, each pause that holds (who set it, why and since when), and what waits on the human.",
 			"Returns it as JSON. Changes nothing.",
 		].join(" "),
 		promptSnippet: "See the Effort's Teammates, Tasks and what waits on the human",
@@ -1132,6 +1176,46 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				}),
 			};
 			return { content: [{ type: "text", text: JSON.stringify(status, null, 2) }], details: status };
+		},
+	});
+
+	pi.registerTool({
+		name: "team_pause",
+		label: "Pause",
+		description: [
+			"Pause the Effort yourself, with a `reason` the human reads in the Team block: no new Task starts and handoffs queue, while running Teammates finish their Task.",
+			"Your pause is one of three that hold independently (the human's, yours, a usage limit's); the Effort runs only when none holds, and you lift only yours, with `team_resume`.",
+			"Refused while you already hold a pause.",
+		].join(" "),
+		promptSnippet: "Pause the Effort yourself, saying why",
+		parameters: PauseParams,
+		defaultActive: false,
+		async execute(_toolCallId, params) {
+			if (!effort) throw new Error("No Effort is open in this session, so there is nothing to pause; the human opens one with `/team start <team>`.");
+			const held = effort;
+			const result = step(effortState(held), { kind: "pause", by: "lead", reason: params.reason, at: now().toISOString() });
+			if (!result.ok) throw new Error(result.refusal);
+			appendLines(held.paths, result.append);
+			paintBlock();
+			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
+		},
+	});
+
+	pi.registerTool({
+		name: "team_resume",
+		label: "Resume",
+		description: [
+			"Lift your own pause, set with `team_pause`; once no pause holds, queued Tasks start through the staffing ladder and you get back what started.",
+			"Refused when you hold no pause: the human's pause is lifted only by the human, with `/team resume`, and a usage pause lifts at its reset.",
+		].join(" "),
+		promptSnippet: "Lift the pause you set with team_pause",
+		parameters: Type.Object({}),
+		defaultActive: false,
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			if (!effort) throw new Error("No Effort is open in this session, so there is nothing to resume; the human opens one with `/team start <team>`.");
+			const lifted = await liftPause(effort, "lead", ctx);
+			if (!lifted.ok) throw new Error(lifted.refusal);
+			return { content: [{ type: "text", text: lifted.said }], details: undefined };
 		},
 	});
 
@@ -1217,7 +1301,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	}
 
 	pi.registerCommand("team", {
-		description: "Run a Team on one Effort: /team start [team], /team setup <team>, /team pending, /team resume [effort], /team report, /team reports, /team attach [teammate] (or just /team)",
+		description: "Run a Team on one Effort: /team start [team], /team setup <team>, /team pending, /team pause [reason], /team resume [effort], /team report, /team reports, /team attach [teammate] (or just /team)",
 		async handler(args, ctx) {
 			// Bare `/team` is the attach picker: getting to a Teammate is what it is reached for most.
 			const [name = "attach", ...rest] = args.trim().split(/\s+/).filter(Boolean);

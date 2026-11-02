@@ -114,6 +114,30 @@ describe("the Team block", () => {
 		]);
 	});
 
+	it("shows each pause that holds on a line of its own, with who set it, since when and why, and how the human lifts theirs", () => {
+		const lines = render(
+			data({
+				pauses: [
+					{ by: "human", reason: "lunch", since: "2026-11-02T12:00:00.000Z" },
+					{ by: "lead", reason: "checking the API", since: "2026-11-02T12:05:00.000Z" },
+					{ by: "usage", since: "2026-11-02T12:10:00.000Z" },
+				],
+				queued: [{ task: "002-qa-tests", role: "qa", why: "paused" }],
+			}),
+		);
+
+		assert.deepEqual(lines, [
+			"╭─ Team · software · flaky-cache ──────── 0 live ─╮",
+			"│ ⏸ paused  ·  working · 1/4 Tasks accepted       │",
+			"│   by you since 12:00 UTC: lunch   /team resume  │",
+			"│   by the Lead since 12:05 UTC: checking the API │",
+			"│   by a usage limit since 12:10 UTC              │",
+			"│ queued  002-qa-tests (qa): paused               │",
+			"│ nothing waiting on you   reports 0              │",
+			"╰─────────────────────────────────────────────────╯",
+		]);
+	});
+
 	it("never gets wider than 96 columns, clipping every cell and flattening newlines, wide characters included, in plain lines RPC can take", () => {
 		const long = "deeply/nested/".repeat(12);
 		const lines = render(
@@ -264,6 +288,18 @@ describe("team_status data", () => {
 		const capped = through([REQUEST, APPROVE, PLAN, { ...handoff("design"), maxTeammates: 0 } as EffortInput]);
 
 		assert.equal(teamStatus(fold(capped), { adoptionsPending: 0 }).phase, "working");
+	});
+
+	it("lists the pauses that hold, the human's first, and none while the Effort runs", () => {
+		const pause = (by: "human" | "lead", at: string, reason?: string): EffortInput => ({ kind: "pause", by, at, ...(reason === undefined ? {} : { reason }) });
+		const paused = through([REQUEST, APPROVE, pause("lead", "2026-11-02T10:20:00.000Z", "checking the API"), pause("human", "2026-11-02T10:25:00.000Z")]);
+
+		assert.deepEqual(teamStatus(fold(paused), { adoptionsPending: 0 }).pauses, [
+			{ by: "human", since: "2026-11-02T10:25:00.000Z" },
+			{ by: "lead", reason: "checking the API", since: "2026-11-02T10:20:00.000Z" },
+		]);
+		const resumed = through([REQUEST, APPROVE, pause("human", "2026-11-02T10:25:00.000Z"), { kind: "resume", by: "human", at: "2026-11-02T10:30:00.000Z" }]);
+		assert.equal(teamStatus(fold(resumed), { adoptionsPending: 0 }).pauses, undefined);
 	});
 
 	it("counts the Reports written", () => {
