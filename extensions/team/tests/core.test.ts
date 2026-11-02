@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, heldPauses, type JournalLine, openEffort, type Step, step, taskStatus, waitingInTerminal } from "../core.ts";
+import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, heldPauses, type JournalLine, openEffort, openMerges, type Step, step, taskStatus, waitingInTerminal, workdir } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -1692,3 +1692,116 @@ describe("a Teammate's lifecycle", () => {
 	});
 });
 
+
+describe("an isolated Task", () => {
+	const WORKSPACE = { kind: "git-worktree", path: "/work/app/.claude/worktrees/team-software-2026-11-02", branch: "team/software-2026-11-02", base: "c".repeat(40), from: "main" } as const;
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", workspace: WORKSPACE, at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] },
+			{ slug: "docs", role: "dev", goal: "Document it.", criteria: ["AC1"] },
+		],
+		criteria: ["AC1"],
+		roles: ["dev"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+	const T0 = "2026-11-02T11:30:00.000Z";
+	const TASKS = "/agent/team/efforts/software-2026-11-02/tasks";
+	const INBOX = { socket: "/tmp/cc-socks/dev-1.sock", token: "token-dev-1" };
+
+	/** Play `id`'s round to a Stop with its result written, its SessionStart first. */
+	function done(lines: EffortLine[], id: string): EffortLine[] {
+		const due = currentResult(fold(lines), id);
+		const result = { path: `${TASKS}/${due?.folder}/result-${due?.round}.md`, written: true };
+		const started = applied(lines, {
+			kind: "journal",
+			teammate: id,
+			cursor: 1,
+			line: { from: "hook", at: T0, event: "SessionStart", payload: { session_id: `${id.padEnd(8, "0")}-0000-4000-8000-000000000001`, source: "startup" }, inbox: INBOX },
+			result,
+		});
+		return applied(started, { kind: "journal", teammate: id, cursor: 2, line: { from: "hook", at: T0, event: "Stop", payload: {} }, result });
+	}
+
+	function review(lines: EffortLine[], slug: string, at = "2026-11-02T13:00:00.000Z"): Extract<EffortInput, { kind: "review" }> {
+		const task = fold(lines).tasks[slug];
+		return { kind: "review", slug, verdict: "accept", result: { path: `${TASKS}/${task?.folder}/result-${task?.round}.md`, written: true }, sendBackLimit: 2, at };
+	}
+
+	it("gets a worktree and branch of its own beside the Workspace, cut from the Effort branch, before its Teammate launches there", () => {
+		const result = run(planned, { kind: "handoff", slug: "rename", isolated: true, at: T0 });
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const worktree = { path: "/work/app/.claude/worktrees/team-software-2026-11-02-task-001", branch: "team/software-2026-11-02-task-001" };
+		assert.deepEqual(result.append[1], { type: "task-handed-off", slug: "rename", folder: "001-dev-rename", role: "dev", teammate: "dev-1", at: T0, round: 1, worktree });
+		assert.deepEqual(
+			result.actions.map((action) => action.kind),
+			["write-task", "add-task-workspace", "launch-teammate", "write-plan"],
+		);
+		assert.deepEqual(result.actions[1], { kind: "add-task-workspace", slug: "rename", ...worktree, from: "team/software-2026-11-02" });
+		assert.equal(workdir(result.state, "dev-1"), worktree.path);
+		assert.match(result.reply ?? "", /team\/software-2026-11-02-task-001/);
+	});
+
+	it("never goes to a reused Teammate, whose working directory is elsewhere", () => {
+		const renamed = done(applied(planned, { kind: "handoff", slug: "rename", at: T0 }), "dev-1");
+		const accepted = applied(renamed, review(renamed, "rename"));
+
+		const result = run(accepted, { kind: "handoff", slug: "docs", isolated: true, at: "2026-11-02T14:00:00.000Z" });
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.equal(result.state.tasks.docs.teammate, "dev-2");
+		assert.equal(workdir(result.state, "dev-1"), WORKSPACE.path);
+		assert.equal(workdir(result.state, "dev-2"), "/work/app/.claude/worktrees/team-software-2026-11-02-task-002");
+	});
+
+	it("records the merge as a write-ahead intent on accept, and accepts only once the merge is in, ending its Teammate and its worktree", () => {
+		const inReview = done(applied(planned, { kind: "handoff", slug: "rename", isolated: true, at: T0 }), "dev-1");
+
+		const intent = run(inReview, review(inReview, "rename"));
+
+		assert.ok(intent.ok, intent.ok ? "" : intent.refusal);
+		assert.deepEqual(intent.append, [
+			{ type: "merge-intended", slug: "rename", branch: "team/software-2026-11-02-task-001", into: "team/software-2026-11-02", at: "2026-11-02T13:00:00.000Z" },
+		]);
+		assert.deepEqual(intent.actions, [
+			{ kind: "merge", slug: "rename", folder: "001-dev-rename", path: "/work/app/.claude/worktrees/team-software-2026-11-02-task-001", branch: "team/software-2026-11-02-task-001", into: WORKSPACE.path },
+		]);
+		assert.equal(taskStatus(intent.state, "rename"), "in review");
+		assert.deepEqual(openMerges(intent.state), [{ slug: "rename", branch: "team/software-2026-11-02-task-001", into: "team/software-2026-11-02" }]);
+		const merging = [...inReview, ...intent.append];
+		assert.match(refusal(merging, review(merging, "rename")), /merge .*under way/);
+
+		const merged = run(merging, { kind: "merge-result", slug: "rename", commit: "d".repeat(40), at: "2026-11-02T13:00:01.000Z" });
+
+		assert.ok(merged.ok, merged.ok ? "" : merged.refusal);
+		assert.deepEqual(merged.append, [
+			{ type: "task-accepted", slug: "rename", round: 1, merge: "d".repeat(40), at: "2026-11-02T13:00:01.000Z" },
+			{ type: "teammate-ended", teammate: "dev-1", how: "stopped", at: "2026-11-02T13:00:01.000Z" },
+		]);
+		assert.deepEqual(merged.actions, [
+			{ kind: "stop-teammate", teammate: "dev-1", shortId: "dev-1000" },
+			{ kind: "remove-task-workspace", slug: "rename", path: "/work/app/.claude/worktrees/team-software-2026-11-02-task-001", branch: "team/software-2026-11-02-task-001" },
+			{ kind: "write-plan" },
+		]);
+		assert.equal(taskStatus(merged.state, "rename"), "accepted");
+		assert.deepEqual(openMerges(merged.state), []);
+		assert.match(merged.reply ?? "", /^Accepted Task `rename`.*merged `team\/software-2026-11-02-task-001` into `team\/software-2026-11-02`/);
+	});
+
+	it("leaves the Task in review when the merge fails, closing the intent so the Lead can decide again", () => {
+		const inReview = done(applied(planned, { kind: "handoff", slug: "rename", isolated: true, at: T0 }), "dev-1");
+		const merging = applied(inReview, review(inReview, "rename"));
+
+		const failed = run(merging, { kind: "merge-result", slug: "rename", error: "conflict in config.ts", at: "2026-11-02T13:00:01.000Z" });
+
+		assert.ok(failed.ok, failed.ok ? "" : failed.refusal);
+		assert.deepEqual(failed.append, [{ type: "merge-failed", slug: "rename", reason: "conflict in config.ts", at: "2026-11-02T13:00:01.000Z" }]);
+		assert.deepEqual(failed.actions, []);
+		assert.equal(taskStatus(failed.state, "rename"), "in review");
+		assert.deepEqual(openMerges(failed.state), []);
+		const after = [...merging, ...failed.append];
+		assert.equal(run(after, review(after, "rename", "2026-11-02T13:10:00.000Z")).ok, true);
+	});
+});

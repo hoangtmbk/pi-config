@@ -123,9 +123,10 @@ export interface FakeClaudeOptions {
 /**
  * One step a fake background session plays: fire a hook event through the
  * hook commands of its `--settings` (the payload gets the session id, folder
- * and event name filled in), or write the result its handoff pointer asks for.
+ * and event name filled in), write the result its handoff pointer asks for,
+ * or edit a file in its working directory, committing it when a message is given.
  */
-export type FakeHookStep = { event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" };
+export type FakeHookStep = { event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string };
 
 /**
  * A hook command a fake session started without waiting on, as Claude Code

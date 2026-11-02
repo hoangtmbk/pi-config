@@ -74,6 +74,19 @@ export interface HandedTask {
 	sendBacks?: number;
 	/** When a re-plan dropped it, which ends this handoff: planned again, it is handed off afresh into a new folder. */
 	dropped?: string;
+	/** An isolated Task's own worktree and branch, cut from the Effort branch's tip; absent for a Task worked in the Workspace. */
+	worktree?: TaskWorktree;
+	/** When the merge of its branch, written ahead on accept, began; absent once the merge is in or has failed. */
+	merging?: string;
+}
+
+/**
+ * An isolated Task's worktree, `…/team-<effort-id>-task-<nnn>/` beside the
+ * Workspace (not nested in it), on branch `team/<effort-id>-task-<nnn>`.
+ */
+export interface TaskWorktree {
+	path: string;
+	branch: string;
 }
 
 /** Where a Task of the plan stands, as `plan.md` shows it. */
@@ -92,6 +105,8 @@ export interface QueuedTask {
 	why: string;
 	/** The permission mode the handoff asked for, which a Teammate started for it launches in. */
 	mode?: string;
+	/** Handed off `isolated`: it gets a worktree of its own when it starts. */
+	isolated?: true;
 	at: string;
 }
 
@@ -176,11 +191,20 @@ export type EffortLine =
 	/** A Teammate was launched. */
 	| ({ type: "teammate-started" } & Teammate)
 	/** A planned Task was handed to a Teammate, its folder written. */
-	| ({ type: "task-handed-off"; slug: string } & Omit<HandedTask, "reported" | "accepted" | "sendBacks">)
+	| ({ type: "task-handed-off"; slug: string } & Omit<HandedTask, "reported" | "accepted" | "sendBacks" | "merging">)
 	/** The Lead sent round `round` of a Task back with feedback, which starts round `round + 1` with the same Teammate. */
 	| { type: "task-sent-back"; slug: string; round: number; at: string }
-	/** The Lead accepted round `round` of a Task, which ends it. */
-	| { type: "task-accepted"; slug: string; round: number; at: string }
+	/** The Lead accepted round `round` of a Task, which ends it; for an isolated Task, once its branch is merged, by merge commit `merge` (absent when it had nothing to merge). */
+	| { type: "task-accepted"; slug: string; round: number; merge?: string; at: string }
+	/**
+	 * Written ahead of merging an isolated Task's `branch` into the Effort
+	 * branch `into` on accept: a `task-accepted` or a `merge-failed` of the
+	 * Task closes it, and one left open after a crash is finished from git's
+	 * evidence (`MERGE_HEAD`, or the branch already merged).
+	 */
+	| { type: "merge-intended"; slug: string; branch: string; into: string; at: string }
+	/** The merge an accept intended didn't happen, and left nothing half-done: the Task is still in review. */
+	| { type: "merge-failed"; slug: string; reason: string; at: string }
 	/**
 	 * The lines below each apply one journal line of `teammate`, and carry the
 	 * `cursor` it was read at, so it is never applied twice.
@@ -211,7 +235,7 @@ export type EffortLine =
 	| { type: "task-reassigned"; slug: string; teammate: string; at: string }
 	/** A re-plan left out a handed-off Task, or gave it another Role: this handoff of it is over. */
 	| { type: "task-dropped"; slug: string; at: string }
-	/** The extension stopped a Teammate with `claude stop`, since its Task was dropped. Reads no journal line. */
+	/** The extension stopped a Teammate with `claude stop`, since its Task was dropped, or its isolated Task merged and its worktree goes. Reads no journal line. */
 	| { type: "teammate-ended"; teammate: string; how: "stopped"; at: string }
 	/** Something decided for the human on their behalf, for the next Report: a permission answer, a rule, a grant used, a limit pause. */
 	| ({ type: "decided-for-you" } & Logged)
@@ -348,7 +372,9 @@ export type EffortInput =
 	 * started for it launches in and the cap of live Teammates (pi's
 	 * `maxTeammates` setting, {@link DEFAULT_MAX_TEAMMATES} by default).
 	 */
-	| { kind: "handoff"; slug: string; at: string; mode?: string; maxTeammates?: number }
+	| { kind: "handoff"; slug: string; at: string; mode?: string; maxTeammates?: number; isolated?: boolean }
+	/** What the merge an accept intended came to: merge commit `commit` (absent when there was nothing to merge), or why git refused it, nothing half-done. */
+	| { kind: "merge-result"; slug: string; commit?: string; error?: string; at: string }
 	/**
 	 * Line `cursor` of `teammate`'s journal (counted from 1), with whether the
 	 * result its current Task is due to write ({@link currentResult}) is on disk.
@@ -423,6 +449,16 @@ export type EffortAction =
 	| { kind: "stop-teammate"; teammate: string; shortId: string }
 	/** Write the Report as `reports/<nnn>.md`. */
 	| { kind: "write-report"; report: Report }
+	/** Cut an isolated Task's worktree at `path` on new branch `branch` from the Effort branch `from`'s tip, copying what `.worktreeinclude` lists, before its Teammate launches there. */
+	| ({ kind: "add-task-workspace"; slug: string; from: string } & TaskWorktree)
+	/**
+	 * Merge an isolated Task's `branch` into the Effort's Workspace at `into`
+	 * with `--no-ff`, refusing a dirty Workspace and leaving nothing half-merged
+	 * on a conflict, then step its `merge-result`. Its intent is on record first.
+	 */
+	| ({ kind: "merge"; slug: string; folder: string; into: string } & TaskWorktree)
+	/** Remove a merged Task's worktree and its branch, once its Teammate is stopped. */
+	| ({ kind: "remove-task-workspace"; slug: string } & TaskWorktree)
 	/** Send the decision to the hook holding `request`, which prints it for Claude Code. */
 	| { kind: "answer-hook"; request: string; teammate: string; decision: HookDecision };
 
@@ -533,7 +569,11 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			return task ? withTask(state, line.slug, { round: line.round + 1, sendBacks: (task.sendBacks ?? 0) + 1 }) : state;
 		}
 		case "task-accepted":
-			return withTask(state, line.slug, { accepted: line.at });
+			return merged(withTask(state, line.slug, { accepted: line.at }), line.slug);
+		case "merge-intended":
+			return withTask(state, line.slug, { merging: line.at });
+		case "merge-failed":
+			return merged(state, line.slug);
 		case "teammate-stopped":
 			return endRequests(withTeammate(state, line, { activity: "idle", doing: "stopped short" }), line.teammate);
 		case "teammate-mode":
@@ -592,6 +632,14 @@ function withTask(state: EffortState, slug: string, change: Partial<HandedTask>)
 	return task ? { ...state, tasks: { ...state.tasks, [slug]: { ...task, ...change } } } : state;
 }
 
+/** The state with Task `slug`'s merge no longer under way, whether it went in or failed. */
+function merged(state: EffortState, slug: string): EffortState {
+	const task = state.tasks[slug];
+	if (task?.merging === undefined) return state;
+	const { merging: _merging, ...rest } = task;
+	return { ...state, tasks: { ...state.tasks, [slug]: rest } };
+}
+
 /** The state with `line.teammate` changed by `change`, its cursor moved to the line's. */
 function withTeammate(state: EffortState, line: { teammate: string; cursor: number }, change: Partial<Teammate>): EffortState {
 	return {
@@ -647,6 +695,8 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return journal(state, input);
 		case "review":
 			return review(state, input);
+		case "merge-result":
+			return mergeResult(state, input);
 		case "drain":
 			return drain(state, input);
 		case "report":
@@ -987,8 +1037,22 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 			refusal: `Task \`${input.slug}\` is already queued (${queued.why}); it starts by itself when a Teammate frees up, so don't hand it off again.`,
 		};
 	}
+	if (input.isolated && !state.workspace) {
+		return {
+			ok: false,
+			refusal: `Effort \`${state.effortId}\` has no git Workspace, so Task \`${input.slug}\` can't have a worktree of its own; hand it off without \`isolated\`.`,
+		};
+	}
 	const folder = `${String(nextFolder(state)).padStart(3, "0")}-${task.role}-${task.slug}`;
-	const wanted: QueuedTask = { slug: task.slug, folder, role: task.role, why: "", at: input.at, ...(input.mode === undefined ? {} : { mode: input.mode }) };
+	const wanted: QueuedTask = {
+		slug: task.slug,
+		folder,
+		role: task.role,
+		why: "",
+		at: input.at,
+		...(input.mode === undefined ? {} : { mode: input.mode }),
+		...(input.isolated ? { isolated: true } : {}),
+	};
 	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
 	const pointer = `Task \`${task.slug}\` (tasks/${folder}/task.md)`;
 	const pauses = heldPauses(state);
@@ -1042,7 +1106,8 @@ function free(state: EffortState, teammate: Teammate): boolean {
  */
 function staff(state: EffortState, task: QueuedTask, max: number): { append: EffortLine[]; actions: EffortAction[]; who: string; note?: string } | undefined {
 	const handed = { type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, at: task.at, round: 1 } as const;
-	const reused = live(state).find((teammate) => teammate.role === task.role && teammate.inbox !== undefined && free(state, teammate));
+	// An isolated Task needs a Teammate launched in its own worktree, so it never reuses one.
+	const reused = task.isolated ? undefined : live(state).find((teammate) => teammate.role === task.role && teammate.inbox !== undefined && free(state, teammate));
 	if (reused?.inbox) {
 		return {
 			append: [
@@ -1074,13 +1139,17 @@ function start(state: EffortState, task: QueuedTask): { append: EffortLine[]; ac
 	const name = `team-${state.effortId}-${id}`;
 	const last = Math.max(...state.teammates.map((teammate) => Date.parse(teammate.startedAt)));
 	const at = new Date(Math.max(Date.parse(task.at), last + STAGGER_MS)).toISOString();
+	const worktree = task.isolated && state.workspace ? taskWorktree(state.workspace, task.folder) : undefined;
+	const launch: EffortAction = { kind: "launch-teammate", teammate: { id, role: task.role, name }, task: { slug: task.slug, folder: task.folder }, at };
 	return {
 		append: [
 			{ type: "teammate-started", id, role: task.role, name, task: task.slug, startedAt: at, ...(task.mode === undefined ? {} : { mode: task.mode }) },
-			{ type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate: id, at: task.at, round: 1 },
+			{ type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate: id, at: task.at, round: 1, ...(worktree ? { worktree } : {}) },
 		],
-		actions: [{ kind: "launch-teammate", teammate: { id, role: task.role, name }, task: { slug: task.slug, folder: task.folder }, at }],
-		who: `started ${id}`,
+		actions: worktree && state.workspace ? [{ kind: "add-task-workspace", slug: task.slug, from: state.workspace.branch, ...worktree }, launch] : [launch],
+		who: worktree
+			? `started ${id} in a worktree of its own, ${worktree.path} on \`${worktree.branch}\` (only what it commits there merges when you accept),`
+			: `started ${id}`,
 	};
 }
 
@@ -1305,6 +1374,21 @@ function review(state: EffortState, input: Extract<EffortInput, { kind: "review"
 			refusal: `Task \`${input.slug}\` has no new result to review: \`${task.teammate}\` hasn't finished round ${task.round} yet, though ${input.result.path} is on disk. Wait for it to stop; you are woken when it does.`,
 		};
 	}
+	if (task.merging !== undefined) {
+		return {
+			ok: false,
+			refusal: `Task \`${input.slug}\` is being accepted: a merge of \`${task.worktree?.branch}\` into the Effort branch has been under way since ${task.merging}. Wait for it; nothing more to review.`,
+		};
+	}
+	if (input.verdict === "accept" && task.worktree && state.workspace) {
+		const { path, branch } = task.worktree;
+		return took(
+			state,
+			[{ type: "merge-intended", slug: input.slug, branch, into: state.workspace.branch, at: input.at }],
+			[{ kind: "merge", slug: input.slug, folder: task.folder, path, branch, into: state.workspace.path }],
+			`Merging \`${branch}\` into \`${state.workspace.branch}\` to accept Task \`${input.slug}\` at round ${task.round}.`,
+		);
+	}
 	if (input.verdict === "accept") {
 		return took(
 			state,
@@ -1369,6 +1453,65 @@ function restaff(state: EffortState, input: Extract<EffortInput, { kind: "review
 }
 
 /**
+ * What the merge an isolated Task's accept intended came to. Merged, the Task
+ * is accepted, its Teammate stopped and its worktree and branch removed; the
+ * Teammate's session ends with its worktree. Refused by git, the merge is
+ * recorded as failed and the Task stays in review, its branch intact, for the
+ * Lead to fix what git named and review again.
+ */
+function mergeResult(state: EffortState, input: Extract<EffortInput, { kind: "merge-result" }>): Step {
+	const task = state.tasks[input.slug];
+	if (!task?.worktree || task.merging === undefined || !state.workspace) {
+		return { ok: false, refusal: `Task \`${input.slug}\` has no merge under way.` };
+	}
+	const { path, branch } = task.worktree;
+	const into = state.workspace.branch;
+	if (input.error !== undefined) {
+		return took(
+			state,
+			[{ type: "merge-failed", slug: input.slug, reason: input.error, at: input.at }],
+			[],
+			`Task \`${input.slug}\` isn't accepted: merging \`${branch}\` into \`${into}\` failed (${input.error}), and nothing was merged. It stays in review with its branch intact; fix that (or send it back) and review it again.`,
+		);
+	}
+	const teammate = state.teammates.find((each) => each.id === task.teammate);
+	const ending = teammate && teammate.ended === undefined && teammate.retiredAt === undefined ? teammate : undefined;
+	return took(
+		state,
+		[
+			{ type: "task-accepted", slug: input.slug, round: task.round, ...(input.commit === undefined ? {} : { merge: input.commit }), at: input.at },
+			...(ending ? [{ type: "teammate-ended", teammate: ending.id, how: "stopped", at: input.at } as const] : []),
+		],
+		[
+			...(ending ? [{ kind: "stop-teammate", teammate: ending.id, shortId: ending.shortId ?? ending.name } as const] : []),
+			{ kind: "remove-task-workspace", slug: input.slug, path, branch },
+			{ kind: "write-plan" },
+		],
+		`Accepted Task \`${input.slug}\` at round ${task.round}: ${input.commit === undefined ? `\`${branch}\` had nothing new, so nothing was` : `merged \`${branch}\` into \`${into}\` (${input.commit.slice(0, 12)}), and`} its worktree and branch are removed, with \`${task.teammate}\` stopped. plan.md shows it accepted.`,
+	);
+}
+
+/** An isolated Task's worktree beside the Workspace and its branch, both named after the Effort's with the Task's number. */
+function taskWorktree(workspace: Workspace, folder: string): TaskWorktree {
+	const nnn = folder.slice(0, 3);
+	return { path: `${workspace.path}-task-${nnn}`, branch: `${workspace.branch}-task-${nnn}` };
+}
+
+/** Where `teammate` works: its isolated Task's worktree, else the Effort's Workspace. */
+export function workdir(state: EffortState, teammate: string): string | undefined {
+	const slug = state.teammates.find((each) => each.id === teammate)?.task;
+	const worktree = slug === undefined ? undefined : state.tasks[slug]?.worktree;
+	return worktree?.path ?? state.workspace?.path;
+}
+
+/** Merges of isolated Tasks written ahead and not yet resolved, for recovery to finish or undo. */
+export function openMerges(state: EffortState): { slug: string; branch: string; into: string }[] {
+	return Object.entries(state.tasks).flatMap(([slug, task]) =>
+		task.merging !== undefined && task.worktree && state.workspace ? [{ slug, branch: task.worktree.branch, into: state.workspace.branch }] : [],
+	);
+}
+
+/**
  * Where Task `slug` stands: planned until handed off; then running, in review
  * once its round's result is reported, sent back while a later round is
  * worked, and accepted for good.
@@ -1414,6 +1557,8 @@ function told(line: EffortLine): string | undefined {
 			return `sent Task \`${line.slug}\` back after round ${line.round}`;
 		case "task-accepted":
 			return `accepted Task \`${line.slug}\` at round ${line.round}`;
+		case "merge-failed":
+			return `the merge of Task \`${line.slug}\` failed: ${line.reason}`;
 		case "paused":
 			return `${line.by === "human" ? "you" : line.by === "lead" ? "the Lead" : "a usage limit"} paused the Effort${line.reason === undefined ? "" : `: ${line.reason}`}`;
 		case "resumed":
