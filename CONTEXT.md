@@ -160,3 +160,9 @@ The folder an Effort's Teammates work in, kept apart from the human's own copy o
 the human can carry on alongside the Team. Each Team says what kind of Workspace it needs.
 Teammates hand work to each other through the Effort's Task records, not through the Workspace.
 _Avoid_: checkout, sandbox, working copy
+
+**Takeover**:
+The human directing a Teammate themselves, by typing to it or stopping it, rather than through
+the Lead. The Teammate is the human's until they hand it back; meanwhile the Lead sends it
+nothing. Watching a Teammate, or answering one of its questions, is not a Takeover.
+_Avoid_: override (that is a Brief's), intervention, stepping in
