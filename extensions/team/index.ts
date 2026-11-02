@@ -48,6 +48,7 @@ import { EVERY_ROLE, listTeams, loadTeam, type Playbook, readSnapshot, type Role
 import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
 import { adoptable, hasEnded, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
 import {
+	answerTerms,
 	appendLines,
 	briefCriteria,
 	checkRecords,
@@ -170,7 +171,11 @@ const AnswerParams = Type.Object({
 	rule: Type.Optional(
 		Type.String({ description: "With `allow`: a session rule for the same tool, such as `Bash(npm test:*)`, so the Teammate isn't asked again this session." }),
 	),
-	grant: Type.Optional(Type.String({ description: "With `allow`: the grant in the Brief or Playbook the allow relies on, logged for the human." })),
+	grant: Type.Optional(
+		Type.String({
+			description: "With `allow`: the grant id in the Playbook or Brief the allow relies on, or `delivery` for the Brief's Delivery, logged for the human. Required to allow a floor action.",
+		}),
+	),
 	answers: Type.Optional(
 		Type.Record(Type.String(), Type.Union([Type.String(), Type.Array(Type.String())]), {
 			description: "For an AskUserQuestion: each question's exact text to the label picked, or a list of labels for a multiSelect question.",
@@ -747,7 +752,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const written = writeFeedback(held.paths, folder, round, feedback);
 		await listenForTeammates(held, ctx);
 		const cwd = workdir(result.state, teammate.id) ?? workspace.path;
-		const launched = await launchBackground(paths.claudePath, cwd, launchArgs(held, teammate, role, playbook, restaffPointer(slug, taskDir, round)));
+		const launched = await launchBackground(paths.claudePath, cwd, launchArgs(held, teammate, role, playbook, restaffPointer(slug, taskDir, round), cwd));
 		if (launched) {
 			rmSync(written);
 			throw new Error(`Teammate \`${teammate.id}\` didn't start, so Task \`${slug}\` isn't sent back and its feedback-${round}.md is taken back: ${launched.error}`);
@@ -791,8 +796,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		return [outcome.reply ?? "", ...notes].join(" ");
 	}
 
-	/** The `claude --bg` arguments that start `teammate` in `role`, with `pointer` as its first turn. */
-	function launchArgs(held: HeldEffort, teammate: { id: string; name: string }, role: Role, playbook: Playbook, pointer: string): string[] {
+	/** The `claude --bg` arguments that start `teammate` in `role` in the folder `cwd`, with `pointer` as its first turn. */
+	function launchArgs(held: HeldEffort, teammate: { id: string; name: string }, role: Role, playbook: Playbook, pointer: string, cwd: string): string[] {
 		return teammateArgs({
 			name: teammate.name,
 			role,
@@ -806,6 +811,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				deny: [role.name, EVERY_ROLE].flatMap((key) => playbook.roles[key]?.deny ?? []),
 				ask: playbook.escalate.flatMap((entry) => entry.ask),
 				records: protectedRecords(held.paths),
+				workspace: cwd,
 			}),
 			prompt: teammatePrompt({ teammateId: teammate.id, role: role.name, brief: held.paths.brief, clarifications: held.paths.clarifications, tasks: held.paths.tasks }, role.prompt),
 			pointer,
@@ -940,8 +946,9 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		if (!state.workspace) return `Effort \`${held.effortId}\` has no Workspace; stop and tell the human.`;
 		const wait = Date.parse(at) - now().getTime();
 		if (wait > 0) await sleep(wait);
-		const args = launchArgs(held, teammate, role, playbook, handoffPointer(task.slug, join(held.paths.tasks, task.folder), 1));
-		return (await launchBackground(paths.claudePath, workdir(state, teammate.id) ?? state.workspace.path, args))?.error;
+		const cwd = workdir(state, teammate.id) ?? state.workspace.path;
+		const args = launchArgs(held, teammate, role, playbook, handoffPointer(task.slug, join(held.paths.tasks, task.folder), 1), cwd);
+		return (await launchBackground(paths.claudePath, cwd, args))?.error;
 	}
 
 	/** One adoption in `/team pending`: approve, send back with a note, or leave it for later. */
@@ -1590,6 +1597,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		description: [
 			"Answer a Teammate's held request: a permission prompt or an AskUserQuestion its hook holds open while the prompt stays live in its terminal.",
 			"For a permission, `decision` is `allow` or `deny` with a `reason`; an allow may add a session `rule` for the same tool and name the `grant` it relies on.",
+			"A floor action (push, publish, deploy, send, delete outside the Workspace) is allowed only citing as `grant` a Playbook grant, a Brief override grant, or `delivery` (the Brief's Delivery), and takes no `rule`; one the Playbook's `escalate` entries ask about goes to the human with `team_escalate`.",
 			"For an AskUserQuestion, `answers` maps each question's exact text to a label, or a list of labels for a multiSelect question.",
 			"The first answer wins: refused once the human answered in the terminal, or the hook gave up holding it. Nothing is allowed by default, and the next Report logs what you decided.",
 		].join(" "),
@@ -1603,8 +1611,25 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			if (params.decision !== undefined && decision === undefined) throw new Error(`\`decision\` is \`allow\` or \`deny\`, not \`${params.decision}\`.`);
 			// What the terminal did meanwhile counts first: the first answer wins.
 			wakeAboutTeammates(applyJournals(held));
-			const answer = { kind: "answer-request" as const, request: params.request, decision, reason: params.reason, rule: params.rule, grant: params.grant, answers: params.answers, at: now().toISOString() };
-			const result = step(effortState(held), answer);
+			const state = effortState(held);
+			// What the approved Brief lets you allow on the floor, deletes judged against the Teammate's own folder.
+			const asker = state.teammateRequests[params.request]?.teammate;
+			const terms =
+				state.brief && state.workspace
+					? answerTerms(snapshotOf(held).playbook, readFileSync(held.paths.brief, "utf8"), (asker && workdir(state, asker)) ?? state.workspace.path)
+					: undefined;
+			const answer = {
+				kind: "answer-request" as const,
+				request: params.request,
+				decision,
+				reason: params.reason,
+				rule: params.rule,
+				grant: params.grant,
+				answers: params.answers,
+				...(terms ? { terms } : {}),
+				at: now().toISOString(),
+			};
+			const result = step(state, answer);
 			if (!result.ok) throw new Error(result.refusal);
 			const opened = await bridge?.catch(() => undefined);
 			for (const action of result.actions) {

@@ -1352,13 +1352,14 @@ const CREW_PLAYBOOK = [
 
 const CREW_EFFORT_ID = "crew-2026-11-02";
 
-/** A Brief for the `crew` Team with criteria `AC1` and `AC2`. */
-function crewBrief(repo: string): string {
+/** A Brief for the `crew` Team with criteria `AC1` and `AC2`, on `playbook` and with any `overrides` lines. */
+function crewBrief(repo: string, playbook = CREW_PLAYBOOK, overrides: string[] = []): string {
 	return [
 		"---",
 		"team: crew",
-		`playbook: ${sha(CREW_PLAYBOOK)}`,
+		`playbook: ${sha(playbook)}`,
 		`repo: ${repo}`,
+		...overrides,
 		"---",
 		"",
 		"# Rename the config key",
@@ -1393,7 +1394,7 @@ function crewBrief(repo: string): string {
  * Roles set every launch flag between them, on {@link CREW_PLAYBOOK}.
  */
 async function crewApproved(
-	options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown> } & Pick<
+	options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown>; playbook?: string; overrides?: string[] } & Pick<
 		NonNullable<Parameters<typeof fakePi>[1]>,
 		"mode" | "env" | "attachExit" | "holdMs"
 	> = {},
@@ -1419,7 +1420,7 @@ async function crewApproved(
 		"roles/reviewer.md": roleMd("reviewer", "permissionMode: dontAsk"),
 		"roles/scout.md": roleMd("scout"),
 	});
-	adopt(roots, "crew", CREW_PLAYBOOK);
+	adopt(roots, "crew", options.playbook ?? CREW_PLAYBOOK);
 	const repo = gitRepo(roots);
 	const pi = fakePi(roots, {
 		cwd: repo,
@@ -1434,7 +1435,7 @@ async function crewApproved(
 	});
 	await pi.team("start crew");
 	const dir = effortDir(roots, CREW_EFFORT_ID);
-	writeFileSync(join(dir, "brief.draft.md"), crewBrief(repo));
+	writeFileSync(join(dir, "brief.draft.md"), crewBrief(repo, options.playbook, options.overrides));
 	await pi.call("team_request_approval", { checkpoint: "brief", path: join(dir, "brief.draft.md") });
 	pi.answer("Approve");
 	await pi.team("pending");
@@ -1585,14 +1586,14 @@ describe("handing off: team_handoff", () => {
 		assert.deepEqual(pi.sleeps, [5000, 10000]);
 	});
 
-	it("gives the Teammate settings that add the hooks, the Playbook's rules for its Role, every escalate ask and a deny on editing the Effort's records, and nothing that replaces the human's own", async () => {
+	it("gives the Teammate settings that add the hooks, the Playbook's rules for its Role, every escalate ask and a deny on editing the Effort's records, and nothing that replaces the human's own; the floor hook also names the folder the Teammate works in", async () => {
 		const { pi, dir } = await crewApproved();
 		await pi.call("team_plan", { tasks: CREW_PLAN });
 
 		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
 		await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
 
-		const hooks = (id: string) => {
+		const hooks = (id: string, workspace: string) => {
 			const command = `'${process.execPath}' '${HOOK_SCRIPT}' '${dir}' '${id}'`;
 			const entry = { hooks: [{ type: "command", command }] };
 			return {
@@ -1605,21 +1606,22 @@ describe("handing off: team_handoff", () => {
 				PermissionDenied: [entry],
 				Notification: [entry],
 				PostToolUse: [entry],
-				PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command }] }],
+				PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: `${command} '${workspace}'` }] }],
 			};
 		};
 		const records = ["brief.md", "clarifications.md", "approvals.jsonl", "playbook.md", "team/**", "effort.jsonl"].map((record) => `Edit(/${dir}/${record})`);
 		const ask = ["Bash(git rebase:*)", "Bash(git push --force:*)", "Edit(package-lock.json)"];
 		const [builder, scout] = pi.claude.launches().map((launch) => JSON.parse(launch.settings ?? "null"));
+		const [builderCwd, scoutCwd] = pi.claude.launches().map((launch) => launch.cwd);
 		assert.deepEqual(builder, {
 			permissions: { allow: ["Bash(npm run build:*)", "Bash(git status)"], deny: ["Bash(npm publish:*)", "Bash(curl:*)", ...records], ask },
 			crossSessionInbound: "accept",
-			hooks: hooks("builder-1"),
+			hooks: hooks("builder-1", builderCwd),
 		});
 		assert.deepEqual(scout, {
 			permissions: { allow: ["Bash(git status)"], deny: ["Bash(curl:*)", ...records], ask },
 			crossSessionInbound: "accept",
-			hooks: hooks("scout-1"),
+			hooks: hooks("scout-1", scoutCwd),
 		});
 	});
 
@@ -2039,6 +2041,85 @@ describe("a Teammate's held requests: team_answer", () => {
 
 		await assert.rejects(pi.call("team_answer", { request: "req-00000000", decision: "allow", reason: "ok" }), new RegExp(`No request \`req-00000000\` waits on you.*\`${request}\``, "s"));
 		await assert.rejects(pi.call("team_answer", { request, decision: "maybe", reason: "ok" }), /`decision` is `allow` or `deny`/);
+	});
+});
+
+/** {@link CREW_PLAYBOOK} with a grant that lets the Lead allow a push of the Effort's branch. */
+const FLOOR_PLAYBOOK = CREW_PLAYBOOK.replace("permissions:\n", "permissions:\n  grants:\n    - id: push-effort-branch\n      allow: Push the Effort's branch to origin, never with force.\n");
+
+/**
+ * An approved crew Effort on {@link FLOOR_PLAYBOOK}, whose Brief adds the
+ * grant `open-pr`, and whose `builder-1` runs each of `commands` in Bash: the
+ * floor hook makes each floor one a prompt, and the fake plays the held
+ * `PermissionRequest` that follows, as Claude Code does. Waits until `floors`
+ * requests are held.
+ */
+async function floorAsking(commands: string[], floors = commands.length) {
+	const crew = await crewApproved({
+		playbook: FLOOR_PLAYBOOK,
+		overrides: ["overrides:", "  - rule: open-pr", '    change: "add grant: open the pull request the Delivery asks for"', "    reason: The human reviews every change as a PR."],
+		hooks: [
+			{ event: "SessionStart", payload: { source: "startup", session_id: "c0ffee12-0000-4000-8000-000000000001" } },
+			{ event: "UserPromptSubmit", payload: { prompt: "New Task `rename-key`" } },
+			...commands.map((command): FakeHookStep => ({ event: "PreToolUse", payload: { tool_name: "Bash", tool_input: { command } } })),
+		],
+	});
+	holding.push(crew.pi.claude);
+	await crew.pi.call("team_plan", { tasks: CREW_PLAN });
+	await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+	const held = () => effortLines(crew.dir).filter((line) => line.type === "request-held");
+	await until(() => held().length === floors, "the Lead holds a request for each floor command");
+	const request = (command: string): string => {
+		const found = held().find((line) => (line as { input?: { command?: unknown } }).input?.command === command);
+		assert.ok(found, `no request holds \`${command}\``);
+		return String(found.request);
+	};
+	return { ...crew, request };
+}
+
+describe("the floor: irreversible outward actions reach the human", () => {
+	afterEach(() => {
+		for (const fake of holding.splice(0)) fake.release();
+	});
+
+	it("holds a floor command the hook asks about, and takes an allow only citing a Playbook grant, a Brief override grant or the Delivery, logging each", async () => {
+		const { pi, dir, request } = await floorAsking(["git push origin HEAD", "gh pr create --fill", "git -C . push origin HEAD:refs/heads/review", "npm test"], 3);
+		const push = request("git push origin HEAD");
+
+		await assert.rejects(pi.call("team_answer", { request: push, decision: "allow", reason: "The Delivery wants a branch." }), (error: Error) => {
+			assert.match(error.message, /floor push `git push origin HEAD`/);
+			assert.match(error.message, /`push-effort-branch`, `open-pr`, `delivery`/);
+			assert.match(error.message, /team_escalate/);
+			return true;
+		});
+		await pi.call("team_answer", { request: push, decision: "allow", reason: "The Effort's branch, no force.", grant: "push-effort-branch" });
+		await pi.call("team_answer", { request: request("gh pr create --fill"), decision: "allow", reason: "The PR the human reviews.", grant: "open-pr" });
+		await pi.call("team_answer", { request: request("git -C . push origin HEAD:refs/heads/review"), decision: "allow", reason: "One branch, ready to merge.", grant: "delivery" });
+
+		for (const hook of pi.claude.held()) {
+			await until(() => hook.exitCode() !== undefined, "each held hook exits");
+			assert.deepEqual(JSON.parse(hook.output() ?? ""), { hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
+		}
+		await pi.call("team_report", { headline: "builder-1 delivered." });
+		const report = readFileSync(join(dir, "reports", "001.md"), "utf8");
+		for (const needed of [
+			"used grant `push-effort-branch` (Playbook: Push the Effort's branch to origin, never with force.) for builder-1's floor push `git push origin HEAD` (Task `rename-key`)",
+			"used grant `open-pr` (Brief override: open the pull request the Delivery asks for) for builder-1's floor send `gh pr create --fill` (Task `rename-key`)",
+			"used the Brief's Delivery (One branch, ready to merge.) for builder-1's floor push `git -C . push origin HEAD:refs/heads/review` (Task `rename-key`)",
+		]) {
+			assert.ok(report.includes(needed), `reports/001.md doesn't say ${needed}:\n${report}`);
+		}
+	});
+
+	it("keeps a request an escalate entry asks about from the Lead's allow, cited or not, and takes its deny", async () => {
+		const { pi, request } = await floorAsking(["git push --force origin HEAD"]);
+		const force = request("git push --force origin HEAD");
+
+		await assert.rejects(
+			pi.call("team_answer", { request: force, decision: "allow", reason: "A tidy history.", grant: "push-effort-branch" }),
+			/`escalate` entry `history-rewrite`.*`team_escalate`/s,
+		);
+		await pi.call("team_answer", { request: force, decision: "deny", reason: "Rewriting history is the human's call." });
 	});
 });
 

@@ -11,8 +11,16 @@
  * the journal is the record, and the Lead reads it from its cursor, so a Lead
  * that isn't listening misses nothing.
  *
- * For every event but one it prints nothing and exits 0, which lets the event
+ * For every event but two it prints nothing and exits 0, which lets the event
  * through unchanged.
+ *
+ * A `PreToolUse` for `Bash` is the floor hook: when the floor classifier
+ * (`floor.mjs`) finds an irreversible outward action in the command, the hook
+ * prints `permissionDecision: "ask"`, so Claude Code prompts even in `auto`
+ * and the prompt arrives as a held `PermissionRequest`. The Workspace it
+ * judges deletes against is the hook command's third argument, given only to
+ * this hook, and the session's `cwd` when it is missing. It is a guardrail,
+ * not a security boundary.
  *
  * A `PermissionRequest` (an AskUserQuestion included) is held instead: the
  * journal line carries a request id, and the hook keeps a socket open to the
@@ -34,6 +42,7 @@ import { randomBytes } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { connect } from "node:net";
 import { join } from "node:path";
+import { floorAction } from "./floor.mjs";
 
 /** How long the doorbell may take before the hook gives up on it; the journal line is already written. */
 const DOORBELL_TIMEOUT_MS = 2_000;
@@ -44,7 +53,7 @@ const DOORBELL_TIMEOUT_MS = 2_000;
  */
 const HOLD_MS = Number(process.env.TEAM_HOOK_HOLD_MS) > 0 ? Number(process.env.TEAM_HOOK_HOLD_MS) : 3_570_000;
 
-const [effortDir, teammate] = process.argv.slice(2);
+const [effortDir, teammate, workspace] = process.argv.slice(2);
 
 function readStdin() {
 	return new Promise((resolve) => {
@@ -148,6 +157,23 @@ function hold(journal, request) {
 	});
 }
 
+/** The floor hook's `ask` for a `PreToolUse` of a floor command, or undefined to let it through. */
+function floorAsk(payload) {
+	if (payload?.hook_event_name !== "PreToolUse" || payload.tool_name !== "Bash") return undefined;
+	const command = payload.tool_input?.command;
+	const root = workspace || payload.cwd;
+	if (typeof command !== "string" || typeof root !== "string") return undefined;
+	const floor = floorAction(command, { workspace: root, cwd: typeof payload.cwd === "string" ? payload.cwd : undefined });
+	if (floor === undefined) return undefined;
+	return {
+		hookSpecificOutput: {
+			hookEventName: "PreToolUse",
+			permissionDecision: "ask",
+			permissionDecisionReason: `floor: ${floor.kind} (\`${floor.command}\`), an irreversible outward action, so it always comes to the human`,
+		},
+	};
+}
+
 const payload = parse(await readStdin());
 if (effortDir && teammate) {
 	const dir = join(effortDir, "teammates", teammate);
@@ -160,6 +186,8 @@ if (effortDir && teammate) {
 	} else {
 		appendFileSync(journal, journalLine(payload));
 		await ringDoorbell();
-		process.exit(0);
+		const floor = floorAsk(payload);
+		if (floor) process.stdout.write(JSON.stringify(floor), () => process.exit(0));
+		else process.exit(0);
 	}
 } else process.exit(0);
