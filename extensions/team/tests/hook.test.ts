@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { createServer, type Server } from "node:net";
+import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { HOOK_SCRIPT } from "../claude.ts";
@@ -199,10 +199,12 @@ describe("the hook script as the PreToolUse floor hook", () => {
  */
 async function answeringLead(
 	answer: (held: { request: string }) => unknown,
-): Promise<{ server: Server; port: number; held: () => Record<string, unknown>[]; doorbells: () => Record<string, unknown>[] }> {
+): Promise<{ server: Server; port: number; held: () => Record<string, unknown>[]; doorbells: () => Record<string, unknown>[]; stop: () => Promise<void> }> {
 	const held: Record<string, unknown>[] = [];
 	const doorbells: Record<string, unknown>[] = [];
+	const sockets = new Set<Socket>();
 	const server = createServer((socket) => {
+		sockets.add(socket);
 		let buffered = "";
 		socket.setEncoding("utf8");
 		socket.on("error", () => socket.destroy());
@@ -223,7 +225,12 @@ async function answeringLead(
 	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 	const address = server.address();
 	if (address === null || typeof address === "string") throw new Error("the fake Lead has no port");
-	return { server, port: address.port, held: () => held, doorbells: () => doorbells };
+	/** Stop listening and drop every connection, as a Lead whose pi process dies does. */
+	const stop = () => {
+		for (const socket of sockets) socket.destroy();
+		return new Promise<void>((resolve) => server.close(() => resolve()));
+	};
+	return { server, port: address.port, held: () => held, doorbells: () => doorbells, stop };
 }
 
 function writeLead(dir: string, port: number): void {
@@ -294,19 +301,55 @@ describe("the hook script holding a PermissionRequest", () => {
 		assert.deepEqual(lead.doorbells(), [{ type: "doorbell", token: "t0ken", teammate: "builder-1" }]);
 	});
 
-	it("gives the request straight back to the terminal when no Lead is listening", async () => {
-		const missing = effortDir();
-		const closed = effortDir();
-		const lead = await answeringLead(() => undefined);
-		await new Promise((resolve) => lead.server.close(resolve));
-		writeLead(closed, lead.port);
+	it("keeps holding with no Lead listening and offers the same request to a new Lead once lead.json names one", async () => {
+		const dir = effortDir();
+		const gone = await answeringLead(() => undefined);
+		await new Promise((resolve) => gone.server.close(resolve));
+		writeLead(dir, gone.port);
+		const lead = await answeringLead(({ request }) => ({ type: "decision", request, decision: { behavior: "deny", message: "not now" } }));
 
-		const results = [await runHook(missing, "builder-1", PERMISSION), await runHook(closed, "builder-1", PERMISSION)];
+		const result = runHook(dir, "builder-1", PERMISSION, { TEAM_HOOK_HOLD_MS: "10000" });
+		await new Promise((resolve) => setTimeout(resolve, 600));
+		assert.deepEqual(journal(dir, "builder-1").map((line) => line.event), ["PermissionRequest"]);
+		writeLead(dir, lead.port);
+		const { code, output } = await result;
+		lead.server.close();
 
-		assert.deepEqual(results, [
-			{ code: 0, output: "" },
-			{ code: 0, output: "" },
-		]);
-		for (const dir of [missing, closed]) assert.deepEqual(journal(dir, "builder-1").map((line) => line.event), ["PermissionRequest", "hold-expired"]);
+		const lines = journal(dir, "builder-1");
+		assert.deepEqual(lines.map((line) => line.event), ["PermissionRequest"]);
+		assert.deepEqual(lead.held(), [{ type: "held", token: "t0ken", teammate: "builder-1", request: lines[0].request }]);
+		assert.equal(code, 0);
+		assert.deepEqual(JSON.parse(output), {
+			hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "not now" } },
+		});
+	});
+
+	it("re-sends the same request when the Lead it reached goes away and another takes its place", async () => {
+		const dir = effortDir();
+		const first = await answeringLead(() => undefined);
+		writeLead(dir, first.port);
+
+		const result = runHook(dir, "builder-1", PERMISSION, { TEAM_HOOK_HOLD_MS: "10000" });
+		while (first.held().length === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+		await first.stop();
+		const second = await answeringLead(({ request }) => ({ type: "decision", request, decision: { behavior: "allow" } }));
+		writeFileSync(join(dir, "lead.json"), JSON.stringify({ pid: process.pid, port: second.port, token: "n3w", sessionFile: "/s.jsonl", startedAt: "2026-11-02T11:00:00.000Z" }));
+		const { code, output } = await result;
+		second.server.close();
+
+		assert.deepEqual(second.held(), [{ type: "held", token: "n3w", teammate: "builder-1", request: first.held()[0].request }]);
+		assert.equal(code, 0);
+		assert.deepEqual(JSON.parse(output).hookSpecificOutput.decision, { behavior: "allow" });
+	});
+
+	it("with no Lead at all, holds until its hold time and only then gives the prompt back to the terminal", async () => {
+		const dir = effortDir();
+		const started = Date.now();
+
+		const result = await runHook(dir, "builder-1", PERMISSION, { TEAM_HOOK_HOLD_MS: "700" });
+
+		assert.ok(Date.now() - started >= 700);
+		assert.deepEqual(result, { code: 0, output: "" });
+		assert.deepEqual(journal(dir, "builder-1").map((line) => line.event), ["PermissionRequest", "hold-expired"]);
 	});
 });
