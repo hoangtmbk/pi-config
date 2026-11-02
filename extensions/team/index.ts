@@ -64,6 +64,7 @@ import {
 	appendClarification,
 	appendLines,
 	briefCriteria,
+	briefRoles,
 	checkRecords,
 	createEffort,
 	type EffortPaths,
@@ -342,6 +343,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	let effort: HeldEffort | undefined;
 	// The Lead bridge the held Effort's hooks ring, open while this session is its Lead.
 	let bridge: Promise<Bridge> | undefined;
+	/** The Teammates being stopped and launched afresh right now, whose journals aren't read until that is on record. */
+	const relaunching = new Set<string>();
 	// Whether the Lead's model is in a run, and what wakes about Teammates wait for it to settle.
 	let busy = false;
 	let waiting: string[] = [];
@@ -598,6 +601,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		let models: Record<string, string> | undefined | null = null;
 		for (const { id, cursor } of state.teammates) {
 			if (only !== undefined && id !== only) continue;
+			// A Teammate being started afresh is read once its relaunch is on record, so its new session's lines go to its new Task.
+			if (relaunching.has(id)) continue;
 			for (const read of readJournal(held.paths, id, cursor ?? 0)) {
 				const due = currentResult(state, id);
 				const path = due ? join(held.paths.tasks, due.folder, `result-${due.round}.md`) : "";
@@ -821,7 +826,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		}
 		if (answer === APPROVE) {
 			// Checked again against what is in force now, since the snapshot may have waited a while.
-			const problems = validateBrief(item.snapshot, { team: state.team, repo: state.repo, playbook: found.playbook });
+			const problems = validateBrief(item.snapshot, { team: state.team, repo: state.repo, playbook: found.playbook, roles: found.team.roles.map((role) => role.name) });
 			if (problems.length > 0) {
 				ctx.ui.notify(`The Brief of Effort \`${state.effortId}\` (request \`${item.id}\`) can't be approved:\n${bullets(problems)}`, "error");
 				return;
@@ -899,7 +904,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		if (checkpoint === BRIEF) {
 			const found = inForce(state);
 			if ("error" in found) throw new Error(`The Brief of Effort \`${state.effortId}\` can't be asked about: ${found.error}.`);
-			const problems = validateBrief(snapshot, { team: state.team, repo: state.repo, playbook: found.playbook });
+			const problems = validateBrief(snapshot, { team: state.team, repo: state.repo, playbook: found.playbook, roles: found.team.roles.map((role) => role.name) });
 			if (problems.length > 0) throw new Error(`The Brief ${path} can't be asked about until these are fixed:\n${bullets(problems)}`);
 		} else if (checkpoint === BRIEF_CHANGE && snapshot_) {
 			const problems = briefChangeProblems(state, snapshot, snapshot_);
@@ -917,7 +922,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * each override naming an id that Playbook has; and a change at all.
 	 */
 	function briefChangeProblems(state: EffortState, text: string, snapshot_: { roles: Role[]; playbook: Playbook }): string[] {
-		const problems = validateBrief(text, { team: state.team, repo: state.repo, playbook: snapshot_.playbook });
+		const problems = validateBrief(text, { team: state.team, repo: state.repo, playbook: snapshot_.playbook, roles: snapshot_.roles.map((role) => role.name) });
 		if (existsSync(effortPaths(paths.agentDir, state.effortId).brief) && sha256(text) === state.brief?.sha256) {
 			problems.push("it is the approved Brief as it stands, so there is no change to approve");
 		}
@@ -942,14 +947,31 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		return { held: effort, state };
 	}
 
-	/** The Roles and Playbook the Effort snapshotted at Brief approval, which is all it staffs from. */
+	/**
+	 * The Roles and Playbook the Effort snapshotted at Brief approval, which is
+	 * all it staffs from, with the launch options its approved Brief sets per
+	 * Role (`roles`) applied.
+	 */
 	function snapshotOf(held: HeldEffort): { roles: Role[]; playbook: Playbook } {
+		const found = rawSnapshot(held);
+		return existsSync(held.paths.brief) ? { ...found, roles: briefRoles(readFileSync(held.paths.brief, "utf8"), found.roles) } : found;
+	}
+
+	/** The Team and Playbook snapshot as written, before the Brief's `roles`. */
+	function rawSnapshot(held: HeldEffort): { roles: Role[]; playbook: Playbook } {
 		const found = readSnapshot(held.paths.team, held.paths.playbook);
 		if ("problems" in found) {
 			const problems = found.problems.map((problem) => `${problem.filePath}: ${problem.reason}`);
 			throw new Error(`The Team snapshot of Effort \`${held.effortId}\` can't be read, so no Teammate starts:\n${bullets(problems)}\n\nStop and tell the human.`);
 		}
 		return found;
+	}
+
+	/** The Roles whose launch options (`model`, `effort`) differ between Brief `before` and Brief `after`. */
+	function changedLaunch(roles: Role[], before: string, after: string): string[] {
+		const old = briefRoles(before, roles);
+		const next = briefRoles(after, roles);
+		return roles.flatMap((role, index) => (old[index]?.model !== next[index]?.model || old[index]?.effort !== next[index]?.effort ? [role.name] : []));
 	}
 
 	/** The mode a Teammate handed `slug` launches in, when the plan and the snapshot name its Role: drift is measured against it. */
@@ -1100,6 +1122,19 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * it causes is what sends the Task's pointer.
 	 */
 	async function staffTask(held: HeldEffort, result: Extract<Step, { ok: true }>, body?: string): Promise<void> {
+		// A launch under an id the Effort already has is a fresh session for that Teammate: its journal waits for the lines.
+		const known = new Set(effortState(held).teammates.map((teammate) => teammate.id));
+		const fresh = result.actions.flatMap((action) => (action.kind === "launch-teammate" && known.has(action.teammate.id) ? [action.teammate.id] : []));
+		for (const id of fresh) relaunching.add(id);
+		try {
+			await staffTaskNow(held, result, body);
+		} finally {
+			for (const id of fresh) relaunching.delete(id);
+		}
+	}
+
+	/** {@link staffTask}, past the journal hold. */
+	async function staffTaskNow(held: HeldEffort, result: Extract<Step, { ok: true }>, body?: string): Promise<void> {
 		const { roles, playbook } = snapshotOf(held);
 		const stopped: string[] = [];
 		const added: Extract<EffortAction, { kind: "add-task-workspace" }>[] = [];
@@ -1400,7 +1435,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			}
 		}
 		const at = now().toISOString();
-		const result = step(state, { kind: "answer", id: item.id, ...picked, at });
+		const refresh = picked.answer === "approved" ? changedLaunch(rawSnapshot(held).roles, readFileSync(held.paths.brief, "utf8"), item.snapshot) : [];
+		const result = step(state, { kind: "answer", id: item.id, ...picked, ...(refresh.length > 0 ? { refresh } : {}), at });
 		if (!result.ok) {
 			ctx.ui.notify(result.refusal, "error");
 			return;

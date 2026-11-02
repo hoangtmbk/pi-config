@@ -336,6 +336,13 @@ export type EffortLine =
 	| { type: "clear-requested"; teammate: string; slug: string; at: string }
 	/** An idle Teammate whose Task is accepted was stopped to make room under the cap. */
 	| { type: "teammate-retired"; teammate: string; at: string }
+	/**
+	 * An idle Teammate whose Role's launch options an approved Brief change
+	 * altered was stopped and launched afresh, under the same id and name, for
+	 * Task `task`, in permission mode `mode`. Its next `SessionStart` gives it
+	 * a new short id.
+	 */
+	| { type: "teammate-relaunched"; teammate: string; task: string; mode?: string; at: string }
 	/** The human used the `/team` menu on a Teammate: the short id they were given, which clears its `(new)` mark. Reads no journal line. */
 	| { type: "teammate-attached"; teammate: string; shortId: string; at: string }
 	/** A send-back gave the Task to a new Teammate, since its own had ended. */
@@ -892,15 +899,34 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			return { ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, clearing: line.slug } : teammate)) };
 		case "teammate-retired":
 			return { ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, retiredAt: line.at } : teammate)) };
+		case "teammate-relaunched":
+			return {
+				...state,
+				teammates: state.teammates.map((teammate) => {
+					if (teammate.id !== line.teammate) return teammate;
+					// What the old session knew goes with it: the new one starts from its launch, with no session rules.
+					const { freshDue: _fresh, inbox: _inbox, activity: _activity, doing: _doing, limit: _limit, rules: _rules, clearing: _clearing, observedMode: _observed, mode: _mode, ...rest } = teammate;
+					return { ...rest, task: line.task, startedAt: line.at, relaunching: true, ...(line.mode === undefined ? {} : { mode: line.mode }) };
+				}),
+			};
 		case "teammate-session": {
 			const before = state.teammates.find((teammate) => teammate.id === line.teammate)?.shortId;
-			const changed = withTeammate(state, line, {
+			const started = withTeammate(state, line, {
 				sessionId: line.sessionId,
 				shortId: line.shortId,
 				...(line.inbox === undefined ? {} : { inbox: line.inbox }),
 				// A short id that replaces another is a new attach target, marked until the human attaches to it.
 				...(before !== undefined && before !== line.shortId ? { newShortId: true } : {}),
 			});
+			// A fresh session's start ends its relaunch.
+			const changed = {
+				...started,
+				teammates: started.teammates.map((teammate) => {
+					if (teammate.id !== line.teammate || !teammate.relaunching) return teammate;
+					const { relaunching: _relaunching, ...rest } = teammate;
+					return rest;
+				}),
+			};
 			if (line.source !== "clear") return changed;
 			// The clear asked for has happened.
 			return {
@@ -1695,7 +1721,15 @@ function answerBriefChange(state: EffortState, item: PendingApproval, input: Ext
 	const tasks = holds.length === 0 ? undefined : `Task${holds.length === 1 ? "" : "s"} ${quoted(holds)}`;
 	const one = holds.length === 1;
 	if (input.answer === "approved") {
-		const fresh = refresh.length > 0 ? `The launch options of ${quoted(refresh)} changed, so each of their Teammates gets a fresh session at its next Task boundary, never mid-Task.` : undefined;
+		const renewed = live(state).filter((teammate) => refresh.includes(teammate.role)).map((teammate) => teammate.id);
+		const fresh =
+			refresh.length === 0
+				? undefined
+				: `The launch options of Role${refresh.length === 1 ? "" : "s"} ${quoted(refresh)} changed, so ${
+						renewed.length === 0
+							? "their next Teammates start with the new ones"
+							: `${quoted(renewed)} ${renewed.length === 1 ? "starts" : "each start"} in a fresh session at its next Task, never mid-Task, keeping ${renewed.length === 1 ? "its" : "their"} id`
+					}.`;
 		return took(state, [line], [
 			{ kind: "promote-brief-change", approval: item, at: input.at },
 			{
@@ -2070,6 +2104,7 @@ function staff(state: EffortState, task: QueuedTask, max: number): { append: Eff
 	const handed = { type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, at: task.at, round: 1 } as const;
 	// An isolated Task needs a Teammate launched in its own worktree, so it never reuses one.
 	const reused = task.isolated ? undefined : live(state).find((teammate) => teammate.role === task.role && teammate.inbox !== undefined && free(state, teammate));
+	if (reused?.freshDue && reused.shortId) return relaunch(state, reused, task);
 	if (reused?.inbox) {
 		return {
 			append: [
@@ -2092,6 +2127,29 @@ function staff(state: EffortState, task: QueuedTask, max: number): { append: Eff
 		actions: [{ kind: "stop-teammate", teammate: idle.id, shortId: idle.shortId }, ...started.actions],
 		who: started.who,
 		note: `It stopped idle \`${idle.id}\`, whose Task is accepted, to stay within the cap of ${max} live Teammates.`,
+	};
+}
+
+/**
+ * Start a free Teammate afresh on the Task, since an approved Brief change
+ * altered its Role's launch options: its old session is stopped (its
+ * conversation kept), and a new one launched under the same id and name, at
+ * a Task boundary, never mid-Task.
+ */
+function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask): { append: EffortLine[]; actions: EffortAction[]; who: string; note: string } {
+	const last = Math.max(...state.teammates.map((each) => Date.parse(each.startedAt)));
+	const at = new Date(Math.max(Date.parse(task.at), last + STAGGER_MS)).toISOString();
+	return {
+		append: [
+			{ type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate: teammate.id, at: task.at, round: 1 },
+			{ type: "teammate-relaunched", teammate: teammate.id, task: task.slug, ...(task.mode === undefined ? {} : { mode: task.mode }), at },
+		],
+		actions: [
+			{ kind: "stop-teammate", teammate: teammate.id, shortId: teammate.shortId ?? teammate.name },
+			{ kind: "launch-teammate", teammate: { id: teammate.id, role: teammate.role, name: teammate.name }, task: { slug: task.slug, folder: task.folder }, at },
+		],
+		who: `started ${teammate.id} afresh`,
+		note: `An approved Brief change altered Role \`${teammate.role}\`'s launch options, so its old session is stopped (its conversation kept) and a new one starts with them; it keeps its id, with a new short id.`,
 	};
 }
 
@@ -2203,8 +2261,8 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 		case "SessionStart": {
 			const sessionId = text(payload.session_id);
 			if (sessionId === undefined) return took(state, [], []);
-			// The short id is the launch session's first eight characters; a clear or a resume keeps it.
-			const shortId = teammate.shortId ?? sessionId.slice(0, 8);
+			// The short id is the launch session's first eight characters; a clear or a resume keeps it, and a fresh session's launch replaces it.
+			const shortId = teammate.relaunching || teammate.shortId === undefined ? sessionId.slice(0, 8) : teammate.shortId;
 			const source = text(payload.source) ?? "startup";
 			const session: EffortLine = { type: "teammate-session", ...at_, source, sessionId, shortId, ...(line.inbox === undefined ? {} : { inbox: line.inbox }), at };
 			// The clear a reuse asked for has happened: the reused Teammate gets its new Task's pointer in the fresh context.
@@ -2284,6 +2342,9 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 function sessionEnded(state: EffortState, teammate: Teammate, input: Extract<EffortInput, { kind: "journal" }>): Step {
 	const reason = text(input.line.payload?.reason) ?? "other";
 	if (reason === "clear" || reason === "resume" || teammate.ended !== undefined) return took(state, [], []);
+	// The old session of a Teammate started afresh ends as the new one starts: that is no crash.
+	const ended = text(input.line.payload?.session_id);
+	if (teammate.relaunching || (ended !== undefined && teammate.sessionId !== undefined && ended !== teammate.sessionId)) return took(state, [], []);
 	const task = state.tasks[teammate.task];
 	const open = task !== undefined && task.teammate === teammate.id && task.accepted === undefined && task.dropped === undefined;
 	const text_ = open

@@ -14,7 +14,7 @@ import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSyn
 import { join, relative, sep } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { type Clarification, type EffortLine, type EffortState, type JournalLine, type PendingApproval, type Report, taskStatus, type Workspace } from "./core.ts";
-import { BRIEF_SKELETON, isKebabCase, type Playbook, sha256 } from "./definitions.ts";
+import { BRIEF_SKELETON, isKebabCase, type Playbook, type Role, sha256 } from "./definitions.ts";
 import type { AnswerTerms, CitableGrant } from "./requests.ts";
 
 /** The files of one Effort, all under `<agent dir>/team/efforts/<effort-id>/`. */
@@ -277,9 +277,13 @@ export interface BriefExpectations {
 	repo: string;
 	/** The Playbook in force, whose sha the Brief records and whose ids overrides name. */
 	playbook: Playbook;
+	/** The Team's Role names, which `roles` may set launch options for; unchecked when absent. */
+	roles?: readonly string[];
 }
 
-const BRIEF_FIELDS = ["team", "playbook", "repo", "overrides"];
+const BRIEF_FIELDS = ["team", "playbook", "repo", "overrides", "roles"];
+/** The launch options a Brief may set per Role, under `roles`: the rest stay the Role's and the Playbook's. */
+const LAUNCH_FIELDS = ["model", "effort"] as const;
 const OVERRIDE_FIELDS = ["rule", "change", "reason"];
 const SKIP = "skip";
 const ADD_GRANT = "add grant:";
@@ -322,7 +326,52 @@ function checkFrontmatter(fields: Record<string, unknown>, expected: BriefExpect
 		problems.push(`\`repo\` must be the Effort's repo, ${expected.repo}, not \`${String(fields.repo)}\``);
 	}
 	problems.push(...checkOverrides(fields.overrides, expected.playbook));
+	problems.push(...checkRoles(fields.roles, expected.roles));
 	return problems;
+}
+
+/** `roles`: a mapping of Role name to its `model` and `effort` for this Effort, each a non-empty string. */
+function checkRoles(roles: unknown, known: readonly string[] | undefined): string[] {
+	if (roles === undefined || roles === null) return [];
+	if (!isMapping(roles)) return [`\`roles\` must map Role names to their launch options, ${quoteList(LAUNCH_FIELDS)}`];
+	const problems: string[] = [];
+	for (const [role, options] of Object.entries(roles)) {
+		if (known !== undefined && !known.includes(role)) problems.push(`\`roles\` names \`${role}\`, which isn't a Role of the Team; the Roles are ${quoteList(known)}`);
+		if (!isMapping(options)) {
+			problems.push(`\`roles.${role}\` must be a mapping of ${quoteList(LAUNCH_FIELDS)}`);
+			continue;
+		}
+		for (const [key, value] of Object.entries(options)) {
+			if (!(LAUNCH_FIELDS as readonly string[]).includes(key)) problems.push(`unknown field \`${key}\` in \`roles.${role}\`; a Brief sets only ${quoteList(LAUNCH_FIELDS)}`);
+			else if (typeof value !== "string" || value.trim() === "") problems.push(`\`roles.${role}.${key}\` must be a non-empty string, not \`${String(value)}\``);
+		}
+	}
+	return problems;
+}
+
+/**
+ * The Team's Roles with the launch options a Brief's `roles` sets for this
+ * Effort applied: `model` and `effort`, as written. A Brief without them, or
+ * one that doesn't parse, leaves the Roles as they are.
+ */
+export function briefRoles(text: string, roles: readonly Role[]): Role[] {
+	let fields: unknown;
+	try {
+		fields = parseFrontmatter(text).frontmatter;
+	} catch {
+		return [...roles];
+	}
+	const set = isMapping(fields) && isMapping(fields.roles) ? fields.roles : {};
+	return roles.map((role) => {
+		const options = set[role.name];
+		if (!isMapping(options)) return role;
+		const changed: Partial<Role> = {};
+		for (const key of LAUNCH_FIELDS) {
+			const value = options[key];
+			if (typeof value === "string" && value.trim() !== "") changed[key] = value.trim();
+		}
+		return { ...role, ...changed };
+	});
 }
 
 /** The ids a Brief's override may name: the Playbook's rules, checkpoints, grants and escalate entries. */
