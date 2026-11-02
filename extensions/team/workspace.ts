@@ -13,7 +13,7 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
-import type { Workspace } from "./core.ts";
+import type { MergeEvidence, Workspace } from "./core.ts";
 import type { WorkspaceKind } from "./definitions.ts";
 
 /** The folder the worktrees go in, relative to the repo root, as a gitignore pattern for that folder. */
@@ -179,9 +179,12 @@ export function addTaskWorkspace(repo: string, task: { path: string; branch: str
  * Refused, with nothing merged, while either worktree has uncommitted changes
  * (the Workspace's would mix into the merge; the Task's would be left out of
  * it) and on a conflict, which is aborted so no half-merge stays behind.
+ * With `abort`, a half-merge a restart left behind is aborted first.
  */
-export function mergeTaskWorkspace(merge: { into: string; path: string; branch: string; slug: string; folder: string }): { commit?: string } | { error: string } {
+export function mergeTaskWorkspace(merge: { into: string; path: string; branch: string; slug: string; folder: string; abort?: boolean }): { commit?: string } | { error: string } {
 	try {
+		// A merge a restart cut short left MERGE_HEAD behind: it is undone first, then done again.
+		if (merge.abort && gitSucceeds(merge.into, ["rev-parse", "-q", "--verify", "MERGE_HEAD"])) git(merge.into, ["merge", "--abort"]);
 		const dirty = changed(merge.into);
 		if (dirty.length > 0) return { error: `the Effort's Workspace ${merge.into} has uncommitted changes (${listed(dirty)}); commit or remove them first` };
 		const left = changed(merge.path);
@@ -200,6 +203,31 @@ export function mergeTaskWorkspace(merge: { into: string; path: string; branch: 
 		return { commit: git(merge.into, ["rev-parse", "HEAD"]).trim() };
 	} catch (error) {
 		if (error instanceof GitError) return { error: error.message };
+		throw error;
+	}
+}
+
+/**
+ * Where the merge of `branch` into the Workspace at `into` stands, for a
+ * restart to finish it: half-done while `MERGE_HEAD` is left behind; merged
+ * once the branch is in, by the merge commit whose second parent is its tip
+ * (none when it had nothing new); else not started. Undefined when git
+ * can't tell, the branch or the Workspace being gone.
+ */
+export function mergeEvidence(into: string, branch: string): MergeEvidence | undefined {
+	if (!existsSync(into)) return undefined;
+	try {
+		if (gitSucceeds(into, ["rev-parse", "-q", "--verify", "MERGE_HEAD"])) return { state: "half-done" };
+		if (!gitSucceeds(into, ["rev-parse", "-q", "--verify", `refs/heads/${branch}`])) return undefined;
+		if (!gitSucceeds(into, ["merge-base", "--is-ancestor", branch, "HEAD"])) return { state: "not-started" };
+		const tip = git(into, ["rev-parse", branch]).trim();
+		const merge = git(into, ["log", "--merges", "--format=%H %P", `${tip}..HEAD`])
+			.split("\n")
+			.map((line) => line.split(" "))
+			.find((shas) => shas[2] === tip)?.[0];
+		return merge === undefined ? { state: "merged" } : { state: "merged", commit: merge };
+	} catch (error) {
+		if (error instanceof GitError) return undefined;
 		throw error;
 	}
 }

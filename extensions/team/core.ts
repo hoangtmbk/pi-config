@@ -290,6 +290,15 @@ export type EffortLine =
 	/** The merge an accept intended didn't happen, and left nothing half-done: the Task is still in review. */
 	| { type: "merge-failed"; slug: string; reason: string; at: string }
 	/**
+	 * Written ahead of launching Teammate `teammate` as `--name` `name`: the
+	 * `lines` its launch puts on record once it is in. Its own
+	 * `teammate-started` closes it, and one left open after a crash is finished
+	 * from `claude agents --json` or the Teammate's journal, or abandoned.
+	 */
+	| { type: "launch-intended"; teammate: string; name: string; lines: EffortLine[]; at: string }
+	/** A launch written ahead never happened: none of its lines went on record. */
+	| { type: "launch-abandoned"; teammate: string; reason: string; at: string }
+	/**
 	 * The lines below each apply one journal line of `teammate`, and carry the
 	 * `cursor` it was read at, so it is never applied twice.
 	 */
@@ -582,6 +591,10 @@ export interface EffortState {
 	finalReport?: number;
 	/** Set once the Effort is over; then nothing more is taken. */
 	ended?: Ended;
+	/** Launches written ahead and not yet in or abandoned, by Teammate id; absent before the first. */
+	launching?: Record<string, { name: string; lines: EffortLine[]; at: string }>;
+	/** Pointers sent over an inbox and not yet known to have landed: the round each Task's is for, by slug; absent when none is owed. */
+	undelivered?: Record<string, number>;
 }
 
 /** A new input to the core. */
@@ -695,7 +708,28 @@ export type EffortInput =
 	/** The shell's clock, every minute while an Effort is held: lifts usage pauses and holds at their reset, and continues limited Teammates when due. */
 	| { kind: "tick"; at: string }
 	/** The human's answer to usage item `id`, one of its {@link USAGE_CHOICES}. */
-	| { kind: "answer-usage"; id: string; choice: string; at: string };
+	| { kind: "answer-usage"; id: string; choice: string; at: string }
+	/**
+	 * After a restart, before the journals are replayed: git's and Claude
+	 * Code's evidence for the intents left open, which the shell gathers.
+	 */
+	| {
+			kind: "recover";
+			/** The `--name`s `claude agents --json` lists; absent when it couldn't be read. */
+			agents?: readonly string[];
+			/** Ids of the Teammates with lines in their journals. */
+			journaled?: readonly string[];
+			/** Where each open merge stands in git, by slug; absent for one git couldn't tell. */
+			merges?: Record<string, MergeEvidence>;
+			/** The Brief promotions `approvals.jsonl` records. */
+			promoted?: readonly { request: string; brief: string; workspace?: Workspace }[];
+			at: string;
+	  }
+	/** After a restart, once the journals are replayed: what was sent and never landed is sent again. `sent` names the Tasks whose pointer the replay sent. */
+	| { kind: "reconcile"; sent?: readonly string[]; at: string };
+
+/** Where an open merge stands in git: in the Effort branch (by merge commit `commit`, absent when it had nothing new), cut short with `MERGE_HEAD` left behind, or never begun. */
+export type MergeEvidence = { state: "merged"; commit?: string } | { state: "half-done" } | { state: "not-started" };
 
 /** Work the core leaves to the shell. */
 export type EffortAction =
@@ -741,8 +775,9 @@ export type EffortAction =
 	 * Merge an isolated Task's `branch` into the Effort's Workspace at `into`
 	 * with `--no-ff`, refusing a dirty Workspace and leaving nothing half-merged
 	 * on a conflict, then step its `merge-result`. Its intent is on record first.
+	 * `abort`: a merge cut short by a restart left `MERGE_HEAD`, aborted first.
 	 */
-	| ({ kind: "merge"; slug: string; folder: string; into: string } & TaskWorktree)
+	| ({ kind: "merge"; slug: string; folder: string; into: string; abort?: true } & TaskWorktree)
 	/** Remove a merged Task's worktree and its branch, once its Teammate is stopped. */
 	| ({ kind: "remove-task-workspace"; slug: string } & TaskWorktree)
 	/** Send the decision to the hook holding `request`, which prints it for Claude Code. */
@@ -758,7 +793,11 @@ export type EffortAction =
 	/** Append the human's answer to an escalated question to `clarifications.md`. */
 	| { kind: "append-clarification"; entry: Clarification }
 	/** Get `message` to the Teammate as its next turn: through its inbox, or by resuming its session. */
-	| { kind: "send-message"; teammate: string; inbox: Inbox; message: string };
+	| { kind: "send-message"; teammate: string; inbox: Inbox; message: string }
+	/** Send the Teammate the pointer to round `round` of the Task again: through its inbox, or by resuming its session. */
+	| { kind: "redeliver"; teammate: string; slug: string; folder: string; round: number }
+	/** Remove `feedback-<round>.md` from the Task's folder: the send-back that wrote it never launched its Teammate. */
+	| { kind: "discard-feedback"; slug: string; folder: string; round: number };
 
 export type Step =
 	| { ok: true; state: EffortState; append: EffortLine[]; actions: EffortAction[]; reply?: string }
@@ -770,7 +809,7 @@ export function openEffort(opened: { effortId: string; team: string; repo: strin
 }
 
 /** Lines a Report doesn't tell of: they only carry what other lines say. */
-const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested", "usage-read", "request-held", "request-answered"]);
+const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested", "usage-read", "request-held", "request-answered", "launch-intended", "launch-abandoned"]);
 
 /** Fold one line into the state, keeping what the next Report tells of. */
 function apply(state: EffortState, line: EffortLine): EffortState {
@@ -825,8 +864,14 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			return { ...state, plan: line.tasks };
 		case "teammate-started": {
 			const { type: _type, ...teammate } = line;
-			return { ...state, teammates: [...state.teammates, teammate] };
+			return { ...launched(state, line.id), teammates: [...state.teammates, teammate] };
 		}
+		case "launch-intended": {
+			const { type: _type, teammate, ...intent } = line;
+			return { ...state, launching: { ...state.launching, [teammate]: intent } };
+		}
+		case "launch-abandoned":
+			return launched(state, line.teammate);
 		case "task-handed-off": {
 			const { type: _type, slug, ...handed } = line;
 			// A reused Teammate takes the Task into a fresh context, so how its last one ended no longer applies.
@@ -842,7 +887,11 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			return { ...state, queue: [...state.queue, queued] };
 		}
 		case "clear-requested":
-			return { ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, clearing: line.slug } : teammate)) };
+			return owe(
+				{ ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, clearing: line.slug } : teammate)) },
+				line.slug,
+				state.tasks[line.slug]?.round,
+			);
 		case "teammate-retired":
 			return { ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, retiredAt: line.at } : teammate)) };
 		case "teammate-session": {
@@ -875,12 +924,12 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 				}),
 			};
 		case "prompt-landed":
-			return landed(withTeammate(state, line, { activity: "busy", doing: undefined }), line.teammate);
+			return delivered(landed(withTeammate(state, line, { activity: "busy", doing: undefined }), line.teammate), line);
 		case "permission-denied":
 			return withTeammate(state, line, {});
 		case "task-sent-back": {
 			const task = state.tasks[line.slug];
-			return task ? withTask(state, line.slug, { round: line.round + 1, sendBacks: (task.sendBacks ?? 0) + 1 }) : state;
+			return task ? owe(withTask(state, line.slug, { round: line.round + 1, sendBacks: (task.sendBacks ?? 0) + 1 }), line.slug, line.round + 1) : state;
 		}
 		case "task-accepted":
 			return merged(withTask(state, line.slug, { accepted: line.at }), line.slug);
@@ -895,7 +944,8 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "task-dropped":
 			return { ...withTask(state, line.slug, { dropped: line.at }), queue: state.queue.filter((queued) => queued.slug !== line.slug) };
 		case "task-reassigned":
-			return withTask(state, line.slug, { teammate: line.teammate });
+			// Its new Teammate's launch carries the pointer.
+			return owe(withTask(state, line.slug, { teammate: line.teammate }), line.slug, undefined);
 		case "teammate-ended":
 			return endRequests({ ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, ended: { how: line.how, at: line.at } } : teammate)) }, line.teammate);
 		case "teammate-crashed":
@@ -977,6 +1027,30 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "usage-answered":
 			return { ...state, usageItems: (state.usageItems ?? []).filter((item) => item.id !== line.id) };
 	}
+}
+
+/** The state with Task `slug`'s pointer owed for `round`, or no longer owed. */
+function owe(state: EffortState, slug: string, round: number | undefined): EffortState {
+	const { [slug]: _owed, ...rest } = state.undelivered ?? {};
+	const undelivered = round === undefined ? rest : { ...rest, [slug]: round };
+	const { undelivered: _all, ...without } = state;
+	return Object.keys(undelivered).length === 0 ? without : { ...without, undelivered };
+}
+
+/** A prompt landed: a pointer it names the owed result of has arrived. */
+function delivered(state: EffortState, line: Extract<EffortLine, { type: "prompt-landed" }>): EffortState {
+	return Object.entries(state.undelivered ?? {}).reduce((each, [slug, round]) => {
+		const task = each.tasks[slug];
+		return task?.teammate === line.teammate && line.prompt.includes(`${task.folder}/result-${round}.md`) ? owe(each, slug, undefined) : each;
+	}, state);
+}
+
+/** The launch of `teammate` written ahead is closed: it is in, or abandoned. */
+function launched(state: EffortState, teammate: string): EffortState {
+	if (state.launching?.[teammate] === undefined) return state;
+	const { [teammate]: _closed, ...rest } = state.launching;
+	const { launching: _all, ...without } = state;
+	return Object.keys(rest).length === 0 ? without : { ...without, launching: rest };
 }
 
 /** The state with `teammate`'s limit set to `limit`, or cleared. */
@@ -1180,6 +1254,10 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return tick(state, input);
 		case "answer-usage":
 			return answerUsage(state, input);
+		case "recover":
+			return recover(state, input);
+		case "reconcile":
+			return reconcile(state, input);
 	}
 }
 
@@ -2577,6 +2655,115 @@ export function openMerges(state: EffortState): { slug: string; branch: string; 
 	return Object.entries(state.tasks).flatMap(([slug, task]) =>
 		task.merging !== undefined && task.worktree && state.workspace ? [{ slug, branch: task.worktree.branch, into: state.workspace.branch }] : [],
 	);
+}
+
+/**
+ * After a restart, before the journals are replayed: finish each intent left
+ * open from the evidence the shell gathered. A launch is in when `claude
+ * agents --json` lists its `--name` or the Teammate wrote to its journal, and
+ * abandoned when neither; a merge already in the Effort branch is recorded,
+ * one cut short is aborted and merged again, one not begun is merged; a Brief
+ * promotion `approvals.jsonl` records with the approved sha is recorded as
+ * answered. Nothing done is done twice. What the evidence can't settle stays
+ * open, and the Lead is told.
+ */
+function recover(state: EffortState, input: Extract<EffortInput, { kind: "recover" }>): Step {
+	let next = state;
+	const append: EffortLine[] = [];
+	const actions: EffortAction[] = [];
+	const add = (step: Step) => {
+		if (!step.ok) return;
+		next = step.state;
+		append.push(...step.append);
+		actions.push(...step.actions, ...(step.reply === undefined ? [] : [{ kind: "wake-lead", text: step.reply } as const]));
+	};
+	for (const [id, intent] of Object.entries(state.launching ?? {})) add(recoverLaunch(next, id, intent, input));
+	for (const { slug } of openMerges(next)) add(recoverMerge(next, slug, input));
+	for (const record of input.promoted ?? []) {
+		const item = next.pending.find((pending) => pending.checkpoint === BRIEF && pending.id === record.request && pending.sha256 === record.brief);
+		if (!item) continue;
+		const answered = answer(next, { kind: "answer", id: item.id, answer: "approved", ...(record.workspace === undefined ? {} : { workspace: record.workspace }), at: input.at });
+		// brief.md, the snapshots and the record are written already.
+		add(answered.ok ? { ...answered, actions: answered.actions.filter((action) => action.kind !== "promote-brief") } : answered);
+	}
+	const plan = actions.some((action) => action.kind === "write-plan");
+	return { ok: true, state: next, append, actions: [...actions.filter((action) => action.kind !== "write-plan"), ...(plan ? [{ kind: "write-plan" } as const] : [])] };
+}
+
+function recoverLaunch(state: EffortState, id: string, intent: { name: string; lines: EffortLine[] }, input: Extract<EffortInput, { kind: "recover" }>): Step {
+	if (input.agents?.includes(intent.name) || input.journaled?.includes(id)) return took(state, intent.lines, [{ kind: "write-plan" }]);
+	if (input.agents === undefined) {
+		return took(state, [], [], `\`${id}\` may not have started: its launch as \`${intent.name}\` was under way when pi stopped, \`claude agents --json\` couldn't be read, and it hasn't written to its journal. It is checked again at the next restart; until then nothing of its launch is on record.`);
+	}
+	const handed = intent.lines.find((line) => line.type === "task-handed-off");
+	const sentBack = intent.lines.find((line) => line.type === "task-sent-back");
+	const slug = handed?.slug ?? sentBack?.slug ?? "";
+	const folder = handed?.folder ?? state.tasks[slug]?.folder ?? "";
+	const abandoned = took(
+		state,
+		[{ type: "launch-abandoned", teammate: id, reason: "`claude agents --json` doesn't list it and it never wrote to its journal", at: input.at }],
+		[
+			...(handed?.worktree ? [{ kind: "remove-task-workspace", slug, ...handed.worktree } as const] : []),
+			...(sentBack ? [{ kind: "discard-feedback", slug, folder, round: sentBack.round } as const] : []),
+		],
+	);
+	if (!abandoned.ok) return abandoned;
+	const status = taskStatus(abandoned.state, slug);
+	const next =
+		status === "planned"
+			? "hand it off again with `team_handoff`"
+			: status === "queued"
+				? "it stays queued, and starts when a Teammate frees up"
+				: `send it back again with \`team_review\`; feedback-${sentBack?.round ?? 0}.md is removed`;
+	return { ...abandoned, reply: `\`${id}\` didn't start before pi stopped: \`claude agents --json\` doesn't list \`${intent.name}\` and it never wrote to its journal, so nothing of its launch is on record. Task \`${slug}\` is still ${status}; ${next}.` };
+}
+
+function recoverMerge(state: EffortState, slug: string, input: Extract<EffortInput, { kind: "recover" }>): Step {
+	const task = state.tasks[slug];
+	const evidence = input.merges?.[slug];
+	if (!task?.worktree || !state.workspace) return took(state, [], []);
+	const { path, branch } = task.worktree;
+	if (evidence === undefined) {
+		return took(state, [], [], `The merge of Task \`${slug}\`'s \`${branch}\` into \`${state.workspace.branch}\`, under way when pi stopped, isn't finished, and git couldn't say where it stands. It stays open and is checked again at the next restart; have the human look at ${state.workspace.path}.`);
+	}
+	if (evidence.state === "merged") return mergeResult(state, { kind: "merge-result", slug, ...(evidence.commit === undefined ? {} : { commit: evidence.commit }), at: input.at });
+	return took(state, [], [{ kind: "merge", slug, folder: task.folder, path, branch, into: state.workspace.path, ...(evidence.state === "half-done" ? { abort: true as const } : {}) }]);
+}
+
+/**
+ * After a restart, once the journals are replayed: a reused Teammate whose
+ * clear never came is cleared again, and a pointer sent and never landed is
+ * sent again, unless the replay sent it (`sent`). A Teammate missing from
+ * `claude agents --json` with no crash on record is idle-stopped: nothing
+ * wakes it but the next send, so this wakes nobody.
+ */
+function reconcile(state: EffortState, input: Extract<EffortInput, { kind: "reconcile" }>): Step {
+	const actions: EffortAction[] = [];
+	for (const teammate of live(state)) {
+		const task = teammate.clearing === undefined ? undefined : state.tasks[teammate.clearing];
+		if (teammate.clearing !== undefined && task && teammate.inbox) actions.push({ kind: "clear-then-send", teammate: teammate.id, inbox: teammate.inbox, slug: teammate.clearing, folder: task.folder });
+	}
+	for (const [slug, round] of Object.entries(state.undelivered ?? {})) {
+		const task = state.tasks[slug];
+		const teammate = state.teammates.find((each) => each.id === task?.teammate);
+		if (!task || !teammate || teammate.ended || teammate.retiredAt !== undefined || teammate.clearing === slug || input.sent?.includes(slug)) continue;
+		actions.push({ kind: "redeliver", teammate: teammate.id, slug, folder: task.folder, round });
+	}
+	return took(state, [], actions);
+}
+
+/**
+ * The one message that wakes the Lead after a restart, from everything that
+ * needs it, with the Effort's `records` after an adoption or a fork, whose
+ * Lead hasn't read them; undefined when nothing needs it.
+ */
+export function awayText(state: EffortState, texts: readonly string[], records?: readonly string[]): string | undefined {
+	if (texts.length === 0) return undefined;
+	return [
+		`While you were away, Effort \`${state.effortId}\`:`,
+		...texts.map((text) => `- ${text}`),
+		...(records === undefined || records.length === 0 ? [] : ["", `Read its records first: ${records.join(", ")}.`]),
+	].join("\n");
 }
 
 /**
