@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { join, relative } from "node:path";
 import { describe, it } from "node:test";
@@ -71,6 +71,7 @@ function fakePi(
 		cwd?: string;
 		bgExit?: number;
 		hooks?: FakeHookStep[];
+		replies?: FakeHookStep[];
 		settings?: Record<string, unknown>;
 		/** The session's file; `session.jsonl` in the scratch folder unless set. */
 		sessionFile?: string;
@@ -118,7 +119,7 @@ function fakePi(
 		},
 		getSettings: () => structuredClone(options.settings ?? {}),
 	};
-	const claude = fakeClaude(roots, { version: options.claudeVersion, bgExit: options.bgExit, hooks: options.hooks });
+	const claude = fakeClaude(roots, { version: options.claudeVersion, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies });
 	registerTeam(pi as unknown as ExtensionAPI, {
 		agentDir: roots.agentDir,
 		claudeConfigPath: roots.claudeConfigPath,
@@ -669,7 +670,7 @@ describe("/team start on a Team with no adopted Playbook", () => {
 
 		assert.match(pi.notifications.at(-1)?.message ?? "", /^Team `software` picked: .*Playbook: adopted 2026-11-02T10:00:00\.000Z.* Effort `software-2026-11-02` opened/);
 		assert.equal(pi.sent.at(-1)?.customType, "team-intake");
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_status"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status"]);
 	});
 
 	it("goes back through setup when the adopted Playbook was edited by hand", async () => {
@@ -752,7 +753,7 @@ describe("intake: `/team start` on a Team with an adopted Playbook", () => {
 		for (const needed of [join(dir, "brief.draft.md"), sha(INTAKE_PLAYBOOK), `repo: ${repo}`, "Constraints", "small-diffs", "**AC1**", "`team_request_approval`", "`brief`"]) {
 			assert.ok(woken?.content.includes(needed), `the intake prompt doesn't mention ${needed}:\n${woken?.content}`);
 		}
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_status"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status"]);
 	});
 
 	it("gives each Effort its own id, so a second one the same day is numbered", async () => {
@@ -1275,7 +1276,7 @@ function crewBrief(repo: string): string {
  * A session whose `crew` Effort has its Brief approved: a user Team whose
  * Roles set every launch flag between them, on {@link CREW_PLAYBOOK}.
  */
-async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; settings?: Record<string, unknown> } = {}) {
+async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown> } = {}) {
 	const roots = tempRoots();
 	const plugin = join(roots.scratch, "plugins", "lint");
 	writeUserTeam(roots, "crew", {
@@ -1299,7 +1300,7 @@ async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; 
 	});
 	adopt(roots, "crew", CREW_PLAYBOOK);
 	const repo = gitRepo(roots);
-	const pi = fakePi(roots, { cwd: repo, bgExit: options.bgExit, hooks: options.hooks, settings: options.settings });
+	const pi = fakePi(roots, { cwd: repo, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies, settings: options.settings });
 	await pi.team("start crew");
 	const dir = effortDir(roots, CREW_EFFORT_ID);
 	writeFileSync(join(dir, "brief.draft.md"), crewBrief(repo));
@@ -1584,7 +1585,9 @@ describe("a Teammate's events reach the Lead", () => {
 		assert.equal(session.source, "startup");
 		assert.match(String(session.sessionId), /^[0-9a-f]{8}-/);
 		assert.equal(session.shortId, String(session.sessionId).slice(0, 8));
-		assert.match((session.inbox as { socket: string }).socket, /^\/tmp\/cc-socks\/\d+\.sock$/);
+		const socket = (session.inbox as { socket: string }).socket;
+		assert.match(socket, /\.sock$/);
+		assert.ok(lstatSync(socket).isSocket(), `${socket} is a listening socket`);
 		assert.deepEqual(teammateWakes(pi.sent), []);
 	});
 
@@ -1719,6 +1722,135 @@ describe("a Teammate's events reach the Lead", () => {
 		await pi.emit("session_shutdown", { reason: "quit" });
 
 		await assert.rejects(ringDoorbell(port, { type: "doorbell" }), /ECONNREFUSED/);
+	});
+});
+
+/** Wait for `condition`, which a Teammate's session makes true from another process. */
+async function until(condition: () => boolean, what: string): Promise<void> {
+	for (let tries = 0; tries < 250; tries++) {
+		if (condition()) return;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	assert.fail(`gave up waiting until ${what}`);
+}
+
+/** A Teammate that takes its pointer, writes the result it asks for and stops: at launch, and for each message in its inbox. */
+const WORKS: FakeHookStep[] = [{ event: "UserPromptSubmit" }, { write: "result" }, { event: "Stop", payload: { last_assistant_message: "Done." } }];
+const RENAME_DIR = join("tasks", "001-builder-rename-key");
+
+/** An approved crew Effort whose `rename-key` Task is handed off to `builder-1`, who has written round 1's result. */
+async function renameReported(options: { hooks?: FakeHookStep[]; replies?: FakeHookStep[] } = {}) {
+	const crew = await crewApproved({ hooks: options.hooks ?? [{ event: "SessionStart", payload: { source: "startup" } }, ...WORKS], replies: options.replies ?? WORKS });
+	await crew.pi.call("team_plan", { tasks: CREW_PLAN });
+	await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+	return crew;
+}
+
+describe("reviewing: team_review", () => {
+	it("refuses a review while there is no new result for the round, and changes nothing", async () => {
+		const { pi, dir } = await renameReported({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		const plan = readFileSync(join(dir, "plan.md"), "utf8");
+
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "accept" }), (error: Error) => {
+			assert.match(error.message, /Task `rename-key` has no new result to review/);
+			assert.ok(error.message.includes(join(dir, RENAME_RESULT)), error.message);
+			return true;
+		});
+		assert.equal(readFileSync(join(dir, "plan.md"), "utf8"), plan);
+		assert.deepEqual(readdirSync(join(dir, RENAME_DIR)).sort(), ["task.md"]);
+	});
+
+	it("accepts a written result: plan.md shows it accepted, nothing reaches the Teammate, and the Task is never handed off or reviewed again", async () => {
+		const { pi, dir } = await renameReported();
+
+		const reply = await pi.call("team_review", { slug: "rename-key", verdict: "accept" });
+
+		assert.match(reply, /^Accepted Task `rename-key` at round 1/);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## rename-key\n[\s\S]*?- Status: accepted, with `builder-1` \(tasks\/001-builder-rename-key\/\)/);
+		assert.deepEqual(pi.claude.inbox(), []);
+		await assert.rejects(pi.call("team_handoff", { slug: "rename-key", body: "# Again\n" }), /Task `rename-key` is accepted/);
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /already accepted/);
+		assert.equal(readFileSync(join(dir, RENAME_DIR, "task.md"), "utf8"), "# Rename\n");
+	});
+
+	it("sends a Task back: writes feedback-1.md, sends the Teammate a pointer to it after the auth line and no clear, and wakes the Lead on result-2.md", async () => {
+		const { pi, dir } = await renameReported();
+		const [session] = effortLines(dir).filter((line) => line.type === "teammate-session");
+		const inbox = session.inbox as { socket: string; token: string };
+		const result1 = readFileSync(join(dir, RENAME_RESULT), "utf8");
+
+		const reply = await pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Also rename it in docs/config.md." });
+
+		assert.match(reply, /Sent Task `rename-key` back to `builder-1` \(send-back 1 of 2\)/);
+		const feedback = join(dir, RENAME_DIR, "feedback-1.md");
+		assert.match(readFileSync(feedback, "utf8"), /Also rename it in docs\/config\.md\./);
+		await until(() => pi.claude.inbox().length > 0, "the pointer reached the inbox");
+		const [connection, ...more] = pi.claude.inbox();
+		assert.deepEqual(more, []);
+		assert.equal(connection.socket, inbox.socket);
+		assert.equal(connection.authorized, true);
+		assert.equal(connection.lines.length, 2, "an auth line and one message: no clear");
+		assert.equal(connection.lines[0], JSON.stringify({ type: "auth", token: inbox.token }));
+		const message = JSON.parse(connection.lines[1]) as { type: string; message: { role: string; content: string } };
+		assert.equal(message.type, "user");
+		assert.equal(message.message.role, "user");
+		const pointer = message.message.content;
+		assert.equal(connection.lines[1], JSON.stringify({ type: "user", message: { role: "user", content: pointer } }));
+		assert.ok(pointer.includes(feedback), pointer);
+		assert.ok(pointer.includes(join(dir, RENAME_DIR, "result-2.md")), pointer);
+		assert.ok(!pointer.includes("docs/config.md"), "the pointer points at the feedback rather than carrying it");
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /- Status: sent back, with `builder-1`/);
+
+		await until(() => teammateWakes(pi.sent).length === 2, "the Lead is woken on round 2's result");
+		assert.ok(teammateWakes(pi.sent)[1].content.includes(join(dir, RENAME_DIR, "result-2.md")), teammateWakes(pi.sent)[1].content);
+		assert.equal(pi.claude.launches().length, 1, "the same session works round 2");
+		assert.deepEqual(readdirSync(join(dir, RENAME_DIR)).sort(), ["feedback-1.md", "result-1.md", "result-2.md", "task.md"]);
+		assert.equal(readFileSync(join(dir, RENAME_RESULT), "utf8"), result1);
+		await assert.rejects(pi.call("team_handoff", { slug: "rename-key", body: "# Again\n" }), /`team_review` sends it back/);
+	});
+
+	it("refuses a third send-back at the Playbook's sendBackLimit of 2, telling the Lead to escalate, and keeps every round's files", async () => {
+		const { pi, dir } = await renameReported();
+		for (const round of [1, 2]) {
+			await pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: `Round ${round} is not there yet.` });
+			await until(() => teammateWakes(pi.sent).length === round + 1, `round ${round + 1}'s result wakes the Lead`);
+		}
+
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Still not." }), (error: Error) => {
+			assert.match(error.message, /sent back 2 times, the Playbook's `sendBackLimit` of 2/);
+			assert.match(error.message, /Escalate to the human/);
+			return true;
+		});
+		assert.equal(pi.claude.inbox().length, 2);
+		assert.deepEqual(readdirSync(join(dir, RENAME_DIR)).sort(), ["feedback-1.md", "feedback-2.md", "result-1.md", "result-2.md", "result-3.md", "task.md"]);
+		assert.match(readFileSync(join(dir, RENAME_DIR, "feedback-1.md"), "utf8"), /Round 1 is not there yet\./);
+		assert.match(readFileSync(join(dir, RENAME_DIR, "feedback-2.md"), "utf8"), /Round 2 is not there yet\./);
+		assert.match(await pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /Accepted Task `rename-key` at round 3/);
+	});
+
+	it("refuses a send-back whose feedback file is already there, overwriting and sending nothing", async () => {
+		const { pi, dir } = await renameReported();
+		const feedback = join(dir, RENAME_DIR, "feedback-1.md");
+		writeFileSync(feedback, "someone else's\n");
+
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Redo it." }), /feedback-1\.md is already there/);
+
+		assert.equal(readFileSync(feedback, "utf8"), "someone else's\n");
+		assert.deepEqual(pi.claude.inbox(), []);
+		assert.equal(effortLines(dir).filter((line) => line.type === "task-sent-back").length, 0);
+	});
+
+	it("tells the Lead when the pointer can't reach the Teammate's inbox", async () => {
+		const { pi, dir } = await renameReported();
+		const [session] = effortLines(dir).filter((line) => line.type === "teammate-session");
+		unlinkSync((session.inbox as { socket: string }).socket);
+
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "send_back", feedback: "Redo it." }), (error: Error) => {
+			assert.match(error.message, /couldn't reach `builder-1`/);
+			assert.match(error.message, /tell the human/);
+			return true;
+		});
+		assert.match(readFileSync(join(dir, RENAME_DIR, "feedback-1.md"), "utf8"), /Redo it\./);
 	});
 });
 
@@ -1966,7 +2098,7 @@ describe("re-attaching: `pi -c`, `/resume` back and `/reload`", () => {
 			assert.equal(lead.stoppedAt, undefined);
 			assert.equal(typeof lead.port, "number");
 			assert.equal(lead.sessionFile, join(roots.scratch, "session.jsonl"));
-			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_status"]);
+			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status"]);
 			assert.deepEqual(again.entries, []);
 			assert.deepEqual(again.notifications, [{ message: `This session leads Effort \`${EFFORT_ID}\` (${dir}) again.`, type: "info" }]);
 			assert.deepEqual(again.sent, []);

@@ -13,7 +13,7 @@
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import type { EffortLine, EffortState, JournalLine, PendingApproval, Workspace } from "./core.ts";
+import { type EffortLine, type EffortState, type JournalLine, type PendingApproval, taskStatus, type Workspace } from "./core.ts";
 import { BRIEF_SKELETON, isKebabCase, type Playbook, sha256 } from "./definitions.ts";
 
 /** The files of one Effort, all under `<agent dir>/team/efforts/<effort-id>/`. */
@@ -372,6 +372,7 @@ export function writePlan(paths: EffortPaths, state: EffortState): void {
 	const lines = [`# Plan of Effort \`${state.effortId}\``, "", "A view of `effort.jsonl`, rewritten by the team extension; editing it changes nothing.", ""];
 	for (const task of state.plan ?? []) {
 		const handed = state.tasks[task.slug];
+		const sendBacks = handed?.sendBacks ?? 0;
 		lines.push(
 			`## ${task.slug}`,
 			"",
@@ -379,7 +380,7 @@ export function writePlan(paths: EffortPaths, state: EffortState): void {
 			`- Goal: ${task.goal}`,
 			`- Depends on: ${task.dependsOn.length > 0 ? task.dependsOn.join(", ") : "nothing"}`,
 			`- Covers: ${task.criteria.length > 0 ? task.criteria.join(", ") : "no criterion"}`,
-			`- Status: ${handed ? `running, with \`${handed.teammate}\` (tasks/${handed.folder}/)` : "planned"}`,
+			`- Status: ${taskStatus(state, task.slug)}${handed ? `, with \`${handed.teammate}\` (tasks/${handed.folder}/)` : ""}${sendBacks > 0 ? `; sent back ${sendBacks} time${sendBacks === 1 ? "" : "s"}` : ""}`,
 			"",
 		);
 	}
@@ -408,6 +409,22 @@ export function writeTask(paths: EffortPaths, folder: string, body: string): str
 		writeFileSync(paths.clarifications, "# Clarifications\n\nAnswers to questions the human was asked during this Effort. They count as part of the Brief.\n");
 	}
 	return dir;
+}
+
+/**
+ * Write the feedback of a send-back as `feedback-<round>.md` in the Task's
+ * folder, and return its path. Refused when that file is already there: no
+ * file in a Task folder is ever overwritten across rounds.
+ */
+export function writeFeedback(paths: EffortPaths, folder: string, round: number, feedback: string): string {
+	const path = join(paths.tasks, folder, `feedback-${round}.md`);
+	try {
+		writeFileSync(path, `# Feedback on round ${round}\n\n${feedback.trim()}\n`, { flag: "wx" });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		throw new Error(`${path} is already there, and no file in a Task folder is ever overwritten, so nothing was sent back. Stop and tell the human.`);
+	}
+	return path;
 }
 
 function isMapping(value: unknown): value is Record<string, unknown> {

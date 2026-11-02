@@ -199,4 +199,22 @@ describe("team_status data", () => {
 			{ id: "dev-1", role: "dev", shortId: "d4e5f6a7", activity: "busy", task: "002-dev-ttl", mode: "acceptEdits", launchMode: "auto" },
 		]);
 	});
+
+	it("counts the Tasks the Lead has accepted", () => {
+		const accept: EffortInput = { kind: "review", slug: "design", verdict: "accept", result: { path: "/e/result-1.md", written: true }, sendBackLimit: 2, at: "2026-11-02T10:50:00.000Z" };
+		const state = fold(
+			through([
+				REQUEST,
+				APPROVE,
+				PLAN,
+				handoff("design"),
+				hook("architect-1", 1, "SessionStart", { source: "startup", permission_mode: "auto" }),
+				hook("architect-1", 2, "UserPromptSubmit", { prompt: "go", permission_mode: "auto" }),
+				hook("architect-1", 3, "Stop", { permission_mode: "auto" }, true),
+				accept,
+			]),
+		);
+
+		assert.deepEqual(teamStatus(state, { adoptionsPending: 0 }).tasks, { accepted: 1, planned: 2 });
+	});
 });

@@ -67,8 +67,8 @@ From then on the Effort reads only those copies, so editing your Team or Playboo
 in it; a copy whose sha no longer matches its approval is reported and never used. A Brief can't
 be approved once its Playbook has been adopted again: start a new Effort.
 
-`team_plan` and `team_handoff` are switched on with the Effort, and refuse until the Brief is
-approved.
+`team_plan`, `team_handoff` and `team_review` are switched on with the Effort, and refuse until
+the Brief is approved.
 
 ### Planning and handing off
 
@@ -113,6 +113,25 @@ is also read when the Lead's run settles, so a lost doorbell loses nothing.
   wakes the Lead with the Teammate's last message.
 
 Wakes that come while the Lead is busy are sent together as one follow-up once its run settles.
+
+### Reviewing
+
+Once woken about a result, the Lead decides on it with `team_review`, which refuses while the
+round's `result-<n>.md` isn't written or its `Stop` hasn't come yet.
+
+- `accept` marks the Task accepted in `plan.md`; it is never handed off or reviewed again.
+- `send_back` writes the Lead's feedback to `feedback-<n>.md`, records the send-back, then sends
+  the Teammate's inbox socket its auth line and a pointer to that file asking for
+  `result-<n+1>.md`. The same session works the next round; nothing is cleared. A send-back past
+  the Playbook's `sendBackLimit` (2 unless set) is refused and the Lead escalates to the human
+  instead.
+
+No file in a Task folder is ever overwritten: a `feedback-<n>.md` already there refuses the
+send-back. A pointer that can't reach the inbox is reported to the Lead, with the send-back
+already on record.
+
+`plan.md` shows each Task as planned, running, in review, sent back or accepted, with its
+Teammate, its folder and how often it was sent back.
 
 ## Leading an Effort across pi sessions
 

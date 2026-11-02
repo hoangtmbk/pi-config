@@ -102,8 +102,8 @@ export interface StatusExtras {
 
 /**
  * The Effort's status, as the block shows it and `team_status` returns it.
- * Nothing yet accepts a Task, queues one or writes a Report, so those are 0
- * and empty until the tickets that add them fill them in here.
+ * Nothing yet queues a Task or writes a Report, so those are empty and 0
+ * until the tickets that add them fill them in here.
  */
 export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockData {
 	const handed = Object.keys(state.tasks).length > 0;
@@ -111,7 +111,7 @@ export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockD
 		effortId: state.effortId,
 		team: state.team,
 		phase: !state.brief ? "intake" : handed ? "working" : "planning",
-		tasks: { accepted: 0, planned: state.plan?.length ?? 0 },
+		tasks: { accepted: Object.values(state.tasks).filter((task) => task.accepted !== undefined).length, planned: state.plan?.length ?? 0 },
 		teammates: state.teammates.map((teammate) => teammateRow(state, teammate)),
 		queued: [],
 		waitingOnYou: state.pending.length + extras.adoptionsPending,

@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, type JournalLine, openEffort, type Step, step } from "../core.ts";
+import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, type JournalLine, openEffort, type Step, step, taskStatus } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -417,6 +417,141 @@ describe("a Teammate's journal", () => {
 
 		assert.ok(again.ok && earlier.ok);
 		assert.deepEqual([again.append, again.actions, earlier.append, earlier.actions], [[], [], [], []]);
+	});
+});
+
+describe("reviewing a Task", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const started = applied(
+		applied(approved, {
+			kind: "plan",
+			tasks: [
+				{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] },
+				{ slug: "docs", role: "dev", goal: "Document it.", criteria: ["AC1"] },
+			],
+			criteria: ["AC1"],
+			roles: ["dev"],
+			at: "2026-11-02T11:10:00.000Z",
+		}),
+		{ kind: "handoff", slug: "rename", at: "2026-11-02T11:30:00.000Z" },
+	);
+	const INBOX = { socket: "/tmp/cc-socks/4242.sock", token: "inbox-token" };
+	const DIR = "/agent/team/efforts/software-2026-11-02/tasks/001-dev-rename";
+
+	function journal(lines: EffortLine[], cursor: number, event: string, written = false): EffortLine[] {
+		return applied(lines, {
+			kind: "journal",
+			teammate: "dev-1",
+			cursor,
+			line: { from: "hook", at: `2026-11-02T12:0${cursor}:00.000Z`, event, payload: { session_id: "8f3c2a1b-0000-4000-8000-000000000001", source: "startup" }, ...(event === "SessionStart" ? { inbox: INBOX } : {}) },
+			result: { path: `${DIR}/result-1.md`, written },
+		});
+	}
+
+	const running = journal(started, 1, "SessionStart");
+	const done = journal(running, 2, "Stop", true);
+
+	function review(verdict: "accept" | "send_back", written = true, options: { slug?: string; feedback?: string; limit?: number; round?: number } = {}): Extract<EffortInput, { kind: "review" }> {
+		return {
+			kind: "review",
+			slug: options.slug ?? "rename",
+			verdict,
+			...(verdict === "send_back" ? { feedback: options.feedback ?? "The loader still reads `colour`." } : {}),
+			result: { path: `${DIR}/result-${options.round ?? 1}.md`, written },
+			sendBackLimit: options.limit ?? 2,
+			at: "2026-11-02T13:00:00.000Z",
+		};
+	}
+
+	it("refuses a review when the current round's result isn't written, naming the result it waits for", () => {
+		const text = refusal(running, review("accept", false));
+
+		assert.match(text, /`rename`/);
+		assert.ok(text.includes(`${DIR}/result-1.md`), text);
+	});
+
+	it("refuses a review while the Teammate is still on the round, though its result is already on disk: never before its Stop is counted done", () => {
+		const text = refusal(running, review("accept", true));
+
+		assert.match(text, /`dev-1` hasn't finished round 1/);
+	});
+
+	it("accepts a Task whose round's result is written, moving it to accepted and refreshing plan.md, waking nobody", () => {
+		assert.equal(taskStatus(fold(done), "rename"), "in review");
+
+		const result = run(done, review("accept"));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append, [{ type: "task-accepted", slug: "rename", round: 1, at: "2026-11-02T13:00:00.000Z" }]);
+		assert.deepEqual(result.actions, [{ kind: "write-plan" }]);
+		assert.equal(taskStatus(result.state, "rename"), "accepted");
+		assert.match(result.reply ?? "", /^Accepted Task `rename`/);
+	});
+
+	it("refuses to review a Task that was never handed off, or one already accepted", () => {
+		const accepted = applied(done, review("accept"));
+
+		assert.match(refusal(done, review("accept", true, { slug: "docs" })), /`docs` hasn't been handed off.*`rename`/);
+		assert.match(refusal(accepted, review("send_back")), /`rename` is already accepted/);
+	});
+
+	it("refuses to hand off again a Task that is running, in review or accepted", () => {
+		const handoff: EffortInput = { kind: "handoff", slug: "rename", at: "2026-11-02T14:00:00.000Z" };
+
+		assert.match(refusal(running, handoff), /`rename` is already running, with `dev-1`.*`team_review`/);
+		assert.match(refusal(done, handoff), /`rename` is already in review, with `dev-1`/);
+		assert.match(refusal(applied(done, review("accept")), handoff), /`rename` is accepted.*never handed off again/);
+	});
+
+	it("sends a Task back to the Teammate that did it, over its inbox and with no clear, starting the next round", () => {
+		const result = run(done, review("send_back"));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append, [{ type: "task-sent-back", slug: "rename", round: 1, at: "2026-11-02T13:00:00.000Z" }]);
+		assert.deepEqual(result.actions, [
+			{ kind: "send-back", teammate: "dev-1", inbox: INBOX, slug: "rename", folder: "001-dev-rename", round: 1, feedback: "The loader still reads `colour`." },
+			{ kind: "write-plan" },
+		]);
+		assert.equal(taskStatus(result.state, "rename"), "sent back");
+		assert.equal(result.state.tasks.rename.sendBacks, 1);
+		assert.deepEqual(currentResult(result.state, "dev-1"), { slug: "rename", folder: "001-dev-rename", round: 2 });
+		assert.match(result.reply ?? "", /`rename`.*`dev-1`.*feedback-1\.md.*result-2\.md/);
+		assert.match(result.reply ?? "", /send-back 1 of 2/);
+	});
+
+	it("refuses a send-back without feedback", () => {
+		assert.match(refusal(done, review("send_back", true, { feedback: "  " })), /feedback/);
+	});
+
+	it("refuses to review round 2 until its result is reported written, then counts each send-back toward the limit", () => {
+		const sentBack = applied(done, review("send_back"));
+
+		assert.match(refusal(sentBack, review("accept", false, { round: 2 })), /round 2's .*result-2\.md isn't written/);
+		const second = applied(journal(sentBack, 3, "Stop", true), review("send_back", true, { round: 2 }));
+		assert.equal(fold(second).tasks.rename.sendBacks, 2);
+		assert.equal(fold(second).tasks.rename.round, 3);
+	});
+
+	it("refuses a send-back at the Playbook's sendBackLimit, telling the Lead to escalate to the human, and still accepts", () => {
+		const once = journal(applied(done, review("send_back", true, { limit: 1 })), 3, "Stop", true);
+
+		const text = refusal(once, review("send_back", true, { limit: 1, round: 2 }));
+
+		assert.match(text, /`rename`.*sent back 1 time.*`sendBackLimit` of 1/);
+		assert.match(text, /[Ee]scalate.*human/);
+		assert.ok(run(once, review("accept", true, { limit: 1, round: 2 })).ok);
+	});
+
+	it("refuses a send-back to a Teammate whose inbox socket isn't known yet", () => {
+		const noInbox = applied(started, {
+			kind: "journal",
+			teammate: "dev-1",
+			cursor: 1,
+			line: { from: "hook", at: "2026-11-02T12:01:00.000Z", event: "Stop", payload: {} },
+			result: { path: `${DIR}/result-1.md`, written: true },
+		});
+
+		assert.match(refusal(noInbox, review("send_back")), /`dev-1`.*inbox/);
 	});
 });
 

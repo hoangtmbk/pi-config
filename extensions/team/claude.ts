@@ -12,8 +12,10 @@
 
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { connect } from "node:net";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Inbox } from "./core.ts";
 import type { PermissionMode, Role } from "./definitions.ts";
 
 /** The Claude Code version this extension was built and tried against. */
@@ -119,6 +121,35 @@ export function launchBackground(claudePath: string, cwd: string, args: string[]
 	return new Promise((resolve) => {
 		execFile(claudePath, args, { cwd, env, timeout: LAUNCH_TIMEOUT_MS, encoding: "utf8" }, (error, _stdout, stderr) => {
 			resolve(error ? { error: (stderr.trim() || error.message).split("\n")[0] } : undefined);
+		});
+	});
+}
+
+/** Long enough for a live session's inbox to take one message. */
+const SEND_TIMEOUT_MS = 10_000;
+
+/**
+ * Send one user message to a Claude Code session's inbox socket: the auth
+ * line with its token, then the message, one JSON object per line. Returns an
+ * error to show the Lead when it doesn't get through.
+ */
+export function sendToInbox(inbox: Inbox, content: string): Promise<{ error: string } | undefined> {
+	return new Promise((resolve) => {
+		let failure: string | undefined;
+		const socket = connect(inbox.socket);
+		socket.setTimeout(SEND_TIMEOUT_MS, () => {
+			failure = `no answer from ${inbox.socket} within ${SEND_TIMEOUT_MS / 1000}s`;
+			socket.destroy();
+		});
+		socket.on("error", (error) => {
+			failure ??= error.message;
+		});
+		socket.on("data", () => {});
+		socket.on("close", () => resolve(failure === undefined ? undefined : { error: failure }));
+		socket.on("connect", () => {
+			socket.end(
+				`${JSON.stringify({ type: "auth", token: inbox.token })}\n${JSON.stringify({ type: "user", message: { role: "user", content } })}\n`,
+			);
 		});
 	});
 }

@@ -16,6 +16,17 @@ export function handoffPointer(slug: string, taskDir: string, round: number): st
 	].join(" ");
 }
 
+/**
+ * The pointer that sends round `round` of a Task back: it names the feedback
+ * file and the next round's result, and carries neither text.
+ */
+export function sendBackPointer(slug: string, taskDir: string, round: number): string {
+	return [
+		`Round ${round} of Task \`${slug}\` was sent back: read ${join(taskDir, `feedback-${round}.md`)} and do what it asks.`,
+		`When it is done, write your result to ${join(taskDir, `result-${round + 1}.md`)}.`,
+	].join(" ");
+}
+
 /** Who the preamble is for, and where the files it points at are. */
 export interface PreambleFor {
 	teammateId: string;

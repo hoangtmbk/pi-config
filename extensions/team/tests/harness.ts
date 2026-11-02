@@ -107,8 +107,13 @@ export interface FakeClaudeOptions {
 	version?: string;
 	/** The exit code of a `--bg` launch; 0 when unset. */
 	bgExit?: number;
-	/** What each started `--bg` session does before its launch returns; nothing when unset. */
+	/**
+	 * What each started `--bg` session does before its launch returns; nothing
+	 * when unset. A session with hooks also opens a real inbox socket.
+	 */
 	hooks?: FakeHookStep[];
+	/** What a session does each time an authorized user message lands in its inbox, that message being its pointer. */
+	replies?: FakeHookStep[];
 }
 
 /**
@@ -141,6 +146,18 @@ export interface FakeClaude {
 	calls(): string[][];
 	/** Every `--bg` launch, oldest first. */
 	launches(): FakeLaunch[];
+	/** Every connection to a session's inbox socket, oldest first. */
+	inbox(): FakeInboxConnection[];
+}
+
+/** One connection to a fake session's inbox socket. */
+export interface FakeInboxConnection {
+	/** The session's socket. */
+	socket: string;
+	/** Whether the first line was `{"type":"auth","token":…}` with the session's token. */
+	authorized: boolean;
+	/** Every line received, verbatim, the auth line first. */
+	lines: string[];
 }
 
 const FAKE_CLAUDE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "fake-claude.ts");
@@ -156,21 +173,35 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 	const dir = mkdtempSync(join(roots.scratch, "fake-claude-"));
 	const argvOut = join(dir, "argv.jsonl");
 	const launchOut = join(dir, "launches.jsonl");
+	const inboxOut = join(dir, "inbox.jsonl");
 	const hooks = join(dir, "hooks.json");
+	const replies = join(dir, "replies.json");
 	if (options.hooks) writeFileSync(hooks, JSON.stringify(options.hooks));
+	if (options.replies) writeFileSync(replies, JSON.stringify(options.replies));
+	// Its own short folder: a Unix socket path can't be much longer than 100 bytes.
+	const sockets = mkdtempSync(join(tmpdir(), "fcs-"));
 	const env: Record<string, string | undefined> = {
 		FAKE_CLAUDE_ARGV_OUT: argvOut,
 		FAKE_CLAUDE_LAUNCH_OUT: launchOut,
 		FAKE_CLAUDE_VERSION: options.version,
 		FAKE_CLAUDE_BG_EXIT: options.bgExit === undefined ? undefined : String(options.bgExit),
 		FAKE_CLAUDE_HOOKS: options.hooks ? hooks : undefined,
+		FAKE_CLAUDE_REPLIES: options.replies ? replies : undefined,
+		FAKE_CLAUDE_SOCKETS: sockets,
+		FAKE_CLAUDE_INBOX_OUT: inboxOut,
+		FAKE_CLAUDE_OWNER: String(process.pid),
 	};
 	const exports = Object.entries(env)
 		.filter((entry): entry is [string, string] => entry[1] !== undefined)
 		.map(([name, value]) => `export ${name}=${shellQuote(value)}`);
 	const path = join(dir, "claude");
 	writeFileSync(path, ["#!/bin/sh", ...exports, `exec ${shellQuote(process.execPath)} ${shellQuote(FAKE_CLAUDE_SCRIPT)} "$@"`, ""].join("\n"), { mode: 0o755 });
-	return { path, calls: () => jsonLines<string[]>(argvOut), launches: () => jsonLines<FakeLaunch>(launchOut) };
+	return {
+		path,
+		calls: () => jsonLines<string[]>(argvOut),
+		launches: () => jsonLines<FakeLaunch>(launchOut),
+		inbox: () => jsonLines<FakeInboxConnection>(inboxOut),
+	};
 }
 
 function jsonLines<T>(file: string): T[] {
