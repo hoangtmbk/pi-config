@@ -45,6 +45,13 @@ interface RegisteredTool {
 	execute(id: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: unknown): Promise<{ content: { type: string; text: string }[] }>;
 }
 
+/** A widget the extension set above the editor, or cleared with `lines` undefined. */
+interface Widget {
+	key: string;
+	lines: string[] | undefined;
+	placement?: string;
+}
+
 /** The tools pi itself has on before the extension changes anything. */
 const PI_TOOLS = ["read", "bash", "edit", "write"];
 
@@ -64,6 +71,7 @@ function fakePi(
 		cwd?: string;
 		bgExit?: number;
 		hooks?: FakeHookStep[];
+		settings?: Record<string, unknown>;
 		/** The session's file; `session.jsonl` in the scratch folder unless set. */
 		sessionFile?: string;
 		/** Custom entries the session already carries, as a resumed or forked one does. */
@@ -84,6 +92,7 @@ function fakePi(
 	const entries: { customType: string; data: unknown }[] = [];
 	const carried = options.entries ?? [];
 	const sessionFile = options.sessionFile ?? join(roots.scratch, "session.jsonl");
+	const widgets: Widget[] = [];
 	const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
 	const pi = {
 		on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
@@ -107,6 +116,7 @@ function fakePi(
 		appendEntry(customType: string, data: unknown) {
 			entries.push({ customType, data });
 		},
+		getSettings: () => structuredClone(options.settings ?? {}),
 	};
 	const claude = fakeClaude(roots, { version: options.claudeVersion, bgExit: options.bgExit, hooks: options.hooks });
 	registerTeam(pi as unknown as ExtensionAPI, {
@@ -149,6 +159,9 @@ function fakePi(
 			async confirm(title: string) {
 				return answer("confirm", title);
 			},
+			setWidget(key: string, lines: string[] | undefined, widgetOptions?: { placement?: string }) {
+				widgets.push({ key, lines, placement: widgetOptions?.placement });
+			},
 		},
 	} as unknown as ExtensionCommandContext;
 
@@ -161,6 +174,8 @@ function fakePi(
 		activations,
 		/** The custom entries the extension appended to the session, oldest first. */
 		entries,
+		/** Every widget the extension set or cleared, oldest first. */
+		widgets,
 		activeTools: () => [...activeTools],
 		claude,
 		/** Queue the human's answers to the next dialogs, in order. */
@@ -654,7 +669,7 @@ describe("/team start on a Team with no adopted Playbook", () => {
 
 		assert.match(pi.notifications.at(-1)?.message ?? "", /^Team `software` picked: .*Playbook: adopted 2026-11-02T10:00:00\.000Z.* Effort `software-2026-11-02` opened/);
 		assert.equal(pi.sent.at(-1)?.customType, "team-intake");
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_status"]);
 	});
 
 	it("goes back through setup when the adopted Playbook was edited by hand", async () => {
@@ -737,7 +752,7 @@ describe("intake: `/team start` on a Team with an adopted Playbook", () => {
 		for (const needed of [join(dir, "brief.draft.md"), sha(INTAKE_PLAYBOOK), `repo: ${repo}`, "Constraints", "small-diffs", "**AC1**", "`team_request_approval`", "`brief`"]) {
 			assert.ok(woken?.content.includes(needed), `the intake prompt doesn't mention ${needed}:\n${woken?.content}`);
 		}
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_status"]);
 	});
 
 	it("gives each Effort its own id, so a second one the same day is numbered", async () => {
@@ -1260,7 +1275,7 @@ function crewBrief(repo: string): string {
  * A session whose `crew` Effort has its Brief approved: a user Team whose
  * Roles set every launch flag between them, on {@link CREW_PLAYBOOK}.
  */
-async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[] } = {}) {
+async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; settings?: Record<string, unknown> } = {}) {
 	const roots = tempRoots();
 	const plugin = join(roots.scratch, "plugins", "lint");
 	writeUserTeam(roots, "crew", {
@@ -1284,7 +1299,7 @@ async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[] }
 	});
 	adopt(roots, "crew", CREW_PLAYBOOK);
 	const repo = gitRepo(roots);
-	const pi = fakePi(roots, { cwd: repo, bgExit: options.bgExit, hooks: options.hooks });
+	const pi = fakePi(roots, { cwd: repo, bgExit: options.bgExit, hooks: options.hooks, settings: options.settings });
 	await pi.team("start crew");
 	const dir = effortDir(roots, CREW_EFFORT_ID);
 	writeFileSync(join(dir, "brief.draft.md"), crewBrief(repo));
@@ -1721,6 +1736,79 @@ describe("/team while the Lead is streaming", () => {
 	});
 });
 
+/** The Team block as last shown above the editor, or undefined once it was taken away. */
+function teamBlock(pi: ReturnType<typeof fakePi>): string[] | undefined {
+	const set = pi.widgets.filter((widget) => widget.key === "team");
+	assert.ok(set.length > 0, "the extension never set the `team` widget");
+	assert.ok(
+		set.every((widget) => widget.placement === "aboveEditor"),
+		"the Team block goes above the editor",
+	);
+	return set.at(-1)?.lines;
+}
+
+describe("the Team block", () => {
+	it("shows above the editor once the session holds an Effort, and goes when the session ends", async () => {
+		const { pi } = intakeSession();
+
+		await pi.team("start software");
+
+		assert.deepEqual(teamBlock(pi), [
+			"╭─ Team · software · software-2026-11-02 ─ 0 live ─╮",
+			"│ ● running  ·  intake                             │",
+			"│ nothing waiting on you   reports 0               │",
+			"╰──────────────────────────────────────────────────╯",
+		]);
+
+		await pi.emit("session_shutdown");
+
+		assert.equal(teamBlock(pi), undefined);
+	});
+
+	it("rows a handed-off Teammate with the mode it got against the one it launched in, and `team_status` returns the block's data", async () => {
+		const { pi } = await crewApproved({
+			hooks: [
+				{ event: "SessionStart", payload: { source: "startup", session_id: "c0ffee12-0000-4000-8000-000000000001", permission_mode: "acceptEdits" } },
+				{ event: "UserPromptSubmit", payload: { prompt: "New Task `rename-key`", permission_mode: "auto" } },
+			],
+		});
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+
+		assert.deepEqual(teamBlock(pi), [
+			"╭─ Team · crew · crew-2026-11-02 ─────────────────────────────────── 1 live ─╮",
+			"│ ● running  ·  working · 0/3 Tasks accepted                                 │",
+			"│ builder-1  c0ffee12  busy  001-builder-rename-key  ctx —  auto≠acceptEdits │",
+			"│ nothing waiting on you   reports 0                                         │",
+			"╰────────────────────────────────────────────────────────────────────────────╯",
+		]);
+		assert.deepEqual(JSON.parse(await pi.call("team_status", {})), {
+			effortId: "crew-2026-11-02",
+			team: "crew",
+			phase: "working",
+			tasks: { accepted: 0, planned: 3 },
+			teammates: [{ id: "builder-1", role: "builder", shortId: "c0ffee12", activity: "busy", task: "001-builder-rename-key", mode: "auto", launchMode: "acceptEdits" }],
+			queued: [],
+			waitingOnYou: 0,
+			reports: 0,
+		});
+	});
+
+	it("is never taller than pi's `maxTeammates` setting allows, counting the Teammates it has no row for", async () => {
+		const { pi } = await crewApproved({ settings: { maxTeammates: 2 } });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		for (const slug of ["rename-key", "check-old-configs", "survey"]) await pi.call("team_handoff", { slug, body: `# ${slug}\n` });
+
+		const block = teamBlock(pi) ?? [];
+		assert.equal(block.length, 6, block.join("\n"));
+		assert.match(block[0], / 3 live ─╮$/);
+		assert.match(block[2], /^│ builder-1 /);
+		assert.match(block[3], /^│ \+2 more Teammates +│$/);
+	});
+});
+
 describe("the package manifest", () => {
 	it("loads the team extension beside the others", () => {
 		const manifest = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")) as { pi: { extensions: string[] } };
@@ -1878,7 +1966,7 @@ describe("re-attaching: `pi -c`, `/resume` back and `/reload`", () => {
 			assert.equal(lead.stoppedAt, undefined);
 			assert.equal(typeof lead.port, "number");
 			assert.equal(lead.sessionFile, join(roots.scratch, "session.jsonl"));
-			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff"]);
+			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_status"]);
 			assert.deepEqual(again.entries, []);
 			assert.deepEqual(again.notifications, [{ message: `This session leads Effort \`${EFFORT_ID}\` (${dir}) again.`, type: "info" }]);
 			assert.deepEqual(again.sent, []);
@@ -1998,15 +2086,23 @@ describe("moving in the tree: `/tree`", () => {
 
 		await pi.emit("session_tree", { newLeafId: "e1", oldLeafId: "e2" });
 
-		assert.deepEqual(pi.sent.slice(before), [
-			{
-				customType: "team-status",
-				content: `This session still leads Effort \`${EFFORT_ID}\` (${effortDir(roots)}), whichever branch of the tree you are on: its state lives in its files. Brief: not yet approved. Tasks handed off: 0. Teammates: 0. Waiting on the human: 0.`,
-				display: true,
-				triggerTurn: undefined,
-				deliverAs: "nextTurn",
-			},
-		]);
+		const queued = pi.sent.slice(before);
+		assert.deepEqual(
+			queued.map(({ customType, display, triggerTurn, deliverAs }) => ({ customType, display, triggerTurn, deliverAs })),
+			[{ customType: "team-status", display: true, triggerTurn: undefined, deliverAs: "nextTurn" }],
+		);
+		const [intro, status] = queued[0].content.split("\n\n");
+		assert.equal(intro, `This session still leads Effort \`${EFFORT_ID}\` (${effortDir(roots)}), whichever branch of the tree you are on: its state lives in its files. Its status, as \`team_status\` gives it:`);
+		assert.deepEqual(JSON.parse(status), {
+			effortId: EFFORT_ID,
+			team: "software",
+			phase: "intake",
+			tasks: { accepted: 0, planned: 0 },
+			teammates: [],
+			queued: [],
+			waitingOnYou: 0,
+			reports: 0,
+		});
 	});
 
 	it("says nothing in a session leading no Effort", async () => {

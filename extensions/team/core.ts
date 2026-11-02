@@ -86,6 +86,14 @@ export interface Teammate {
 	inbox?: Inbox;
 	/** The last line of its journal applied to the Effort, counted from 1; absent before any. */
 	cursor?: number;
+	/** The permission mode it was launched in. */
+	mode?: string;
+	/** The permission mode its hooks last reported, once one differs from {@link mode}: drift is logged, not a Takeover. */
+	observedMode?: string;
+	/** Absent until a prompt first lands: then `busy`, and `idle` once it stops. */
+	activity?: "busy" | "idle";
+	/** How its last turn ended, while idle: `round 1 done`, `stopped short`. */
+	doing?: string;
 }
 
 /** A Teammate's inbox socket, which Claude Code gives its hooks in the environment. */
@@ -136,7 +144,9 @@ export type EffortLine =
 	/** A `Stop` with the round's result written: the Task's round is done. */
 	| { type: "task-done"; teammate: string; cursor: number; slug: string; round: number; at: string }
 	/** A `Stop` without a new result: the Teammate stopped short, saying this last. */
-	| { type: "teammate-stopped"; teammate: string; cursor: number; slug: string; message: string; at: string };
+	| { type: "teammate-stopped"; teammate: string; cursor: number; slug: string; message: string; at: string }
+	/** A hook reported a permission mode other than the one last known: the mode the Teammate actually got. */
+	| { type: "teammate-mode"; teammate: string; cursor: number; mode: string; at: string };
 
 /** What an Effort's lines fold to. */
 export interface EffortState {
@@ -181,8 +191,8 @@ export type EffortInput =
 			roles: readonly string[];
 			at: string;
 	  }
-	/** `team_handoff` of a planned Task. */
-	| { kind: "handoff"; slug: string; at: string }
+	/** `team_handoff` of a planned Task, with the permission mode the Teammate launches in. */
+	| { kind: "handoff"; slug: string; at: string; mode?: string }
 	/**
 	 * Line `cursor` of `teammate`'s journal (counted from 1), with whether the
 	 * result its current Task is due to write ({@link currentResult}) is on disk.
@@ -253,11 +263,15 @@ function apply(state: EffortState, line: EffortLine): EffortState {
 				...(line.inbox === undefined ? {} : { inbox: line.inbox }),
 			});
 		case "prompt-landed":
+			return withTeammate(state, line, { activity: "busy", doing: undefined });
 		case "permission-denied":
-		case "teammate-stopped":
 			return withTeammate(state, line, {});
+		case "teammate-stopped":
+			return withTeammate(state, line, { activity: "idle", doing: "stopped short" });
+		case "teammate-mode":
+			return withTeammate(state, line, { observedMode: line.mode });
 		case "task-done": {
-			const advanced = withTeammate(state, line, {});
+			const advanced = withTeammate(state, line, { activity: "idle", doing: `round ${line.round} done` });
 			const task = advanced.tasks[line.slug];
 			return task ? { ...advanced, tasks: { ...advanced.tasks, [line.slug]: { ...task, reported: line.round } } } : advanced;
 		}
@@ -472,7 +486,7 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 	return took(
 		state,
 		[
-			{ type: "teammate-started", id, role: task.role, name, task: task.slug, startedAt: input.at },
+			{ type: "teammate-started", id, role: task.role, name, task: task.slug, startedAt: input.at, ...(input.mode === undefined ? {} : { mode: input.mode }) },
 			{ type: "task-handed-off", slug: task.slug, folder, role: task.role, teammate: id, at: input.at, round: 1 },
 		],
 		[{ kind: "launch-teammate", teammate: { id, role: task.role, name }, task: { slug: task.slug, folder } }, { kind: "write-plan" }],
@@ -497,12 +511,24 @@ function text(value: unknown): string | undefined {
 /**
  * One line of a Teammate's journal, applied once: a line at or before the
  * Teammate's cursor was applied already. Events this doesn't act on append
- * nothing, so they leave no trace and wake nobody.
+ * nothing, so they leave no trace and wake nobody. Any event whose
+ * `permission_mode` differs from the mode last known first appends a
+ * `teammate-mode` line, which wakes nobody either.
  */
 function journal(state: EffortState, input: Extract<EffortInput, { kind: "journal" }>): Step {
 	const teammate = state.teammates.find((each) => each.id === input.teammate);
 	if (!teammate) return { ok: false, refusal: `Effort \`${state.effortId}\` has no Teammate \`${input.teammate}\` to read a journal of.` };
 	if (input.cursor <= (teammate.cursor ?? 0)) return took(state, [], []);
+	const event = journalEvent(state, teammate, input);
+	const reported = text(input.line.payload?.permission_mode);
+	// Claude Code calls manual `default`.
+	const mode = reported === "default" ? "manual" : reported;
+	if (!event.ok || mode === undefined || mode === (teammate.observedMode ?? teammate.mode)) return event;
+	return took(state, [{ type: "teammate-mode", teammate: teammate.id, cursor: input.cursor, mode, at: input.line.at }, ...event.append], event.actions, event.reply);
+}
+
+/** What one journal event of `teammate` appends, past its cursor. */
+function journalEvent(state: EffortState, teammate: Teammate, input: Extract<EffortInput, { kind: "journal" }>): Step {
 	const { cursor, line } = input;
 	const payload = line.payload ?? {};
 	const at = line.at;

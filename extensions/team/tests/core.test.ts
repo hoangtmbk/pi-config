@@ -419,3 +419,49 @@ describe("a Teammate's journal", () => {
 		assert.deepEqual([again.append, again.actions, earlier.append, earlier.actions], [[], [], [], []]);
 	});
 });
+
+describe("a Teammate's permission mode", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const started = applied(
+		applied(approved, { kind: "plan", tasks: [{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] }], criteria: ["AC1"], roles: ["dev"], at: "2026-11-02T11:10:00.000Z" }),
+		{ kind: "handoff", slug: "rename", at: "2026-11-02T11:30:00.000Z", mode: "auto" },
+	);
+
+	function hook(cursor: number, name: string, mode: string): Extract<EffortInput, { kind: "journal" }> {
+		return {
+			kind: "journal",
+			teammate: "dev-1",
+			cursor,
+			line: { from: "hook", at: `2026-11-02T11:4${cursor}:00.000Z`, event: name, payload: { session_id: "8f3c2a1b-0000", hook_event_name: name, permission_mode: mode } },
+			result: { path: "/r/result-1.md", written: false },
+		};
+	}
+
+	it("records the mode a Teammate launched in", () => {
+		assert.equal(fold(started).teammates[0].mode, "auto");
+	});
+
+	it("logs a mode its hooks report other than the one last known, once per change, before the event's own line and waking nobody", () => {
+		const same = run(started, hook(1, "SessionStart", "auto"));
+		assert.ok(same.ok);
+		assert.deepEqual(same.append.map((line) => line.type), ["teammate-session"]);
+
+		const opened = applied(started, hook(1, "SessionStart", "auto"));
+		const drifted = run(opened, hook(2, "UserPromptSubmit", "acceptEdits"));
+		assert.ok(drifted.ok);
+		assert.deepEqual(drifted.append[0], { type: "teammate-mode", teammate: "dev-1", cursor: 2, mode: "acceptEdits", at: "2026-11-02T11:42:00.000Z" });
+		assert.deepEqual(drifted.append.map((line) => line.type), ["teammate-mode", "prompt-landed"]);
+		assert.deepEqual(drifted.actions, []);
+		assert.equal(drifted.state.teammates[0].observedMode, "acceptEdits");
+
+		const steady = run([...opened, ...drifted.append], hook(3, "PostToolUse", "acceptEdits"));
+		assert.ok(steady.ok);
+		assert.deepEqual(steady.append, []);
+	});
+
+	it("reads Claude Code's `default` as manual", () => {
+		const result = run(started, hook(1, "SessionStart", "default"));
+		assert.ok(result.ok);
+		assert.deepEqual(result.append[0], { type: "teammate-mode", teammate: "dev-1", cursor: 1, mode: "manual", at: "2026-11-02T11:41:00.000Z" });
+	});
+});
