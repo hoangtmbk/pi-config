@@ -28,6 +28,21 @@ export interface PendingApproval {
 	at: string;
 }
 
+/**
+ * Where the Effort's Teammates work, added at Brief approval: for a
+ * `git-worktree` Workspace, the worktree on the Effort's own branch, cut from
+ * the default branch `from` at commit `base`.
+ */
+export interface Workspace {
+	kind: "git-worktree";
+	path: string;
+	branch: string;
+	/** The commit the Effort started from. */
+	base: string;
+	/** The default branch `base` was the tip of. */
+	from: string;
+}
+
 /** One line of `effort.jsonl`. */
 export type EffortLine =
 	/** The first line: the Effort exists, on this Team, repo and Playbook. */
@@ -35,7 +50,7 @@ export type EffortLine =
 	/** The Lead asked the human to approve a snapshot. */
 	| ({ type: "approval-requested" } & PendingApproval)
 	/** The human answered a request in `/team pending`. */
-	| { type: "approval-answered"; id: string; answer: "approved" | "sent-back"; note?: string; at: string };
+	| { type: "approval-answered"; id: string; answer: "approved" | "sent-back"; note?: string; workspace?: Workspace; at: string };
 
 /** What an Effort's lines fold to. */
 export interface EffortState {
@@ -47,6 +62,8 @@ export interface EffortState {
 	playbook: string;
 	/** Set once the human approves the Brief; until then no Teammate starts. */
 	brief?: { sha256: string; approvedAt: string; request: string };
+	/** Added when the Brief is approved. */
+	workspace?: Workspace;
 	/** What waits on the human, oldest first. */
 	pending: PendingApproval[];
 	/** How many approvals have been requested, which numbers the next one. */
@@ -57,8 +74,8 @@ export interface EffortState {
 export type EffortInput =
 	/** `team_request_approval`, with the draft already validated and snapshotted. */
 	| { kind: "request-approval"; checkpoint: string; path: string; sha256: string; snapshot: string; at: string }
-	/** The human's answer to a pending item. */
-	| { kind: "answer"; id: string; answer: "approved" | "sent-back"; note?: string; at: string }
+	/** The human's answer to a pending item, with the Workspace the shell added for an approved Brief. */
+	| { kind: "answer"; id: string; answer: "approved" | "sent-back"; note?: string; workspace?: Workspace; at: string }
 	/** A Lead tool that would start a Teammate. */
 	| { kind: "start-teammate"; tool: "team_plan" | "team_handoff" };
 
@@ -96,7 +113,12 @@ function apply(state: EffortState, line: EffortLine): EffortState {
 			const answered = state.pending.find((item) => item.id === line.id);
 			const pending = state.pending.filter((item) => item.id !== line.id);
 			if (line.answer === "approved" && answered?.checkpoint === BRIEF) {
-				return { ...state, pending, brief: { sha256: answered.sha256, approvedAt: line.at, request: answered.id } };
+				return {
+					...state,
+					pending,
+					brief: { sha256: answered.sha256, approvedAt: line.at, request: answered.id },
+					...(line.workspace === undefined ? {} : { workspace: line.workspace }),
+				};
 			}
 			return { ...state, pending };
 		}
@@ -182,6 +204,7 @@ function answer(state: EffortState, input: Extract<EffortInput, { kind: "answer"
 		id: input.id,
 		answer: input.answer,
 		...(input.note === undefined ? {} : { note: input.note }),
+		...(input.answer === "approved" && input.workspace !== undefined ? { workspace: input.workspace } : {}),
 		at: input.at,
 	};
 	if (input.answer === "approved") {
@@ -189,7 +212,15 @@ function answer(state: EffortState, input: Extract<EffortInput, { kind: "answer"
 			{ kind: "promote-brief", approval: item, at: input.at },
 			{
 				kind: "wake-lead",
-				text: `The human approved the Brief of Effort \`${state.effortId}\` (request \`${item.id}\`, sha256 ${item.sha256}). It is now brief.md in the Effort's directory and is never edited. Teammates may start once planning is available.`,
+				text: [
+					`The human approved the Brief of Effort \`${state.effortId}\` (request \`${item.id}\`, sha256 ${item.sha256}). It is now brief.md in the Effort's directory and is never edited.`,
+					input.workspace
+						? `The Workspace is ${input.workspace.path}, on branch \`${input.workspace.branch}\` cut from \`${input.workspace.from}\` at ${input.workspace.base}.`
+						: undefined,
+					"Teammates may start once planning is available.",
+				]
+					.filter((part) => part !== undefined)
+					.join(" "),
 			},
 		]);
 	}
