@@ -401,6 +401,19 @@ describe("team_status data", () => {
 		assert.equal(teamStatus(fold(through([...held, asked(2, "hold-expired")])), { adoptionsPending: 0 }).waitingOnYou, 1);
 	});
 
+	it("counts a request the Lead escalated as waiting on the human, until the human answers it", () => {
+		const asked = (cursor: number, event: string, payload?: Record<string, unknown>): EffortInput => {
+			const base = hook("architect-1", cursor, event, payload);
+			return base.kind === "journal" ? { ...base, line: { ...base.line, request: "req-0000000a" } } : base;
+		};
+		const held = [REQUEST, APPROVE, PLAN, handoff("design"), asked(1, "PermissionRequest", { tool_name: "Bash", tool_input: { command: "npm publish" } })];
+		const escalated = [...held, { kind: "escalate", request: "req-0000000a", summary: "Publishing is outside the Brief.", at: "2026-11-02T10:30:00.000Z" } as EffortInput];
+
+		assert.equal(teamStatus(fold(through(escalated)), { adoptionsPending: 0 }).waitingOnYou, 1);
+		const answered = [...escalated, { kind: "answer-escalation", id: "req-0000000a", decision: "deny", reason: "Not now.", at: "2026-11-02T10:35:00.000Z" } as EffortInput];
+		assert.equal(teamStatus(fold(through(answered)), { adoptionsPending: 0 }).waitingOnYou, 0);
+	});
+
 	it("rows a Teammate whose new session gave it a new short id as new, until the human attaches to it through pi", () => {
 		const opened = through([REQUEST, APPROVE, PLAN, handoff("design"), hook("architect-1", 1, "SessionStart", { source: "startup", permission_mode: "auto" })]);
 		const relaunched: EffortLine[] = [

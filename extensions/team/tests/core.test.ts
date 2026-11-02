@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openMerges, type Step, step, taskStatus, type UsageReading, waitingInTerminal, workdir } from "../core.ts";
+import { currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openEscalations, openMerges, type Step, step, taskStatus, type UsageReading, waitingInTerminal, workdir } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -1185,6 +1185,211 @@ describe("a Teammate's held requests", () => {
 			'11:50 answered dev-1\'s "Which store should the renamed key live in?": Redis; "Which callers should move now?": api, worker (Task `rename`)',
 		]);
 	});
+
+	describe("escalated to the human", () => {
+		const INBOX = { socket: "/tmp/cc-socks/4242.sock", token: "inbox-token" };
+		const session = applied(started, line(1, "SessionStart", { inbox: INBOX }, { source: "startup" }));
+		const prompt = applied(session, asked(2, "req-0000000a"));
+		const question = applied(session, asked(2, "req-0000000b", "AskUserQuestion", QUESTIONS));
+		const stoppedShort = applied(session, line(2, "Stop", {}, { last_assistant_message: "Should the old key keep working for a release?" }));
+		const STORE = "Which store should the renamed key live in?";
+		const CALLERS = "Which callers should move now?";
+
+		function escalate(extra: Partial<Extract<EffortInput, { kind: "escalate" }>>): Extract<EffortInput, { kind: "escalate" }> {
+			return { kind: "escalate", summary: "Publishing is outside the Brief.", at: "2026-11-02T11:48:00.000Z", ...extra };
+		}
+
+		function human(id: string, extra: Partial<Extract<EffortInput, { kind: "answer-escalation" }>>): Extract<EffortInput, { kind: "answer-escalation" }> {
+			return { kind: "answer-escalation", id, at: "2026-11-02T11:55:00.000Z", ...extra };
+		}
+
+		function actionOf<K extends EffortAction["kind"]>(result: Step, kind: K): Extract<EffortAction, { kind: K }> | undefined {
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			return result.actions.find((each): each is Extract<EffortAction, { kind: K }> => each.kind === kind);
+		}
+
+		function reported(lines: EffortLine[], title: string): string[] | undefined {
+			const result = run(lines, { kind: "report", headline: "On track.", criteria: ["AC1"], modes: [], at: "2026-11-02T12:00:00.000Z" });
+			const action = actionOf(result, "write-report");
+			return action?.report.sections.find((each) => each.title === title)?.lines;
+		}
+
+		it("moves a held permission request to the human's pending items with the Lead's summary, so only that Task waits", () => {
+			const result = run(prompt, escalate({ request: "req-0000000a" }));
+
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			assert.deepEqual(result.actions, []);
+			assert.match(result.reply ?? "", /`req-0000000a`.*`\/team pending`/);
+			assert.match(result.reply ?? "", /Only Task `rename` waits/);
+			assert.deepEqual(
+				openEscalations(result.state).map((each) => [each.id, each.teammate, each.task, each.kind, each.summary]),
+				[["req-0000000a", "dev-1", "rename", "permission", "Publishing is outside the Brief."]],
+			);
+		});
+
+		it("refuses a request no hook holds, one already escalated, and an escalation without a summary", () => {
+			assert.match(refusal(prompt, escalate({ request: "req-ffffffff" })), /`req-0000000a`/);
+			const answered = applied(prompt, answer("req-0000000a", { decision: "deny", reason: "no" }));
+			assert.match(refusal(answered, escalate({ request: "req-0000000a" })), /already answered/);
+			const escalated = applied(prompt, escalate({ request: "req-0000000a" }));
+			assert.match(refusal(escalated, escalate({ request: "req-0000000a" })), /already escalated/);
+			assert.match(refusal(prompt, escalate({ request: "req-0000000a", summary: " " })), /summary/);
+			assert.match(refusal(prompt, escalate({})), /request.*teammate/);
+		});
+
+		it("takes only the human's answer to an escalated permission: the Lead's is refused, the human's reaches the hook and wakes the Lead", () => {
+			const escalated = applied(prompt, escalate({ request: "req-0000000a" }));
+
+			assert.match(refusal(escalated, answer("req-0000000a", { decision: "allow", reason: "the human said so in chat" })), /only the human.*`\/team pending`/);
+			const result = run(escalated, human("req-0000000a", { decision: "deny", reason: "Not this release." }));
+
+			assert.deepEqual(decision(result), { behavior: "deny", message: "Not this release." });
+			assert.match(wake(result), /The human denied `req-0000000a`.*Not this release\./s);
+			assert.equal(actionOf(result, "append-clarification"), undefined, "a permission is no question for clarifications.md");
+			assert.ok(result.ok);
+			assert.deepEqual(openEscalations(result.state), []);
+			assert.deepEqual(result.state.decided, [], "the human decided it, so nothing is decided for them");
+			assert.match(refusal([...escalated, ...result.append], human("req-0000000a", { decision: "allow", reason: "ok" })), /already answered/);
+		});
+
+		it("appends the human's answer to an escalated AskUserQuestion to clarifications.md with who asked, the Task and what the Brief said", () => {
+			const escalated = applied(question, escalate({ request: "req-0000000b", summary: "The Brief names no store.", brief: "AC1 only says the key is renamed." }));
+			const answers = { [STORE]: "Redis", [CALLERS]: ["api"] };
+
+			const result = run(escalated, human("req-0000000b", { answers }));
+
+			assert.deepEqual(decision(result), { behavior: "allow", updatedInput: { ...QUESTIONS, answers } });
+			assert.deepEqual(actionOf(result, "append-clarification")?.entry, {
+				id: "req-0000000b",
+				teammate: "dev-1",
+				task: "rename",
+				question: `"${STORE}" (one of \`Redis\`, \`Memory\`); "${CALLERS}" (any of \`api\`, \`worker\`)`,
+				summary: "The Brief names no store.",
+				brief: "AC1 only says the key is renamed.",
+				answer: `"${STORE}": Redis; "${CALLERS}": api`,
+				via: "pending",
+				at: "2026-11-02T11:55:00.000Z",
+			});
+			assert.match(wake(result), /The human answered `req-0000000b`/);
+		});
+
+		it("takes the human's answer to an escalated question relayed from chat through team_answer, as theirs and with no wake", () => {
+			const escalated = applied(question, escalate({ request: "req-0000000b" }));
+
+			const result = run(escalated, answer("req-0000000b", { answers: { [STORE]: "Memory", [CALLERS]: ["worker"] } }));
+
+			assert.equal(actionOf(result, "append-clarification")?.entry.via, "lead");
+			assert.equal(actionOf(result, "wake-lead"), undefined);
+			assert.ok(result.ok);
+			assert.deepEqual(result.state.decided, []);
+			assert.match(result.reply ?? "", /clarifications\.md/);
+		});
+
+		it("refuses an answer the escalated question can't take, as team_answer does", () => {
+			const escalated = applied(question, escalate({ request: "req-0000000b" }));
+
+			assert.match(refusal(escalated, human("req-0000000b", { answers: { [STORE]: "Redis" } })), /Which callers should move now\?/);
+			assert.match(refusal(escalated, human("req-ffffffff", { answers: {} })), /No escalated item `req-ffffffff`/);
+		});
+
+		it("escalates a prose question from a Teammate that stopped short, answered as free text sent to it and kept in clarifications.md", () => {
+			const result = run(stoppedShort, escalate({ teammate: "dev-1", question: "Should the old key keep working for a release?", summary: "Deprecation isn't in the Brief." }));
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			assert.deepEqual(
+				openEscalations(result.state).map((each) => [each.id, each.kind, each.question]),
+				[["q1", "prose", "Should the old key keep working for a release?"]],
+			);
+			const escalated = [...stoppedShort, ...result.append];
+
+			assert.match(refusal(escalated, human("q1", { text: " " })), /answer/);
+			const answered = run(escalated, human("q1", { text: "Yes, for one release." }));
+
+			const sent = actionOf(answered, "send-message");
+			assert.deepEqual([sent?.teammate, sent?.inbox], ["dev-1", INBOX]);
+			assert.match(sent?.message ?? "", /Yes, for one release\./);
+			assert.match(sent?.message ?? "", /clarifications\.md/);
+			assert.equal(actionOf(answered, "append-clarification")?.entry.answer, "Yes, for one release.");
+			assert.match(wake(answered), /The human answered `q1`/);
+			assert.ok(answered.ok);
+			assert.deepEqual(openEscalations(answered.state), []);
+		});
+
+		it("takes a prose answer relayed from chat through team_answer's text", () => {
+			const escalated = applied(stoppedShort, escalate({ teammate: "dev-1", question: "Keep the old key?" }));
+
+			const result = run(escalated, answer("q1", { text: "Keep it for a release." }));
+
+			assert.equal(actionOf(result, "send-message")?.teammate, "dev-1");
+			assert.equal(actionOf(result, "append-clarification")?.entry.via, "lead");
+		});
+
+		it("refuses a prose question from a Teammate it doesn't know or that hasn't stopped short, and a second one while the first is open", () => {
+			assert.match(refusal(stoppedShort, escalate({ teammate: "qa-1", question: "?" })), /no Teammate `qa-1`/);
+			assert.match(refusal(session, escalate({ teammate: "dev-1", question: "Keep the old key?" })), /stopped short/);
+			assert.match(refusal(stoppedShort, escalate({ teammate: "dev-1" })), /question/);
+			const escalated = applied(stoppedShort, escalate({ teammate: "dev-1", question: "Keep the old key?" }));
+			assert.match(refusal(escalated, escalate({ teammate: "dev-1", question: "And the docs?" })), /`q1`/);
+		});
+
+		it("takes the human's allow of an escalated floor action, which the Lead could not allow", () => {
+			const force = applied(session, asked(2, "req-0000000c", "Bash", { command: "git push --force origin HEAD" }));
+			assert.match(refusal(force, answer("req-0000000c", { decision: "allow", reason: "ok" })), /team_escalate/);
+			const escalated = applied(force, escalate({ request: "req-0000000c", summary: "A force push rewrites history." }));
+
+			const result = run(escalated, human("req-0000000c", { decision: "allow", reason: "Rewriting it is fine this once." }));
+
+			assert.deepEqual(decision(result), { behavior: "allow" });
+			assert.match(wake(result), /The human allowed `req-0000000c`/);
+		});
+
+		it("lets an escalated prompt go once the Teammate's turn ends or its hook gives up, so nothing counts twice", () => {
+			const escalated = applied(prompt, escalate({ request: "req-0000000a" }));
+			const expired = applied(escalated, line(3, "hold-expired", { request: "req-0000000a" } as Partial<JournalLine>));
+			const ended = applied(escalated, line(3, "Stop", {}, { last_assistant_message: "I stopped." }));
+
+			assert.deepEqual([openEscalations(fold(expired)), waitingInTerminal(fold(expired)).length], [[], 1]);
+			assert.deepEqual(openEscalations(fold(ended)), []);
+			assert.match(refusal(expired, human("req-0000000a", { decision: "allow", reason: "ok" })), /only the human can answer it now, in dev-1's terminal/);
+		});
+
+		it("tells the next Report what was escalated and answered, and what still waits on the human", () => {
+			const one = applied(prompt, escalate({ request: "req-0000000a" }));
+			const two = applied(applied(one, asked(3, "req-0000000b", "AskUserQuestion", QUESTIONS)), escalate({ request: "req-0000000b", summary: "The Brief names no store." }));
+			const answered = applied(two, human("req-0000000b", { answers: { [STORE]: "Redis", [CALLERS]: ["api", "worker"] } }));
+
+			assert.deepEqual(reported(answered, "Waiting on you"), ["`req-0000000a`: dev-1's `Bash` prompt on Task `rename`, escalated: Publishing is outside the Brief. Answer it in `/team pending`"]);
+			const since = reported(answered, "Since the last Report") ?? [];
+			assert.ok(since.includes("11:48 escalated dev-1's `Bash` prompt (`req-0000000a`) to you: Publishing is outside the Brief."), since.join("\n"));
+			assert.ok(since.includes(`11:55 you answered \`req-0000000b\`: "${STORE}": Redis; "${CALLERS}": api, worker`), since.join("\n"));
+		});
+	});
+
+	describe("team_send", () => {
+		const INBOX = { socket: "/tmp/cc-socks/4242.sock", token: "inbox-token" };
+		const session = applied(started, line(1, "SessionStart", { inbox: INBOX }, { source: "startup" }));
+
+		function send(teammate: string, message: string): Extract<EffortInput, { kind: "send" }> {
+			return { kind: "send", teammate, message, at: "2026-11-02T11:50:00.000Z" };
+		}
+
+		it("sends a prose message to a Teammate's inbox, on record", () => {
+			const result = run(session, send("dev-1", "Rename it in docs/config.md too."));
+
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			assert.deepEqual(result.actions, [{ kind: "send-message", teammate: "dev-1", inbox: INBOX, message: "Rename it in docs/config.md too." }]);
+			assert.deepEqual(result.append.map((each) => each.type), ["message-sent"]);
+		});
+
+		it("refuses a Teammate it doesn't know, one with no session yet, one that ended, and an empty or long message", () => {
+			assert.match(refusal(session, send("qa-1", "hi")), /no Teammate `qa-1`.*`dev-1`/);
+			assert.match(refusal(started, send("dev-1", "hi")), /no session yet/);
+			const crashed = applied(session, line(2, "SessionEnd", {}, { reason: "other" }));
+			assert.match(refusal(crashed, send("dev-1", "hi")), /ended/);
+			assert.match(refusal(session, send("dev-1", "  ")), /empty/);
+			assert.match(refusal(session, send("dev-1", "x".repeat(2001))), /2000/);
+		});
+	});
+
 	describe("the floor guard", () => {
 		const TERMS = {
 			workspace: "/work/app-ws",

@@ -29,11 +29,14 @@ import {
 	DEFAULT_MAX_TEAMMATES,
 	type EffortAction,
 	type EffortState,
+	type Escalation,
+	escalationText,
 	type FinalFacts,
 	fold,
 	freshStatusLine,
 	type Inbox,
 	openEffort,
+	openEscalations,
 	PLAYBOOK_CHANGE,
 	type PendingApproval,
 	type PlaybookChange,
@@ -56,6 +59,7 @@ import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
 import { adoptable, hasEnded, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
 import {
 	answerTerms,
+	appendClarification,
 	appendLines,
 	briefCriteria,
 	checkRecords,
@@ -78,7 +82,7 @@ import {
 	writeTask,
 } from "./records.ts";
 import { repoRoot } from "./repo.ts";
-import { terminalText } from "./requests.ts";
+import { askedQuestions, terminalText } from "./requests.ts";
 import { REPORT_OVERLAY, type ReportChrome, ReportView, type ReportTui } from "./reports-view.ts";
 import { addTaskWorkspace, addWorkspace, effortWorktrees, endWorktrees, mergeTaskWorkspace, removeTaskWorkspace } from "./workspace.ts";
 import {
@@ -106,7 +110,7 @@ import { handoffPointer, restaffPointer, sendBackPointer, teammatePrompt } from 
 /** The Lead's tools while this session runs Team setup. */
 const SETUP_TOOLS = ["team_request_approval"];
 /** The Lead's tools while this session holds an Effort. */
-const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer"];
+const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer", "team_escalate", "team_send"];
 /** Every Lead tool: registered at load, and switched on only by what the session runs. */
 const LEAD_TOOLS = [...new Set([...SETUP_TOOLS, ...EFFORT_TOOLS])];
 
@@ -188,7 +192,26 @@ const AnswerParams = Type.Object({
 			description: "For an AskUserQuestion: each question's exact text to the label picked, or a list of labels for a multiSelect question.",
 		}),
 	),
+	text: Type.Optional(Type.String({ description: "For an escalated prose question (`q<n>`): the human's answer in their own words, as they gave it to you in chat." })),
 });
+
+const EscalateParams = Type.Object({
+	request: Type.Optional(Type.String({ description: "The held request to escalate, `req-<8 hex>`. Leave it out to escalate a prose question with `teammate` and `question`." })),
+	teammate: Type.Optional(Type.String({ description: "For a prose question: the Teammate that stopped short asking it, such as `dev-1`." })),
+	question: Type.Optional(Type.String({ description: "For a prose question: the question, as the Teammate's last message asked it." })),
+	summary: Type.String({ description: "For the human: what is asked, and why the Brief doesn't settle it, in a sentence or two." }),
+	brief: Type.Optional(Type.String({ description: "What the Brief says on it, if anything; it goes into clarifications.md with the human's answer." })),
+});
+
+const SendParams = Type.Object({
+	teammate: Type.String({ description: "The Teammate to message, such as `dev-1`." }),
+	message: Type.String({ description: "A short prose message, at most 2000 characters; longer instructions belong in a Task." }),
+});
+
+/** The `/team pending` choices for an escalated permission, and the end of a multiSelect question's picks. */
+const ALLOW = "Allow";
+const DENY = "Deny";
+const DONE = "Done";
 
 /** What a `team_report` result carries for the human's view of it in chat; the Lead reads only its short `content`. */
 interface ReportDetails {
@@ -1189,6 +1212,104 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	}
 
 	/**
+	 * The escalated items in `/team pending`, oldest first: a permission takes
+	 * allow or deny with a reason, a question the Teammate's own options, and a
+	 * prose question the human's words. Backing out leaves an item for later.
+	 * Each is looked up again before it is asked and before its answer is
+	 * taken, since its Teammate's terminal can settle it meanwhile.
+	 */
+	async function answerEscalations(held: HeldEffort, items: readonly Escalation[], ctx: ExtensionCommandContext): Promise<void> {
+		for (const { id } of items) {
+			if (effort !== held) return;
+			wakeAboutTeammates(applyJournals(held));
+			const escalation = openEscalations(effortState(held)).find((each) => each.id === id);
+			if (!escalation) continue;
+			const answer = await askEscalation(held, escalation, ctx);
+			if (!answer || effort !== held) continue;
+			wakeAboutTeammates(applyJournals(held));
+			const result = step(effortState(held), { kind: "answer-escalation", id, ...answer, at: now().toISOString() });
+			if (!result.ok) {
+				ctx.ui.notify(result.refusal, "error");
+				continue;
+			}
+			const failed = await carryOutAnswer(held, result);
+			if (failed) ctx.ui.notify(failed, "error");
+		}
+	}
+
+	/** The human's answer to one escalated item, from its dialogs, or undefined when they leave it for later. */
+	async function askEscalation(
+		held: HeldEffort,
+		escalation: Escalation,
+		ctx: ExtensionCommandContext,
+	): Promise<{ decision?: "allow" | "deny"; reason?: string; answers?: Record<string, string | string[]>; text?: string } | undefined> {
+		const state = effortState(held);
+		const head = [
+			`\`${escalation.id}\`: ${escalationText(escalation, state)}, escalated by the Lead: ${escalation.summary}`,
+			...(escalation.brief === undefined ? [] : [`The Brief says: ${escalation.brief}`]),
+		];
+		if (escalation.kind === "prose") {
+			const title = [...head, `${escalation.teammate} asks: ${escalation.question}`, `Your answer goes to ${escalation.teammate} and into clarifications.md:`].join("\n");
+			const text = (await ctx.ui.input(title))?.trim();
+			return text ? { text } : undefined;
+		}
+		if (escalation.kind === "permission") {
+			const picked = await ctx.ui.select([...head, `It asks for ${escalation.question}.`].join("\n"), [ALLOW, DENY, LATER]);
+			if (picked !== ALLOW && picked !== DENY) return undefined;
+			const decision = picked === ALLOW ? "allow" : "deny";
+			const reason = await ctx.ui.input(decision === "deny" ? `Why not? ${escalation.teammate} reads it:` : "Why? The Lead and the next Report read it:");
+			if (reason === undefined) return undefined;
+			return { decision, reason: reason.trim() || `the human ${decision === "allow" ? "allowed" : "denied"} it in /team pending` };
+		}
+		const request = state.teammateRequests[escalation.id];
+		if (!request) return undefined;
+		const answers: Record<string, string | string[]> = {};
+		for (const [n, asked] of askedQuestions(request).entries()) {
+			const title = [...(n === 0 ? head : [`\`${escalation.id}\`, question ${n + 1}:`]), `"${asked.question}"${asked.multiSelect ? " (pick any, then Done)" : ""}`].join("\n");
+			if (!asked.multiSelect) {
+				const label = await ctx.ui.select(title, [...asked.labels, LATER]);
+				if (label === undefined || !asked.labels.includes(label)) return undefined;
+				answers[asked.question] = label;
+				continue;
+			}
+			const picks = new Set<string>();
+			while (picks.size < asked.labels.length) {
+				const left = asked.labels.filter((label) => !picks.has(label));
+				const label = await ctx.ui.select(title, [...left, ...(picks.size > 0 ? [DONE] : []), LATER]);
+				if (label === DONE) break;
+				if (label === undefined || !left.includes(label)) return undefined;
+				picks.add(label);
+			}
+			answers[asked.question] = asked.labels.filter((label) => picks.has(label));
+		}
+		return { answers };
+	}
+
+	/**
+	 * Carry out the human's answer to an escalated item: the hook's decision or
+	 * the Teammate's message goes first, and only once it got there is the
+	 * answer kept in clarifications.md, on record, and the Lead woken with it.
+	 * What went wrong, or undefined.
+	 */
+	async function carryOutAnswer(held: HeldEffort, result: Extract<Step, { ok: true }>): Promise<string | undefined> {
+		const opened = await bridge?.catch(() => undefined);
+		for (const action of result.actions) {
+			if (action.kind === "answer-hook" && !opened?.answer(action.request, action.decision)) {
+				wakeAboutTeammates(applyJournals(held));
+				return `No hook holds \`${action.request}\` any more, so your answer can't reach it: it waits in ${action.teammate}'s terminal (\`/team attach ${action.teammate}\`).`;
+			}
+			if (action.kind === "send-message") {
+				const failed = await deliver(held, action.teammate, action.inbox, action.message);
+				if (failed) return `Your answer didn't reach ${action.teammate}, so it still waits: ${failed.error}.`;
+			}
+		}
+		for (const action of result.actions) if (action.kind === "append-clarification") appendClarification(held.paths, action.entry);
+		appendLines(held.paths, result.append);
+		for (const action of result.actions) if (action.kind === "wake-lead") wakeLead("team-pending", action.text);
+		paintBlock();
+		return undefined;
+	}
+	/**
 	 * The Effort's requests in `/team pending`: each proposed Playbook change
 	 * first, since sign-off waits for them, then sign-off, then a Brief. Each
 	 * is looked up again before it is asked, since an answer can end the
@@ -1380,13 +1501,15 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				const state = held ? effortState(held) : undefined;
 				const briefs = state?.pending ?? [];
 				const terminal = state ? waitingInTerminal(state) : [];
+				const escalated = state ? openEscalations(state) : [];
 				const usage = state?.usageItems ?? [];
-				if (pending.length === 0 && briefs.length === 0 && terminal.length === 0 && usage.length === 0) {
+				if (pending.length === 0 && briefs.length === 0 && terminal.length === 0 && escalated.length === 0 && usage.length === 0) {
 					ctx.ui.notify("Nothing is waiting on you.", "info");
 					return;
 				}
 				for (const item of [...pending]) await answerAdoption(item, ctx);
 				if (held) await answerApprovals(held, briefs, ctx);
+				if (held) await answerEscalations(held, escalated, ctx);
 				for (const item of terminal) {
 					const attach = `Attach to ${item.teammate}`;
 					const answer = await ctx.ui.select(`\`${item.request}\` waited past its hook's hold: ${terminalText(item)}`, [attach, LATER]);
@@ -1847,6 +1970,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				rule: params.rule,
 				grant: params.grant,
 				answers: params.answers,
+				text: params.text,
 				...(terms ? { terms } : {}),
 				at: now().toISOString(),
 			};
@@ -1863,6 +1987,64 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 						? `No hook holds \`${action.request}\` any more, so your answer can't reach it: it waits in ${action.teammate}'s terminal (\`/team attach ${action.teammate}\`). Stop and tell the human.`
 						: again.refusal,
 				);
+			}
+			// An escalated prose question's answer goes to its Teammate; it is on record only once it got there.
+			for (const action of result.actions) {
+				if (action.kind !== "send-message") continue;
+				const failed = await deliver(held, action.teammate, action.inbox, action.message);
+				if (failed) throw new Error(`The human's answer didn't reach ${action.teammate}, so nothing is recorded: ${failed.error}. Stop and tell the human.`);
+			}
+			for (const action of result.actions) if (action.kind === "append-clarification") appendClarification(held.paths, action.entry);
+			appendLines(held.paths, result.append);
+			paintBlock();
+			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
+		},
+	});
+
+	pi.registerTool({
+		name: "team_escalate",
+		label: "Escalate",
+		description: [
+			"Move a question the Brief doesn't settle to the human's `/team pending`, with your `summary`: a held `request` (a permission prompt or an AskUserQuestion), or the prose `question` a stopped-short `teammate` asked.",
+			"Only the Task that asked waits on it; the rest of the Effort goes on. An escalated permission takes only the human's answer in `/team pending`.",
+			"An escalated question may also be answered by the human in chat: pass their answer on with `team_answer` (`answers`, or `text` for a prose question). Every answer to a question goes into clarifications.md, which counts as part of the Brief.",
+		].join(" "),
+		promptSnippet: "Escalate a held request or a stopped-short Teammate's question to the human, with a summary",
+		parameters: EscalateParams,
+		defaultActive: false,
+		async execute(_toolCallId, params) {
+			if (!effort) throw new Error("No Effort is open in this session, so there is nothing to escalate; the human opens one with `/team start <team>`.");
+			const held = effort;
+			// What the terminal did meanwhile counts first: a request it answered can't be escalated.
+			wakeAboutTeammates(applyJournals(held));
+			const result = step(effortState(held), { kind: "escalate", ...params, at: now().toISOString() });
+			if (!result.ok) throw new Error(result.refusal);
+			appendLines(held.paths, result.append);
+			paintBlock();
+			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
+		},
+	});
+
+	pi.registerTool({
+		name: "team_send",
+		label: "Send",
+		description: [
+			"Send a Teammate a short prose message, at most 2000 characters, which it reads as its next turn: through its inbox, or by resuming its session.",
+			"Use it for a nudge or a fact it needs; new work goes in a Task with `team_handoff`, and a send-back with `team_review`. The message is on record once it is sent.",
+		].join(" "),
+		promptSnippet: "Send a Teammate a short prose message",
+		parameters: SendParams,
+		defaultActive: false,
+		async execute(_toolCallId, params) {
+			if (!effort) throw new Error("No Effort is open in this session, so there is no Teammate to message; the human opens one with `/team start <team>`.");
+			const held = effort;
+			wakeAboutTeammates(applyJournals(held));
+			const result = step(effortState(held), { kind: "send", ...params, at: now().toISOString() });
+			if (!result.ok) throw new Error(result.refusal);
+			for (const action of result.actions) {
+				if (action.kind !== "send-message") continue;
+				const failed = await deliver(held, action.teammate, action.inbox, action.message);
+				if (failed) throw new Error(`The message didn't reach ${action.teammate}, so nothing is recorded: ${failed.error}.`);
 			}
 			appendLines(held.paths, result.append);
 			paintBlock();

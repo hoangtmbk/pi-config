@@ -70,6 +70,8 @@ export interface RequestAnswer {
 	rule?: string;
 	grant?: string;
 	answers?: Record<string, string | string[]>;
+	/** The human's free-text answer to an escalated prose question, relayed from chat. */
+	text?: string;
 	/** What the approved Playbook and Brief let the Lead allow. Without them, no floor action can be allowed. */
 	terms?: AnswerTerms;
 }
@@ -139,10 +141,45 @@ function backticked(items: readonly string[]): string {
 	return items.map((item) => `\`${item}\``).join(", ");
 }
 
+/** Whether a held request is an `AskUserQuestion` rather than a permission prompt. */
+export function isQuestion(held: HeldRequest): boolean {
+	return held.tool === QUESTION_TOOL;
+}
+
+/** An `AskUserQuestion`'s questions, each with its own options, for the human to pick from. */
+export function askedQuestions(held: HeldRequest): { question: string; multiSelect: boolean; labels: string[] }[] {
+	return questions(held.input);
+}
+
+/** What a held request asks, in a line: its questions with their options, or the tool and what it would run on. */
+export function askedText(held: HeldRequest): string {
+	if (held.tool === QUESTION_TOOL) {
+		return questions(held.input)
+			.map((each) => `"${each.question}" (${each.multiSelect ? "any" : "one"} of ${backticked(each.labels)})`)
+			.join("; ");
+	}
+	return `\`${held.tool}\` \`${gist(held.input)}\``;
+}
+
+/** What a request is, as a pending item names it: a `Bash` prompt, or a question. */
+export function requestKind(held: HeldRequest): string {
+	return held.tool === QUESTION_TOOL ? "question" : `\`${held.tool}\` prompt`;
+}
+
+/** An `AskUserQuestion`'s answers in a line, in the order it asked them. */
+export function answersText(held: HeldRequest, given: Record<string, string | string[]>): string {
+	return questions(held.input)
+		.map((each) => {
+			const value = given[each.question];
+			return `"${each.question}": ${Array.isArray(value) ? value.join(", ") : value}`;
+		})
+		.join("; ");
+}
+
 /** The text that wakes the Lead with a request. */
 export function askText(held: HeldRequest): string {
 	const on = held.task === undefined ? "" : ` on Task \`${held.task}\``;
-	const live = `It is also live in ${held.teammate}'s terminal; the first answer wins. Nothing is allowed by default: if the Brief doesn't settle it, deny it or leave it to the human.`;
+	const live = `It is also live in ${held.teammate}'s terminal; the first answer wins. Nothing is allowed by default: if the Brief doesn't settle it, deny it or move it to the human with \`team_escalate\`.`;
 	if (held.tool === QUESTION_TOOL) {
 		const asked = questions(held.input).map((each) => `- "${each.question}" (${each.multiSelect ? "any" : "one"} of ${backticked(each.labels)})`);
 		return [
@@ -336,12 +373,8 @@ function takeQuestionAnswer(held: HeldRequest, answer: RequestAnswer, reason: st
 		if (!known.has(key)) problems.push(`"${key}" isn't one of its questions; key each answer by the question's exact text`);
 	}
 	if (problems.length > 0) return `The answers to ${about} can't be sent until these are fixed:\n${problems.map((problem) => `- ${problem}`).join("\n")}`;
-	const told = asked.map((each) => {
-		const value = given[each.question];
-		return `"${each.question}": ${Array.isArray(value) ? value.join(", ") : value}`;
-	});
 	return {
 		decision: { behavior: "allow", updatedInput: { ...held.input, answers: given } },
-		logged: [`answered ${held.teammate}'s ${told.join("; ")}`],
+		logged: [`answered ${held.teammate}'s ${answersText(held, given)}`],
 	};
 }
