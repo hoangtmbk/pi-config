@@ -2124,6 +2124,12 @@ describe("the final Report and sign-off", () => {
 		]);
 	});
 
+	it("orders the final Report's sections as the spec lists them, found work before usage, the sign-off's own after the logged ones", () => {
+		const report = written(run(running, finalReport("2026-11-02T12:00:00.000Z", { leadCostUsd: 1.5 })));
+		const titles = report.sections.map((each) => each.title);
+		assert.deepEqual(titles.slice(titles.indexOf("Checkpoints")), ["Checkpoints", "Found work", "Proposed Playbook changes", "Worktrees", "Usage"]);
+	});
+
 	it("asks for sign-off and for each proposed Playbook change separately", () => {
 		const state = fold(asked);
 		assert.deepEqual(

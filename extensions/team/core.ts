@@ -3562,9 +3562,11 @@ function report(state: EffortState, input: Extract<EffortInput, { kind: "report"
 	const found: EffortLine[] = (input.found ?? []).map((what) => what.trim()).filter((what) => what !== "").map((what) => ({ type: "found-work", what, at: input.at }));
 	const now = found.reduce(apply, state);
 	const n = state.reports + 1;
-	const logged = [...reportSections(now, n === 1 ? input.modes : undefined), { title: "Usage", lines: usageLines(now, input.leadCostUsd) }].filter((each) => each.lines.length > 0);
-	// The final Report tells all found work, not only what is new, so its own section replaces the logged one.
-	const sections = input.final ? [...logged.filter((each) => each.title !== "Found work"), ...finalSections(now, input.final)] : logged;
+	const usage = { title: "Usage", lines: usageLines(now, input.leadCostUsd) };
+	// The final Report tells all found work, not only what is new, so its own section replaces the logged one; usage stays last, as in every Report.
+	const kept = reportSections(now, n === 1 ? input.modes : undefined);
+	const logged = input.final ? [...kept.filter((each) => each.title !== "Found work"), ...finalSections(now, input.final)] : kept;
+	const sections = [...logged, usage].filter((each) => each.lines.length > 0);
 	const written: Report = { n, at: input.at, headline, coverage, sections, ...(input.final ? { final: true as const } : {}) };
 	const file = `reports/${String(n).padStart(3, "0")}.md`;
 	return took(
