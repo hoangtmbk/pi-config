@@ -9,8 +9,8 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { openEffort, type PendingApproval } from "../core.ts";
-import type { Playbook } from "../definitions.ts";
-import { answerTerms, appendClarification, appendLines, checkRecords, createEffort, promoteBrief, readLines, validateBrief } from "../records.ts";
+import type { Playbook, Role } from "../definitions.ts";
+import { answerTerms, appendClarification, appendLines, briefRoles, checkRecords, createEffort, promoteBrief, readLines, validateBrief } from "../records.ts";
 import { goodTeam, tempRoots, writeFiles } from "./harness.ts";
 
 const SHA = "a".repeat(64);
@@ -164,6 +164,18 @@ function sha(content: string | Buffer): string {
 }
 
 const NOW = new Date("2026-11-02T10:00:00.000Z");
+
+describe("the launch options a Brief sets per Role", () => {
+	const DEV: Role = { name: "dev", description: "Writes code.", model: "sonnet", allowedTools: [], disallowedTools: [], mcpServers: {}, plugins: [], prompt: "", filePath: "/roles/dev.md" };
+
+	it("applies a Role's `model` and `effort` as written", () => {
+		assert.deepEqual(briefRoles("---\nroles:\n  dev:\n    model: opus\n    effort: high\n---\n# Brief\n", [DEV]), [{ ...DEV, model: "opus", effort: "high" }]);
+	});
+
+	it("refuses a Brief whose frontmatter won't parse, instead of quietly dropping its overrides", () => {
+		assert.throws(() => briefRoles("---\nroles: [dev\n---\n# Brief\n", [DEV]), /frontmatter .*isn't valid YAML/);
+	});
+});
 
 describe("what an approved Brief lets the Lead allow", () => {
 	const ESCALATING: Playbook = { ...PLAYBOOK, escalate: [{ id: "history-rewrite", when: "rewriting history", ask: ["Bash(git rebase:*)"] }, { id: "lockfile", when: "the lockfile", ask: ["Edit(package-lock.json)"] }] };

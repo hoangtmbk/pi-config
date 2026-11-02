@@ -443,15 +443,16 @@ function checkRoles(roles: unknown, known: readonly string[] | undefined): strin
 
 /**
  * The Team's Roles with the launch options a Brief's `roles` sets for this
- * Effort applied: `model` and `effort`, as written. A Brief without them, or
- * one that doesn't parse, leaves the Roles as they are.
+ * Effort applied: `model` and `effort`, as written. A Brief without them
+ * leaves the Roles as they are; one whose frontmatter doesn't parse throws,
+ * since its overrides can't be told.
  */
 export function briefRoles(text: string, roles: readonly Role[]): Role[] {
 	let fields: unknown;
 	try {
 		fields = parseFrontmatter(text).frontmatter;
-	} catch {
-		return [...roles];
+	} catch (error) {
+		throw new Error(`The Brief's frontmatter isn't valid YAML, so the launch options it sets per Role can't be read: ${(error instanceof Error ? error.message : String(error)).split("\n")[0]}`);
 	}
 	const set = isMapping(fields) && isMapping(fields.roles) ? fields.roles : {};
 	return roles.map((role) => {
