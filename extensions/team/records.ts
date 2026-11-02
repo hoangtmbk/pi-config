@@ -14,7 +14,7 @@ import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSyn
 import { join, relative, sep } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { type Clarification, type EffortLine, type EffortState, type JournalLine, type PendingApproval, type Report, taskStatus, type Workspace } from "./core.ts";
-import { BRIEF_SKELETON, isKebabCase, type Playbook, type Role, sha256 } from "./definitions.ts";
+import { BRIEF_SKELETON, isKebabCase, type Playbook, type Role, readSnapshot, type Snapshot, sha256 } from "./definitions.ts";
 import type { AnswerTerms, CitableGrant } from "./requests.ts";
 
 /** The files of one Effort, all under `<agent dir>/team/efforts/<effort-id>/`. */
@@ -274,6 +274,49 @@ export function checkRecords(paths: EffortPaths): string[] {
 	compare(paths.playbook, existsSync(paths.playbook) ? sha256(readFileSync(paths.playbook)) : undefined, approved.playbook);
 	compare(`${paths.team}/`, existsSync(paths.team) ? teamDigest(paths.team) : undefined, approved.team);
 	return problems;
+}
+
+/** What an Effort reads of its approved records, each checked against its approval first. */
+export interface Approved extends Snapshot {
+	/** `brief.md` as approved; `roles` already has the launch options it sets applied. */
+	brief: string;
+	/** The Roles as the Team snapshot has them, before the Brief's `roles`. */
+	teamRoles: Role[];
+}
+
+/**
+ * Read the Effort's approved Brief and its Team and Playbook snapshot, after
+ * checking each against `approvals.jsonl`. Every reader of them goes through
+ * here, so a record changed since approval is reported and never used: the
+ * error names each one with both shas.
+ */
+export function readApproved(paths: EffortPaths, effortId: string): Approved {
+	const problems = checkRecords(paths);
+	if (problems.length > 0) throw new Error(`Effort \`${effortId}\` has records that changed since the human approved them, so they are not used:\n${bulletList(problems)}`);
+	const found = readSnapshot(paths.team, paths.playbook);
+	if ("problems" in found) {
+		const listed = found.problems.map((problem) => `${problem.filePath}: ${problem.reason}`);
+		throw new Error(`The Team snapshot of Effort \`${effortId}\` can't be read, so no Teammate starts:\n${bulletList(listed)}`);
+	}
+	const brief = readFileSync(paths.brief, "utf8");
+	return { brief, playbook: found.playbook, teamRoles: found.roles, roles: briefRoles(brief, found.roles) };
+}
+
+/**
+ * What keeps a Brief change from being asked about or approved: the Brief
+ * skeleton and frontmatter against the Effort's Playbook snapshot, with
+ * each override naming an id that Playbook has; and a change at all.
+ */
+export function briefChangeProblems(text: string, current: Approved, effort: { team: string; repo: string }): string[] {
+	const problems = validateBrief(text, { team: effort.team, repo: effort.repo, playbook: current.playbook, roles: current.teamRoles.map((role) => role.name) });
+	if (sha256(text) === sha256(current.brief)) problems.push("it is the approved Brief as it stands, so there is no change to approve");
+	return problems;
+}
+
+/** The Roles whose launch options (`model`, `effort`) the Brief change `after` sets differently from the approved Brief. */
+export function changedLaunch(current: Approved, after: string): string[] {
+	const next = briefRoles(after, current.teamRoles);
+	return current.roles.flatMap((role, index) => (role.model !== next[index]?.model || role.effort !== next[index]?.effort ? [role.name] : []));
 }
 
 /** What a Brief's frontmatter must agree with: the Effort it belongs to. */
@@ -613,6 +656,10 @@ export function writeFeedback(paths: EffortPaths, folder: string, round: number,
 
 function isMapping(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function bulletList(lines: readonly string[]): string {
+	return lines.map((line) => `- ${line}`).join("\n");
 }
 
 function quoteList(items: readonly string[]): string {

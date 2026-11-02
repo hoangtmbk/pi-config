@@ -710,13 +710,19 @@ export function listTeams(roots: TeamRoots): Team[] {
 		.map(([name, { dir, source }]) => readTeam(dir, name, source, roots.agentDir));
 }
 
+/** The Roles and Playbook an Effort snapshotted at Brief approval, which is all it staffs from. */
+export interface Snapshot {
+	roles: Role[];
+	playbook: Playbook;
+}
+
 /**
  * The Roles and Playbook an Effort snapshotted at Brief approval: its
  * `team/roles/*.md` and its `playbook.md`. Both were validated before they
  * were approved, and a bundled Team's limits were applied then, so the
  * copies are read as the human's own.
  */
-export function readSnapshot(teamDir: string, playbookFile: string): { roles: Role[]; playbook: Playbook } | { problems: ConfigError[] } {
+export function readSnapshot(teamDir: string, playbookFile: string): Snapshot | { problems: ConfigError[] } {
 	const rolesDir = join(teamDir, "roles");
 	const problems: ConfigError[] = [];
 	const roles: Role[] = [];

@@ -59,7 +59,7 @@ import {
 	waitingInTerminal,
 	workdir,
 } from "./core.ts";
-import { EVERY_ROLE, listTeams, loadTeam, type Playbook, readSnapshot, type Role, sha256, type Team, type TeamRoots } from "./definitions.ts";
+import { EVERY_ROLE, listTeams, loadTeam, type Playbook, type Role, sha256, type Team, type TeamRoots } from "./definitions.ts";
 import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
 import { adoptable, hasEnded, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
 import {
@@ -67,8 +67,9 @@ import {
 	appendClarification,
 	appendLines,
 	briefCriteria,
-	briefRoles,
-	checkRecords,
+	type Approved,
+	briefChangeProblems,
+	changedLaunch,
 	createEffort,
 	type EffortPaths,
 	effortPaths,
@@ -78,6 +79,7 @@ import {
 	readApprovals,
 	readJournal,
 	readLead,
+	readApproved,
 	readLines,
 	readReports,
 	recordApproval,
@@ -709,7 +711,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	/** Each Role's model in the Effort's Team snapshot, which a model-family limit holds Roles by; none before its Brief is approved. */
 	function roleModels(held: HeldEffort): Record<string, string> | undefined {
 		try {
-			return Object.fromEntries(snapshotOf(held).roles.flatMap((role) => (role.model === undefined ? [] : [[role.name, role.model]])));
+			return Object.fromEntries(readApproved(held.paths, held.effortId).roles.flatMap((role) => (role.model === undefined ? [] : [[role.name, role.model]])));
 		} catch {
 			return undefined;
 		}
@@ -1095,8 +1097,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 */
 	function requestBriefApproval(held: HeldEffort, checkpoint: string, path: string, affects?: string[]): string {
 		const state = effortState(held);
-		const snapshot_ = state.brief ? snapshotOf(held) : undefined;
-		const checkpoints = snapshot_ ? [...snapshot_.playbook.checkpoints.map(({ id }) => id), ...snapshot_.playbook.escalate.map(({ id }) => id)] : [];
+		const current = state.brief ? approved(held) : undefined;
+		const checkpoints = current ? [...current.playbook.checkpoints.map(({ id }) => id), ...current.playbook.escalate.map(({ id }) => id)] : [];
 		const refusal = refuseRequest(state, checkpoint, { affects, checkpoints });
 		if (refusal !== undefined) throw new Error(refusal);
 		const ofBrief = checkpoint === BRIEF || checkpoint === BRIEF_CHANGE;
@@ -1116,27 +1118,14 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			if ("error" in found) throw new Error(`The Brief of Effort \`${state.effortId}\` can't be asked about: ${found.error}.`);
 			const problems = validateBrief(snapshot, { team: state.team, repo: state.repo, playbook: found.playbook, roles: found.team.roles.map((role) => role.name) });
 			if (problems.length > 0) throw new Error(`The Brief ${path} can't be asked about until these are fixed:\n${bullets(problems)}`);
-		} else if (checkpoint === BRIEF_CHANGE && snapshot_) {
-			const problems = briefChangeProblems(state, snapshot, snapshot_);
+		} else if (checkpoint === BRIEF_CHANGE && current) {
+			const problems = briefChangeProblems(snapshot, current, state);
 			if (problems.length > 0) throw new Error(`The Brief change ${path} can't be asked about until these are fixed:\n${bullets(problems)}`);
 		}
 		const result = step(state, { kind: "request-approval", checkpoint, path, sha256: sha256(bytes), snapshot, ...(affects === undefined ? {} : { affects }), checkpoints, at: now().toISOString() });
 		if (!result.ok) throw new Error(result.refusal);
 		appendLines(held.paths, result.append);
 		return result.reply ?? "";
-	}
-
-	/**
-	 * What keeps a Brief change from being asked about or approved: the Brief
-	 * skeleton and frontmatter against the Effort's Playbook snapshot, with
-	 * each override naming an id that Playbook has; and a change at all.
-	 */
-	function briefChangeProblems(state: EffortState, text: string, snapshot_: { roles: Role[]; playbook: Playbook }): string[] {
-		const problems = validateBrief(text, { team: state.team, repo: state.repo, playbook: snapshot_.playbook, roles: snapshot_.roles.map((role) => role.name) });
-		if (existsSync(effortPaths(paths.agentDir, state.effortId).brief) && sha256(text) === state.brief?.sha256) {
-			problems.push("it is the approved Brief as it stands, so there is no change to approve");
-		}
-		return problems;
 	}
 
 	/**
@@ -1148,40 +1137,23 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const state = effortState(effort);
 		const result = step(state, { kind: "start-teammate", tool });
 		if (!result.ok) throw new Error(result.refusal);
-		const problems = checkRecords(effort.paths);
-		if (problems.length > 0) {
-			const text = `Effort \`${effort.effortId}\` has records that changed since the human approved them, so they are not used:\n${bullets(problems)}`;
-			ctx.ui.notify(text, "error");
-			throw new Error(`${text}\n\nStop and tell the human; \`${tool}\` runs again once the records match their approval.`);
-		}
+		approved(effort, ctx);
 		return { held: effort, state };
 	}
 
 	/**
-	 * The Roles and Playbook the Effort snapshotted at Brief approval, which is
-	 * all it staffs from, with the launch options its approved Brief sets per
-	 * Role (`roles`) applied.
+	 * The Effort's approved Brief and its Team and Playbook snapshot, which is
+	 * all it staffs and answers from: each checked against its approval
+	 * first, and one changed since told to the human and never used.
 	 */
-	function snapshotOf(held: HeldEffort): { roles: Role[]; playbook: Playbook } {
-		const found = rawSnapshot(held);
-		return existsSync(held.paths.brief) ? { ...found, roles: briefRoles(readFileSync(held.paths.brief, "utf8"), found.roles) } : found;
-	}
-
-	/** The Team and Playbook snapshot as written, before the Brief's `roles`. */
-	function rawSnapshot(held: HeldEffort): { roles: Role[]; playbook: Playbook } {
-		const found = readSnapshot(held.paths.team, held.paths.playbook);
-		if ("problems" in found) {
-			const problems = found.problems.map((problem) => `${problem.filePath}: ${problem.reason}`);
-			throw new Error(`The Team snapshot of Effort \`${held.effortId}\` can't be read, so no Teammate starts:\n${bullets(problems)}\n\nStop and tell the human.`);
+	function approved(held: HeldEffort, ctx: ExtensionContext | undefined = leadCtx): Approved {
+		try {
+			return readApproved(held.paths, held.effortId);
+		} catch (error) {
+			const text = error instanceof Error ? error.message : String(error);
+			ctx?.ui.notify(text, "error");
+			throw new Error(`${text}\n\nStop and tell the human; the Effort goes on once its records match their approval.`);
 		}
-		return found;
-	}
-
-	/** The Roles whose launch options (`model`, `effort`) differ between Brief `before` and Brief `after`. */
-	function changedLaunch(roles: Role[], before: string, after: string): string[] {
-		const old = briefRoles(before, roles);
-		const next = briefRoles(after, roles);
-		return roles.flatMap((role, index) => (old[index]?.model !== next[index]?.model || old[index]?.effort !== next[index]?.effort ? [role.name] : []));
 	}
 
 	/** The mode a Teammate handed `slug` launches in, when the plan and the snapshot name its Role: drift is measured against it. */
@@ -1223,7 +1195,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		{ teammate, slug, folder, round, feedback }: Extract<EffortAction, { kind: "restaff-teammate" }>,
 		ctx: ExtensionContext,
 	): Promise<void> {
-		const { roles, playbook } = snapshotOf(held);
+		const { roles, playbook } = approved(held);
 		const role = roles.find((each) => each.name === teammate.role);
 		const workspace = result.state.workspace;
 		if (!role || !workspace) throw new Error(`Task \`${slug}\` can't go to a new Teammate: Effort \`${held.effortId}\` has no Role \`${teammate.role}\` in its Team snapshot or no Workspace. Stop and tell the human.`);
@@ -1347,7 +1319,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 	/** {@link staffTask}, past the journal hold. */
 	async function staffTaskNow(held: HeldEffort, result: Extract<Step, { ok: true }>, body?: string): Promise<void> {
-		const { roles, playbook } = snapshotOf(held);
+		const { roles, playbook } = approved(held);
 		const stopped: string[] = [];
 		const added: Extract<EffortAction, { kind: "add-task-workspace" }>[] = [];
 		const still = body === undefined ? "queued" : "planned";
@@ -1632,7 +1604,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 */
 	async function answerBriefChange(held: HeldEffort, item: PendingApproval, ctx: ExtensionCommandContext): Promise<void> {
 		const state = effortState(held);
-		const snapshot_ = snapshotOf(held);
+		const current = approved(held, ctx);
 		const holds = item.affects ?? [];
 		const title = [
 			`Approve a Brief change of Effort \`${state.effortId}\` (request \`${item.id}\`)? ${item.path} (sha256 ${item.sha256})`,
@@ -1642,14 +1614,14 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const picked = await approveOrSendBack(title, ctx);
 		if (!picked) return;
 		if (picked.answer === "approved") {
-			const problems = briefChangeProblems(state, item.snapshot, snapshot_);
+			const problems = briefChangeProblems(item.snapshot, current, state);
 			if (problems.length > 0) {
 				ctx.ui.notify(`The Brief change of Effort \`${state.effortId}\` (request \`${item.id}\`) can't be approved:\n${bullets(problems)}`, "error");
 				return;
 			}
 		}
 		const at = now().toISOString();
-		const refresh = picked.answer === "approved" ? changedLaunch(rawSnapshot(held).roles, readFileSync(held.paths.brief, "utf8"), item.snapshot) : [];
+		const refresh = picked.answer === "approved" ? changedLaunch(current, item.snapshot) : [];
 		const result = step(state, { kind: "answer", id: item.id, ...picked, ...(refresh.length > 0 ? { refresh } : {}), at });
 		if (!result.ok) {
 			ctx.ui.notify(result.refusal, "error");
@@ -1824,7 +1796,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * that Playbook, and the Effort's worktrees as git has them now.
 	 */
 	function finalFacts(held: HeldEffort, state: EffortState, changes: readonly PlaybookChange[]): FinalFacts {
-		const { roles, playbook } = snapshotOf(held);
+		const { roles, playbook } = approved(held);
 		const problems = changes.flatMap((change) => {
 			const made = changedPlaybook(playbook, change, roles.map((role) => role.name));
 			return "error" in made ? [`Playbook change \`${change.id}\`: ${made.error}`] : [];
@@ -2070,8 +2042,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		defaultActive: false,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { held, state } = approvedEffort("team_plan", ctx);
-			const { roles } = snapshotOf(held);
-			const criteria = briefCriteria(readFileSync(held.paths.brief, "utf8"));
+			const { roles, brief } = approved(held, ctx);
+			const criteria = briefCriteria(brief);
 			const result = step(state, { kind: "plan", tasks: params.tasks, criteria, roles: roles.map((role) => role.name), reason: params.reason, at: now().toISOString() });
 			if (!result.ok) throw new Error(result.refusal);
 			await carryOut(held, result, async () => {});
@@ -2099,7 +2071,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { held, state } = approvedEffort("team_handoff", ctx);
-			const { roles, playbook } = snapshotOf(held);
+			const { roles, playbook } = approved(held);
 			const result = step(state, {
 				kind: "handoff",
 				slug: params.slug,
@@ -2137,7 +2109,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			if (verdict === undefined) throw new Error(`\`verdict\` is \`accept\` or \`send_back\`, not \`${params.verdict}\`.`);
 			const due = state.tasks[params.slug];
 			const path = due ? join(held.paths.tasks, due.folder, `result-${due.round}.md`) : "";
-			const { roles, playbook } = snapshotOf(held);
+			const { roles, playbook } = approved(held);
 			const result = step(state, {
 				kind: "review",
 				slug: params.slug,
@@ -2268,9 +2240,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			const held = effort;
 			// The Report's usage is as of now: each live Teammate's status line is read first.
 			const state = readStatusLines(held);
-			const criteria = state.brief ? briefCriteria(readFileSync(held.paths.brief, "utf8")) : [];
-			// The Role modes go only into the plan Report, and need the snapshot only then.
-			const snapshot = state.brief && state.reports === 0 ? snapshotOf(held) : undefined;
+			const records = state.brief ? approved(held, ctx) : undefined;
+			const criteria = records ? briefCriteria(records.brief) : [];
+			// The Role modes go only into the plan Report.
+			const snapshot = state.reports === 0 ? records : undefined;
 			const modes = snapshot ? snapshot.roles.map((role) => ({ role: role.name, mode: modeInForce(snapshot.playbook, role) })) : [];
 			const final = params.final && state.brief ? finalFacts(held, state, params.changes ?? []) : undefined;
 			const leadCostUsd = leadCost(ctx.sessionManager.getEntries());
@@ -2326,7 +2299,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		promptSnippet: "Answer a Teammate's held permission request or AskUserQuestion: allow or deny, with a reason",
 		parameters: AnswerParams,
 		defaultActive: false,
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!effort) throw new Error("No Effort is open in this session, so no request waits on you; the human opens one with `/team start <team>`.");
 			const held = effort;
 			const decision = params.decision === undefined ? undefined : DECISIONS.find((each) => each === params.decision);
@@ -2336,10 +2309,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			const state = effortState(held);
 			// What the approved Brief lets you allow on the floor, deletes judged against the Teammate's own folder.
 			const asker = state.teammateRequests[params.request]?.teammate;
-			const terms =
-				state.brief && state.workspace
-					? answerTerms(snapshotOf(held).playbook, readFileSync(held.paths.brief, "utf8"), (asker && workdir(state, asker)) ?? state.workspace.path)
-					: undefined;
+			const records = state.brief && state.workspace ? approved(held, ctx) : undefined;
+			const terms = records && state.workspace ? answerTerms(records.playbook, records.brief, (asker && workdir(state, asker)) ?? state.workspace.path) : undefined;
 			const answer = {
 				kind: "answer-request" as const,
 				request: params.request,
