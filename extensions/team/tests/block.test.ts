@@ -138,6 +138,29 @@ describe("the Team block", () => {
 		]);
 	});
 
+	it("shows the usage pause's limit and reset, and a line per model hold with the Roles it holds and until when", () => {
+		const lines = render(
+			data({
+				pauses: [{ by: "usage", kind: "weekly", reason: "weekly limit", reset: "2026-11-09T00:00:00.000Z", since: "2026-11-02T12:10:00.000Z" }],
+				holds: [
+					{ kind: "opus", roles: ["architect", "reviewer"], reset: "2026-11-02T15:45:00.000Z" },
+					{ kind: "consent", roles: ["dev"], teammate: "dev-1" },
+				],
+				waitingOnYou: 1,
+			}),
+		);
+
+		assert.deepEqual(lines, [
+			"╭─ Team · software · flaky-cache ────────────────────────────────────── 0 live ─╮",
+			"│ ⏸ paused  ·  working · 1/4 Tasks accepted                                     │",
+			"│   by a usage limit since 12:10 UTC: weekly limit, resets 2026-11-09 00:00 UTC │",
+			"│ held  architect, reviewer on an Opus limit until 15:45 UTC                    │",
+			"│ held  dev on a usage-credit confirm in dev-1's terminal                       │",
+			"│ ▲ 1 waiting on you  /team pending   reports 0                                 │",
+			"╰───────────────────────────────────────────────────────────────────────────────╯",
+		]);
+	});
+
 	it("shows the account's usage under the status line: each window or n/a, when it resets, where the reading came from and how old it is", () => {
 		const lines = render(
 			data({
@@ -397,5 +420,21 @@ describe("team_status data", () => {
 		const attached = step(fold(relaunched), { kind: "attach", teammate: "architect-1", at: "2026-11-02T11:10:00.000Z" });
 		assert.ok(attached.ok);
 		assert.equal(teamStatus(attached.state, { adoptionsPending: 0 }).teammates[0].newShortId, undefined);
+	});
+
+	it("carries the usage pause's limit and reset and the model holds, and counts the usage items waiting on the human", () => {
+		const opened = through([REQUEST, APPROVE, PLAN]);
+		const limited: EffortLine[] = [
+			...opened,
+			{ type: "paused", by: "usage", kind: "session", reason: "session limit", reset: "2026-11-02T15:45:00.000Z", at: "2026-11-02T12:10:00.000Z" },
+			{ type: "model-held", family: "opus", kind: "opus", roles: ["architect"], reset: "2026-11-02T16:00:00.000Z", at: "2026-11-02T12:11:00.000Z" },
+			{ type: "usage-escalated", id: "u1", why: "retries", kind: "overloaded", teammate: "dev-1", at: "2026-11-02T12:12:00.000Z" },
+		];
+		const status = teamStatus(fold(limited), { adoptionsPending: 0 });
+
+		assert.deepEqual(status.pauses, [{ by: "usage", kind: "session", reason: "session limit", reset: "2026-11-02T15:45:00.000Z", since: "2026-11-02T12:10:00.000Z" }]);
+		assert.deepEqual(status.holds, [{ kind: "opus", roles: ["architect"], reset: "2026-11-02T16:00:00.000Z" }]);
+		assert.equal(status.waitingOnYou, 1);
+		assert.equal(teamStatus(fold(opened), { adoptionsPending: 0 }).holds, undefined);
 	});
 });

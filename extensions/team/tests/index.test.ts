@@ -284,6 +284,10 @@ function fakePi(
 		copied,
 		/** What the extension did with pi's TUI, oldest first. */
 		tuiEvents,
+		/** Move the extension's clock to `at`. */
+		travel(at: string) {
+			clock = new Date(at);
+		},
 		/** Move the extension's clock on by `ms`. */
 		advance(ms: number) {
 			clock = new Date(clock.getTime() + ms);
@@ -1968,6 +1972,83 @@ async function printed(hook: FakeHeldHook): Promise<unknown> {
 function journalled(dir: string, event: string): boolean {
 	return readFileSync(join(dir, "teammates", "builder-1", "events.jsonl"), "utf8").includes(`"event":"${event}"`);
 }
+
+/** `builder-1` on `rename-key` runs out on the session limit, which resets at `reset`; any other Task's Teammate works it. */
+function sessionOut(reset: Date): FakeHookStep[] {
+	const hours = reset.getUTCHours();
+	const clock = `${hours % 12 || 12}:${String(reset.getUTCMinutes()).padStart(2, "0")}${hours < 12 ? "am" : "pm"}`;
+	return [
+		{ event: "SessionStart", payload: { source: "startup" } },
+		{ event: "UserPromptSubmit" },
+		{ event: "StopFailure", payload: { error: "rate_limit", last_assistant_message: `You've hit your session limit · resets ${clock} (UTC)` }, when: "rename-key" },
+		{ write: "result", when: "survey" },
+		{ event: "Stop", payload: { last_assistant_message: "Done." }, when: "survey" },
+	];
+}
+
+describe("usage limits: a Teammate's StopFailure", () => {
+	it("pauses the Effort on a session limit, queues new Tasks, then at the reset starts them and sends the limited Teammate `continue`", async () => {
+		// The hook stamps journal lines with the real time, which the reset is read after: the clock is set to it.
+		const started = new Date();
+		const reset = new Date(Math.floor(started.getTime() / 60_000) * 60_000 + 61 * 60_000);
+		const hhmm = reset.toISOString().slice(11, 16);
+		const crew = await crewApproved({ hooks: sessionOut(reset), replies: [{ event: "UserPromptSubmit" }, { event: "Stop", payload: { last_assistant_message: "Renamed." } }] });
+		const { pi, dir } = crew;
+		pi.travel(started.toISOString());
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await until(() => effortLines(dir).some((line) => line.type === "paused" && line.by === "usage"), "the session limit paused the Effort");
+
+		assert.deepEqual(teammateWakes(pi.sent), [], "the Lead's turns spend the same account, so a limit wakes nobody");
+		assert.ok(pi.timers().length > 0, "the Lead ticks a clock while it holds the Effort");
+		const block = pi.widgets.at(-1)?.lines ?? [];
+		assert.ok(block.some((line) => new RegExp(`by a usage limit since \\d\\d:\\d\\d UTC: session limit, resets (\\S+ )?${hhmm} UTC`).test(line)), block.join("\n"));
+		const queued = await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
+		assert.match(queued, new RegExp(`queued Task \`survey\`.*paused by a usage limit since .*: session limit, until (\\S+ )?${hhmm} UTC`, "s"));
+		assert.equal(pi.claude.launches().length, 1, "no new Task starts while paused");
+
+		// At the reset the pause lifts and the queued Task starts; the limited Teammate waits out the grace.
+		pi.travel(new Date(reset.getTime() + 30_000).toISOString());
+		await pi.tick();
+		assert.ok(!effortLines(dir).some((line) => line.type === "teammate-continued"));
+		assert.equal(pi.claude.launches().length, 2, "the queued Task starts once the pause lifts");
+		assert.deepEqual(pi.claude.inbox(), []);
+
+		pi.travel(new Date(reset.getTime() + 120_000).toISOString());
+		await pi.tick();
+		await until(() => pi.claude.inbox().length > 0, "continue reached builder-1's inbox");
+		const [connection] = pi.claude.inbox();
+		assert.equal(connection.lines[1], JSON.stringify({ type: "user", message: { role: "user", content: "continue" } }));
+		await until(() => effortLines(dir).some((line) => line.type === "teammate-continued"), "the continue is on record");
+		await pi.tick();
+		assert.equal(effortLines(dir).filter((line) => line.type === "teammate-continued").length, 1, "continue is sent once");
+		await pi.emit("session_shutdown");
+		assert.deepEqual(pi.timers(), [], "the clock stops with the session");
+	});
+
+	it("asks the human about a weekly limit with no reset it can read, in `/team pending`, and cancelling ends the Effort as `/team cancel` does", async () => {
+		const weekly: FakeHookStep[] = [
+			{ event: "SessionStart", payload: { source: "startup" } },
+			{ event: "UserPromptSubmit" },
+			{ event: "StopFailure", payload: { error: "rate_limit", last_assistant_message: "You've hit your weekly limit" } },
+		];
+		const { pi, dir } = await crewApproved({ hooks: weekly });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await until(() => effortLines(dir).some((line) => line.type === "usage-escalated"), "the weekly limit waits on the human");
+		const [session] = effortLines(dir).filter((line) => line.type === "teammate-session");
+
+		pi.answer("Cancel the Effort: stop every Teammate and end it without sign-off");
+		await pi.team("pending");
+		const asked = pi.dialogs.at(-1);
+		assert.match(asked?.title ?? "", /weekly limit/);
+		assert.deepEqual(asked?.options, ["Stay paused until it resets", "Cancel the Effort: stop every Teammate and end it without sign-off", "Later"]);
+		assert.ok(pi.claude.calls().some((argv) => argv[0] === "stop" && argv[1] === session.shortId), JSON.stringify(pi.claude.calls()));
+		assert.ok(effortLines(dir).some((line) => line.type === "usage-answered" && line.choice === "cancel"));
+		assert.ok(effortLines(dir).some((line) => line.type === "effort-ended" && line.how === "cancelled"));
+		assert.match(pi.sent.at(-1)?.content ?? "", /Cancelled Effort .* holds no Effort now/s);
+	});
+});
 
 describe("a Teammate's held requests: team_answer", () => {
 	afterEach(() => {

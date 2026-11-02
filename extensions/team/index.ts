@@ -41,6 +41,10 @@ import {
 	SIGN_OFF,
 	type Step,
 	step,
+	USAGE_CHOICES,
+	usageHolds,
+	type UsageItem,
+	usageText,
 	USAGE_FRESH_MS,
 	type UsageReading,
 	type Workspace,
@@ -225,7 +229,7 @@ export interface TeamDeps {
 	bundledTeamsDir?: string;
 	/** The clock adoption times are read from. Injected by tests, and by nothing else. */
 	now?: () => Date;
-	/** Run `tick` every `ms` until the returned stop is called: the Team block's usage readings. Injected by tests, and by nothing else. */
+	/** Run `tick` every `ms` until the returned stop is called: the Team block's usage readings, and the clock usage limits lift on. Injected by tests, and by nothing else. */
 	every?: (ms: number, tick: () => Promise<void> | void) => () => void;
 	/** The pid this session leads an Effort as. Injected by tests standing in for another pi process, and by nothing else. */
 	pid?: number;
@@ -238,6 +242,20 @@ export interface TeamDeps {
 	/** Put text on the clipboard, pi's `copyToClipboard`. Injected by tests, and by nothing else. */
 	copy?: (text: string) => Promise<void>;
 }
+
+/** How often the Lead's clock looks at what a usage limit holds back. */
+const TICK_MS = 60_000;
+
+/** What a Teammate a usage limit stopped is sent once it resets, as the human would type it. */
+const CONTINUE = "continue";
+
+/** What each usage-item choice reads as in `/team pending`. */
+const USAGE_LABELS: Record<string, string> = {
+	stay: "Stay paused until it resets",
+	cancel: "Cancel the Effort: stop every Teammate and end it without sign-off",
+	retry: "Retry: send it `continue` again",
+	leave: "Leave it to the Lead",
+};
 
 /** The paths the extension runs against once defaults are filled in. */
 interface Paths extends TeamRoots {
@@ -269,7 +287,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		deps.every ??
 		((ms: number, tick: () => Promise<void> | void) => {
 			const timer = setInterval(() => void tick(), ms);
-			// The block's readings never keep pi running.
+			// Neither the block's readings nor the usage clock keep pi running.
 			timer.unref();
 			return () => clearInterval(timer);
 		});
@@ -293,6 +311,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	// Where the Team block goes, when pi has a UI, and the lines it last showed.
 	let surface: ExtensionUIContext | undefined;
 	let shown: string[] | undefined;
+	// The clock that lifts what a usage limit holds back, running while this session holds an Effort, and the context queued Tasks start in.
+	let stopClock: (() => void) | undefined;
+	let ticking = false;
+	let leadCtx: ExtensionContext | undefined;
 	// While the block shows: the timer that reads usage into it, the reading under way, and when `get_usage` was last asked.
 	let stopUsage: (() => void) | undefined;
 	let usageRun: Promise<void> | undefined;
@@ -313,13 +335,24 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * human can have changed; an unchanged block isn't handed to pi again.
 	 */
 	function paintBlock(): void {
+		const state = effort ? effortState(effort) : undefined;
+		syncClock(state);
 		if (!surface) return;
-		const lines = effort ? renderTeamBlock(teamStatus(effortState(effort), { adoptionsPending: pending.length }), now().getTime(), { maxTeammates: maxTeammates() }) : undefined;
+		const lines = state ? renderTeamBlock(teamStatus(state, { adoptionsPending: pending.length }), now().getTime(), { maxTeammates: maxTeammates() }) : undefined;
 		if (lines && !stopUsage) stopUsage = every(USAGE_FRESH_MS, readUsage);
 		if (!lines) endUsage();
 		if (lines === shown || (lines && shown && lines.length === shown.length && lines.every((line, index) => line === shown?.[index]))) return;
 		shown = lines;
 		surface.setWidget(BLOCK_KEY, lines, { placement: "aboveEditor" });
+	}
+
+	/** Run the Lead's clock while a usage limit holds anything back in the held Effort, and only then. */
+	function syncClock(state: EffortState | undefined): void {
+		if (state && usageHolds(state)) stopClock ??= every(TICK_MS, tickEffort);
+		else {
+			stopClock?.();
+			stopClock = undefined;
+		}
 	}
 
 	function endUsage(): void {
@@ -456,9 +489,62 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			return false;
 		}
 		effort = held;
+		leadCtx = ctx;
 		syncLeadTools();
 		paintBlock();
+		// A reset that passed while no session led the Effort is caught up on now.
+		void tickEffort();
 		return true;
+	}
+
+	/**
+	 * One beat of the Lead's clock: what a usage limit holds back is let go
+	 * once its reset has passed, and a Teammate due a retry or its reset's
+	 * grace is sent `continue`. A beat still running when the next comes
+	 * skips that one.
+	 */
+	async function tickEffort(): Promise<void> {
+		const held = effort;
+		if (!held || ticking) return;
+		ticking = true;
+		try {
+			const result = step(effortState(held), { kind: "tick", at: now().toISOString() });
+			if (!result.ok || result.append.length === 0) return;
+			appendLines(held.paths, result.append);
+			paintBlock();
+			wakeAboutTeammates(await afterUsage(held, result));
+		} finally {
+			ticking = false;
+		}
+	}
+
+	/**
+	 * Carry out what a usage step asks once its lines are on record: send
+	 * `continue`, start the queued Tasks a lifted pause or hold lets go, and
+	 * return what the Lead must hear, a failed send among it.
+	 */
+	async function afterUsage(held: HeldEffort, result: Extract<Step, { ok: true }>): Promise<string[]> {
+		const texts: string[] = [];
+		for (const action of result.actions) {
+			if (action.kind === "wake-lead") texts.push(action.text);
+			else if (action.kind === "send-continue") {
+				const failed = await deliver(held, action.teammate, action.inbox, CONTINUE);
+				if (failed) texts.push(`\`${action.teammate}\`'s usage limit reset, but \`continue\` couldn't reach it (${failed.error}), so it is still stopped. Stop and tell the human.`);
+			}
+		}
+		const lifted = result.append.some((line) => (line.type === "resumed" && line.by === "usage") || line.type === "model-released");
+		if (lifted && leadCtx) texts.push(...(await startQueued(held, effortState(held), leadCtx)));
+		paintBlock();
+		return texts;
+	}
+
+	/** Each Role's model in the Effort's Team snapshot, which a model-family limit holds Roles by; none before its Brief is approved. */
+	function roleModels(held: HeldEffort): Record<string, string> | undefined {
+		try {
+			return Object.fromEntries(snapshotOf(held).roles.flatMap((role) => (role.model === undefined ? [] : [[role.name, role.model]])));
+		} catch {
+			return undefined;
+		}
 	}
 
 	/**
@@ -470,18 +556,35 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	function applyJournals(held: HeldEffort, only?: string): string[] {
 		let state = effortState(held);
 		const texts: string[] = [];
+		// A reset naming no time zone is read in the machine's.
+		const tz = -now().getTimezoneOffset();
+		let models: Record<string, string> | undefined | null = null;
 		for (const { id, cursor } of state.teammates) {
 			if (only !== undefined && id !== only) continue;
 			for (const read of readJournal(held.paths, id, cursor ?? 0)) {
 				const due = currentResult(state, id);
 				const path = due ? join(held.paths.tasks, due.folder, `result-${due.round}.md`) : "";
-				const result = step(state, { kind: "journal", teammate: id, cursor: read.cursor, line: read.line, result: { path, written: path !== "" && existsSync(path) } });
+				if (models === null) models = roleModels(held);
+				const result = step(state, {
+					kind: "journal",
+					teammate: id,
+					cursor: read.cursor,
+					line: read.line,
+					result: { path, written: path !== "" && existsSync(path) },
+					tz,
+					...(models ? { models } : {}),
+				});
 				if (!result.ok) break;
 				appendLines(held.paths, result.append);
 				state = result.state;
 				for (const action of result.actions) {
 					if (action.kind === "wake-lead") texts.push(action.text);
 					else if (action.kind === "send-pointer") sendPointer(held, action);
+				}
+				// Claude Code's auto-resume fired: the others on that limit get `continue`, and what it held back starts.
+				if (result.actions.some((action) => action.kind === "send-continue") || result.append.some((line) => (line.type === "resumed" && line.by === "usage") || line.type === "model-released")) {
+					const usage = { ...result, actions: result.actions.filter((action) => action.kind === "send-continue") };
+					void afterUsage(held, usage).then(wakeAboutTeammates, (error: unknown) => wakeAboutTeammates([`A usage limit lifted, but what it held back didn't restart: ${error instanceof Error ? error.message : String(error)}`]));
 				}
 			}
 		}
@@ -525,6 +628,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		stopClock?.();
+		stopClock = undefined;
 		// The block shows only while this session holds the Effort.
 		if (shown) surface?.setWidget(BLOCK_KEY, undefined, { placement: "aboveEditor" });
 		shown = undefined;
@@ -1050,6 +1155,32 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		}
 	}
 
+	/** One usage item in `/team pending`: the choices its kind offers, or leave it for later. */
+	async function answerUsage(held: HeldEffort, item: UsageItem, ctx: ExtensionCommandContext): Promise<void> {
+		const choices = USAGE_CHOICES[item.why];
+		const answer = await ctx.ui.select(usageText(item, effortState(held).teammates), [...choices.map((choice) => USAGE_LABELS[choice]), LATER]);
+		const choice = choices.find((each) => USAGE_LABELS[each] === answer);
+		if (choice === undefined) return;
+		const state = effortState(held);
+		const result = step(state, { kind: "answer-usage", id: item.id, choice, at: now().toISOString() });
+		if (!result.ok) {
+			ctx.ui.notify(result.refusal, "error");
+			return;
+		}
+		// Cancelling ends the Effort as `/team cancel` does.
+		if (result.actions.some((action) => action.kind === "end-effort")) return carryOutEnd(held, state, result, ctx);
+		const texts: string[] = [];
+		for (const action of result.actions) {
+			if (action.kind !== "stop-teammate") continue;
+			const failed = await stopTeammate(result.state, action);
+			if (failed) texts.push(`\`${action.teammate}\` didn't stop with \`claude stop ${action.shortId}\` (${failed.error}); tell the human.`);
+		}
+		appendLines(held.paths, result.append);
+		texts.unshift(...(await afterUsage(held, result)));
+		ctx.ui.notify(result.reply ?? "", "info");
+		wakeAboutTeammates(texts);
+	}
+
 	/**
 	 * The Effort's requests in `/team pending`: each proposed Playbook change
 	 * first, since sign-off waits for them, then sign-off, then a Brief. Each
@@ -1242,7 +1373,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				const state = held ? effortState(held) : undefined;
 				const briefs = state?.pending ?? [];
 				const terminal = state ? waitingInTerminal(state) : [];
-				if (pending.length === 0 && briefs.length === 0 && terminal.length === 0) {
+				const usage = state?.usageItems ?? [];
+				if (pending.length === 0 && briefs.length === 0 && terminal.length === 0 && usage.length === 0) {
 					ctx.ui.notify("Nothing is waiting on you.", "info");
 					return;
 				}
@@ -1253,6 +1385,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 					const answer = await ctx.ui.select(`\`${item.request}\` waited past its hook's hold: ${terminalText(item)}`, [attach, LATER]);
 					if (answer === attach) await attachTo(item.teammate, ctx);
 				}
+				// An answer before it can end the Effort, which leaves nothing to answer.
+				for (const item of usage) if (held && effort === held) await answerUsage(held, item, ctx);
 			},
 		},
 		pause: {

@@ -132,7 +132,10 @@ export interface FakeClaudeOptions {
  * or update its status line, which runs the `statusLine.command` of its
  * `--settings` with the payload (the session id and folder filled in).
  */
-export type FakeHookStep = { event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string } | { statusLine: Record<string, unknown> };
+export type FakeHookStep = ({ event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string } | { statusLine: Record<string, unknown> }) & {
+	/** Play the step only for a pointer that includes this text. */
+	when?: string;
+};
 
 /**
  * A hook command a fake session started without waiting on, as Claude Code

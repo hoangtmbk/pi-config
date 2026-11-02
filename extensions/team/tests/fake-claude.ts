@@ -27,7 +27,9 @@
  *   one. A step with `hold: true` starts each hook command without
  *   waiting for it, as Claude Code waits on a held `PermissionRequest` while
  *   its prompt stays live: the step after it plays at once, standing for
- *   whatever the human does in the terminal meanwhile.
+ *   whatever the human does in the terminal meanwhile. A step with `when` plays
+ *   only for a pointer that includes that text, so one Task's Teammate can do
+ *   what another's doesn't.
  * - `FAKE_CLAUDE_HELD_OUT`: a file each held hook command appends one JSON
  *   line to: its process group, the event, and the files its stdout and exit
  *   code land in once it exits. Killing the group with SIGTERM is what Claude
@@ -261,7 +263,7 @@ function fileOf(flag: string): string | undefined {
 }
 
 /** One scripted step of a started session. */
-type HookStep = { event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string } | { statusLine: Record<string, unknown> };
+type HookStep = ({ event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string } | { statusLine: Record<string, unknown> }) & { when?: string };
 
 /** Start the session's inbox server, detached so it outlives this launch, and wait until it listens. */
 async function openInbox(session: Session): Promise<void> {
@@ -376,6 +378,7 @@ function playSteps(steps: HookStep[], session: Session, pointer: string): void {
 	const settings = JSON.parse(session.settings ?? "{}") as { hooks?: Record<string, { matcher?: string; hooks: { command: string }[] }[]>; statusLine?: { command?: string } };
 	const inbox = { CLAUDE_CODE_MESSAGING_SOCKET: session.socket, CLAUDE_CODE_MESSAGING_TOKEN: session.token };
 	for (const step of steps) {
+		if (step.when !== undefined && !pointer.includes(step.when)) continue;
 		if ("statusLine" in step) {
 			const command = settings.statusLine?.command;
 			if (command === undefined) throw new Error("fake claude: the session's settings have no status line command");

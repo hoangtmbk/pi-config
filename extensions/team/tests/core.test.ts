@@ -2088,3 +2088,292 @@ describe("an isolated Task", () => {
 		assert.equal(run(after, review(after, "rename", "2026-11-02T13:10:00.000Z")).ok, true);
 	});
 });
+
+describe("usage limits", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "design", role: "architect", goal: "Design the rename.", criteria: ["AC1"] },
+			{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] },
+			{ slug: "docs", role: "dev", goal: "Document it.", criteria: ["AC1"] },
+			{ slug: "tests", role: "qa", goal: "Test it.", criteria: ["AC1"] },
+			{ slug: "review", role: "architect", goal: "Review it.", criteria: ["AC1"] },
+		],
+		criteria: ["AC1"],
+		roles: ["architect", "dev", "qa"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+	const MODELS = { architect: "opus", dev: "sonnet", qa: "claude-sonnet-4-5" };
+	const T0 = "2026-11-02T11:30:00.000Z";
+	const FAILED = "2026-11-02T12:10:00.000Z";
+	const RESET = "2026-11-02T15:45:00.000Z";
+	const SESSION = "You've hit your session limit · resets 3:45pm";
+
+	/** Hand Task `slug` off and play its Teammate's SessionStart, so it has an inbox to be continued through. */
+	function running(lines: EffortLine[], slug: string, at = T0): EffortLine[] {
+		const handed = applied(lines, { kind: "handoff", slug, at });
+		const id = fold(handed).tasks[slug]?.teammate ?? "";
+		return journal(handed, id, { from: "hook", at, event: "SessionStart", payload: { session_id: `${id.padEnd(8, "0")}-0000-4000-8000-000000000001`, source: "startup" }, inbox: { socket: `/tmp/${id}.sock`, token: `token-${id}` } });
+	}
+
+	function journalStep(lines: EffortLine[], id: string, line: JournalLine, written = false): Step {
+		const cursor = (fold(lines).teammates.find((each) => each.id === id)?.cursor ?? 0) + 1;
+		return run(lines, { kind: "journal", teammate: id, cursor, line, result: { path: "/r/result-1.md", written }, tz: 0, models: MODELS });
+	}
+
+	function journal(lines: EffortLine[], id: string, line: JournalLine, written = false): EffortLine[] {
+		const result = journalStep(lines, id, line, written);
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		return [...lines, ...result.append];
+	}
+
+	function failure(id: string, message: string, at = FAILED, error = "rate_limit"): JournalLine {
+		return { from: "hook", at, event: "StopFailure", payload: { error, last_assistant_message: message } };
+	}
+
+	function notification(type: string, at: string): JournalLine {
+		return { from: "hook", at, event: "Notification", payload: { notification_type: type, message: "" } };
+	}
+
+	function prompt(at: string): JournalLine {
+		return { from: "hook", at, event: "UserPromptSubmit", payload: { prompt: "continue" } };
+	}
+
+	function tick(lines: EffortLine[], at: string): Extract<Step, { ok: true }> {
+		const result = run(lines, { kind: "tick", at });
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		return result;
+	}
+
+	function continued(result: Step): string[] {
+		return result.ok ? result.actions.flatMap((action) => (action.kind === "send-continue" ? [action.teammate] : [])) : [];
+	}
+
+	it("sets the usage pause on a session or weekly limit, with its kind and reset: new Tasks queue, running Teammates finish, and the Report logs it", () => {
+		const dev = running(running(planned, "rename"), "tests");
+		const limited = journalStep(dev, "dev-1", failure("dev-1", SESSION));
+		assert.ok(limited.ok, limited.ok ? "" : limited.refusal);
+		assert.deepEqual(heldPauses(limited.state), [{ by: "usage", kind: "session", reason: "session limit", reset: RESET, at: FAILED }]);
+		assert.deepEqual(limited.state.teammates.find((each) => each.id === "dev-1")?.limit, { kind: "session", reset: RESET, at: FAILED });
+		assert.equal(limited.state.teammates.find((each) => each.id === "dev-1")?.activity, "idle");
+		// Nothing wakes the Lead, nor is stopped: the limit is the account's, and the Lead's turns spend it too.
+		assert.deepEqual(limited.actions, []);
+		const lines = [...dev, ...limited.append];
+
+		const queued = run(lines, { kind: "handoff", slug: "docs", at: "2026-11-02T12:15:00.000Z" });
+		assert.ok(queued.ok, queued.ok ? "" : queued.refusal);
+		assert.equal(queued.state.queue[0]?.why, "paused");
+		assert.match(queued.reply ?? "", /paused by a usage limit since 12:10 UTC: session limit, until 15:45 UTC.*it lifts at its reset/);
+
+		const finished = journalStep(lines, "qa-1", { from: "hook", at: "2026-11-02T12:20:00.000Z", event: "Stop", payload: { last_assistant_message: "Done." } }, true);
+		assert.ok(finished.ok, finished.ok ? "" : finished.refusal);
+		assert.equal(taskStatus(finished.state, "tests"), "in review");
+
+		// The same limit hit again by another Teammate changes nothing about the pause.
+		const again = journalStep(lines, "qa-1", failure("qa-1", SESSION, "2026-11-02T12:11:00.000Z"));
+		assert.ok(again.ok, again.ok ? "" : again.refusal);
+		assert.deepEqual(again.append.map((line) => line.type), ["teammate-limited"]);
+
+		const weekly = journalStep(lines, "qa-1", failure("qa-1", "You've hit your weekly limit · resets Tue 9am", "2026-11-02T12:11:00.000Z"));
+		assert.ok(weekly.ok, weekly.ok ? "" : weekly.refusal);
+		assert.deepEqual(heldPauses(weekly.state), [{ by: "usage", kind: "weekly", reason: "weekly limit", reset: "2026-11-03T09:00:00.000Z", at: "2026-11-02T12:11:00.000Z" }]);
+
+		const reported = run(lines, { kind: "report", headline: "Held.", criteria: ["AC1"], modes: [], at: "2026-11-02T13:00:00.000Z" });
+		const written = reported.ok ? reported.actions.find((each) => each.kind === "write-report") : undefined;
+		const decided = written?.kind === "write-report" ? written.report.sections.find((each) => each.title === "Decided for you")?.lines : undefined;
+		assert.deepEqual(decided, ["12:10 paused the Effort on dev-1's session limit, until 15:45 UTC (Task `rename`)"]);
+	});
+
+	it("holds only the Roles on an Opus or Sonnet limit's family: their new Tasks queue, other Roles start, and it lifts at the reset", () => {
+		const architect = running(planned, "design");
+		const limited = journalStep(architect, "architect-1", failure("architect-1", "You've hit your Opus limit · resets 3:45pm"));
+		assert.ok(limited.ok, limited.ok ? "" : limited.refusal);
+		assert.deepEqual(heldPauses(limited.state), []);
+		assert.deepEqual(limited.state.holds, { opus: { family: "opus", kind: "opus", roles: ["architect"], reset: RESET, at: FAILED } });
+		const lines = [...architect, ...limited.append];
+
+		const other = run(lines, { kind: "handoff", slug: "rename", at: "2026-11-02T12:15:00.000Z" });
+		assert.ok(other.ok, other.ok ? "" : other.refusal);
+		assert.match(other.reply ?? "", /^started dev-1/);
+
+		const held = run(lines, { kind: "handoff", slug: "review", at: "2026-11-02T12:15:00.000Z" });
+		assert.ok(held.ok, held.ok ? "" : held.refusal);
+		assert.equal(held.state.queue[0]?.why, "held: Opus limit until 15:45 UTC");
+		assert.match(held.reply ?? "", /^queued Task `review`.*Role `architect` is held by an Opus limit until 15:45 UTC/);
+		const queued = [...lines, ...held.append];
+		const stalled = run(queued, { kind: "drain", at: "2026-11-02T12:16:00.000Z" });
+		assert.deepEqual(stalled.ok && [stalled.append, stalled.actions], [[], []]);
+
+		const lifted = tick(queued, RESET);
+		assert.deepEqual(lifted.append.map((line) => line.type), ["model-released"]);
+		assert.deepEqual(lifted.ok && lifted.state.holds, {});
+		const drained = run([...queued, ...lifted.append], { kind: "drain", at: RESET });
+		assert.match(drained.ok ? (drained.reply ?? "") : "", /^Queued Task `review` started architect-2/);
+	});
+
+	it("retries a burst throttle, an overload or a server error at 1, 2 and 5 min on the clock, then asks the human: retry again or leave it to the Lead", () => {
+		let lines = running(planned, "rename");
+		const failures = [
+			["You've hit a burst: API Error: Server is temporarily limiting requests (not your usage limit)", "rate_limit"],
+			["Repeated 529 Overloaded errors", "overloaded"],
+			["API Error: 500 Internal server error", "server_error"],
+		];
+		let at = Date.parse(FAILED);
+		const sent: string[] = [];
+		for (const [i, wait] of [60_000, 120_000, 300_000].entries()) {
+			const [message, error] = failures[i] ?? [];
+			lines = journal(lines, "dev-1", failure("dev-1", message ?? "", new Date(at).toISOString(), error));
+			// Nothing goes a moment before the retry is due.
+			assert.deepEqual(continued(tick(lines, new Date(at + wait - 1000).toISOString())), []);
+			const retried = tick(lines, new Date(at + wait).toISOString());
+			assert.deepEqual(continued(retried), ["dev-1"]);
+			sent.push(new Date(at + wait).toISOString());
+			lines = [...lines, ...retried.append];
+			// Sent once: the next tick sends nothing until the retry lands and fails again.
+			assert.deepEqual(continued(tick(lines, new Date(at + wait + 60_000).toISOString())), []);
+			at += wait + 30_000;
+			lines = journal(lines, "dev-1", prompt(new Date(at).toISOString()));
+		}
+		assert.deepEqual(sent, ["2026-11-02T12:11:00.000Z", "2026-11-02T12:13:30.000Z", "2026-11-02T12:19:00.000Z"]);
+
+		const ranOut = journalStep(lines, "dev-1", failure("dev-1", "Repeated 529 Overloaded errors", new Date(at).toISOString(), "overloaded"));
+		assert.ok(ranOut.ok, ranOut.ok ? "" : ranOut.refusal);
+		assert.deepEqual(ranOut.actions, []);
+		assert.deepEqual(ranOut.state.usageItems, [{ id: "u1", why: "retries", kind: "overloaded", teammate: "dev-1", at: new Date(at).toISOString() }]);
+		lines = [...lines, ...ranOut.append];
+		assert.deepEqual(continued(tick(lines, "2026-11-02T14:00:00.000Z")), []);
+
+		const retry = run(lines, { kind: "answer-usage", id: "u1", choice: "retry", at: "2026-11-02T14:00:00.000Z" });
+		assert.ok(retry.ok, retry.ok ? "" : retry.refusal);
+		assert.deepEqual(continued(retry), ["dev-1"]);
+		assert.deepEqual(retry.state.usageItems, []);
+		// The ladder starts over: the next failure waits a minute again.
+		const again = journal(journal([...lines, ...retry.append], "dev-1", prompt("2026-11-02T14:00:05.000Z")), "dev-1", failure("dev-1", "Repeated 529 Overloaded errors", "2026-11-02T14:01:00.000Z", "overloaded"));
+		assert.deepEqual(continued(tick(again, "2026-11-02T14:02:00.000Z")), ["dev-1"]);
+
+		const leave = run(lines, { kind: "answer-usage", id: "u1", choice: "leave", at: "2026-11-02T14:00:00.000Z" });
+		assert.ok(leave.ok, leave.ok ? "" : leave.refusal);
+		const woken = leave.actions.find((action) => action.kind === "wake-lead");
+		assert.match(woken?.kind === "wake-lead" ? woken.text : "", /dev-1.*overloaded after 3 retries on Task `rename`.*Never change its model/s);
+		assert.equal(run(lines, { kind: "answer-usage", id: "u1", choice: "stay", at: "2026-11-02T14:00:00.000Z" }).ok, false);
+		assert.equal(run(lines, { kind: "answer-usage", id: "u9", choice: "retry", at: "2026-11-02T14:00:00.000Z" }).ok, false);
+
+		const reported = run(lines, { kind: "report", headline: "Retried.", criteria: ["AC1"], modes: [], at: "2026-11-02T14:00:00.000Z" });
+		const written = reported.ok ? reported.actions.find((each) => each.kind === "write-report") : undefined;
+		const decided = written?.kind === "write-report" ? written.report.sections.find((each) => each.title === "Decided for you")?.lines : undefined;
+		assert.deepEqual(decided, [
+			"12:11 retried dev-1 after throttle (1 of 3) (Task `rename`)",
+			"12:13 retried dev-1 after overloaded (2 of 3) (Task `rename`)",
+			"12:19 retried dev-1 after server error (3 of 3) (Task `rename`)",
+		]);
+	});
+
+	it("asks the human about a reset more than a day away: staying keeps the pause, cancelling stops every Teammate and has the Lead report", () => {
+		const lines = running(running(planned, "rename"), "tests");
+		const limited = journalStep(lines, "dev-1", failure("dev-1", "You've hit your weekly limit · resets Mon 12:00am"));
+		assert.ok(limited.ok, limited.ok ? "" : limited.refusal);
+		assert.deepEqual(limited.state.usageItems, [{ id: "u1", why: "far-reset", kind: "weekly", teammate: "dev-1", reset: "2026-11-09T00:00:00.000Z", at: FAILED }]);
+		const asked = [...lines, ...limited.append];
+		const waiting = run(asked, { kind: "report", headline: "Held.", criteria: ["AC1"], modes: [], at: "2026-11-02T13:00:00.000Z" });
+		const written = waiting.ok ? waiting.actions.find((each) => each.kind === "write-report") : undefined;
+		const section = written?.kind === "write-report" ? written.report.sections.find((each) => each.title === "Waiting on you")?.lines : undefined;
+		assert.deepEqual(section, ["`u1`: the usage pause on a weekly limit lifts at 2026-11-09 00:00 UTC, more than a day away: stay paused, or cancel the Effort, in `/team pending`"]);
+
+		const stay = run(asked, { kind: "answer-usage", id: "u1", choice: "stay", at: "2026-11-02T13:00:00.000Z" });
+		assert.ok(stay.ok, stay.ok ? "" : stay.refusal);
+		assert.deepEqual(stay.state.usageItems, []);
+		assert.equal(heldPauses(stay.state)[0]?.kind, "weekly");
+		assert.deepEqual(stay.actions, []);
+
+		const cancel = run(asked, { kind: "answer-usage", id: "u1", choice: "cancel", at: "2026-11-02T13:00:00.000Z" });
+		assert.ok(cancel.ok, cancel.ok ? "" : cancel.refusal);
+		assert.deepEqual(
+			cancel.actions.flatMap((action) => (action.kind === "stop-teammate" ? [action.teammate] : [])),
+			["dev-1", "qa-1"],
+		);
+		assert.deepEqual(cancel.state.teammates.map((each) => each.ended?.how), ["stopped", "stopped"]);
+		// It is `/team cancel`: the Effort ends without sign-off.
+		assert.equal(cancel.state.ended?.how, "cancelled");
+		assert.ok(cancel.actions.some((action) => action.kind === "end-effort" && action.how === "cancelled"));
+		assert.deepEqual(cancel.state.usageItems, []);
+
+		// A reset Claude Code didn't give asks too: nobody knows when it lifts.
+		const unsaid = journalStep(lines, "dev-1", failure("dev-1", "You've hit your session limit"));
+		assert.deepEqual(unsaid.ok && unsaid.state.usageItems?.map((item) => [item.why, item.reset]), [["far-reset", undefined]]);
+	});
+
+	it("lifts the usage pause at its reset and sends continue ~2 min later to each still-idle limited Teammate, never while its auto-wait is armed", () => {
+		let lines = running(running(running(planned, "rename"), "tests"), "design");
+		lines = journal(lines, "dev-1", failure("dev-1", SESSION));
+		lines = journal(lines, "qa-1", failure("qa-1", `${SESSION}\nContinuing automatically at 3:45pm · Esc to cancel`, "2026-11-02T12:11:00.000Z"));
+		lines = journal(lines, "architect-1", failure("architect-1", SESSION, "2026-11-02T12:12:00.000Z"));
+		// The human typed to architect-1 meanwhile: it is busy, so it isn't continued.
+		lines = journal(lines, "architect-1", prompt("2026-11-02T13:00:00.000Z"));
+
+		const atReset = tick(lines, RESET);
+		assert.deepEqual(atReset.append.map((line) => line.type), ["resumed"]);
+		assert.deepEqual(heldPauses(atReset.state), []);
+		lines = [...lines, ...atReset.append];
+		assert.deepEqual(continued(tick(lines, "2026-11-02T15:46:59.000Z")), []);
+		const grace = tick(lines, "2026-11-02T15:47:00.000Z");
+		assert.deepEqual(continued(grace), ["dev-1"]);
+		lines = [...lines, ...grace.append];
+		assert.deepEqual(continued(tick(lines, "2026-11-02T15:48:00.000Z")), []);
+
+		// The armed auto-wait goes stale: it is disarmed, and the next tick continues qa-1.
+		lines = journal(lines, "qa-1", notification("quota_auto_resume_stale", "2026-11-02T15:50:00.000Z"));
+		assert.deepEqual(continued(tick(lines, "2026-11-02T15:51:00.000Z")), ["qa-1"]);
+	});
+
+	it("continues the other idle Teammates on the same limit at once when Claude Code's auto-resume fires for one", () => {
+		let lines = running(running(running(planned, "rename"), "tests"), "design");
+		lines = journal(lines, "dev-1", failure("dev-1", `${SESSION}\nContinuing automatically at 3:45pm · Esc to cancel`));
+		lines = journal(lines, "qa-1", failure("qa-1", SESSION, "2026-11-02T12:11:00.000Z"));
+		lines = journal(lines, "architect-1", failure("architect-1", "You've hit your Opus limit · resets 3:45pm", "2026-11-02T12:12:00.000Z"));
+		// Armed, dev-1 is sent nothing, even well past the reset's grace.
+		assert.deepEqual(continued(tick(lines, "2026-11-02T15:40:00.000Z")), []);
+
+		const fired = journalStep(lines, "dev-1", notification("quota_auto_resume_fired", "2026-11-02T15:45:10.000Z"));
+		assert.ok(fired.ok, fired.ok ? "" : fired.refusal);
+		assert.deepEqual(continued(fired), ["qa-1"]);
+		assert.deepEqual(heldPauses(fired.state), []);
+		// The Opus hold is another limit: it waits for its own reset.
+		assert.deepEqual(Object.keys(fired.state.holds ?? {}), ["opus"]);
+		lines = [...lines, ...fired.append];
+		assert.deepEqual(continued(tick(lines, "2026-11-02T15:46:00.000Z")), []);
+		const opus = tick(lines, "2026-11-02T15:47:00.000Z");
+		assert.deepEqual(continued(opus), ["architect-1"]);
+		// Replayed, the notification appends nothing more.
+		const replayed = run([...lines, ...opus.append], { kind: "journal", teammate: "dev-1", cursor: fold(lines).teammates.find((each) => each.id === "dev-1")?.cursor ?? 0, line: notification("quota_auto_resume_fired", "2026-11-02T15:45:10.000Z"), result: { path: "/r/result-1.md", written: false } });
+		assert.deepEqual(replayed.ok && replayed.append, []);
+	});
+
+	it("holds the Fable Roles on a usage-credit confirm nobody answered, and hands it to the human through the Lead, who never confirms it", () => {
+		const lines = running(planned, "rename");
+		const consent = journalStep(lines, "dev-1", failure("dev-1", "Your limit is reached and the prompt to confirm usage credits went unanswered — nothing was sent", FAILED, "billing_error"));
+		assert.ok(consent.ok, consent.ok ? "" : consent.refusal);
+		assert.deepEqual(consent.state.holds, { fable: { family: "fable", kind: "consent", roles: ["dev"], teammate: "dev-1", at: FAILED } });
+		const woken = consent.actions.find((action) => action.kind === "wake-lead");
+		assert.match(woken?.kind === "wake-lead" ? woken.text : "", /Only the human confirms usage credits.*Never confirm them yourself/s);
+		const held = [...lines, ...consent.append];
+		const docs = run(held, { kind: "handoff", slug: "docs", at: "2026-11-02T12:15:00.000Z" });
+		assert.equal(docs.ok && docs.state.queue[0]?.why, "held: usage-credit confirm");
+		// The human answered it in dev-1's terminal: its turn goes on, and the hold lifts.
+		const answered = journalStep(held, "dev-1", prompt("2026-11-02T12:20:00.000Z"));
+		assert.deepEqual(answered.ok && answered.state.holds, {});
+	});
+
+	it("hands a failure it doesn't recognise to the Lead with the Teammate's last message", () => {
+		const lines = running(planned, "rename");
+		const failed = journalStep(lines, "dev-1", failure("dev-1", "Your credit balance is too low", FAILED, "billing_error"));
+		assert.ok(failed.ok, failed.ok ? "" : failed.refusal);
+		assert.deepEqual(heldPauses(failed.state), []);
+		const woken = failed.actions.find((action) => action.kind === "wake-lead");
+		assert.match(woken?.kind === "wake-lead" ? woken.text : "", /dev-1.*Task `rename` failed \(billing_error\).*Your credit balance is too low/s);
+		// Applied once: a replay wakes nobody again.
+		const cursor = fold([...lines, ...failed.append]).teammates.find((each) => each.id === "dev-1")?.cursor ?? 0;
+		const replayed = run([...lines, ...failed.append], { kind: "journal", teammate: "dev-1", cursor, line: failure("dev-1", "Your credit balance is too low", FAILED, "billing_error"), result: { path: "/r/result-1.md", written: false } });
+		assert.deepEqual(replayed.ok && replayed.actions, []);
+	});
+});
