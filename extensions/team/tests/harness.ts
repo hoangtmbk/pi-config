@@ -107,7 +107,16 @@ export interface FakeClaudeOptions {
 	version?: string;
 	/** The exit code of a `--bg` launch; 0 when unset. */
 	bgExit?: number;
+	/** What each started `--bg` session does before its launch returns; nothing when unset. */
+	hooks?: FakeHookStep[];
 }
+
+/**
+ * One step a fake background session plays: fire a hook event through the
+ * hook commands of its `--settings` (the payload gets the session id, folder
+ * and event name filled in), or write the result its handoff pointer asks for.
+ */
+export type FakeHookStep = { event: string; payload?: Record<string, unknown> } | { write: "result" };
 
 /** One `claude --bg` launch, as the fake saw it. */
 export interface FakeLaunch {
@@ -147,11 +156,14 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 	const dir = mkdtempSync(join(roots.scratch, "fake-claude-"));
 	const argvOut = join(dir, "argv.jsonl");
 	const launchOut = join(dir, "launches.jsonl");
+	const hooks = join(dir, "hooks.json");
+	if (options.hooks) writeFileSync(hooks, JSON.stringify(options.hooks));
 	const env: Record<string, string | undefined> = {
 		FAKE_CLAUDE_ARGV_OUT: argvOut,
 		FAKE_CLAUDE_LAUNCH_OUT: launchOut,
 		FAKE_CLAUDE_VERSION: options.version,
 		FAKE_CLAUDE_BG_EXIT: options.bgExit === undefined ? undefined : String(options.bgExit),
+		FAKE_CLAUDE_HOOKS: options.hooks ? hooks : undefined,
 	};
 	const exports = Object.entries(env)
 		.filter((entry): entry is [string, string] => entry[1] !== undefined)

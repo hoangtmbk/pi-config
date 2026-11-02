@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { type EffortInput, type EffortLine, type EffortState, fold, openEffort, type Step, step } from "../core.ts";
+import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, type JournalLine, openEffort, type Step, step } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -300,5 +300,122 @@ describe("handing off", () => {
 			refusal(designed, replan([{ slug: "design", role: "dev", goal: "Design.", criteria: ["AC1", "AC2"] }])),
 			/`design`.*`architect`/,
 		);
+	});
+});
+
+describe("a Teammate's journal", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const started = applied(
+		applied(approved, {
+			kind: "plan",
+			tasks: [{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] }],
+			criteria: ["AC1"],
+			roles: ["dev"],
+			at: "2026-11-02T11:10:00.000Z",
+		}),
+		{ kind: "handoff", slug: "rename", at: "2026-11-02T11:30:00.000Z" },
+	);
+	const RESULT = "/agent/team/efforts/software-2026-11-02/tasks/001-dev-rename/result-1.md";
+	const SESSION = "8f3c2a1b-0000-4000-8000-000000000001";
+
+	function event(cursor: number, name: string, payload: Record<string, unknown> = {}, extra: Partial<JournalLine> = {}, written = false): Extract<EffortInput, { kind: "journal" }> {
+		return {
+			kind: "journal",
+			teammate: "dev-1",
+			cursor,
+			line: { from: "hook", at: `2026-11-02T11:3${cursor}:00.000Z`, event: name, payload: { session_id: SESSION, hook_event_name: name, ...payload }, ...extra },
+			result: { path: RESULT, written },
+		};
+	}
+
+	it("names the result file a Teammate's current Task is due to write", () => {
+		assert.deepEqual(currentResult(fold(started), "dev-1"), { slug: "rename", folder: "001-dev-rename", round: 1 });
+		assert.equal(currentResult(fold(started), "qa-1"), undefined);
+	});
+
+	it("records a SessionStart's session id, short id and inbox socket, with the cursor it consumed, and wakes nobody", () => {
+		const result = run(started, event(1, "SessionStart", { source: "startup" }, { inbox: { socket: "/tmp/cc-socks/4242.sock", token: "inbox-token" } }));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.actions, []);
+		assert.equal(result.append.length, 1);
+		assert.equal(result.append[0].type, "teammate-session");
+		assert.equal((result.append[0] as { cursor: number }).cursor, 1);
+		const [teammate] = result.state.teammates;
+		assert.equal(teammate.sessionId, SESSION);
+		assert.equal(teammate.shortId, "8f3c2a1b");
+		assert.deepEqual(teammate.inbox, { socket: "/tmp/cc-socks/4242.sock", token: "inbox-token" });
+		assert.equal(teammate.cursor, 1);
+	});
+
+	it("keeps the short id across a clear while taking the new session id", () => {
+		const opened = applied(started, event(1, "SessionStart", { source: "startup" }, { inbox: { socket: "/tmp/cc-socks/4242.sock", token: "inbox-token" } }));
+
+		const result = run(opened, event(2, "SessionStart", { source: "clear", session_id: "0b1c2d3e-0000-4000-8000-000000000002" }));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const [teammate] = result.state.teammates;
+		assert.equal(teammate.sessionId, "0b1c2d3e-0000-4000-8000-000000000002");
+		assert.equal(teammate.shortId, "8f3c2a1b");
+		assert.deepEqual(teammate.inbox, { socket: "/tmp/cc-socks/4242.sock", token: "inbox-token" });
+	});
+
+	it("logs a landed prompt and a denied permission without waking the Lead, and drops an idle notification", () => {
+		const prompted = run(started, event(1, "UserPromptSubmit", { prompt: "New Task `rename`: read …" }));
+		const denied = run(started, event(1, "PermissionDenied", { tool_name: "Bash", tool_input: { command: "git push" } }));
+		const idle = run(started, event(1, "Notification", { notification_type: "idle_prompt", message: "Claude is waiting for your input" }));
+
+		assert.ok(prompted.ok && denied.ok && idle.ok);
+		assert.deepEqual(
+			[prompted, denied].map((result) => (result.ok ? [result.append.map((line) => line.type), result.actions] : [])),
+			[
+				[["prompt-landed"], []],
+				[["permission-denied"], []],
+			],
+		);
+		assert.deepEqual([idle.append, idle.actions], [[], []]);
+	});
+
+	it("counts a Stop with the round's result written as done, waking the Lead with the Task and the result's path", () => {
+		const result = run(started, event(3, "Stop", { last_assistant_message: "Renamed it." }, {}, true));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append.map((line) => [line.type, (line as { cursor: number }).cursor]), [["task-done", 3]]);
+		assert.equal(result.actions.length, 1);
+		const [wake] = result.actions;
+		assert.equal(wake.kind, "wake-lead");
+		assert.match(wake.kind === "wake-lead" ? wake.text : "", /`dev-1`.*`rename`/);
+		assert.ok(wake.kind === "wake-lead" && wake.text.includes(RESULT));
+	});
+
+	it("counts a Stop without the round's result as stopped short, giving the Lead the last assistant message", () => {
+		const result = run(started, event(3, "Stop", { last_assistant_message: "I couldn't find the config loader." }));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append.map((line) => line.type), ["teammate-stopped"]);
+		const [wake] = result.actions;
+		const text = wake?.kind === "wake-lead" ? wake.text : "";
+		assert.match(text, /stopped short/);
+		assert.match(text, /I couldn't find the config loader\./);
+		assert.ok(text.includes(RESULT));
+	});
+
+	it("doesn't count a result already reported as new", () => {
+		const done = applied(started, event(3, "Stop", {}, {}, true));
+
+		const result = run(done, event(4, "Stop", { last_assistant_message: "Anything else?" }, {}, true));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append.map((line) => line.type), ["teammate-stopped"]);
+	});
+
+	it("applies each journal line once: a line at or before the Teammate's cursor changes nothing", () => {
+		const done = applied(started, event(3, "Stop", {}, {}, true));
+
+		const again = run(done, event(3, "Stop", {}, {}, true));
+		const earlier = run(done, event(2, "UserPromptSubmit", { prompt: "New Task" }));
+
+		assert.ok(again.ok && earlier.ok);
+		assert.deepEqual([again.append, again.actions, earlier.append, earlier.actions], [[], [], [], []]);
 	});
 });

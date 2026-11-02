@@ -62,6 +62,10 @@ export interface HandedTask {
 	role: string;
 	teammate: string;
 	at: string;
+	/** The round in progress: its result is `result-<round>.md` in the folder. */
+	round: number;
+	/** The last round whose result was reported to the Lead as done. */
+	reported?: number;
 }
 
 /** A Claude Code background session the Effort started, filling one Role for life. */
@@ -74,6 +78,35 @@ export interface Teammate {
 	/** The slug of the Task in its context. */
 	task: string;
 	startedAt: string;
+	/** Its current Claude Code session id, from its latest `SessionStart`; a clear changes it. */
+	sessionId?: string;
+	/** The id `claude agents --json` and `claude attach` know it by, which a clear keeps. */
+	shortId?: string;
+	/** Its inbox socket and the token to write to it, from its latest `SessionStart` that carried them. */
+	inbox?: Inbox;
+	/** The last line of its journal applied to the Effort, counted from 1; absent before any. */
+	cursor?: number;
+}
+
+/** A Teammate's inbox socket, which Claude Code gives its hooks in the environment. */
+export interface Inbox {
+	socket: string;
+	token: string;
+}
+
+/**
+ * One line of a Teammate's journal, `teammates/<id>/events.jsonl`. The hook
+ * script writes one per hook event: the payload as Claude Code sent it, with
+ * the inbox on a `SessionStart`.
+ */
+export interface JournalLine {
+	/** Who wrote it: `hook` for the hook script. */
+	from: string;
+	at: string;
+	/** The hook event, `hook_event_name`. */
+	event?: string;
+	payload?: Record<string, unknown>;
+	inbox?: Inbox;
 }
 
 /** One line of `effort.jsonl`. */
@@ -89,7 +122,21 @@ export type EffortLine =
 	/** A Teammate was launched. */
 	| ({ type: "teammate-started" } & Teammate)
 	/** A planned Task was handed to a Teammate, its folder written. */
-	| ({ type: "task-handed-off"; slug: string } & HandedTask);
+	| ({ type: "task-handed-off"; slug: string } & Omit<HandedTask, "reported">)
+	/**
+	 * The lines below each apply one journal line of `teammate`, and carry the
+	 * `cursor` it was read at, so it is never applied twice.
+	 */
+	/** A `SessionStart`: the Teammate's session, short id and inbox now. */
+	| { type: "teammate-session"; teammate: string; cursor: number; source: string; sessionId: string; shortId: string; inbox?: Inbox; at: string }
+	/** A `UserPromptSubmit`: a message reached the Teammate's model, which is how a send is known to have landed. */
+	| { type: "prompt-landed"; teammate: string; cursor: number; prompt: string; at: string }
+	/** A `PermissionDenied`: a tool call was refused by a rule or the classifier. */
+	| { type: "permission-denied"; teammate: string; cursor: number; tool: string; reason?: string; at: string }
+	/** A `Stop` with the round's result written: the Task's round is done. */
+	| { type: "task-done"; teammate: string; cursor: number; slug: string; round: number; at: string }
+	/** A `Stop` without a new result: the Teammate stopped short, saying this last. */
+	| { type: "teammate-stopped"; teammate: string; cursor: number; slug: string; message: string; at: string };
 
 /** What an Effort's lines fold to. */
 export interface EffortState {
@@ -135,7 +182,12 @@ export type EffortInput =
 			at: string;
 	  }
 	/** `team_handoff` of a planned Task. */
-	| { kind: "handoff"; slug: string; at: string };
+	| { kind: "handoff"; slug: string; at: string }
+	/**
+	 * Line `cursor` of `teammate`'s journal (counted from 1), with whether the
+	 * result its current Task is due to write ({@link currentResult}) is on disk.
+	 */
+	| { kind: "journal"; teammate: string; cursor: number; line: JournalLine; result: { path: string; written: boolean } };
 
 /** Work the core leaves to the shell. */
 export type EffortAction =
@@ -194,7 +246,30 @@ function apply(state: EffortState, line: EffortLine): EffortState {
 			const { type: _type, slug, ...handed } = line;
 			return { ...state, tasks: { ...state.tasks, [slug]: handed } };
 		}
+		case "teammate-session":
+			return withTeammate(state, line, {
+				sessionId: line.sessionId,
+				shortId: line.shortId,
+				...(line.inbox === undefined ? {} : { inbox: line.inbox }),
+			});
+		case "prompt-landed":
+		case "permission-denied":
+		case "teammate-stopped":
+			return withTeammate(state, line, {});
+		case "task-done": {
+			const advanced = withTeammate(state, line, {});
+			const task = advanced.tasks[line.slug];
+			return task ? { ...advanced, tasks: { ...advanced.tasks, [line.slug]: { ...task, reported: line.round } } } : advanced;
+		}
 	}
+}
+
+/** The state with `line.teammate` changed by `change`, its cursor moved to the line's. */
+function withTeammate(state: EffortState, line: { teammate: string; cursor: number }, change: Partial<Teammate>): EffortState {
+	return {
+		...state,
+		teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, ...change, cursor: line.cursor } : teammate)),
+	};
 }
 
 /** The state an Effort's lines fold to. The first line must open the Effort. */
@@ -223,6 +298,8 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return requestApproval(state, input);
 		case "answer":
 			return answer(state, input);
+		case "journal":
+			return journal(state, input);
 	}
 }
 
@@ -396,9 +473,87 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 		state,
 		[
 			{ type: "teammate-started", id, role: task.role, name, task: task.slug, startedAt: input.at },
-			{ type: "task-handed-off", slug: task.slug, folder, role: task.role, teammate: id, at: input.at },
+			{ type: "task-handed-off", slug: task.slug, folder, role: task.role, teammate: id, at: input.at, round: 1 },
 		],
 		[{ kind: "launch-teammate", teammate: { id, role: task.role, name }, task: { slug: task.slug, folder } }, { kind: "write-plan" }],
 		`started ${id} on Task \`${task.slug}\` (tasks/${folder}/task.md).`,
+	);
+}
+
+/**
+ * The result `teammate`'s current Task is due to write: `result-<round>.md`
+ * in the Task's folder. Undefined for a Teammate the Effort doesn't have.
+ */
+export function currentResult(state: EffortState, teammate: string): { slug: string; folder: string; round: number } | undefined {
+	const slug = state.teammates.find((each) => each.id === teammate)?.task;
+	const task = slug === undefined ? undefined : state.tasks[slug];
+	return slug === undefined || task === undefined ? undefined : { slug, folder: task.folder, round: task.round };
+}
+
+function text(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * One line of a Teammate's journal, applied once: a line at or before the
+ * Teammate's cursor was applied already. Events this doesn't act on append
+ * nothing, so they leave no trace and wake nobody.
+ */
+function journal(state: EffortState, input: Extract<EffortInput, { kind: "journal" }>): Step {
+	const teammate = state.teammates.find((each) => each.id === input.teammate);
+	if (!teammate) return { ok: false, refusal: `Effort \`${state.effortId}\` has no Teammate \`${input.teammate}\` to read a journal of.` };
+	if (input.cursor <= (teammate.cursor ?? 0)) return took(state, [], []);
+	const { cursor, line } = input;
+	const payload = line.payload ?? {};
+	const at = line.at;
+	const at_ = { teammate: teammate.id, cursor };
+	switch (line.event) {
+		case "SessionStart": {
+			const sessionId = text(payload.session_id);
+			if (sessionId === undefined) return took(state, [], []);
+			// The short id is the launch session's first eight characters; a clear or a resume keeps it.
+			const shortId = teammate.shortId ?? sessionId.slice(0, 8);
+			const source = text(payload.source) ?? "startup";
+			return took(state, [{ type: "teammate-session", ...at_, source, sessionId, shortId, ...(line.inbox === undefined ? {} : { inbox: line.inbox }), at }], []);
+		}
+		case "UserPromptSubmit":
+			return took(state, [{ type: "prompt-landed", ...at_, prompt: text(payload.prompt) ?? "", at }], []);
+		case "PermissionDenied": {
+			const reason = text(payload.reason);
+			return took(state, [{ type: "permission-denied", ...at_, tool: text(payload.tool_name) ?? "", ...(reason === undefined ? {} : { reason }), at }], []);
+		}
+		case "Stop":
+			return stopped(state, teammate, input);
+		default:
+			return took(state, [], []);
+	}
+}
+
+/**
+ * A `Stop`. Done means the round's result is written and not yet reported;
+ * anything else is stopped short, and the Lead gets the last thing it said.
+ */
+function stopped(state: EffortState, teammate: Teammate, input: Extract<EffortInput, { kind: "journal" }>): Step {
+	const due = currentResult(state, teammate.id);
+	if (!due) return took(state, [], []);
+	const { cursor, line } = input;
+	const fresh = input.result.written && state.tasks[due.slug]?.reported !== due.round;
+	if (fresh) {
+		return took(
+			state,
+			[{ type: "task-done", teammate: teammate.id, cursor, slug: due.slug, round: due.round, at: line.at }],
+			[{ kind: "wake-lead", text: `\`${teammate.id}\` finished round ${due.round} of Task \`${due.slug}\`: its result is ${input.result.path}. Read it and decide what comes next.` }],
+		);
+	}
+	const message = text(line.payload?.last_assistant_message) ?? "";
+	return took(
+		state,
+		[{ type: "teammate-stopped", teammate: teammate.id, cursor, slug: due.slug, message, at: line.at }],
+		[
+			{
+				kind: "wake-lead",
+				text: `\`${teammate.id}\` stopped short on Task \`${due.slug}\`: it stopped without writing a new ${input.result.path}. Its last message:\n\n${message || "(none)"}`,
+			},
+		],
 	);
 }
