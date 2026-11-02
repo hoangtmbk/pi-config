@@ -6,13 +6,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { connect } from "node:net";
 import { join, relative } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { HOOK_SCRIPT } from "../claude.ts";
 import { registerTeam } from "../index.ts";
-import { commit, fakeClaude, git, gitRepo, goodTeam, roleMd, type TempRoots, teamMd, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
+import { commit, type FakeHookStep, fakeClaude, git, gitRepo, goodTeam, roleMd, type TempRoots, teamMd, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
 
 const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 
@@ -54,7 +55,7 @@ const NOW = new Date("2026-11-02T10:00:00.000Z");
  * context whose toasts are recorded too and whose dialogs answer from a queue
  * the test fills, the way the human would.
  */
-function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?: boolean; cwd?: string; bgExit?: number } = {}) {
+function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?: boolean; cwd?: string; bgExit?: number; hooks?: FakeHookStep[] } = {}) {
 	const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
 	const tools = new Map<string, RegisteredTool>();
 	const sent: SentMessage[] = [];
@@ -64,7 +65,11 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 	let activeTools = [...PI_TOOLS];
 	const activations: string[][] = [];
 	const entries: { customType: string; data: unknown }[] = [];
+	const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
 	const pi = {
+		on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+		},
 		registerCommand(name: string, command: { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) {
 			commands.set(name, command);
 		},
@@ -84,7 +89,7 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 			entries.push({ customType, data });
 		},
 	};
-	const claude = fakeClaude(roots, { version: options.claudeVersion, bgExit: options.bgExit });
+	const claude = fakeClaude(roots, { version: options.claudeVersion, bgExit: options.bgExit, hooks: options.hooks });
 	registerTeam(pi as unknown as ExtensionAPI, {
 		agentDir: roots.agentDir,
 		claudeConfigPath: roots.claudeConfigPath,
@@ -101,6 +106,7 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 		hasUI: true,
 		cwd: options.cwd ?? roots.scratch,
 		isIdle: () => !options.streaming,
+		sessionManager: { getSessionFile: () => join(roots.scratch, "session.jsonl") },
 		async waitForIdle() {
 			throw new Error("a `/team` command waited for the Lead to finish streaming");
 		},
@@ -137,6 +143,10 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 		/** Queue the human's answers to the next dialogs, in order. */
 		answer(...played: (string | boolean | undefined)[]) {
 			answers.push(...played);
+		},
+		/** Fire one of pi's events at the extension's handlers, as pi does: `agent_start`, `agent_settled`, `session_shutdown`. */
+		async emit(event: string, payload: Record<string, unknown> = {}): Promise<void> {
+			for (const handler of handlers.get(event) ?? []) await handler({ type: event, ...payload }, ctx);
 		},
 		/** Run `/team <args>` the way pi does when the human types it. */
 		async team(args: string): Promise<void> {
@@ -1223,7 +1233,7 @@ function crewBrief(repo: string): string {
  * A session whose `crew` Effort has its Brief approved: a user Team whose
  * Roles set every launch flag between them, on {@link CREW_PLAYBOOK}.
  */
-async function crewApproved(options: { bgExit?: number } = {}) {
+async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[] } = {}) {
 	const roots = tempRoots();
 	const plugin = join(roots.scratch, "plugins", "lint");
 	writeUserTeam(roots, "crew", {
@@ -1247,7 +1257,7 @@ async function crewApproved(options: { bgExit?: number } = {}) {
 	});
 	adopt(roots, "crew", CREW_PLAYBOOK);
 	const repo = gitRepo(roots);
-	const pi = fakePi(roots, { cwd: repo, bgExit: options.bgExit });
+	const pi = fakePi(roots, { cwd: repo, bgExit: options.bgExit, hooks: options.hooks });
 	await pi.team("start crew");
 	const dir = effortDir(roots, CREW_EFFORT_ID);
 	writeFileSync(join(dir, "brief.draft.md"), crewBrief(repo));
@@ -1488,6 +1498,185 @@ describe("handing off: team_handoff", () => {
 
 		assert.equal(pi.claude.launches().length, 0);
 		assert.equal(existsSync(join(dir, "tasks")), false);
+	});
+});
+
+/** The `effort.jsonl` lines of an Effort, parsed. */
+function effortLines(dir: string): Record<string, unknown>[] {
+	return readFileSync(join(dir, "effort.jsonl"), "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+/** Ring the Lead bridge's doorbell as the hook script does, resolving once the Lead has closed the connection. */
+function ringDoorbell(port: number, line: Record<string, unknown>): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const socket = connect({ host: "127.0.0.1", port }, () => socket.end(`${JSON.stringify(line)}\n`));
+		socket.on("error", reject);
+		socket.on("close", () => resolve());
+	});
+}
+
+/** What woke the Lead about its Teammates. */
+function teammateWakes(sent: SentMessage[]): SentMessage[] {
+	return sent.filter((message) => message.customType === "team-teammate");
+}
+
+const RENAME_RESULT = join("tasks", "001-builder-rename-key", "result-1.md");
+
+describe("a Teammate's events reach the Lead", () => {
+	it("records the Teammate's session id, short id and inbox socket from its SessionStart, with the journal cursor it consumed", async () => {
+		const { pi, dir } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+
+		const journal = readFileSync(join(dir, "teammates", "builder-1", "events.jsonl"), "utf8").split("\n").filter(Boolean);
+		assert.equal(journal.length, 1);
+		const sessions = effortLines(dir).filter((line) => line.type === "teammate-session");
+		assert.equal(sessions.length, 1);
+		const [session] = sessions;
+		assert.equal(session.teammate, "builder-1");
+		assert.equal(session.cursor, 1);
+		assert.equal(session.source, "startup");
+		assert.match(String(session.sessionId), /^[0-9a-f]{8}-/);
+		assert.equal(session.shortId, String(session.sessionId).slice(0, 8));
+		assert.match((session.inbox as { socket: string }).socket, /^\/tmp\/cc-socks\/\d+\.sock$/);
+		assert.deepEqual(teammateWakes(pi.sent), []);
+	});
+
+	it("wakes the Lead once when a Stop follows the round's result, naming the Teammate, the Task and the result", async () => {
+		const { pi, dir } = await crewApproved({
+			hooks: [
+				{ event: "SessionStart", payload: { source: "startup" } },
+				{ event: "UserPromptSubmit", payload: { prompt: "New Task `rename-key`" } },
+				{ write: "result" },
+				{ event: "Stop", payload: { last_assistant_message: "Renamed it." } },
+			],
+		});
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+
+		const wakes = teammateWakes(pi.sent);
+		assert.equal(wakes.length, 1);
+		assert.equal(wakes[0].triggerTurn, true);
+		assert.equal(wakes[0].deliverAs, "followUp");
+		assert.match(wakes[0].content, /`builder-1`.*`rename-key`/);
+		assert.ok(wakes[0].content.includes(join(dir, RENAME_RESULT)), wakes[0].content);
+		const applied = effortLines(dir)
+			.filter((line) => typeof line.cursor === "number")
+			.map((line) => [line.type, line.cursor]);
+		assert.deepEqual(applied, [
+			["teammate-session", 1],
+			["prompt-landed", 2],
+			["task-done", 3],
+		]);
+	});
+
+	it("wakes the Lead with \"stopped short\" and the last assistant message when a Stop comes without a new result", async () => {
+		const { pi, dir } = await crewApproved({
+			hooks: [
+				{ event: "SessionStart", payload: { source: "startup" } },
+				{ event: "Stop", payload: { last_assistant_message: "I need the old config format before I can start." } },
+			],
+		});
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+
+		const wakes = teammateWakes(pi.sent);
+		assert.equal(wakes.length, 1);
+		assert.match(wakes[0].content, /`builder-1` stopped short on Task `rename-key`/);
+		assert.ok(wakes[0].content.includes("I need the old config format before I can start."), wakes[0].content);
+		assert.ok(wakes[0].content.includes(join(dir, RENAME_RESULT)), wakes[0].content);
+		assert.equal(effortLines(dir).filter((line) => line.type === "teammate-stopped").length, 1);
+	});
+
+	it("drops an idle Notification and logs a PermissionDenied, waking nobody", async () => {
+		const { pi, dir } = await crewApproved({
+			hooks: [
+				{ event: "Notification", payload: { notification_type: "idle_prompt", message: "Claude is waiting for your input" } },
+				{ event: "PermissionDenied", payload: { tool_name: "Bash", reason: "denied by rule" } },
+			],
+		});
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+
+		const applied = effortLines(dir)
+			.filter((line) => typeof line.cursor === "number")
+			.map((line) => [line.type, line.cursor, line.tool]);
+		assert.deepEqual(applied, [["permission-denied", 2, "Bash"]]);
+		assert.deepEqual(teammateWakes(pi.sent), []);
+	});
+
+	it("batches what finishes while the Lead is streaming into one follow-up, sent when its run settles", async () => {
+		const { pi } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }, { write: "result" }, { event: "Stop", payload: { last_assistant_message: "Done." } }] });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.emit("agent_start");
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
+
+		assert.deepEqual(teammateWakes(pi.sent), []);
+		await pi.emit("agent_settled", { aborted: false });
+		const wakes = teammateWakes(pi.sent);
+		assert.equal(wakes.length, 1);
+		assert.equal(wakes[0].triggerTurn, true);
+		assert.equal(wakes[0].deliverAs, "followUp");
+		assert.match(wakes[0].content, /`builder-1`.*`rename-key`/);
+		assert.match(wakes[0].content, /`scout-1`.*`survey`/);
+		await pi.emit("agent_settled", { aborted: false });
+		assert.equal(teammateWakes(pi.sent).length, 1);
+	});
+
+	it("writes lead.json with the bridge's port and token, ignores a doorbell without the token, and applies a line rung twice once", async () => {
+		const { pi, dir, roots } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		const lead = JSON.parse(readFileSync(join(dir, "lead.json"), "utf8")) as { pid: number; port: number; token: string; sessionFile: string; startedAt: string };
+		assert.equal(lead.pid, process.pid);
+		assert.equal(typeof lead.port, "number");
+		assert.match(lead.token, /^[0-9a-f]{16,}$/);
+		assert.equal(lead.startedAt, NOW.toISOString());
+		assert.equal(lead.sessionFile, join(roots.scratch, "session.jsonl"));
+
+		// The Teammate finishes, its hook journals the Stop, and only then does a doorbell ring.
+		writeFileSync(join(dir, RENAME_RESULT), "# Result\n");
+		const stop = { session_id: "8f3c2a1b-0000-4000-8000-000000000001", hook_event_name: "Stop", last_assistant_message: "Renamed it." };
+		writeFileSync(join(dir, "teammates", "builder-1", "events.jsonl"), `${JSON.stringify({ from: "hook", at: NOW.toISOString(), event: "Stop", payload: stop })}\n`);
+		const before = effortLines(dir).length;
+
+		await ringDoorbell(lead.port, { type: "doorbell", token: "not-the-token", teammate: "builder-1" });
+		await ringDoorbell(lead.port, { type: "doorbell", teammate: "builder-1" });
+
+		assert.equal(effortLines(dir).length, before);
+		assert.deepEqual(teammateWakes(pi.sent), []);
+
+		await ringDoorbell(lead.port, { type: "doorbell", token: lead.token, teammate: "builder-1" });
+		await ringDoorbell(lead.port, { type: "doorbell", token: lead.token, teammate: "builder-1" });
+		await pi.emit("agent_settled", { aborted: false });
+
+		assert.deepEqual(
+			effortLines(dir)
+				.slice(before)
+				.map((line) => [line.type, line.cursor]),
+			[["task-done", 1]],
+		);
+		assert.equal(teammateWakes(pi.sent).length, 1);
+	});
+
+	it("stops listening when the session shuts down", async () => {
+		const { pi, dir } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		const { port } = JSON.parse(readFileSync(join(dir, "lead.json"), "utf8")) as { port: number };
+
+		await pi.emit("session_shutdown", { reason: "quit" });
+
+		await assert.rejects(ringDoorbell(port, { type: "doorbell" }), /ECONNREFUSED/);
 	});
 });
 

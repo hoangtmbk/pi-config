@@ -18,11 +18,26 @@ import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { type Bridge, openBridge } from "./bridge.ts";
 import { launchBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
-import { type EffortAction, type EffortState, fold, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace } from "./core.ts";
+import { currentResult, type EffortAction, type EffortState, fold, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace } from "./core.ts";
 import { EVERY_ROLE, listTeams, loadTeam, type Playbook, readSnapshot, type Role, sha256, type Team, type TeamRoots } from "./definitions.ts";
 import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
-import { appendLines, briefCriteria, checkRecords, createEffort, type EffortPaths, promoteBrief, protectedRecords, readLines, validateBrief, writePlan, writeTask } from "./records.ts";
+import {
+	appendLines,
+	briefCriteria,
+	checkRecords,
+	createEffort,
+	type EffortPaths,
+	promoteBrief,
+	protectedRecords,
+	readJournal,
+	readLines,
+	validateBrief,
+	writeLead,
+	writePlan,
+	writeTask,
+} from "./records.ts";
 import { repoRoot } from "./repo.ts";
 import { addWorkspace } from "./workspace.ts";
 import {
@@ -122,6 +137,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	let pending: PendingAdoption[] = [];
 	// The one Effort this session's Lead holds.
 	let effort: HeldEffort | undefined;
+	// The Lead bridge the held Effort's hooks ring, once a Teammate is launched.
+	let bridge: Promise<Bridge> | undefined;
+	// Whether the Lead's model is in a run, and what wakes about Teammates wait for it to settle.
+	let busy = false;
+	let waiting: string[] = [];
 
 	function syncLeadTools(): void {
 		const others = pi.getActiveTools().filter((name) => !LEAD_TOOLS.includes(name));
@@ -153,6 +173,77 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	function wakeLead(customType: string, text: string): void {
 		pi.sendMessage({ customType, content: text, display: true }, { triggerTurn: true, deliverAs: "followUp" });
 	}
+
+	/**
+	 * Start the Lead bridge for the held Effort, once, and write `lead.json`
+	 * so the hook script can ring it. Every launch waits for it first.
+	 */
+	async function listenForTeammates(held: HeldEffort, ctx: ExtensionContext): Promise<void> {
+		bridge ??= openBridge((teammate) => {
+			if (effort) wakeAboutTeammates(applyJournals(effort, teammate));
+		}).then(
+			(opened) => {
+				writeLead(held.paths, { pid: process.pid, port: opened.port, token: opened.token, sessionFile: ctx.sessionManager.getSessionFile(), startedAt: now().toISOString() });
+				return opened;
+			},
+			(error: unknown) => {
+				bridge = undefined;
+				throw error;
+			},
+		);
+		await bridge;
+	}
+
+	/**
+	 * Apply every Teammate's journal (or only `only`'s) from its cursor, and
+	 * return what the Lead must be woken with. A line already applied is
+	 * skipped by the core, so a doorbell rung twice, or a re-read, changes
+	 * nothing.
+	 */
+	function applyJournals(held: HeldEffort, only?: string): string[] {
+		let state = effortState(held);
+		const texts: string[] = [];
+		for (const { id, cursor } of state.teammates) {
+			if (only !== undefined && id !== only) continue;
+			for (const read of readJournal(held.paths, id, cursor ?? 0)) {
+				const due = currentResult(state, id);
+				const path = due ? join(held.paths.tasks, due.folder, `result-${due.round}.md`) : "";
+				const result = step(state, { kind: "journal", teammate: id, cursor: read.cursor, line: read.line, result: { path, written: path !== "" && existsSync(path) } });
+				if (!result.ok) break;
+				appendLines(held.paths, result.append);
+				state = result.state;
+				for (const action of result.actions) if (action.kind === "wake-lead") texts.push(action.text);
+			}
+		}
+		return texts;
+	}
+
+	/** Wake the Lead about its Teammates now, or with everything else once its run settles. */
+	function wakeAboutTeammates(texts: string[]): void {
+		if (busy) waiting.push(...texts);
+		else if (texts.length > 0) wakeLead("team-teammate", texts.join("\n\n"));
+	}
+
+	pi.on("agent_start", () => {
+		busy = true;
+	});
+
+	pi.on("agent_settled", () => {
+		busy = false;
+		// A doorbell is only a nudge: whatever the journals hold now is applied, rung or not.
+		const texts = [...waiting, ...(effort ? applyJournals(effort) : [])];
+		waiting = [];
+		wakeAboutTeammates(texts);
+	});
+
+	pi.on("session_shutdown", async () => {
+		const open = bridge;
+		bridge = undefined;
+		await open?.then(
+			(opened) => opened.close(),
+			() => {},
+		);
+	});
 
 	function runSetup(team: Team, startsTeam: boolean): void {
 		const begun = beginSetup(paths.agentDir, team, startsTeam);
@@ -469,6 +560,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			const workspace = state.workspace;
 			if (!workspace) throw new Error(`Effort \`${held.effortId}\` has no Workspace, so no Teammate starts; stop and tell the human.`);
 			const { roles, playbook } = snapshotOf(held);
+			await listenForTeammates(held, ctx);
 			await carryOut(held, result, async ({ teammate, task }) => {
 				const role = roles.find((each) => each.name === teammate.role);
 				if (!role) throw new Error(`The Team snapshot of Effort \`${held.effortId}\` has no Role \`${teammate.role}\`, so no Teammate starts; stop and tell the human.`);
@@ -496,6 +588,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				const launched = await launchBackground(paths.claudePath, workspace.path, args);
 				if (launched) throw new Error(`Teammate \`${teammate.id}\` didn't start, so Task \`${task.slug}\` is still planned: ${launched.error}`);
 			});
+			// Its hooks can ring before it is recorded as started, so its journal is read once it is.
+			wakeAboutTeammates(applyJournals(held));
 			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
 		},
 	});

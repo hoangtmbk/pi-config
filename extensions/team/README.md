@@ -95,6 +95,24 @@ The Effort directory is added with `--add-dir`, `EnterPlanMode` is always disall
 first turn is a pointer to `task.md`. A launch that fails leaves the Task planned. A Task that
 needs a worktree of its own (`isolated`) is refused.
 
+### What a Teammate tells the Lead
+
+Each hook a Teammate fires runs `hook.mjs`, which appends the event as one line to the Teammate's
+journal, `teammates/<id>/events.jsonl`, then rings the Lead's doorbell: a localhost port and token
+the Lead writes to `lead.json` before its first launch. The doorbell only says "read this journal";
+the Lead applies each line once, from the Teammate's cursor, and every `effort.jsonl` line it adds
+for one carries that cursor. A doorbell without the token is ignored, and whatever a journal holds
+is also read when the Lead's run settles, so a lost doorbell loses nothing.
+
+- `SessionStart` records the Teammate's session id, short id and inbox socket;
+- `UserPromptSubmit` is logged as a message having landed, and `PermissionDenied` is logged;
+- an idle `Notification` is dropped;
+- a `Stop` after the round's `result-<n>.md` is written means the round is done, and wakes the
+  Lead with the Task and the result's path. A `Stop` without a new result is "stopped short", and
+  wakes the Lead with the Teammate's last message.
+
+Wakes that come while the Lead is busy are sent together as one follow-up once its run settles.
+
 ## Defining a Team
 
 A Team is a folder:

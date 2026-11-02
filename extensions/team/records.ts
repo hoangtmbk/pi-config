@@ -10,10 +10,10 @@
  * reported and never used.
  */
 
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import type { EffortLine, EffortState, PendingApproval, Workspace } from "./core.ts";
+import type { EffortLine, EffortState, JournalLine, PendingApproval, Workspace } from "./core.ts";
 import { BRIEF_SKELETON, isKebabCase, type Playbook, sha256 } from "./definitions.ts";
 
 /** The files of one Effort, all under `<agent dir>/team/efforts/<effort-id>/`. */
@@ -37,8 +37,10 @@ export interface EffortPaths {
 	plan: string;
 	/** One folder per Task handed off, `tasks/<nnn>-<role>-<slug>/`. */
 	tasks: string;
-	/** One folder per Teammate, `teammates/<id>/`, with its launch files. */
+	/** One folder per Teammate, `teammates/<id>/`, with its launch files and its journal. */
 	teammates: string;
+	/** Where the Lead bridge listens, for the hook script's doorbell: {@link LeadRecord}. */
+	lead: string;
 }
 
 export function effortsDir(agentDir: string): string {
@@ -59,6 +61,7 @@ export function effortPaths(agentDir: string, effortId: string): EffortPaths {
 		plan: join(dir, "plan.md"),
 		tasks: join(dir, "tasks"),
 		teammates: join(dir, "teammates"),
+		lead: join(dir, "lead.json"),
 	};
 }
 
@@ -413,4 +416,51 @@ function isMapping(value: unknown): value is Record<string, unknown> {
 
 function quoteList(items: readonly string[]): string {
 	return items.map((item) => `\`${item}\``).join(", ");
+}
+
+/** `lead.json`: the live Lead's bridge, which the hook script rings. */
+export interface LeadRecord {
+	pid: number;
+	/** The bridge's port on 127.0.0.1. */
+	port: number;
+	/** The token a doorbell must carry. */
+	token: string;
+	/** The pi session file of the Lead, absent for a session kept in memory. */
+	sessionFile?: string;
+	startedAt: string;
+}
+
+/** Write `lead.json` whole, through a rename, so the hook script never reads half of it. */
+export function writeLead(paths: EffortPaths, lead: LeadRecord): void {
+	const partial = `${paths.lead}.${process.pid}.tmp`;
+	writeFileSync(partial, `${JSON.stringify(lead)}\n`);
+	renameSync(partial, paths.lead);
+}
+
+/** A Teammate's journal, `teammates/<id>/events.jsonl`, which the hook script appends to. */
+export function journalFile(paths: EffortPaths, teammate: string): string {
+	return join(paths.teammates, teammate, "events.jsonl");
+}
+
+/**
+ * The lines of a Teammate's journal after line `after`, each with its cursor:
+ * its line number, counted from 1. Only whole lines are read, so a line the
+ * hook script is still writing waits for the next read. A line that isn't
+ * JSON keeps its number and reads as a line with no event.
+ */
+export function readJournal(paths: EffortPaths, teammate: string, after: number): { cursor: number; line: JournalLine }[] {
+	const file = journalFile(paths, teammate);
+	if (!existsSync(file)) return [];
+	const whole = readFileSync(file, "utf8").split("\n").slice(0, -1);
+	return whole.slice(after).map((text, index) => ({ cursor: after + index + 1, line: journalLine(text) }));
+}
+
+function journalLine(text: string): JournalLine {
+	try {
+		const parsed: unknown = JSON.parse(text);
+		if (isMapping(parsed)) return { ...parsed, from: String(parsed.from ?? ""), at: String(parsed.at ?? "") } as JournalLine;
+	} catch {
+		// Kept as a line with no event below.
+	}
+	return { from: "unreadable", at: "" };
 }
