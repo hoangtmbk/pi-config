@@ -181,6 +181,14 @@ export interface AgentStatus {
 const AGENTS_TIMEOUT_MS = 10_000;
 
 /**
+ * Whether a session named `name` may still be live, by an `agentsList`
+ * reading: listed in it, or the list couldn't be read, so nothing says it is gone.
+ */
+export function stillListed(agents: Map<string, AgentStatus> | { error: string }, name: string | undefined): boolean {
+	return !(agents instanceof Map) || (name !== undefined && agents.has(name));
+}
+
+/**
  * The live background sessions, from `claude agents --json`, by `--name`: a
  * session missing from it was stopped, idle or not. Its shape is read
  * leniently, as a list of sessions or an object holding one, since Claude

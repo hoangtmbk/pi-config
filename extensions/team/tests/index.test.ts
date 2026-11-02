@@ -2784,6 +2784,18 @@ describe("staffing: the ladder and clearing between Tasks", () => {
 		assert.equal(effortLines(dir).filter((line) => line.type === "teammate-started").length, 1, "the id is kept");
 	});
 
+	it("tells the human once when pi's `maxTeammates` isn't a whole number of 1 or more, and staffs under the default of 3", async () => {
+		const { pi } = await crewApproved({ settings: { maxTeammates: "1" }, hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		await pi.call("team_plan", { tasks: STAFF_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
+
+		assert.equal(pi.claude.launches().length, 2);
+		const told = pi.notifications.filter((each) => each.message.includes("maxTeammates"));
+		assert.deepEqual(told, [{ message: 'pi\'s `maxTeammates` setting is "1", which isn\'t a whole number of 1 or more, so the default of 3 live Teammates is used. Fix it in pi\'s settings and `/reload`.', type: "error" }]);
+	});
+
 	it("queues a Task at pi's `maxTeammates`, saying why in the reply and the Team block, and starts it when an acceptance frees room", async () => {
 		const { pi, dir } = await crewApproved({ settings: { maxTeammates: 1 }, hooks: [{ event: "SessionStart", payload: { source: "startup" } }, ...WORKS], replies: WORKS });
 		await pi.call("team_plan", { tasks: STAFF_PLAN });

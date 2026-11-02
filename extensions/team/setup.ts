@@ -194,6 +194,13 @@ export function modeInForce(playbook: Playbook, role: Role): PermissionMode {
 	return playbook.roles[role.name]?.mode ?? playbook.roles[EVERY_ROLE]?.mode ?? role.permissionMode ?? "auto";
 }
 
+/** The mode a Teammate handed `slug` launches in, when `plan` and the snapshot name its Role: drift is measured against it. */
+export function plannedMode(plan: readonly { slug: string; role: string }[] | undefined, slug: string, roles: readonly Role[], playbook: Playbook): PermissionMode | undefined {
+	const planned = plan?.find((task) => task.slug === slug);
+	const role = planned && roles.find((each) => each.name === planned.role);
+	return role ? modeInForce(playbook, role) : undefined;
+}
+
 function quoted(names: readonly string[]): string {
 	return names.map((name) => `\`${name}\``).join(", ");
 }

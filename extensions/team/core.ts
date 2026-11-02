@@ -975,7 +975,7 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 					brief: { sha256: answered.sha256, approvedAt: line.at, request: answered.id },
 					// Each live Teammate of a Role whose launch options changed, or holding session rules the change outdates, gets a fresh session at its next Task boundary.
 					teammates: state.teammates.map((teammate) =>
-						(refresh.includes(teammate.role) || renew.includes(teammate.id)) && teammate.retiredAt === undefined && !teammate.ended ? { ...teammate, freshDue: true } : teammate,
+						(refresh.includes(teammate.role) || renew.includes(teammate.id)) && isLive(teammate) ? { ...teammate, freshDue: true } : teammate,
 					),
 				};
 			}
@@ -2204,6 +2204,15 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 /** How many Teammates may be live at once when pi's `maxTeammates` setting is absent. */
 export const DEFAULT_MAX_TEAMMATES = 3;
 
+/** The cap pi's `maxTeammates` setting `set` gives: a whole number of 1 or more, else the default with what is wrong with it. */
+export function maxTeammatesSetting(set: unknown): { max: number; problem?: string } {
+	if (set === undefined || (typeof set === "number" && Number.isInteger(set) && set >= 1)) return { max: (set as number | undefined) ?? DEFAULT_MAX_TEAMMATES };
+	return {
+		max: DEFAULT_MAX_TEAMMATES,
+		problem: `pi's \`maxTeammates\` setting is ${JSON.stringify(set)}, which isn't a whole number of 1 or more, so the default of ${DEFAULT_MAX_TEAMMATES} live Teammates is used. Fix it in pi's settings and \`/reload\`.`,
+	};
+}
+
 /** The least time between two Teammate launches, so a burst of handoffs doesn't start them all at once. */
 export const STAGGER_MS = 5000;
 
@@ -2309,9 +2318,14 @@ function nextFolder(state: EffortState): number {
 	return Math.max(0, ...[...Object.values(state.tasks), ...state.queue].map((task) => Number.parseInt(task.folder, 10) || 0)) + 1;
 }
 
-/** Live Teammates: started, not stopped to make room, and not ended by a drop or a crash. */
+/** Whether `teammate` is live: started, not stopped to make room, and not ended by a drop or a crash. */
+export function isLive(teammate: Teammate): boolean {
+	return teammate.retiredAt === undefined && teammate.ended === undefined;
+}
+
+/** Live Teammates, as {@link isLive} has it. */
 function live(state: EffortState): Teammate[] {
-	return state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined);
+	return state.teammates.filter(isLive);
 }
 
 /** Whether `teammate` is between Tasks: its Task is accepted and it hasn't been given another. */
@@ -2587,7 +2601,7 @@ function takeoverEvent(state: EffortState, teammate: Teammate, input: Extract<Ef
 	const { cursor, line } = input;
 	const at = line.at;
 	const mod = line.from === "mod";
-	if (teammate.ended !== undefined || teammate.retiredAt !== undefined) return mod ? took(state, [], []) : undefined;
+	if (!isLive(teammate)) return mod ? took(state, [], []) : undefined;
 	// Until its fresh session starts, what the human types reaches only the old one, which is being stopped for a Brief change's fresh start.
 	if (teammate.relaunching && teammate.takeover === undefined) return mod ? took(state, [], []) : undefined;
 	if (teammate.takeover === undefined && teammate.denied !== undefined && (mod ? line.event !== "handback" : AFTER_A_NO.has(line.event ?? ""))) {
@@ -3242,7 +3256,7 @@ function mergeResult(state: EffortState, input: Extract<EffortInput, { kind: "me
 		);
 	}
 	const teammate = state.teammates.find((each) => each.id === task.teammate);
-	const ending = teammate && teammate.ended === undefined && teammate.retiredAt === undefined ? teammate : undefined;
+	const ending = teammate && isLive(teammate) ? teammate : undefined;
 	return took(
 		state,
 		[
@@ -3402,7 +3416,7 @@ function reconcile(state: EffortState, input: Extract<EffortInput, { kind: "reco
 		const task = state.tasks[slug];
 		const teammate = state.teammates.find((each) => each.id === task?.teammate);
 		// A Teammate the human holds gets what it is owed at the hand-back.
-		if (!task || !teammate || teammate.ended || teammate.retiredAt !== undefined || teammate.takeover !== undefined || teammate.clearing === slug || input.sent?.includes(slug)) continue;
+		if (!task || !teammate || !isLive(teammate) || teammate.takeover !== undefined || teammate.clearing === slug || input.sent?.includes(slug)) continue;
 		actions.push({ kind: "redeliver", teammate: teammate.id, slug, folder: task.folder, round });
 	}
 	const reply = unstarted

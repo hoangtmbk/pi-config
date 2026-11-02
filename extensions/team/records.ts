@@ -10,7 +10,7 @@
  * reported and never used.
  */
 
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { type Clarification, type EffortLine, type EffortState, type JournalLine, type PendingApproval, type Report, taskStatus, type Workspace } from "./core.ts";
@@ -754,6 +754,52 @@ export function readLead(paths: EffortPaths): LeadRecord | NoLiveLead | undefine
 		throw new Error(`${paths.lead} isn't a Lead record of \`{ pid, port, token, sessionFile, startedAt }\`; only the extension writes it. Move it aside once no pi session leads the Effort, and lead it again.`);
 	}
 	return lead as unknown as LeadRecord | NoLiveLead;
+}
+
+/** Whether the file at `path` is still there with sha256 `sha`: what was asked about is what is answered. */
+export function unchangedSince(path: string, sha: string): boolean {
+	return existsSync(path) && sha256(readFileSync(path)) === sha;
+}
+
+/** The result file of a Task's round, `tasks/<folder>/result-<round>.md`, or "" when no round is due. */
+export function resultFile(paths: EffortPaths, due: { folder: string; round: number } | undefined): string {
+	return due ? join(paths.tasks, due.folder, `result-${due.round}.md`) : "";
+}
+
+/** Take back a send-back's `feedback-<round>.md`, written ahead of a send-back that never got on record. */
+export function discardFeedback(paths: EffortPaths, folder: string, round: number): void {
+	rmSync(join(paths.tasks, folder, `feedback-${round}.md`), { force: true });
+}
+
+/** Write (`on`) or remove the `teammates/<id>/takeover` marker, which tells the hook script a human holds the Teammate. */
+export function markTakeover(paths: EffortPaths, teammate: string, on: boolean, at: string): void {
+	const dir = join(paths.teammates, teammate);
+	if (!on) {
+		rmSync(join(dir, "takeover"), { force: true });
+		return;
+	}
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "takeover"), `${at}\n`);
+}
+
+/** Whether Teammate `teammate`'s takeover marker is on disk. */
+export function takeoverMarked(paths: EffortPaths, teammate: string): boolean {
+	return existsSync(join(paths.teammates, teammate, "takeover"));
+}
+
+/**
+ * Teammate `teammate`'s `statusline.json` as its wrapper last wrote it, with
+ * the file's modification time, which is when it was taken; undefined before
+ * Claude Code first runs it, once the session's footer draws.
+ */
+export function readStatusLine(paths: EffortPaths, teammate: string): { text: string; at: string } | undefined {
+	const file = join(paths.teammates, teammate, "statusline.json");
+	try {
+		return { text: readFileSync(file, "utf8"), at: statSync(file).mtime.toISOString() };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
 }
 
 /** A Teammate's journal, `teammates/<id>/events.jsonl`, which the hook script appends to. */

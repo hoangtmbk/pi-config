@@ -738,6 +738,24 @@ export function readSnapshot(teamDir: string, playbookFile: string): Snapshot | 
 	return { roles, playbook: parsed.playbook };
 }
 
+/**
+ * The Team and Playbook an Effort runs on, until its Brief is approved and
+ * snapshots them: Team `name` as it is now, on the Playbook adopted when the
+ * Effort opened (`playbookSha`). A Playbook adopted again or edited since is
+ * refused, since the Brief records the one it was agreed under.
+ */
+export function teamInForce(roots: TeamRoots, name: string, playbookSha: string, effortId: string): { team: Team; playbook: Playbook } | { error: string } {
+	const team = loadTeam(roots, name);
+	if (!team) return { error: `Team \`${name}\` of Effort \`${effortId}\` no longer exists` };
+	if (team.adoption.state !== "adopted" || team.adoption.playbook.sha256 !== playbookSha) {
+		const now = team.adoption.state === "adopted" ? `is now ${team.adoption.playbook.sha256}` : `is ${team.adoption.state}`;
+		return {
+			error: `the \`${name}\` Playbook Effort \`${effortId}\` opened on (sha256 ${playbookSha}) ${now}, so its Brief can no longer be checked against it; start a new Effort on the Playbook in force`,
+		};
+	}
+	return { team, playbook: team.adoption.playbook };
+}
+
 /** One Team by name, or undefined when there is none by that name. */
 export function loadTeam(roots: TeamRoots, name: string): Team | undefined {
 	return listTeams(roots).find((team) => team.name === name);

@@ -25,7 +25,7 @@
  */
 
 import { sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
-import { type EffortState, heldPauses, openEscalations, type PauseSetter, type TakeoverTrigger, type Teammate, type UsageWindow, usageSource, waitingConfirm, waitingInTerminal } from "./core.ts";
+import { type EffortState, heldPauses, isLive, openEscalations, type PauseSetter, type TakeoverTrigger, type Teammate, type UsageWindow, usageSource, waitingConfirm, waitingInTerminal } from "./core.ts";
 
 /** The widest the frame may get, borders included. */
 export const MAX_WIDTH = 96;
@@ -155,7 +155,7 @@ export interface StatusExtras {
  */
 export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockData {
 	const handed = Object.keys(state.tasks).length > 0 || state.queue.length > 0;
-	const teammates = state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined).map((teammate) => {
+	const teammates = state.teammates.filter(isLive).map((teammate) => {
 		const row = teammateRow(state, teammate);
 		return extras.confirmed === undefined || extras.confirmed.has(teammate.id) ? row : { ...row, unconfirmed: true };
 	});
