@@ -55,6 +55,7 @@ describe("the bundled software Team", () => {
 			"scope-creep",
 			"one-branch",
 		]);
+		assert.deepEqual(team.defaultPlaybook.briefSections, ["Constraints", "Context"]);
 		assert.deepEqual(listTeams(roots).map((listed) => listed.name), ["software"]);
 	});
 });
@@ -360,6 +361,37 @@ describe("a Playbook", () => {
 		assert.equal(playbook.sha256, createHash("sha256").update(content).digest("hex"));
 	});
 
+	it("adds the Brief sections listed under its `Brief sections` heading, which are not rules", () => {
+		const roots = tempRoots();
+		const withSections = [
+			body,
+			"",
+			"## Brief sections",
+			"",
+			"A Brief for this Team also has:",
+			"",
+			"- **Constraints**: what the change must not break.",
+			"- **Risks and rollback**: what could go wrong.",
+			"",
+			"## Afterwards",
+			"",
+			"- **after-rule**: still a rule.",
+		].join("\n");
+		writeUserTeam(roots, "pb", teamWithPlaybook("checkpoints: []", withSections));
+
+		const playbook = loadTeam(roots, "pb")?.defaultPlaybook;
+
+		assert.deepEqual(playbook?.briefSections, ["Constraints", "Risks and rollback"]);
+		assert.deepEqual(playbook?.rules, ["one-architect", "scope-creep", "design-first", "qa-last", "after-rule"]);
+	});
+
+	it("adds no Brief sections when it has no `Brief sections` heading", () => {
+		const roots = tempRoots();
+		writeUserTeam(roots, "pb", teamWithPlaybook("checkpoints: []"));
+
+		assert.deepEqual(loadTeam(roots, "pb")?.defaultPlaybook?.briefSections, []);
+	});
+
 	it("sends back twice when it doesn't say", () => {
 		const roots = tempRoots();
 		writeUserTeam(roots, "pb", teamWithPlaybook("checkpoints: []"));
@@ -418,6 +450,12 @@ describe("a Playbook", () => {
 			frontmatter: "checkpoints: []",
 			body: "- **criteria-are-the-human's**: the human owns the criteria.",
 			expect: [/the rule id `criteria-are-the-human's` must be kebab-case/],
+		},
+		{
+			name: "a Brief section the skeleton already has",
+			frontmatter: "checkpoints: []",
+			body: "## Brief sections\n\n- **Scope**: again.",
+			expect: [/the Brief section `Scope` is already part of every Brief/],
 		},
 	];
 

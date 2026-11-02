@@ -38,6 +38,14 @@ How the Lead runs this Team. **Rules** are the bullets that start with a bold id
 follow them, and departing from one is a per-Effort override on the Brief, named by that id.
 Everything else is guidance, and the Lead uses its judgment there.
 
+## Brief sections
+
+Besides the sections every Brief has, a Brief for this Team has:
+
+- **Constraints**: what the change must keep true: interfaces that stay as they are, no new
+  dependency, behaviour that must not move.
+- **Context**: where the work lives in the repo, and the docs and standards that apply.
+
 ## Who does what
 
 | Role | Gets Tasks to | Hands back |

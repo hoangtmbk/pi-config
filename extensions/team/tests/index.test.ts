@@ -11,7 +11,7 @@ import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { registerTeam } from "../index.ts";
-import { fakeClaude, goodTeam, roleMd, type TempRoots, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
+import { fakeClaude, gitRepo, goodTeam, roleMd, type TempRoots, tempRoots, writeFiles, writeUserTeam } from "./harness.ts";
 
 const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 
@@ -53,7 +53,7 @@ const NOW = new Date("2026-11-02T10:00:00.000Z");
  * context whose toasts are recorded too and whose dialogs answer from a queue
  * the test fills, the way the human would.
  */
-function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?: boolean } = {}) {
+function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?: boolean; cwd?: string } = {}) {
 	const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
 	const tools = new Map<string, RegisteredTool>();
 	const sent: SentMessage[] = [];
@@ -62,6 +62,7 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 	const answers: (string | boolean | undefined)[] = [];
 	let activeTools = [...PI_TOOLS];
 	const activations: string[][] = [];
+	const entries: { customType: string; data: unknown }[] = [];
 	const pi = {
 		registerCommand(name: string, command: { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) {
 			commands.set(name, command);
@@ -77,6 +78,9 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 		},
 		sendMessage(message: { customType: string; content: string; display?: boolean }, sendOptions?: { triggerTurn?: boolean; deliverAs?: string }) {
 			sent.push({ ...message, triggerTurn: sendOptions?.triggerTurn, deliverAs: sendOptions?.deliverAs });
+		},
+		appendEntry(customType: string, data: unknown) {
+			entries.push({ customType, data });
 		},
 	};
 	const claude = fakeClaude(roots, { version: options.claudeVersion });
@@ -94,7 +98,7 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 	}
 	const ctx = {
 		hasUI: true,
-		cwd: roots.scratch,
+		cwd: options.cwd ?? roots.scratch,
 		isIdle: () => !options.streaming,
 		async waitForIdle() {
 			throw new Error("a `/team` command waited for the Lead to finish streaming");
@@ -125,6 +129,8 @@ function fakePi(roots: TempRoots, options: { claudeVersion?: string; streaming?:
 		notifications,
 		dialogs,
 		activations,
+		/** The custom entries the extension appended to the session, oldest first. */
+		entries,
 		activeTools: () => [...activeTools],
 		claude,
 		/** Queue the human's answers to the next dialogs, in order. */
@@ -171,20 +177,23 @@ describe("/team", () => {
 });
 
 describe("/team start <team>", () => {
-	it("picks a Team that loads cleanly, saying what it has and when its Playbook was adopted", async () => {
+	it("picks a Team that loads cleanly, saying what it has and when its Playbook was adopted, and opens its Effort", async () => {
 		const roots = tempRoots();
 		adopt(roots, "software", "---\nsendBackLimit: 1\n---\n");
-		const pi = fakePi(roots);
+		const pi = fakePi(roots, { cwd: gitRepo(roots) });
 
 		await pi.team("start software");
 
 		assert.deepEqual(pi.notifications, [
 			{
-				message: `Team \`software\` picked: Roles \`architect\`, \`dev\`, \`qa\`. Playbook: adopted 2026-11-01T09:00:00.000Z (${join(playbooksDir(roots), "software.md")}).`,
+				message: `Team \`software\` picked: Roles \`architect\`, \`dev\`, \`qa\`. Playbook: adopted 2026-11-01T09:00:00.000Z (${join(playbooksDir(roots), "software.md")}). Effort \`software-2026-11-02\` opened at ${join(roots.agentDir, "team", "efforts", "software-2026-11-02")}; the Lead drafts its Brief with you, and nothing runs until you approve it from \`/team pending\`.`,
 				type: "info",
 			},
 		]);
-		assert.deepEqual(pi.sent, []);
+		assert.deepEqual(
+			pi.sent.map((message) => message.customType),
+			["team-intake"],
+		);
 	});
 
 	it("refuses an unknown Team, naming the Teams there are", async () => {
@@ -524,7 +533,7 @@ describe("/team pending: adopting a Playbook", () => {
 
 	it("counts the Playbook as adopted for `/team start` afterwards", async () => {
 		const roots = tempRoots();
-		const pi = fakePi(roots);
+		const pi = fakePi(roots, { cwd: gitRepo(roots) });
 		await requestAdoption(pi, roots, "software");
 		pi.answer("Approve");
 		await pi.team("pending");
@@ -589,9 +598,9 @@ describe("/team pending: adopting a Playbook", () => {
 });
 
 describe("/team start on a Team with no adopted Playbook", () => {
-	it("starts Team setup first, then continues once the Playbook is adopted", async () => {
+	it("starts Team setup first, then continues to intake once the Playbook is adopted", async () => {
 		const roots = tempRoots();
-		const pi = fakePi(roots);
+		const pi = fakePi(roots, { cwd: gitRepo(roots) });
 
 		await pi.team("start software");
 
@@ -605,7 +614,9 @@ describe("/team start on a Team with no adopted Playbook", () => {
 		pi.answer("Approve");
 		await pi.team("pending");
 
-		assert.match(pi.notifications.at(-1)?.message ?? "", /^Team `software` picked: .*Playbook: adopted 2026-11-02T10:00:00\.000Z/);
+		assert.match(pi.notifications.at(-1)?.message ?? "", /^Team `software` picked: .*Playbook: adopted 2026-11-02T10:00:00\.000Z.* Effort `software-2026-11-02` opened/);
+		assert.equal(pi.sent.at(-1)?.customType, "team-intake");
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff"]);
 	});
 
 	it("goes back through setup when the adopted Playbook was edited by hand", async () => {
@@ -630,6 +641,328 @@ describe("/team start on a Team with no adopted Playbook", () => {
 		await pi.team("pending");
 
 		assert.doesNotMatch(pi.notifications.map((notification) => notification.message).join("\n"), /picked/);
+	});
+});
+
+/** An adopted Playbook that adds a Brief section and has one rule, for intake. */
+const INTAKE_PLAYBOOK = [
+	"---",
+	"sendBackLimit: 1",
+	"permissions:",
+	"  roles:",
+	"    dev: { mode: acceptEdits }",
+	"---",
+	"",
+	"## Brief sections",
+	"",
+	"- **Constraints**: what the change must keep true.",
+	"",
+	"## Rules",
+	"",
+	"- **small-diffs**: keep each Task's diff small.",
+	"",
+].join("\n");
+
+const EFFORT_ID = "software-2026-11-02";
+
+function effortDir(roots: TempRoots, effortId = EFFORT_ID): string {
+	return join(roots.agentDir, "team", "efforts", effortId);
+}
+
+/** A session in a git repo whose `software` Team has {@link INTAKE_PLAYBOOK} adopted. */
+function intakeSession(roots = tempRoots()) {
+	adopt(roots, "software", INTAKE_PLAYBOOK);
+	const repo = gitRepo(roots);
+	return { roots, repo, pi: fakePi(roots, { cwd: repo }) };
+}
+
+describe("intake: `/team start` on a Team with an adopted Playbook", () => {
+	it("opens an Effort: its own directory and effort.jsonl, a `team-effort` entry, and the Lead woken to draft the Brief", async () => {
+		const { roots, repo, pi } = intakeSession();
+
+		await pi.team("start software");
+
+		const dir = effortDir(roots);
+		const lines = readFileSync(join(dir, "effort.jsonl"), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as unknown);
+		assert.deepEqual(lines, [{ type: "effort-opened", effortId: EFFORT_ID, team: "software", repo, playbook: sha(INTAKE_PLAYBOOK), at: NOW.toISOString() }]);
+		assert.deepEqual(pi.entries, [{ customType: "team-effort", data: { effortId: EFFORT_ID, effortDir: dir } }]);
+		assert.equal(pi.notifications.length, 1);
+		assert.equal(pi.notifications[0].type, "info");
+		assert.match(pi.notifications[0].message, /^Team `software` picked: Roles `architect`, `dev`, `qa`\. Playbook: adopted 2026-11-01T09:00:00\.000Z/);
+		assert.ok(pi.notifications[0].message.includes(`Effort \`${EFFORT_ID}\` opened at ${dir}`), pi.notifications[0].message);
+		const woken = pi.sent.at(-1);
+		assert.equal(woken?.customType, "team-intake");
+		assert.equal(woken?.triggerTurn, true);
+		for (const needed of [join(dir, "brief.draft.md"), sha(INTAKE_PLAYBOOK), `repo: ${repo}`, "Constraints", "small-diffs", "**AC1**", "`team_request_approval`", "`brief`"]) {
+			assert.ok(woken?.content.includes(needed), `the intake prompt doesn't mention ${needed}:\n${woken?.content}`);
+		}
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff"]);
+	});
+
+	it("gives each Effort its own id, so a second one the same day is numbered", async () => {
+		const { roots, repo, pi } = intakeSession();
+		await pi.team("start software");
+
+		const other = fakePi(roots, { cwd: repo });
+		await other.team("start software");
+
+		assert.deepEqual(other.entries, [{ customType: "team-effort", data: { effortId: `${EFFORT_ID}-2`, effortDir: effortDir(roots, `${EFFORT_ID}-2`) } }]);
+		assert.equal(existsSync(join(effortDir(roots, `${EFFORT_ID}-2`), "effort.jsonl")), true);
+	});
+
+	it("refuses to open an Effort outside a git repo, since the Brief records the repo", async () => {
+		const roots = tempRoots();
+		adopt(roots, "software", INTAKE_PLAYBOOK);
+		const pi = fakePi(roots);
+
+		await pi.team("start software");
+
+		assert.equal(pi.notifications.at(-1)?.type, "error");
+		assert.match(pi.notifications.at(-1)?.message ?? "", /not inside a git repo/);
+		assert.equal(existsSync(join(roots.agentDir, "team", "efforts")), false);
+		assert.deepEqual(pi.entries, []);
+		assert.deepEqual(pi.sent, []);
+	});
+
+	it("refuses a second Effort while this session holds one, naming it", async () => {
+		const { pi } = intakeSession();
+		await pi.team("start software");
+
+		await pi.team("start software");
+
+		assert.equal(pi.notifications.at(-1)?.type, "error");
+		assert.ok(pi.notifications.at(-1)?.message.includes(`\`${EFFORT_ID}\``), pi.notifications.at(-1)?.message);
+		assert.equal(pi.entries.length, 1);
+	});
+});
+
+/** A Brief for the intake session that passes, with `swap` applied to its text. */
+function brief(repo: string, swap: (text: string) => string = (text) => text): string {
+	return swap(
+		[
+			"---",
+			"team: software",
+			`playbook: ${sha(INTAKE_PLAYBOOK)}`,
+			`repo: ${repo}`,
+			"overrides:",
+			"  - { rule: small-diffs, change: skip, reason: The rename touches every file. }",
+			"---",
+			"",
+			"# Rename the config key",
+			"",
+			"## Goal",
+			"",
+			"Rename `colour` to `color` everywhere.",
+			"",
+			"## Acceptance criteria",
+			"",
+			"- **AC1** No file mentions `colour`.",
+			"- **AC2** Old configs still load.",
+			"",
+			"## Scope",
+			"",
+			"In: the config loader and its docs.",
+			"Out: the CLI.",
+			"",
+			"## Decide for me / Ask me",
+			"",
+			"Decide test names; ask before changing the public API.",
+			"",
+			"## Delivery",
+			"",
+			"One branch, ready to merge.",
+			"",
+			"## Constraints",
+			"",
+			"Old configs keep loading.",
+			"",
+		].join("\n"),
+	);
+}
+
+/** An intake session whose Lead has written `text` as the Brief draft and asked for its approval. */
+async function briefAsked(text?: (repo: string) => string) {
+	const session = intakeSession();
+	await session.pi.team("start software");
+	const draft = join(effortDir(session.roots), "brief.draft.md");
+	writeFileSync(draft, text ? text(session.repo) : brief(session.repo));
+	const reply = await session.pi.call("team_request_approval", { checkpoint: "brief", path: draft });
+	return { ...session, draft, reply };
+}
+
+describe("intake: asking the human to approve the Brief", () => {
+	it("refuses a Brief missing a skeleton section, repeating an acceptance-criterion id or overriding an unknown rule, naming each problem", async () => {
+		const { roots, repo, pi } = intakeSession();
+		await pi.team("start software");
+		const draft = join(effortDir(roots), "brief.draft.md");
+		writeFileSync(
+			draft,
+			brief(repo, (text) => text.replace("## Delivery\n\nOne branch, ready to merge.\n\n", "").replace("**AC2**", "**AC1**").replace("rule: small-diffs", "rule: tiny-diffs")),
+		);
+
+		await assert.rejects(pi.call("team_request_approval", { checkpoint: "brief", path: draft }), (error: Error) => {
+			assert.match(error.message, /no `Delivery` section/);
+			assert.match(error.message, /`AC1` is used more than once/);
+			assert.match(error.message, /`tiny-diffs`.*`small-diffs`/);
+			return true;
+		});
+		await pi.team("pending");
+		assert.equal(pi.notifications.at(-1)?.message, "Nothing is waiting on you.");
+	});
+
+	it("refuses a Brief that doesn't record the Effort's repo and Playbook sha", async () => {
+		const { roots, repo, pi } = intakeSession();
+		await pi.team("start software");
+		const draft = join(effortDir(roots), "brief.draft.md");
+		writeFileSync(draft, brief(repo, (text) => text.replace(`repo: ${repo}`, "repo: /elsewhere").replace(sha(INTAKE_PLAYBOOK), "b".repeat(64))));
+
+		await assert.rejects(pi.call("team_request_approval", { checkpoint: "brief", path: draft }), (error: Error) => {
+			assert.ok(error.message.includes(`\`repo\` must be the Effort's repo, ${repo}`), error.message);
+			assert.ok(error.message.includes(`\`playbook\` must be the sha256 of the Playbook in force, ${sha(INTAKE_PLAYBOOK)}`), error.message);
+			return true;
+		});
+	});
+
+	it("refuses any file but the Effort's own Brief draft, naming the draft", async () => {
+		const { roots, repo, pi } = intakeSession();
+		await pi.team("start software");
+		const elsewhere = join(repo, "brief.md");
+		writeFileSync(elsewhere, brief(repo));
+
+		await assert.rejects(pi.call("team_request_approval", { checkpoint: "brief", path: elsewhere }), (error: Error) => {
+			assert.ok(error.message.includes(join(effortDir(roots), "brief.draft.md")), error.message);
+			return true;
+		});
+	});
+
+	it("adds the Brief to `/team pending`, whose dialog lists each Role with the mode it runs in", async () => {
+		const { draft, reply, pi } = await briefAsked();
+		const asked = readFileSync(draft);
+
+		pi.answer("Later");
+		await pi.team("pending");
+
+		assert.ok(reply.includes(sha(asked)), reply);
+		assert.match(reply, /`\/team pending`/);
+		const [dialog] = pi.dialogs;
+		assert.deepEqual(dialog.options, ANSWERS);
+		assert.ok(dialog.title.includes(draft) && dialog.title.includes(sha(asked)), dialog.title);
+		assert.match(dialog.title, /- `architect`: auto\n- `dev`: acceptEdits\n- `qa`: auto/);
+	});
+
+	it("keeps Teammates from starting until the Brief is approved: `team_plan` and `team_handoff` refuse", async () => {
+		const { pi } = await briefAsked();
+
+		await assert.rejects(pi.call("team_plan", { tasks: [] }), /No Teammate starts before the human approves the Brief/);
+		await assert.rejects(pi.call("team_handoff", { slug: "design", body: "Design it." }), /No Teammate starts before the human approves the Brief/);
+	});
+});
+
+describe("intake: the human's answer to the Brief", () => {
+	it("approving writes the snapshot asked about as brief.md, snapshots the Playbook and the Team, records their shas, and wakes the Lead", async () => {
+		const { roots, draft, pi } = await briefAsked();
+		const asked = readFileSync(draft);
+		writeFileSync(draft, "changed after asking\n");
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		const dir = effortDir(roots);
+		assert.deepEqual(readFileSync(join(dir, "brief.md")), asked);
+		assert.equal(readFileSync(join(dir, "playbook.md"), "utf8"), INTAKE_PLAYBOOK);
+		const bundled = join(REPO_ROOT, "extensions", "team", "teams", "software");
+		assert.deepEqual(readFileSync(join(dir, "team", "roles", "dev.md")), readFileSync(join(bundled, "roles", "dev.md")));
+		const approvals = readFileSync(join(dir, "approvals.jsonl"), "utf8").trim().split("\n");
+		assert.equal(approvals.length, 1);
+		const record = JSON.parse(approvals[0]) as Record<string, string>;
+		assert.equal(record.act, "brief");
+		assert.equal(record.brief, sha(asked));
+		assert.equal(record.playbook, sha(INTAKE_PLAYBOOK));
+		assert.match(record.team, /^[0-9a-f]{64}$/);
+		assert.equal(record.at, NOW.toISOString());
+		const woken = pi.sent.at(-1);
+		assert.equal(woken?.customType, "team-pending");
+		assert.equal(woken?.triggerTurn, true);
+		assert.match(woken?.content ?? "", /approved the Brief/);
+		await pi.team("pending");
+		assert.equal(pi.notifications.at(-1)?.message, "Nothing is waiting on you.");
+	});
+
+	it("lets the Effort past the Brief once approved, and edits to the human's own Team or Playbook change nothing in it", async () => {
+		const { roots, pi } = await briefAsked();
+		pi.answer("Approve");
+		await pi.team("pending");
+		const dir = effortDir(roots);
+		const before = [readFileSync(join(dir, "playbook.md")), readFileSync(join(dir, "team", "team.md"))];
+
+		writeFileSync(join(playbooksDir(roots), "software.md"), `${INTAKE_PLAYBOOK}\n- **new-rule**: added later.\n`);
+		writeUserTeam(roots, "software", goodTeam("software"));
+
+		assert.deepEqual([readFileSync(join(dir, "playbook.md")), readFileSync(join(dir, "team", "team.md"))], before);
+		await assert.rejects(pi.call("team_plan", { tasks: [] }), (error: Error) => {
+			assert.doesNotMatch(error.message, /No Teammate starts|changed since/);
+			return true;
+		});
+	});
+
+	it("reports a record whose sha no longer matches its approval, and never uses it", async () => {
+		const { roots, pi } = await briefAsked();
+		pi.answer("Approve");
+		await pi.team("pending");
+		const tampered = join(effortDir(roots), "brief.md");
+		writeFileSync(tampered, "edited after approval\n");
+
+		await assert.rejects(pi.call("team_handoff", { slug: "design", body: "Design it." }), (error: Error) => {
+			assert.ok(error.message.includes(`${tampered} has sha256 ${sha("edited after approval\n")}`), error.message);
+			return true;
+		});
+		assert.equal(pi.notifications.at(-1)?.type, "error");
+		assert.ok(pi.notifications.at(-1)?.message.includes(tampered), pi.notifications.at(-1)?.message);
+	});
+
+	it("sending back wakes the Lead with the note and approves nothing, and the Lead can ask again", async () => {
+		const { roots, draft, pi } = await briefAsked();
+
+		pi.answer("Send back with a note", "AC2 needs a version range.");
+		await pi.team("pending");
+
+		assert.equal(existsSync(join(effortDir(roots), "brief.md")), false);
+		const woken = pi.sent.at(-1);
+		assert.equal(woken?.customType, "team-pending");
+		assert.match(woken?.content ?? "", /AC2 needs a version range\./);
+		await assert.rejects(pi.call("team_plan", { tasks: [] }), /No Teammate starts/);
+		const again = await pi.call("team_request_approval", { checkpoint: "brief", path: draft });
+		assert.match(again, /request `r2`/);
+	});
+
+	it("keeps the Brief waiting when the human answers later or backs out of the note", async () => {
+		const { roots, pi } = await briefAsked();
+		const sentBefore = pi.sent.length;
+
+		pi.answer("Later");
+		await pi.team("pending");
+		pi.answer("Send back with a note", undefined);
+		await pi.team("pending");
+
+		assert.equal(pi.sent.length, sentBefore);
+		assert.equal(existsSync(join(effortDir(roots), "brief.md")), false);
+		pi.answer("Approve");
+		await pi.team("pending");
+		assert.equal(existsSync(join(effortDir(roots), "brief.md")), true);
+	});
+
+	it("won't approve a Brief once the Playbook it was agreed under is adopted again, and says why", async () => {
+		const { roots, pi } = await briefAsked();
+		adopt(roots, "software", `${INTAKE_PLAYBOOK}\n- **new-rule**: added later.\n`);
+
+		await pi.team("pending");
+
+		assert.equal(pi.notifications.at(-1)?.type, "error");
+		assert.match(pi.notifications.at(-1)?.message ?? "", /can't be approved: the `software` Playbook .* is now [0-9a-f]{64}/);
+		assert.equal(existsSync(join(effortDir(roots), "brief.md")), false);
 	});
 });
 

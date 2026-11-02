@@ -5,14 +5,15 @@ the repo's, defined in the Teams section of [`CONTEXT.md`](../../CONTEXT.md): a 
 folder of markdown, a **Role** is one position on it, a **Playbook** is the Team's standing rules,
 and a **Workspace** is where its Teammates work.
 
-So far the extension knows its Teams, runs Team setup to adopt a Playbook, and `/team start` gets
-as far as picking a Team.
+So far the extension knows its Teams, runs Team setup to adopt a Playbook, and `/team start` opens
+an Effort and runs its intake up to the human approving its Brief. Planning and Teammates come later.
 
 ## Usage
 
 ```
-/team start <team>   pick a Team; refused, naming each file and reason, if any file of it is wrong.
-                     A Team with no adopted Playbook goes through Team setup first, then is picked
+/team start <team>   pick a Team and open an Effort on it; refused, naming each file and reason, if
+                     any file of it is wrong. A Team with no adopted Playbook goes through Team
+                     setup first. Refused outside a git repo, and while this session holds an Effort
 /team start          the Lead proposes a Team from each Team's description
 /team setup <team>   Team setup: agree the Team's Playbook with the Lead, then adopt it
 /team pending        answer what waits on you: approve, send back with a note, or later
@@ -40,8 +41,33 @@ mode drops on entry (any-command Bash, interpreter wildcards, package-manager ru
 `Agent`, `Monitor`) for a Role that runs in `auto`, and an `escalate` entry with no `ask:` list.
 
 The Lead's tools (`team_request_approval`) are registered at load but switched off; Team setup
-switches them on, and adoption switches them off again. Setup and pending items live in the pi
-session's memory for now.
+switches them on, and adoption switches them off again. Setup and its pending items live in the pi
+session's memory.
+
+## Intake
+
+`/team start` on a Team with an adopted Playbook opens an **Effort**: a folder
+`~/.pi/agent/team/efforts/<team>-<yyyy-mm-dd>/` (numbered `-2`, `-3`, … when taken) whose
+`effort.jsonl` is the extension's whole memory of it, starting with the Team, the repo (the git
+root of pi's folder) and the sha256 of the Playbook in force. The session records it in a
+`team-effort` entry. One session holds one Effort.
+
+The Lead grills you one question at a time and writes the **Brief** to `brief.draft.md` in the
+Effort: frontmatter with `team`, `playbook` (that sha), `repo` and `overrides`, then Goal,
+Acceptance criteria (`- **AC1** …`, unique ids), Scope, Decide for me / Ask me, Delivery, and any
+sections the Playbook adds under `## Brief sections`. It then calls `team_request_approval` with
+checkpoint `brief`, which refuses the draft naming each problem: a missing section, a repeated or
+missing criterion id, an override naming a rule the Playbook doesn't have, a wrong repo or sha.
+
+In `/team pending` you see the draft's path and sha, the repo, and every Role with the mode it
+would run in. Approving writes the snapshot asked about as `brief.md`, copies the Playbook to
+`playbook.md` and the Team to `team/`, and appends a line with their sha256s to `approvals.jsonl`.
+From then on the Effort reads only those copies, so editing your Team or Playbook changes nothing
+in it; a copy whose sha no longer matches its approval is reported and never used. A Brief can't
+be approved once its Playbook has been adopted again: start a new Effort.
+
+`team_plan` and `team_handoff` are switched on with the Effort, and refuse until the Brief is
+approved. Planning and handing off are not built yet.
 
 ## Defining a Team
 
@@ -104,6 +130,10 @@ through a recording fake pi in `tests/index.test.ts`.
 index.ts         wiring: the /team command and its subcommand table
 definitions.ts   Teams, Roles and Playbooks: discovery, validation, adoption state
 start.ts         what /team start says, and what it asks the Lead (pure)
+core.ts          the Effort core: a pure state machine over effort.jsonl
+intake.ts        what the Lead is asked at intake, and the Brief's approval dialog (pure)
+records.ts       the Effort folder: Brief validation, approved records and their shas
+repo.ts          the git root an Effort works on
 setup.ts         Team setup: seeding the draft, validating and adopting it, its warnings
 claude.ts        the only module that runs claude (version check)
 teams/software/  the bundled software Team: architect, dev and qa, and its default Playbook

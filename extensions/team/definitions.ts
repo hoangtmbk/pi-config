@@ -118,6 +118,8 @@ export interface Playbook {
 	roles: Record<string, RolePermissions>;
 	/** The ids of the body's rules, in the order written. */
 	rules: string[];
+	/** The sections this Team's Briefs have beyond `BRIEF_SKELETON`, in the order written. */
+	briefSections: string[];
 	body: string;
 }
 
@@ -384,6 +386,49 @@ const BOLD_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+\*\*([^*]+)\*\*/;
  */
 const ALMOST_ID = /^[^\sA-Z]*-[^\sA-Z]*$/;
 
+/** The sections every Brief has, whatever its Team. */
+export const BRIEF_SKELETON = ["Goal", "Acceptance criteria", "Scope", "Decide for me / Ask me", "Delivery"] as const;
+
+/** The heading a Playbook lists its extra Brief sections under. */
+const BRIEF_SECTIONS_HEADING = "brief sections";
+
+const HEADING = /^(#{1,6})\s+(.*?)\s*#*\s*$/;
+
+/**
+ * Split the `## Brief sections` block off a Playbook's body. Its bold list
+ * items name the sections the Team's Briefs add (`- **Constraints**: …`); they
+ * are not rules, so the rest is what rule ids are read from.
+ */
+function splitBriefSections(body: string, check: FileCheck): { sections: string[]; rest: string } {
+	const sections: string[] = [];
+	const rest: string[] = [];
+	let inside: number | undefined;
+	for (const line of body.split("\n")) {
+		const heading = HEADING.exec(line);
+		if (heading) {
+			const level = heading[1].length;
+			if (inside !== undefined && level <= inside) inside = undefined;
+			if (heading[2].toLowerCase() === BRIEF_SECTIONS_HEADING) {
+				inside = level;
+				continue;
+			}
+		}
+		if (inside === undefined) {
+			rest.push(line);
+			continue;
+		}
+		const name = BOLD_ITEM.exec(line)?.[1]?.trim();
+		if (name === undefined) continue;
+		const lower = name.toLowerCase();
+		if (BRIEF_SKELETON.some((section) => section.toLowerCase() === lower)) {
+			check.fail(`the Brief section \`${name}\` is already part of every Brief (${quoteList(BRIEF_SKELETON)}); list only the sections this Team adds`);
+		} else if (sections.some((section) => section.toLowerCase() === lower)) {
+			check.fail(`the Brief section \`${name}\` is listed more than once under \`Brief sections\``);
+		} else sections.push(name);
+	}
+	return { sections, rest: rest.join("\n") };
+}
+
 function ruleIds(body: string, check: FileCheck): string[] {
 	const ids: string[] = [];
 	for (const line of body.split("\n")) {
@@ -488,7 +533,8 @@ export function parsePlaybook(filePath: string, context: PlaybookContext, bytes?
 		}
 	}
 
-	const rules = ruleIds(body, check);
+	const { sections: briefSections, rest } = splitBriefSections(body, check);
+	const rules = ruleIds(rest, check);
 
 	const kinds = new Map<string, string[]>();
 	const claim = (id: string, kind: string) => kinds.set(id, [...(kinds.get(id) ?? []), kind]);
@@ -504,7 +550,7 @@ export function parsePlaybook(filePath: string, context: PlaybookContext, bytes?
 
 	if (check.problems.length > 0) return { problems: check.problems };
 	return {
-		playbook: { filePath, sha256: sha256(raw), sendBackLimit, checkpoints, grants, escalate, roles, rules, body },
+		playbook: { filePath, sha256: sha256(raw), sendBackLimit, checkpoints, grants, escalate, roles, rules, briefSections, body },
 		problems: [],
 	};
 }
