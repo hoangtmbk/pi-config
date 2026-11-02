@@ -40,14 +40,24 @@
  *   `session.receive` handlers first, and one a handler consumes plays no
  *   replies. A handler's `$.command.run({ command: "clear" })` clears as
  *   `/clear` does: `SessionEnd` with reason `clear`, a new session id, then
- *   `SessionStart` with source `clear`, through the settings' hook commands.
- * - `stop <short id>` stops a background session: it exits 0, recorded in
- *   its argv, and the session is left to the test.
+ *   `SessionStart` with source `clear`, through the settings' hook commands;
+ *   its `FAKE_CLAUDE_AGENTS` record takes the new session id and keeps its
+ *   short id.
  * - `FAKE_CLAUDE_ATTACH_OUT`: a file each `attach` appends one JSON line to:
  *   its argv and the device and inode its stdin, stdout and stderr are open
  *   on, so a test can tell whether it was handed the terminal pi runs on.
  * - `FAKE_CLAUDE_ATTACH_EXIT`: the exit code of an `attach`, `0` when unset.
  *   It prints nothing, since the terminal it inherits is the test runner's.
+ * - `FAKE_CLAUDE_AGENTS`: a folder that holds one JSON file per started
+ *   session, `<session id>.json` ({@link Agent}), as Claude Code's own
+ *   registry of background sessions. `agents --json` prints the live ones as
+ *   a JSON array; `stop <short id>` ends one, keeping its record, as the real
+ *   one keeps the conversation; `--bg --resume <session id> <message>` wakes one
+ *   with a new socket, plays `SessionStart` with `source:
+ *   "resume"`, then plays `FAKE_CLAUDE_REPLIES` with the message as its
+ *   pointer. A session idle-stops when its record says `live: false` and its
+ *   socket is gone (the harness's `idleStop`), and a played `SessionEnd`
+ *   step ends it, as a crash does.
  *
  * Anything else it is asked to do exits 1 with a message saying so, so a test
  * that reaches further than the fake goes is loud about it.
@@ -55,7 +65,7 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, fstatSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, fstatSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 
@@ -70,6 +80,17 @@ interface Session {
 	settings: string | undefined;
 	/** The `--plugin-dir` folders, loaded as mods. */
 	plugins: string[];
+}
+
+/** A session in `FAKE_CLAUDE_AGENTS`: what resuming it needs, and what `agents --json` says of it. */
+interface Agent extends Session {
+	/** The session id since its last `/clear`; `id` stays the first, as its short id does. */
+	sessionId?: string;
+	name: string | undefined;
+	live: boolean;
+	status: string;
+	state: string;
+	waitingFor?: string;
 }
 
 if (argv[0] === "--fake-inbox") {
@@ -87,8 +108,36 @@ async function main(): Promise<void> {
 		process.exit(0);
 	}
 
+	if (argv[0] === "agents" && argv[1] === "--json") {
+		const agents = registry().filter((agent) => agent.live);
+		process.stdout.write(`${JSON.stringify(agents.map((agent) => ({ id: agent.id.slice(0, 8), sessionId: agent.sessionId ?? agent.id, name: agent.name, status: agent.status, state: agent.state, ...(agent.waitingFor === undefined ? {} : { waitingFor: agent.waitingFor }) })))}\n`);
+		process.exit(0);
+	}
+
 	if (argv[0] === "stop" && argv[1] !== undefined) {
-		process.stdout.write(`fake claude: stopped ${argv[1]}\n`);
+		const agent = registry().find((each) => each.live && each.id.startsWith(argv[1] ?? ""));
+		if (!agent) {
+			process.stderr.write(`fake claude: no running session ${argv[1]}\n`);
+			process.exit(1);
+		}
+		end(agent);
+		process.exit(0);
+	}
+
+	if (argv[0] === "--bg" && argv[1] === "--resume") {
+		const agent = registry().find((each) => (each.sessionId ?? each.id) === argv[2]);
+		if (!agent) {
+			process.stderr.write(`fake claude: no session ${argv[2]} to resume\n`);
+			process.exit(1);
+		}
+		rmSync(agent.socket, { force: true });
+		const sockets = process.env.FAKE_CLAUDE_SOCKETS;
+		const session: Session = { ...agent, id: agent.sessionId ?? agent.id, socket: sockets ? join(sockets, `${randomBytes(4).toString("hex")}.sock`) : agent.socket, token: `inbox-${randomBytes(4).toString("hex")}` };
+		record({ ...agent, socket: session.socket, token: session.token, live: true, status: "running", state: "idle" });
+		if (sockets) await openInbox(session);
+		playSteps([{ event: "SessionStart", payload: { source: "resume" } }], session, "");
+		play(process.env.FAKE_CLAUDE_REPLIES, session, argv[3] ?? "");
+		process.stdout.write("fake claude: background session resumed\n");
 		process.exit(0);
 	}
 
@@ -116,6 +165,8 @@ async function main(): Promise<void> {
 				settings: launch.settings,
 				plugins: argv.flatMap((arg, index) => (arg === "--plugin-dir" && argv[index + 1] !== undefined ? [argv[index + 1]] : [])),
 			};
+			const name = argv.indexOf("--name") === -1 ? undefined : argv[argv.indexOf("--name") + 1];
+			record({ ...session, name, live: true, status: "running", state: "idle" });
 			if (process.env.FAKE_CLAUDE_HOOKS && sockets) await openInbox(session);
 			play(process.env.FAKE_CLAUDE_HOOKS, session, argv.at(-1) ?? "");
 			process.stdout.write("fake claude: background session started\n");
@@ -135,6 +186,26 @@ async function main(): Promise<void> {
 
 	process.stderr.write(`fake claude: no scripted behaviour for ${JSON.stringify(argv)}\n`);
 	process.exit(1);
+}
+
+/** Every session `FAKE_CLAUDE_AGENTS` holds, live or not. */
+function registry(): Agent[] {
+	const dir = process.env.FAKE_CLAUDE_AGENTS;
+	if (!dir || !existsSync(dir)) return [];
+	return readdirSync(dir)
+		.filter((file) => file.endsWith(".json"))
+		.map((file) => JSON.parse(readFileSync(join(dir, file), "utf8")) as Agent);
+}
+
+function record(agent: Agent): void {
+	const dir = process.env.FAKE_CLAUDE_AGENTS;
+	if (dir) writeFileSync(join(dir, `${agent.id}.json`), JSON.stringify(agent));
+}
+
+/** End a session: gone from `agents --json`, its inbox closed with its socket, its record kept for a resume. */
+function end(agent: Agent): void {
+	record({ ...agent, live: false });
+	rmSync(agent.socket, { force: true });
 }
 
 /** The contents of the file a flag names, or undefined when the flag or the file is absent. */
@@ -217,7 +288,9 @@ async function consumed(session: Session, text: string): Promise<boolean> {
 			async run({ command }: { command: string }): Promise<void> {
 				if (command !== "clear") throw new Error(`fake claude: no scripted command /${command}`);
 				playSteps([{ event: "SessionEnd", payload: { reason: "clear" } }], session, "");
+				const before = registry().find((each) => (each.sessionId ?? each.id) === session.id);
 				session.id = randomUUID();
+				if (before) record({ ...before, sessionId: session.id });
 				playSteps([{ event: "SessionStart", payload: { source: "clear" } }], session, "");
 			},
 		},
@@ -271,6 +344,10 @@ function playSteps(steps: HookStep[], session: Session, pointer: string): void {
 			for (const hook of group.hooks) {
 				execFileSync("sh", ["-c", hook.command], { cwd: session.cwd, input: JSON.stringify(payload), env: { ...process.env, ...inbox }, stdio: ["pipe", "ignore", "inherit"] });
 			}
+		}
+		if (step.event === "SessionEnd" && payload.reason !== "clear" && payload.reason !== "resume") {
+			const agent = registry().find((each) => (each.sessionId ?? each.id) === session.id);
+			if (agent) end(agent);
 		}
 	}
 }

@@ -70,10 +70,12 @@ export interface HandedTask {
 	accepted?: string;
 	/** How many times the Lead sent it back; absent before the first. */
 	sendBacks?: number;
+	/** When a re-plan dropped it, which ends this handoff: planned again, it is handed off afresh into a new folder. */
+	dropped?: string;
 }
 
 /** Where a Task of the plan stands, as `plan.md` shows it. */
-export type TaskStatus = "planned" | "queued" | "running" | "in review" | "sent back" | "accepted";
+export type TaskStatus = "planned" | "queued" | "running" | "in review" | "sent back" | "accepted" | "dropped";
 
 /**
  * A Task handed off while the Effort is at its cap of live Teammates, waiting
@@ -125,6 +127,13 @@ export interface Teammate {
 	attached?: string;
 	/** Set when a new session gave it a new short id the human hasn't attached to through pi: the block marks it `(new)`. */
 	newShortId?: boolean;
+	/**
+	 * Set once its session is over for the Effort: `stopped` with `claude stop`
+	 * when its Task was dropped, or `crashed` on a `SessionEnd` nobody asked
+	 * for. It is never woken again, and its Task's next round goes to another
+	 * Teammate of its Role. An idle stop is not this: a send wakes it.
+	 */
+	ended?: { how: "stopped" | "crashed"; at: string };
 }
 
 /** A Teammate's inbox socket, which Claude Code gives its hooks in the environment. */
@@ -178,6 +187,8 @@ export type EffortLine =
 	| { type: "permission-denied"; teammate: string; cursor: number; tool: string; reason?: string; at: string }
 	/** A `Stop` with the round's result written: the Task's round is done. */
 	| { type: "task-done"; teammate: string; cursor: number; slug: string; round: number; at: string }
+	/** A `SessionEnd` that wasn't a clear, a resume or the extension's own `claude stop`: the Teammate's session is over. */
+	| { type: "teammate-crashed"; teammate: string; cursor: number; reason: string; at: string }
 	/** A `Stop` without a new result: the Teammate stopped short, saying this last. */
 	| { type: "teammate-stopped"; teammate: string; cursor: number; slug: string; message: string; at: string }
 	/** A hook reported a permission mode other than the one last known: the mode the Teammate actually got. */
@@ -190,6 +201,12 @@ export type EffortLine =
 	| { type: "teammate-retired"; teammate: string; at: string }
 	/** The human used the `/team` menu on a Teammate: the short id they were given, which clears its `(new)` mark. Reads no journal line. */
 	| { type: "teammate-attached"; teammate: string; shortId: string; at: string }
+	/** A send-back gave the Task to a new Teammate, since its own had ended. */
+	| { type: "task-reassigned"; slug: string; teammate: string; at: string }
+	/** A re-plan left out a handed-off Task, or gave it another Role: this handoff of it is over. */
+	| { type: "task-dropped"; slug: string; at: string }
+	/** The extension stopped a Teammate with `claude stop`, since its Task was dropped. Reads no journal line. */
+	| { type: "teammate-ended"; teammate: string; how: "stopped"; at: string }
 	/** Something decided for the human on their behalf, for the next Report: a permission answer, a rule, a grant used, a limit pause. */
 	| ({ type: "decided-for-you" } & Logged)
 	/** Work found outside the Brief (scope creep), kept for the final Report as a suggestion. */
@@ -312,6 +329,8 @@ export type EffortInput =
 			feedback?: string;
 			result: { path: string; written: boolean };
 			sendBackLimit: number;
+			/** The permission mode a new Teammate of the Task's Role launches in, should a send-back need one. */
+			mode?: string;
 			at: string;
 	  }
 	/**
@@ -352,6 +371,14 @@ export type EffortAction =
 	 * own reasoning, and writes `result-<round + 1>.md` next.
 	 */
 	| { kind: "send-back"; teammate: string; inbox: Inbox; slug: string; folder: string; round: number; feedback: string }
+	/**
+	 * Write `feedback` as `feedback-<round>.md` in the Task's folder, then
+	 * launch a new Teammate on the Task, since its own has ended: its pointer
+	 * names `task.md`, the results and feedback so far, and `result-<round + 1>.md`.
+	 */
+	| { kind: "restaff-teammate"; teammate: Omit<Teammate, "task" | "startedAt">; slug: string; folder: string; round: number; feedback: string }
+	/** Stop the Teammate's background session, `claude stop <short id>`, which keeps its conversation; its `--name` before it has a short id. */
+	| { kind: "stop-teammate"; teammate: string; shortId: string }
 	/** Write the Report as `reports/<nnn>.md`. */
 	| { kind: "write-report"; report: Report };
 
@@ -467,6 +494,14 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			return withTeammate(state, line, { activity: "idle", doing: "stopped short" });
 		case "teammate-mode":
 			return withTeammate(state, line, { observedMode: line.mode });
+		case "task-dropped":
+			return { ...withTask(state, line.slug, { dropped: line.at }), queue: state.queue.filter((queued) => queued.slug !== line.slug) };
+		case "task-reassigned":
+			return withTask(state, line.slug, { teammate: line.teammate });
+		case "teammate-ended":
+			return { ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, ended: { how: line.how, at: line.at } } : teammate)) };
+		case "teammate-crashed":
+			return withTeammate(state, line, { ended: { how: "crashed", at: line.at } });
 		case "decided-for-you":
 		case "found-work": {
 			const { type, ...logged } = line;
@@ -675,17 +710,59 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 	if (uncovered.length > 0) {
 		problems.push(`no Task covers ${quoted(uncovered)}; every acceptance criterion of the Brief must be covered, and dropping one is a Brief change for the human`);
 	}
+	// A handoff left out, or moved to another Role, is dropped; an accepted Task is done, and stays as it was.
+	const dropping: string[] = [];
 	for (const [slug, handed] of Object.entries(state.tasks)) {
+		if (handed.dropped !== undefined) continue;
 		const kept = tasks.find((task) => task.slug === slug);
-		if (!kept) problems.push(`Task \`${slug}\` was handed off to \`${handed.teammate}\`, so it stays in the plan`);
-		else if (kept.role !== handed.role) problems.push(`Task \`${slug}\` was handed off to \`${handed.teammate}\` in Role \`${handed.role}\`, so it keeps that Role`);
+		if (handed.accepted !== undefined) {
+			if (!kept) problems.push(`Task \`${slug}\` is accepted, so it stays in the plan`);
+			else if (kept.role !== handed.role) problems.push(`Task \`${slug}\` is accepted in Role \`${handed.role}\`, so it keeps that Role`);
+		} else if (!kept || kept.role !== handed.role) dropping.push(slug);
 	}
+	// A queued Task has no Teammate yet: dropped, it just leaves the queue.
+	const unqueuing = state.queue.filter((queued) => {
+		const kept = tasks.find((task) => task.slug === queued.slug);
+		return !kept || kept.role !== queued.role;
+	});
 	if (problems.length > 0) {
 		return { ok: false, refusal: `The plan for Effort \`${state.effortId}\` can't be taken until these are fixed:\n${problems.map((problem) => `- ${problem}`).join("\n")}` };
 	}
-	const reply = `${state.plan ? "Replaced" : "Wrote"} the plan of Effort \`${state.effortId}\`: ${tasks.length} Task${tasks.length === 1 ? "" : "s"}, covering ${quoted(input.criteria)}. Hand each off with \`team_handoff\` when it is ready.`;
 	const reason = input.reason?.trim();
-	return took(state, [{ type: "plan-written", tasks, ...(reason ? { reason } : {}), at: input.at }], [{ kind: "write-plan" }], reply);
+	const append: EffortLine[] = [{ type: "plan-written", tasks, ...(reason ? { reason } : {}), at: input.at }];
+	const actions: EffortAction[] = [];
+	const notes: string[] = [];
+	for (const slug of dropping) {
+		const handed = state.tasks[slug];
+		const teammate = state.teammates.find((each) => each.id === handed?.teammate);
+		const replanned = tasks.find((task) => task.slug === slug);
+		append.push({ type: "task-dropped", slug, at: input.at });
+		const live = teammate !== undefined && teammate.ended === undefined && teammate.task === slug;
+		if (live) {
+			append.push({ type: "teammate-ended", teammate: teammate.id, how: "stopped", at: input.at });
+			actions.push({ kind: "stop-teammate", teammate: teammate.id, shortId: teammate.shortId ?? teammate.name });
+		}
+		const stopped = live ? `, and stopped \`${teammate.id}\` with \`claude stop\`, which keeps its conversation` : "";
+		notes.push(
+			replanned
+				? `Dropped the handoff of Task \`${slug}\` to \`${handed?.teammate}\`${stopped}: it is planned again in Role \`${replanned.role}\`, and \`team_handoff\` starts it afresh in a new folder.`
+				: `Dropped Task \`${slug}\`${stopped}.`,
+		);
+	}
+	for (const queued of unqueuing) {
+		const replanned = tasks.find((task) => task.slug === queued.slug);
+		append.push({ type: "task-dropped", slug: queued.slug, at: input.at });
+		notes.push(
+			replanned
+				? `Dropped queued Task \`${queued.slug}\`: it is planned again in Role \`${replanned.role}\`, and \`team_handoff\` hands it off afresh in a new folder.`
+				: `Dropped queued Task \`${queued.slug}\`.`,
+		);
+	}
+	const reply = [
+		`${state.plan ? "Replaced" : "Wrote"} the plan of Effort \`${state.effortId}\`: ${tasks.length} Task${tasks.length === 1 ? "" : "s"}, covering ${quoted(input.criteria)}. Hand each off with \`team_handoff\` when it is ready.`,
+		...notes,
+	].join("\n");
+	return took(state, append, [...actions, { kind: "write-plan" }], reply);
 }
 
 /** How many Teammates may be live at once when pi's `maxTeammates` setting is absent. */
@@ -711,7 +788,7 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 		};
 	}
 	const handed = state.tasks[input.slug];
-	if (handed) {
+	if (handed && handed.dropped === undefined) {
 		const status = taskStatus(state, input.slug);
 		if (status === "accepted") {
 			return { ok: false, refusal: `Task \`${input.slug}\` is accepted (round ${handed.round}, with \`${handed.teammate}\`), and an accepted Task is never handed off again.` };
@@ -728,7 +805,7 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 			refusal: `Task \`${input.slug}\` is already queued (${queued.why}); it starts by itself when a Teammate frees up, so don't hand it off again.`,
 		};
 	}
-	const folder = `${String(Object.keys(state.tasks).length + state.queue.length + 1).padStart(3, "0")}-${task.role}-${task.slug}`;
+	const folder = `${String(nextFolder(state)).padStart(3, "0")}-${task.role}-${task.slug}`;
 	const wanted: QueuedTask = { slug: task.slug, folder, role: task.role, why: "", at: input.at, ...(input.mode === undefined ? {} : { mode: input.mode }) };
 	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
 	const staffed = staff(state, wanted, max);
@@ -750,9 +827,14 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 	);
 }
 
-/** Live Teammates: started and not stopped to make room. */
+/** The number of the next Task folder: one past the highest yet, queued ones included, since a dropped Task handed off again takes a new one. */
+function nextFolder(state: EffortState): number {
+	return Math.max(0, ...[...Object.values(state.tasks), ...state.queue].map((task) => Number.parseInt(task.folder, 10) || 0)) + 1;
+}
+
+/** Live Teammates: started, not stopped to make room, and not ended by a drop or a crash. */
 function live(state: EffortState): Teammate[] {
-	return state.teammates.filter((teammate) => teammate.retiredAt === undefined);
+	return state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined);
 }
 
 /** Whether `teammate` is between Tasks: its Task is accepted and it hasn't been given another. */
@@ -904,9 +986,27 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 		}
 		case "Stop":
 			return stopped(state, teammate, input);
+		case "SessionEnd":
+			return sessionEnded(state, teammate, input);
 		default:
 			return took(state, [], []);
 	}
+}
+
+/**
+ * A `SessionEnd`. A clear or a resume goes on in a new session, and a
+ * Teammate the extension stopped is already over; anything else is a crash,
+ * which ends the Teammate and wakes the Lead once, through the cursor.
+ */
+function sessionEnded(state: EffortState, teammate: Teammate, input: Extract<EffortInput, { kind: "journal" }>): Step {
+	const reason = text(input.line.payload?.reason) ?? "other";
+	if (reason === "clear" || reason === "resume" || teammate.ended !== undefined) return took(state, [], []);
+	const task = state.tasks[teammate.task];
+	const open = task !== undefined && task.teammate === teammate.id && task.accepted === undefined && task.dropped === undefined;
+	const text_ = open
+		? `\`${teammate.id}\`'s session ended (${reason}) during round ${task.round} of Task \`${teammate.task}\`, so it is gone for this Effort. A send-back of the Task with \`team_review\` goes to another Teammate of Role \`${teammate.role}\`, carrying its folder; or drop it with \`team_plan\`; or stop and tell the human.`
+		: `\`${teammate.id}\`'s session ended (${reason}), so it is gone for this Effort. It had no open Task.`;
+	return took(state, [{ type: "teammate-crashed", teammate: teammate.id, cursor: input.cursor, reason, at: input.line.at }], [{ kind: "wake-lead", text: text_ }]);
 }
 
 /**
@@ -955,6 +1055,9 @@ function review(state: EffortState, input: Extract<EffortInput, { kind: "review"
 	if (task.accepted !== undefined) {
 		return { ok: false, refusal: `Task \`${input.slug}\` is already accepted (round ${task.round}), and an accepted Task is never reviewed again.` };
 	}
+	if (task.dropped !== undefined) {
+		return { ok: false, refusal: `Task \`${input.slug}\` was dropped from the plan, so there is nothing to review; plan it again with \`team_plan\` and hand it off afresh.` };
+	}
 	if (!input.result.written) {
 		return {
 			ok: false,
@@ -986,7 +1089,9 @@ function review(state: EffortState, input: Extract<EffortInput, { kind: "review"
 			refusal: `Task \`${input.slug}\` was sent back ${sendBacks} time${sendBacks === 1 ? "" : "s"}, the Playbook's \`sendBackLimit\` of ${input.sendBackLimit}, so it can't be sent back again. Escalate to the human instead: stop and tell them what is still wrong with ${input.result.path} and ask how to go on. You can still accept it.`,
 		};
 	}
-	const inbox = state.teammates.find((each) => each.id === task.teammate)?.inbox;
+	const current = state.teammates.find((each) => each.id === task.teammate);
+	if (current?.ended !== undefined) return restaff(state, input, task, feedback, `send-back ${sendBacks + 1} of ${input.sendBackLimit}`);
+	const inbox = current?.inbox;
 	if (!inbox) {
 		return {
 			ok: false,
@@ -1005,13 +1110,42 @@ function review(state: EffortState, input: Extract<EffortInput, { kind: "review"
 }
 
 /**
+ * A send-back of a Task whose Teammate has ended: a new Teammate of its Role
+ * takes the next round in the same folder, where the Task, its results and
+ * the feedback are.
+ */
+function restaff(state: EffortState, input: Extract<EffortInput, { kind: "review" }>, task: HandedTask, feedback: string, count: string): Step {
+	const n = state.teammates.filter((teammate) => teammate.role === task.role).length + 1;
+	const id = `${task.role}-${n}`;
+	const name = `team-${state.effortId}-${id}`;
+	return took(
+		state,
+		[
+			{ type: "teammate-started", id, role: task.role, name, task: input.slug, startedAt: input.at, ...(input.mode === undefined ? {} : { mode: input.mode }) },
+			{ type: "task-sent-back", slug: input.slug, round: task.round, at: input.at },
+			{ type: "task-reassigned", slug: input.slug, teammate: id, at: input.at },
+		],
+		[
+			{ kind: "restaff-teammate", teammate: { id, role: task.role, name }, slug: input.slug, folder: task.folder, round: task.round, feedback },
+			{ kind: "write-plan" },
+		],
+		`Sent Task \`${input.slug}\` back (${count}) with feedback-${task.round}.md. \`${task.teammate}\` has ended, so this started \`${id}\` on it, pointed at the Task's folder; it writes result-${task.round + 1}.md next, and you are woken when it does.`,
+	);
+}
+
+/**
  * Where Task `slug` stands: planned until handed off; then running, in review
  * once its round's result is reported, sent back while a later round is
  * worked, and accepted for good.
  */
 export function taskStatus(state: EffortState, slug: string): TaskStatus {
 	const task = state.tasks[slug];
-	if (!task) return state.queue.some((queued) => queued.slug === slug) ? "queued" : "planned";
+	if (!task || task.dropped !== undefined) {
+		if (state.queue.some((queued) => queued.slug === slug)) return "queued";
+		// A dropped Task planned again waits for a fresh handoff.
+		if (!task || state.plan?.some((planned) => planned.slug === slug)) return "planned";
+		return "dropped";
+	}
 	if (task.accepted !== undefined) return "accepted";
 	if (task.reported === task.round) return "in review";
 	return task.round > 1 ? "sent back" : "running";

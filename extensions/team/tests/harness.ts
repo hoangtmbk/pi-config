@@ -6,7 +6,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, fstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -152,6 +152,27 @@ export interface FakeClaude {
 	inbox(): FakeInboxConnection[];
 	/** Every `claude attach`, oldest first. */
 	attaches(): FakeAttach[];
+	/** Every session it started, live or not, as its registry holds it. */
+	agents(): FakeAgent[];
+	/** Idle-stop the session named `name`, as Claude Code does after about an hour: gone from `agents --json`, its socket closed, no hook. */
+	idleStop(name: string): void;
+	/** Close the socket of the session named `name` but leave it in `agents --json`, so a send to it is refused. */
+	refuseSends(name: string): void;
+	/** Forget the session named `name` altogether, as if Claude Code had cleaned it up: no record, no socket, nothing to resume. */
+	forget(name: string): void;
+	/** Set what `agents --json` says of the session named `name`. */
+	setAgent(name: string, change: Partial<Pick<FakeAgent, "status" | "state" | "waitingFor">>): void;
+}
+
+/** A session in the fake's registry. */
+export interface FakeAgent {
+	id: string;
+	name?: string;
+	socket: string;
+	live: boolean;
+	status: string;
+	state: string;
+	waitingFor?: string;
 }
 
 /** One connection to a fake session's inbox socket. */
@@ -200,6 +221,18 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 	if (options.replies) writeFileSync(replies, JSON.stringify(options.replies));
 	// Its own short folder: a Unix socket path can't be much longer than 100 bytes.
 	const sockets = mkdtempSync(join(tmpdir(), "fcs-"));
+	const agents = join(dir, "agents");
+	mkdirSync(agents);
+	const agentFile = (name: string): string => {
+		const file = readdirSync(agents).find((each) => (JSON.parse(readFileSync(join(agents, each), "utf8")) as FakeAgent).name === name);
+		if (file === undefined) throw new Error(`the fake claude started no session named ${name}`);
+		return join(agents, file);
+	};
+	const change = (name: string, edit: (agent: FakeAgent) => FakeAgent): void => {
+		const file = agentFile(name);
+		const agent = edit(JSON.parse(readFileSync(file, "utf8")) as FakeAgent);
+		writeFileSync(file, JSON.stringify(agent));
+	};
 	const env: Record<string, string | undefined> = {
 		FAKE_CLAUDE_ARGV_OUT: argvOut,
 		FAKE_CLAUDE_LAUNCH_OUT: launchOut,
@@ -211,6 +244,7 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 		FAKE_CLAUDE_INBOX_OUT: inboxOut,
 		FAKE_CLAUDE_OWNER: String(process.pid),
 		FAKE_CLAUDE_ATTACH_OUT: attachOut,
+		FAKE_CLAUDE_AGENTS: agents,
 		FAKE_CLAUDE_ATTACH_EXIT: options.attachExit === undefined ? undefined : String(options.attachExit),
 	};
 	const exports = Object.entries(env)
@@ -224,6 +258,23 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 		launches: () => jsonLines<FakeLaunch>(launchOut),
 		inbox: () => jsonLines<FakeInboxConnection>(inboxOut),
 		attaches: () => jsonLines<FakeAttach>(attachOut),
+		agents: () => readdirSync(agents).map((file) => JSON.parse(readFileSync(join(agents, file), "utf8")) as FakeAgent),
+		idleStop: (name) =>
+			change(name, (agent) => {
+				rmSync(agent.socket, { force: true });
+				return { ...agent, live: false };
+			}),
+		refuseSends: (name) =>
+			change(name, (agent) => {
+				rmSync(agent.socket, { force: true });
+				return agent;
+			}),
+		forget: (name) => {
+			const file = agentFile(name);
+			rmSync((JSON.parse(readFileSync(file, "utf8")) as FakeAgent).socket, { force: true });
+			rmSync(file);
+		},
+		setAgent: (name, edit) => change(name, (agent) => ({ ...agent, ...edit })),
 	};
 }
 

@@ -288,7 +288,7 @@ describe("handing off", () => {
 		assert.match(refusal(designed, handoff("design")), /`design` is already running.*`architect-1`/);
 	});
 
-	it("refuses a re-plan that drops a handed-off Task or gives it another Role", () => {
+	it("drops a handed-off Task left out of a re-plan, and replans one given another Role", () => {
 		const designed = applied(planned, handoff("design"));
 		const replan = (tasks: Extract<EffortInput, { kind: "plan" }>["tasks"]) => ({
 			kind: "plan" as const,
@@ -298,11 +298,15 @@ describe("handing off", () => {
 			at: "2026-11-02T11:40:00.000Z",
 		});
 
-		assert.match(refusal(designed, replan([{ slug: "rename", role: "dev", goal: "Rename.", criteria: ["AC1", "AC2"] }])), /`design`.*handed off/);
-		assert.match(
-			refusal(designed, replan([{ slug: "design", role: "dev", goal: "Design.", criteria: ["AC1", "AC2"] }])),
-			/`design`.*`architect`/,
-		);
+		const left = run(designed, replan([{ slug: "rename", role: "dev", goal: "Rename.", criteria: ["AC1", "AC2"] }]));
+		assert.ok(left.ok, left.ok ? "" : left.refusal);
+		assert.equal(taskStatus(left.state, "design"), "dropped");
+		const reviewed = run(applied(designed, replan([{ slug: "rename", role: "dev", goal: "Rename.", criteria: ["AC1", "AC2"] }])), { kind: "review", slug: "design", verdict: "accept", result: { path: "/r.md", written: true }, sendBackLimit: 2, at: "2026-11-02T11:50:00.000Z" });
+		assert.ok(!reviewed.ok);
+		assert.match(reviewed.refusal, /Task `design` was dropped from the plan/);
+		const moved = run(designed, replan([{ slug: "design", role: "dev", goal: "Design.", criteria: ["AC1", "AC2"] }]));
+		assert.ok(moved.ok, moved.ok ? "" : moved.refusal);
+		assert.equal(taskStatus(moved.state, "design"), "planned");
 	});
 });
 
@@ -745,6 +749,29 @@ describe("staffing a handoff", () => {
 		assert.match(refusal(queued, handoff("rename", { max: 1 })), /`rename` is already queued.*starts by itself/);
 	});
 
+	it("drops a queued Task a re-plan leaves out or gives another Role, so no drain starts it", () => {
+		const queued = applied(applied(applied(planned, handoff("design", { max: 1 })), handoff("rename", { max: 1 })), handoff("docs", { max: 1 }));
+		const replan = run(queued, {
+			kind: "plan",
+			tasks: [
+				{ slug: "design", role: "architect", goal: "Design the rename.", criteria: ["AC1"] },
+				{ slug: "rename", role: "qa", goal: "Rename the key.", criteria: ["AC1"] },
+			],
+			criteria: ["AC1"],
+			roles: ["architect", "dev", "qa"],
+			at: "2026-11-02T11:40:00.000Z",
+		});
+
+		assert.ok(replan.ok, replan.ok ? "" : replan.refusal);
+		assert.deepEqual(replan.state.queue, []);
+		assert.equal(taskStatus(replan.state, "rename"), "planned");
+		assert.match(replan.reply ?? "", /Dropped queued Task `docs`\./);
+		assert.match(replan.reply ?? "", /Dropped queued Task `rename`: it is planned again in Role `qa`/);
+		const drained = run([...queued, ...replan.append], { kind: "drain", at: "2026-11-02T13:00:05.000Z", maxTeammates: 3 });
+		assert.ok(drained.ok);
+		assert.deepEqual(drained.append, []);
+	});
+
 	it("at the cap, stops an idle Teammate of a Role with no queued Task to start one for this Role", () => {
 		const designed = accepted(stops(applied(planned, handoff("design", { max: 2 })), "architect-1"), "architect-1", 2);
 		const full = applied(designed, handoff("rename", { max: 2 }));
@@ -1151,3 +1178,155 @@ describe("attaching to a Teammate", () => {
 		assert.match(refusal(started, { kind: "attach", teammate: "dev-1", at: "2026-11-02T11:40:00.000Z" }), /`dev-1` has no short id yet/);
 	});
 });
+
+describe("a Teammate's lifecycle", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const RENAME = { slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] };
+	const DOCS = { slug: "docs", role: "dev", goal: "Document it.", criteria: ["AC1"] };
+
+	function plan(tasks: Extract<EffortInput, { kind: "plan" }>["tasks"], at = "2026-11-02T12:30:00.000Z"): Extract<EffortInput, { kind: "plan" }> {
+		return { kind: "plan", tasks, criteria: ["AC1"], roles: ["dev", "qa"], at };
+	}
+
+	const handed = applied(applied(approved, plan([RENAME, DOCS], "2026-11-02T11:10:00.000Z")), { kind: "handoff", slug: "rename", at: "2026-11-02T11:30:00.000Z" });
+	const INBOX = { socket: "/tmp/cc-socks/4242.sock", token: "inbox-token" };
+	const DIR = "/agent/team/efforts/software-2026-11-02/tasks/001-dev-rename";
+
+	function journal(lines: EffortLine[], cursor: number, event: string, payload: Record<string, unknown> = {}, written = false): Step {
+		return run(lines, {
+			kind: "journal",
+			teammate: "dev-1",
+			cursor,
+			line: {
+				from: "hook",
+				at: `2026-11-02T12:0${cursor}:00.000Z`,
+				event,
+				payload: { session_id: "8f3c2a1b-0000-4000-8000-000000000001", source: "startup", ...payload },
+				...(event === "SessionStart" ? { inbox: INBOX } : {}),
+			},
+			result: { path: `${DIR}/result-1.md`, written },
+		});
+	}
+
+	function journalled(lines: EffortLine[], cursor: number, event: string, payload: Record<string, unknown> = {}, written = false): EffortLine[] {
+		const result = journal(lines, cursor, event, payload, written);
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		return [...lines, ...result.append];
+	}
+
+	const running = journalled(handed, 1, "SessionStart");
+
+	it("drops a running Task left out of a re-plan, and stops its Teammate with `claude stop`, keeping its conversation", () => {
+		const result = run(running, plan([DOCS]));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append.slice(1), [
+			{ type: "task-dropped", slug: "rename", at: "2026-11-02T12:30:00.000Z" },
+			{ type: "teammate-ended", teammate: "dev-1", how: "stopped", at: "2026-11-02T12:30:00.000Z" },
+		]);
+		assert.deepEqual(result.actions, [{ kind: "stop-teammate", teammate: "dev-1", shortId: "8f3c2a1b" }, { kind: "write-plan" }]);
+		assert.equal(taskStatus(result.state, "rename"), "dropped");
+		assert.match(result.reply ?? "", /[Dd]ropped Task `rename`.*stopped `dev-1`/);
+	});
+
+	it("gives a re-Roled Task to a new Teammate of its new Role, in a new folder", () => {
+		const reroled = applied(running, plan([{ ...RENAME, role: "qa" }, DOCS]));
+		const docs = run(reroled, { kind: "handoff", slug: "docs", at: "2026-11-02T12:40:00.000Z" });
+		assert.ok(docs.ok, docs.ok ? "" : docs.refusal);
+		const again = run([...reroled, ...docs.append], { kind: "handoff", slug: "rename", at: "2026-11-02T12:41:00.000Z" });
+
+		assert.ok(again.ok, again.ok ? "" : again.refusal);
+		assert.equal(again.state.tasks.docs.folder, "002-dev-docs");
+		assert.deepEqual(
+			{ folder: again.state.tasks.rename.folder, teammate: again.state.tasks.rename.teammate },
+			{ folder: "003-qa-rename", teammate: "qa-1" },
+		);
+		assert.equal(taskStatus(again.state, "rename"), "running");
+		assert.deepEqual(again.state.teammates.find((each) => each.id === "dev-1")?.ended, { how: "stopped", at: "2026-11-02T12:30:00.000Z" });
+	});
+
+	it("keeps an accepted Task in the plan, in its Role", () => {
+		const done = journalled(running, 2, "Stop", {}, true);
+		const accepted = applied(done, {
+			kind: "review",
+			slug: "rename",
+			verdict: "accept",
+			result: { path: `${DIR}/result-1.md`, written: true },
+			sendBackLimit: 2,
+			at: "2026-11-02T12:20:00.000Z",
+		});
+
+		assert.match(refusal(accepted, plan([DOCS])), /`rename` is accepted, so it stays in the plan/);
+		assert.match(refusal(accepted, plan([{ ...RENAME, role: "qa" }, DOCS])), /`rename` is accepted in Role `dev`, so it keeps that Role/);
+	});
+
+	it("wakes the Lead once when a Teammate's session ends by itself, and ends that Teammate", () => {
+		const crash = journal(running, 2, "SessionEnd", { reason: "other" });
+
+		assert.ok(crash.ok, crash.ok ? "" : crash.refusal);
+		assert.deepEqual(crash.append, [{ type: "teammate-crashed", teammate: "dev-1", cursor: 2, reason: "other", at: "2026-11-02T12:02:00.000Z" }]);
+		assert.equal(crash.actions.length, 1);
+		assert.equal(crash.actions[0].kind, "wake-lead");
+		assert.match(crash.actions[0].kind === "wake-lead" ? crash.actions[0].text : "", /`dev-1`'s session ended \(other\).*Task `rename`.*send-back/s);
+		assert.deepEqual(crash.state.teammates[0].ended, { how: "crashed", at: "2026-11-02T12:02:00.000Z" });
+
+		const replayed = run([...running, ...crash.append], {
+			kind: "journal",
+			teammate: "dev-1",
+			cursor: 2,
+			line: { from: "hook", at: "2026-11-02T12:02:00.000Z", event: "SessionEnd", payload: { reason: "other" } },
+			result: { path: `${DIR}/result-1.md`, written: false },
+		});
+		assert.ok(replayed.ok);
+		assert.deepEqual(replayed.append, [], "the cursor keeps a replayed journal line from waking the Lead again");
+	});
+
+	it("doesn't count a clear, a resume or its own `claude stop` as a crash", () => {
+		for (const reason of ["clear", "resume"]) {
+			const ended = journal(running, 2, "SessionEnd", { reason });
+			assert.ok(ended.ok);
+			assert.deepEqual(ended.actions, [], reason);
+		}
+		const stopped = applied(running, plan([DOCS]));
+		const after = journal(stopped, 2, "SessionEnd", { reason: "other" });
+		assert.ok(after.ok);
+		assert.deepEqual(after.actions, []);
+	});
+
+	it("sends a Task back to a new Teammate of its Role when its own has ended, in the same folder", () => {
+		const done = journalled(running, 2, "Stop", {}, true);
+		const crashed = journalled(done, 3, "SessionEnd", { reason: "other" });
+		const result = run(crashed, {
+			kind: "review",
+			slug: "rename",
+			verdict: "send_back",
+			feedback: "The loader still reads `colour`.",
+			result: { path: `${DIR}/result-1.md`, written: true },
+			sendBackLimit: 2,
+			mode: "auto",
+			at: "2026-11-02T13:00:00.000Z",
+		});
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append, [
+			{ type: "teammate-started", id: "dev-2", role: "dev", name: "team-software-2026-11-02-dev-2", task: "rename", startedAt: "2026-11-02T13:00:00.000Z", mode: "auto" },
+			{ type: "task-sent-back", slug: "rename", round: 1, at: "2026-11-02T13:00:00.000Z" },
+			{ type: "task-reassigned", slug: "rename", teammate: "dev-2", at: "2026-11-02T13:00:00.000Z" },
+		]);
+		assert.deepEqual(result.actions, [
+			{
+				kind: "restaff-teammate",
+				teammate: { id: "dev-2", role: "dev", name: "team-software-2026-11-02-dev-2" },
+				slug: "rename",
+				folder: "001-dev-rename",
+				round: 1,
+				feedback: "The loader still reads `colour`.",
+			},
+			{ kind: "write-plan" },
+		]);
+		assert.deepEqual({ teammate: result.state.tasks.rename.teammate, round: result.state.tasks.rename.round }, { teammate: "dev-2", round: 2 });
+		assert.equal(taskStatus(result.state, "rename"), "sent back");
+		assert.match(result.reply ?? "", /`dev-1` has ended.*started `dev-2`.*result-2\.md/);
+	});
+});
+
