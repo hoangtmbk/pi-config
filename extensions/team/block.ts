@@ -25,7 +25,7 @@
  */
 
 import { sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
-import { type EffortState, heldPauses, openEscalations, type PauseSetter, type Teammate, type UsageWindow, usageSource, waitingInTerminal } from "./core.ts";
+import { type EffortState, heldPauses, openEscalations, type PauseSetter, type TakeoverTrigger, type Teammate, type UsageWindow, usageSource, waitingInTerminal } from "./core.ts";
 
 /** The widest the frame may get, borders included. */
 export const MAX_WIDTH = 96;
@@ -61,6 +61,8 @@ export interface TeammateRow {
 	mode?: string;
 	/** The mode it was launched in, when it differs from {@link mode}: that is drift. */
 	launchMode?: string;
+	/** Set while the human holds it: since when, and what started the Takeover as the human reads it. */
+	takeover?: { since: string; trigger: string };
 }
 
 /** A planned Task waiting for a Teammate, and why. */
@@ -217,7 +219,22 @@ function teammateRow(state: EffortState, teammate: Teammate): TeammateRow {
 		...(ctx === undefined ? {} : { ctx }),
 		...(mode === undefined ? {} : { mode }),
 		...(drifted ? { launchMode: teammate.mode } : {}),
+		...(teammate.takeover === undefined ? {} : { takeover: { since: teammate.takeover.since, trigger: triggerText(teammate.takeover.trigger) } }),
 	};
+}
+
+/** What started a Takeover, said to the human who did it. */
+function triggerText(trigger: TakeoverTrigger): string {
+	switch (trigger.kind) {
+		case "prompt":
+			return "you typed a prompt";
+		case "command":
+			return `you ran ${trigger.command}`;
+		case "interrupt":
+			return "you interrupted a turn";
+		case "deny":
+			return "you said No to its prompt";
+	}
 }
 
 /** One part of the block: zero or more unframed lines, each at most `width` columns. */
@@ -320,20 +337,28 @@ function age(ms: number): string {
  * cell is the one that gives. At most `maxTeammates` lines, so the block's
  * height has a bound: past it, the last line counts the Teammates not shown.
  */
-function teammateRows(data: TeamBlockData, _now: number, options: BlockOptions, width: number): string[] {
+function teammateRows(data: TeamBlockData, now: number, options: BlockOptions, width: number): string[] {
 	const cap = Math.max(1, options.maxTeammates);
 	const rows = data.teammates.length > cap ? data.teammates.slice(0, cap - 1) : data.teammates;
 	const hidden = data.teammates.length - rows.length;
 	const ids = column(rows.map((row) => clip(oneLine(row.id), MAX_ID)));
 	const shorts = column(rows.map((row) => oneLine(row.shortId === undefined ? "—" : row.newShortId ? `${row.shortId} (new)` : row.shortId)));
-	const activities = column(rows.map((row) => row.activity));
-	const ctxs = column(rows.map((row) => (row.ctx === undefined ? "ctx —" : `ctx ${Math.round(row.ctx)}%`)));
-	const modes = rows.map((row) => oneLine(row.launchMode === undefined || row.launchMode === row.mode ? (row.mode ?? "") : `${row.mode ?? "?"}≠${row.launchMode}`));
+	// A Teammate the human holds shows whose it is and for how long in place of its activity, and in
+	// place of its Task, context and mode, what started the Takeover and how to hand it back.
+	const activities = column(rows.map((row) => (row.takeover === undefined ? row.activity : `✋ YOURS ${age(now - Date.parse(row.takeover.since))}`)));
 	const left = rows.map((_, index) => [ids[index], shorts[index], activities[index]].join(GAP));
-	const right = rows.map((_, index) => [ctxs[index], modes[index]].filter(Boolean).join(GAP));
-	const room = width - Math.max(0, ...left.map(visibleWidth)) - Math.max(0, ...right.map(visibleWidth)) - 2 * GAP.length;
-	const tasks = column(rows.map((row) => clip(oneLine(row.doing ? `${row.task} · ${row.doing}` : row.task), room)));
-	const lines = rows.map((_, index) => [left[index], tasks[index], right[index]].join(GAP).trimEnd());
+	const leftWidth = Math.max(0, ...left.map(visibleWidth));
+	const working = rows.flatMap((row, index) => (row.takeover === undefined ? [{ row, index }] : []));
+	const ctxs = column(working.map(({ row }) => (row.ctx === undefined ? "ctx —" : `ctx ${Math.round(row.ctx)}%`)));
+	const modes = working.map(({ row }) => oneLine(row.launchMode === undefined || row.launchMode === row.mode ? (row.mode ?? "") : `${row.mode ?? "?"}≠${row.launchMode}`));
+	const right = working.map((_, at) => [ctxs[at], modes[at]].filter(Boolean).join(GAP));
+	const room = width - leftWidth - Math.max(0, ...right.map(visibleWidth)) - 2 * GAP.length;
+	const tasks = column(working.map(({ row }) => clip(oneLine(row.doing ? `${row.task} · ${row.doing}` : row.task), room)));
+	const lines = rows.map((row, index) => {
+		if (row.takeover !== undefined) return [left[index], clipHead(`${oneLine(row.takeover.trigger)} · `, `/team handback ${oneLine(row.id)}`, width - leftWidth - GAP.length)].join(GAP);
+		const at = working.findIndex((each) => each.index === index);
+		return [left[index], tasks[at], right[at]].join(GAP).trimEnd();
+	});
 	return hidden > 0 ? [...lines, `+${hidden} more Teammate${hidden === 1 ? "" : "s"}`] : lines;
 }
 
@@ -366,6 +391,12 @@ export function clip(text: string, width: number): string {
 	if (width <= 0) return "";
 	if (visibleWidth(text) <= width) return text;
 	return `${sliceByColumn(text, 0, width - 1, true)}${ELLIPSIS}`;
+}
+
+/** `head` then `tail` in at most `width` columns, clipping `head` first so the tail stays whole while it fits. */
+function clipHead(head: string, tail: string, width: number): string {
+	const room = width - visibleWidth(tail);
+	return room <= 0 ? clip(tail, width) : `${clip(head, room)}${tail}`;
 }
 
 /** `text` filled out to `width` columns. */

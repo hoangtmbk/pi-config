@@ -36,6 +36,8 @@ interface Dialog {
 	kind: "select" | "input" | "editor" | "confirm";
 	title: string;
 	options?: string[];
+	/** A confirm's text. */
+	text?: string;
 	answer: string | boolean | undefined;
 }
 
@@ -205,10 +207,10 @@ function fakePi(
 		requestRender: (force?: boolean) => tuiEvents.push(`requestRender(${force === true})`),
 		terminal: { rows: 40, columns: 100, write: (data: string) => tuiEvents.push(`write ${JSON.stringify(data)}`) },
 	};
-	function answer(kind: Dialog["kind"], title: string, choices?: string[]) {
+	function answer(kind: Dialog["kind"], title: string, choices?: string[], text?: string) {
 		assert.ok(answers.length > 0, `the extension opened a ${kind} dialog "${title}" the test has no answer for`);
 		const played = answers.shift();
-		dialogs.push({ kind, title, options: choices, answer: played });
+		dialogs.push({ kind, title, options: choices, ...(text === undefined ? {} : { text }), answer: played });
 		return played;
 	}
 	const ctx = {
@@ -236,8 +238,8 @@ function fakePi(
 			async editor(title: string) {
 				return answer("editor", title);
 			},
-			async confirm(title: string) {
-				return answer("confirm", title);
+			async confirm(title: string, text?: string) {
+				return answer("confirm", title, undefined, text);
 			},
 			setWidget(key: string, lines: string[] | undefined, widgetOptions?: { placement?: string }) {
 				widgets.push({ key, lines, placement: widgetOptions?.placement });
@@ -370,8 +372,8 @@ describe("/team", () => {
 		await pi.team("");
 
 		assert.deepEqual(pi.notifications, [
-			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`.", type: "error" },
-			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`.", type: "info" },
+			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`, `handback`.", type: "error" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`, `handback`.", type: "info" },
 		]);
 	});
 });
@@ -1618,7 +1620,7 @@ describe("handing off: team_handoff", () => {
 		assert.deepEqual(pi.sleeps, [5000, 10000]);
 	});
 
-	it("gives the Teammate settings that add the hooks, the Playbook's rules for its Role, every escalate ask and a deny on editing the Effort's records, and nothing that replaces the human's own; the floor hook also names the folder the Teammate works in", async () => {
+	it("gives the Teammate settings that add the hooks, the env its mod journals by, the Playbook's rules for its Role, every escalate ask and a deny on editing the Effort's records, and nothing that replaces the human's own; the floor hook also names the folder the Teammate works in", async () => {
 		const { pi, dir } = await crewApproved();
 		await pi.call("team_plan", { tasks: CREW_PLAN });
 
@@ -1638,6 +1640,7 @@ describe("handing off: team_handoff", () => {
 				PermissionDenied: [entry],
 				Notification: [entry],
 				PostToolUse: [entry],
+				PostToolUseFailure: [entry],
 				PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: `${command} '${workspace}'` }] }],
 			};
 		};
@@ -1651,12 +1654,14 @@ describe("handing off: team_handoff", () => {
 			crossSessionInbound: "accept",
 			hooks: hooks("builder-1", builderCwd),
 			statusLine: statusLine("builder-1"),
+			env: { TEAM_HOOK: JSON.stringify([process.execPath, HOOK_SCRIPT, dir, "builder-1"]) },
 		});
 		assert.deepEqual(scout, {
 			permissions: { allow: ["Bash(git status)"], deny: ["Bash(curl:*)", ...records], ask },
 			crossSessionInbound: "accept",
 			hooks: hooks("scout-1", scoutCwd),
 			statusLine: statusLine("scout-1"),
+			env: { TEAM_HOOK: JSON.stringify([process.execPath, HOOK_SCRIPT, dir, "scout-1"]) },
 		});
 	});
 
@@ -2697,6 +2702,126 @@ describe("staffing: the ladder and clearing between Tasks", () => {
 	});
 });
 
+/** `builder-1` takes `rename-key`'s pointer in session `c0ffee12`, then the human types a prompt of their own in its terminal. */
+const TAKEN: FakeHookStep[] = [
+	{ event: "SessionStart", payload: { source: "startup", session_id: "c0ffee12-0000-4000-8000-000000000001" } },
+	{ event: "UserPromptSubmit" },
+	{ mod: "prompt.submit", input: { text: "Use snake_case for the new key.", origin: { kind: "composer" } } },
+];
+const TAKEOVER_MARKER = join("teammates", "builder-1", "takeover");
+const HANDBACK_TITLE = "Hand `builder-1` back to the Lead?";
+const HANDBACK_TEXT =
+	"Any send held for it while you had it is dropped, and the Lead reviews what you did in its terminal like any result. The next new Task it gets starts with a clear of its context.";
+
+/** An approved crew Effort on {@link STAFF_PLAN} whose `builder-1`, handed `rename-key`, the human has taken over in its terminal. */
+async function takenOver() {
+	const crew = await crewApproved({ hooks: TAKEN, replies: WORKS });
+	await crew.pi.call("team_plan", { tasks: STAFF_PLAN });
+	await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+	await until(() => effortLines(crew.dir).some((line) => line.type === "takeover-started"), "the Lead records the Takeover");
+	await until(() => teammateWakes(crew.pi.sent).some((wake) => wake.content.includes("The human took over `builder-1`")), "the Lead is woken about the Takeover");
+	crew.pi.dialogs.length = 0;
+	crew.pi.notifications.length = 0;
+	return crew;
+}
+
+describe("taking a Teammate over: the human at its terminal", () => {
+	it("holds the Lead's sends and the result while the human has `builder-1`, then the mod's `/handback` ends it with a summary wake, and the next new Task clears it", async () => {
+		const { pi, dir } = await takenOver();
+
+		assert.ok(existsSync(join(dir, TAKEOVER_MARKER)), "the hook's takeover marker is written");
+		assert.deepEqual(effortLines(dir).find((line) => line.type === "takeover-started")?.trigger, { kind: "prompt" });
+		const sendReply = await pi.call("team_send", { teammate: "builder-1", message: "Rename it in docs/config.md too." });
+		assert.match(sendReply, /held/);
+		assert.deepEqual(pi.claude.inbox(), [], "a held send reaches no inbox");
+		writeFileSync(join(dir, RENAME_RESULT), "Renamed by hand.\n");
+		await pi.claude.terminal(BUILDER_1, [{ event: "Stop", payload: { last_assistant_message: "Done." } }]);
+		await until(() => journalled(dir, "Stop"), "the Stop is journalled");
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /taken `builder-1` over/);
+		assert.ok(!effortLines(dir).some((line) => line.type === "task-done"), "a Stop during a Takeover isn't done");
+
+		await pi.claude.terminal(BUILDER_1, [{ mod: "command.run", input: { command: "handback", args: "renamed by hand", origin: { kind: "composer" } } }]);
+
+		await until(() => effortLines(dir).some((line) => line.type === "takeover-ended"), "the Lead records the hand-back");
+		const ended = effortLines(dir).find((line) => line.type === "takeover-ended");
+		assert.equal(ended?.by, "terminal");
+		assert.equal(ended?.note, "renamed by hand");
+		assert.ok(effortLines(dir).some((line) => line.type === "task-done" && line.slug === "rename-key"), "the result written meanwhile is done at the hand-back");
+		assert.ok(!existsSync(join(dir, TAKEOVER_MARKER)), "the marker is removed");
+		await until(() => teammateWakes(pi.sent).some((wake) => wake.content.includes("handed `builder-1` back from its terminal")), "the Lead is woken at the hand-back");
+		const summary = teammateWakes(pi.sent).find((wake) => wake.content.includes("handed `builder-1` back"))?.content ?? "";
+		for (const part of ['"Use snake_case for the new key."', '"Rename it in docs/config.md too."', "Their note: renamed by hand", join(dir, RENAME_RESULT)]) {
+			assert.ok(summary.includes(part), `the summary has ${part}:\n${summary}`);
+		}
+		assert.match(await pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /^Accepted Task `rename-key`/);
+
+		await pi.call("team_handoff", { slug: "update-docs", body: "# Docs\n" });
+
+		await until(() => pi.claude.inbox().length === 2, "the clear and the pointer reach the inbox");
+		assert.deepEqual(pi.claude.inbox().map(sentContent), [CLEAR_MARKER, newTaskPointer(dir, "update-docs", "002-builder-update-docs")]);
+	});
+
+	it("`/team handback` asks first, then ends the Takeover in pi, dropping the held send and waking the Lead with the note", async () => {
+		const { pi, dir } = await takenOver();
+		await pi.call("team_send", { teammate: "builder-1", message: "Rename it in docs/config.md too." });
+		pi.answer(true);
+
+		await pi.team("handback builder-1 done by hand");
+
+		assert.deepEqual(pi.dialogs, [{ kind: "confirm", title: HANDBACK_TITLE, options: undefined, text: HANDBACK_TEXT, answer: true }]);
+		assert.deepEqual(pi.notifications, [{ message: "Handed `builder-1` back: 1 held send is dropped, and the Lead reviews what you did.", type: "info" }]);
+		const ended = effortLines(dir).find((line) => line.type === "takeover-ended");
+		assert.equal(ended?.by, "pi");
+		assert.equal(ended?.note, "done by hand");
+		assert.ok(!existsSync(join(dir, TAKEOVER_MARKER)));
+		const summary = teammateWakes(pi.sent).at(-1)?.content ?? "";
+		assert.ok(summary.includes("handed `builder-1` back in pi"), summary);
+		assert.ok(summary.includes("Their note: done by hand"), summary);
+		assert.deepEqual(pi.claude.inbox(), [], "the held send is dropped, not sent");
+	});
+
+	it("`/team handback` changes nothing when the human declines", async () => {
+		const { pi, dir } = await takenOver();
+		pi.answer(false);
+
+		await pi.team("handback builder-1");
+
+		assert.equal(pi.dialogs.length, 1);
+		assert.ok(!effortLines(dir).some((line) => line.type === "takeover-ended"));
+		assert.ok(existsSync(join(dir, TAKEOVER_MARKER)));
+	});
+
+	it("`/team handback` refuses a Teammate nobody holds without asking, and names the taken-over ones when given none", async () => {
+		const { pi } = await renameReported({ replies: [] });
+		pi.dialogs.length = 0;
+		pi.notifications.length = 0;
+
+		await pi.team("handback builder-1");
+		await pi.team("handback");
+
+		assert.deepEqual(pi.dialogs, []);
+		assert.deepEqual(pi.notifications, [
+			{ message: "Nobody holds `builder-1`: it isn't taken over, so there is nothing to hand back.", type: "error" },
+			{ message: "Name the Teammate to hand back: `/team handback <teammate> [note]`. Taken over now: none.", type: "error" },
+		]);
+	});
+
+	it("the attach menu offers \"Hand back\" during a Takeover, which asks as `/team handback` does and records no attach", async () => {
+		const { pi, dir } = await takenOver();
+		pi.answer("Hand back", true);
+
+		await pi.team("attach builder-1");
+
+		assert.deepEqual(pi.dialogs, [
+			{ kind: "select", title: "builder-1 (c0ffee12)", options: ["Attach here", "Copy the command", "Hand back"], answer: "Hand back" },
+			{ kind: "confirm", title: HANDBACK_TITLE, options: undefined, text: HANDBACK_TEXT, answer: true },
+		]);
+		assert.deepEqual(pi.claude.attaches(), []);
+		assert.deepEqual(attachedLines(dir), []);
+		assert.equal(effortLines(dir).find((line) => line.type === "takeover-ended")?.by, "pi");
+	});
+});
+
 describe("/team while the Lead is streaming", () => {
 	it("runs setup and pending without waiting for the Lead to go idle", async () => {
 		const roots = tempRoots();
@@ -3584,8 +3709,8 @@ describe("/team attach [id]", () => {
 		await leading.team("attach qa-1");
 
 		assert.deepEqual(pi.notifications, [
-			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`.", type: "info" },
-			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`.", type: "info" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`, `handback`.", type: "info" },
+			{ message: "No Teammate has a session to attach to: this session holds no Effort. Subcommands: `start`, `setup`, `pending`, `pause`, `resume`, `report`, `reports`, `cancel`, `attach`, `handback`.", type: "info" },
 		]);
 		assert.deepEqual(leading.notifications, [{ message: "There is no Teammate `qa-1` with a session to attach to. Teammates with one: `builder-1`.", type: "error" }]);
 	});

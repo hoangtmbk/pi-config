@@ -58,6 +58,16 @@
  *   `SessionStart` with source `clear`, through the settings' hook commands;
  *   its `FAKE_CLAUDE_AGENTS` record takes the new session id and keeps its
  *   short id.
+ * - A `{ mod: <event>, input }` step stands for the human at the session's
+ *   terminal: the input (`prompt.submit`, `command.run`, `turn.complete` or
+ *   `session.start`, as Claude Code raises it) goes through the session's mods'
+ *   handlers for that event, in a process of its own, as Claude Code calls
+ *   them. Their `$` has `env.get` (the `--settings` file's `env` over the
+ *   process's), `process.run`, which runs the command with its `stdin`, and
+ *   `command.register`; the engine's own behaviour beneath them does nothing.
+ * - `claude --fake-terminal <json {name, steps}>` plays steps, as in
+ *   `FAKE_CLAUDE_HOOKS`, on the session named `name`: the human at its
+ *   terminal later on, after the launch returned.
  * - `FAKE_CLAUDE_ATTACH_OUT`: a file each `attach` appends one JSON line to:
  *   its argv and the device and inode its stdin, stdout and stderr are open
  *   on, so a test can tell whether it was handed the terminal pi runs on.
@@ -119,6 +129,14 @@ interface Agent extends Session {
 
 if (argv[0] === "--fake-inbox") {
 	serveInbox(JSON.parse(argv[1] ?? "{}") as Session);
+} else if (argv[0] === "--fake-terminal") {
+	const { name, steps } = JSON.parse(argv[1] ?? "{}") as { name: string; steps: HookStep[] };
+	const agent = registry().find((each) => each.name === name);
+	if (agent === undefined) throw new Error(`fake claude: no session named ${name}`);
+	playSteps(steps, { ...agent, id: agent.sessionId ?? agent.id }, "");
+} else if (argv[0] === "--fake-mod") {
+	const { session, event, input } = JSON.parse(argv[1] ?? "{}") as { session: Session; event: string; input: unknown };
+	process.stdout.write(`${JSON.stringify((await raise(session, event, input)) ?? null)}\n`);
 } else {
 	await main();
 }
@@ -266,7 +284,7 @@ function fileOf(flag: string): string | undefined {
 }
 
 /** One scripted step of a started session. */
-type HookStep = ({ event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string } | { statusLine: Record<string, unknown> }) & { when?: string };
+type HookStep = ({ event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string } | { statusLine: Record<string, unknown> } | { mod: string; input: Record<string, unknown> }) & { when?: string };
 
 /** Start the session's inbox server, detached so it outlives this launch, and wait until it listens. */
 async function openInbox(session: Session): Promise<void> {
@@ -317,22 +335,64 @@ function serveInbox(session: Session): void {
 	}, 200);
 }
 
-/** A mod's `session.receive` handler, as Claude Code calls it. */
-type Receive = ($: unknown, event: { text: string }, next: (event: { text: string }) => unknown) => unknown;
+/** A mod's handler, as Claude Code calls it. */
+type Handler = ($: unknown, event: unknown, next: (event: unknown) => unknown) => unknown;
 
-/** Run the message through the session's mods; true when one consumed it. */
-async function consumed(session: Session, text: string): Promise<boolean> {
-	const handlers: Receive[] = [];
+/** The session's mods' handlers for `name`, in the order their modules register them. */
+async function handlersFor(session: Session, name: string): Promise<Handler[]> {
+	const handlers: Handler[] = [];
 	for (const plugin of session.plugins) {
 		const hooks = join(plugin, "hooks", "hooks.json");
 		if (!existsSync(hooks)) continue;
 		for (const module of (JSON.parse(readFileSync(hooks, "utf8")) as { modules?: string[] }).modules ?? []) {
-			const loaded = (await import(join(plugin, "hooks", module))) as { register?: (on: (event: string, handler: Receive) => void) => void };
+			const loaded = (await import(join(plugin, "hooks", module))) as { register?: (on: (event: string, handler: Handler) => void) => void };
 			loaded.register?.((event, handler) => {
-				if (event === "session.receive") handlers.push(handler);
+				if (event === name) handlers.push(handler);
 			});
 		}
 	}
+	return handlers;
+}
+
+/** Run `event` through the handlers in turn, each one's `next` the one after it, the last's the engine (`engine`). */
+function through(handlers: Handler[], $: unknown, event: unknown, engine: (event: unknown) => unknown = () => undefined): unknown {
+	const at = (index: number, each: unknown): unknown => {
+		const handler = handlers[index];
+		return handler === undefined ? engine(each) : handler($, each, (next) => at(index + 1, next));
+	};
+	return at(0, event);
+}
+
+/** Raise the human's input at the terminal through the session's mods: a `{ mod }` step. */
+async function raise(session: Session, event: string, input: unknown): Promise<unknown> {
+	const env = (JSON.parse(session.settings ?? "{}") as { env?: Record<string, string> }).env ?? {};
+	const $ = {
+		env: { get: async (name: string) => env[name] ?? process.env[name] },
+		process: {
+			async run(command: readonly string[], init: { stdin?: string } = {}) {
+				const [file = "", ...args] = command;
+				try {
+					const stdout = execFileSync(file, args, { cwd: session.cwd, input: init.stdin ?? "", encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] });
+					return { exitCode: 0, stdout, stderr: "" };
+				} catch (error) {
+					const failed = error as { status?: number; stdout?: string; stderr?: string };
+					return { exitCode: failed.status ?? 1, stdout: failed.stdout ?? "", stderr: failed.stderr ?? "" };
+				}
+			},
+		},
+		command: {
+			register: async ({ name }: { name: string }) => ({ command: name }),
+			run: async ({ command }: { command: string }) => {
+				throw new Error(`fake claude: no scripted command /${command} from a mod step`);
+			},
+		},
+	};
+	return await through(await handlersFor(session, event), $, input);
+}
+
+/** Run the message through the session's mods; true when one consumed it. */
+async function consumed(session: Session, text: string): Promise<boolean> {
+	const handlers = await handlersFor(session, "session.receive");
 	const $ = {
 		command: {
 			async run({ command }: { command: string }): Promise<void> {
@@ -345,11 +405,7 @@ async function consumed(session: Session, text: string): Promise<boolean> {
 			},
 		},
 	};
-	const through = (index: number, event: { text: string }): unknown => {
-		const handler = handlers[index];
-		return handler === undefined ? undefined : handler($, event, (next) => through(index + 1, next));
-	};
-	const result = (await through(0, { text })) as { consumed?: unknown } | undefined;
+	const result = (await through(handlers, $, { text })) as { consumed?: unknown } | undefined;
 	return result?.consumed !== undefined;
 }
 
@@ -382,6 +438,10 @@ function playSteps(steps: HookStep[], session: Session, pointer: string): void {
 	const inbox = { CLAUDE_CODE_MESSAGING_SOCKET: session.socket, CLAUDE_CODE_MESSAGING_TOKEN: session.token };
 	for (const step of steps) {
 		if (step.when !== undefined && !pointer.includes(step.when)) continue;
+		if ("mod" in step) {
+			execFileSync(process.execPath, [process.argv[1] ?? "", "--fake-mod", JSON.stringify({ session, event: step.mod, input: step.input })], { stdio: ["ignore", "ignore", "inherit"] });
+			continue;
+		}
 		if ("statusLine" in step) {
 			const command = settings.statusLine?.command;
 			if (command === undefined) throw new Error("fake claude: the session's settings have no status line command");

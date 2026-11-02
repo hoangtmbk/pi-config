@@ -3,7 +3,8 @@
  *
  * Attaching only ever views a Teammate's session: it is never a Takeover, and
  * tmux is only a viewer, never a host (ADR-0006). The menu is a table, so the
- * Takeover's "hand back" (#113) is one more row.
+ * Takeover's "Hand back" (#113) is one more row, shown only while the human
+ * holds the Teammate; it isn't an attach, so it records none.
  */
 
 import { execFile } from "node:child_process";
@@ -18,6 +19,8 @@ export interface AttachTarget {
 	claudePath: string;
 	/** `claude attach <short id>`, as the human would type it. */
 	command: string;
+	/** The human holds it in a Takeover, so the menu offers to hand it back. */
+	takenOver?: boolean;
 }
 
 /** What a menu entry can reach. */
@@ -28,13 +31,17 @@ export interface AttachSurface {
 	env: Record<string, string | undefined>;
 	tmuxPath: string;
 	copy(text: string): Promise<void>;
+	/** `/team handback` on the Teammate: its confirm, then the hand-back. */
+	handBack?(teammate: string): Promise<void>;
 }
 
 /** One entry of the menu, shown only when {@link shows} says so. */
 interface MenuEntry {
 	label: string;
-	shows(surface: AttachSurface): boolean;
+	shows(surface: AttachSurface, target: AttachTarget): boolean;
 	run(target: AttachTarget, surface: AttachSurface): Promise<void>;
+	/** False for an entry that doesn't reach the session, so no attach is recorded. */
+	attaches?: false;
 }
 
 const MENU: MenuEntry[] = [
@@ -64,12 +71,18 @@ const MENU: MenuEntry[] = [
 			}
 		},
 	},
+	{
+		label: "Hand back",
+		shows: (surface, target) => target.takenOver === true && surface.handBack !== undefined,
+		run: (target, surface) => surface.handBack?.(target.teammate) ?? Promise.resolve(),
+		attaches: false,
+	},
 ];
 
 /** The target for a picked Teammate row; undefined for one with no session yet. */
 export function attachTarget(row: TeammateRow, claudePath: string): AttachTarget | undefined {
 	if (row.shortId === undefined) return undefined;
-	return { teammate: row.id, shortId: row.shortId, claudePath, command: attachCommand(claudePath, row.shortId) };
+	return { teammate: row.id, shortId: row.shortId, claudePath, command: attachCommand(claudePath, row.shortId), ...(row.takeover === undefined ? {} : { takenOver: true }) };
 }
 
 /** A Teammate's line in the picker: id, short id, what it is doing and its Task. */
@@ -79,17 +92,17 @@ export function pickerLabel(row: TeammateRow): string {
 
 /**
  * Ask the human what to do with the picked Teammate, then do it. Resolves
- * with the run, or undefined when the human backs out. Outside the TUI there
- * is no menu to show: the command is shown instead.
+ * with the run and whether it is an attach, or undefined when the human backs
+ * out. Outside the TUI there is no menu to show: the command is shown instead.
  */
-export async function chooseAttach(target: AttachTarget, surface: AttachSurface): Promise<(() => Promise<void>) | undefined> {
+export async function chooseAttach(target: AttachTarget, surface: AttachSurface): Promise<{ run: () => Promise<void>; attaches: boolean } | undefined> {
 	if (surface.mode !== "tui") {
-		return async () => surface.ui.notify(`Attach to \`${target.teammate}\` from a terminal: ${target.command}`, "info");
+		return { run: async () => surface.ui.notify(`Attach to \`${target.teammate}\` from a terminal: ${target.command}`, "info"), attaches: true };
 	}
-	const entries = MENU.filter((entry) => entry.shows(surface));
+	const entries = MENU.filter((entry) => entry.shows(surface, target));
 	const label = await surface.ui.select(`${target.teammate} (${target.shortId})`, entries.map((entry) => entry.label));
 	const entry = entries.find((candidate) => candidate.label === label);
-	return entry ? () => entry.run(target, surface) : undefined;
+	return entry ? { run: () => entry.run(target, surface), attaches: entry.attaches !== false } : undefined;
 }
 
 /**

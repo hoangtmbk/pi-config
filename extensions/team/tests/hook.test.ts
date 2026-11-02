@@ -109,6 +109,23 @@ describe("the hook script", () => {
 		);
 	});
 
+	it("journals what the mod hands it as a mod line, ringing the doorbell, so the Lead hears the human's input in the terminal", async () => {
+		const dir = effortDir();
+		const lead = await fakeLead();
+		writeFileSync(join(dir, "lead.json"), JSON.stringify({ pid: process.pid, port: lead.port, token: "t0ken", sessionFile: "/s.jsonl", startedAt: "2026-11-02T10:00:00.000Z" }));
+
+		const ran = await runHook(dir, "builder-1", { mod: "prompt.submit", payload: { text: "try the other key" } });
+		await lead.settled();
+		lead.server.close();
+
+		assert.deepEqual(ran, { code: 0, output: "" });
+		const [line, ...rest] = journal(dir, "builder-1");
+		assert.deepEqual(rest, []);
+		assert.equal(typeof line.at, "string");
+		assert.deepEqual({ ...line, at: undefined }, { from: "mod", at: undefined, event: "prompt.submit", payload: { text: "try the other key" } });
+		assert.deepEqual(lead.lines().map((each) => JSON.parse(each)), [{ type: "doorbell", token: "t0ken", teammate: "builder-1" }]);
+	});
+
 	it("journals a SessionStart with the inbox socket and token Claude Code gives the hook", async () => {
 		const dir = effortDir();
 
@@ -291,6 +308,23 @@ describe("the hook script holding a PermissionRequest", () => {
 		const lines = journal(dir, "builder-1");
 		assert.deepEqual(lines.map((line) => line.event), ["PermissionRequest", "hold-expired"]);
 		assert.equal(lines[1].request, lines[0].request);
+		assert.deepEqual(lead.doorbells(), [{ type: "doorbell", token: "t0ken", teammate: "builder-1" }]);
+	});
+
+	it("exits at once with no decision during a Takeover, journalling the prompt without a request id and ringing the doorbell", async () => {
+		const dir = effortDir();
+		const lead = await answeringLead(({ request }) => ({ type: "decision", request, decision: { behavior: "allow" } }));
+		writeLead(dir, lead.port);
+		mkdirSync(join(dir, "teammates", "builder-1"), { recursive: true });
+		writeFileSync(join(dir, "teammates", "builder-1", "takeover"), "");
+
+		const result = await runHook(dir, "builder-1", PERMISSION);
+		lead.server.close();
+
+		assert.deepEqual(result, { code: 0, output: "" });
+		const lines = journal(dir, "builder-1");
+		assert.deepEqual(lines.map((line) => [line.event, line.request]), [["PermissionRequest", undefined]]);
+		assert.deepEqual(lead.held(), []);
 		assert.deepEqual(lead.doorbells(), [{ type: "doorbell", token: "t0ken", teammate: "builder-1" }]);
 	});
 
