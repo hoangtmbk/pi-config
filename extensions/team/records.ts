@@ -13,7 +13,7 @@
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import type { EffortLine, PendingApproval } from "./core.ts";
+import type { EffortLine, PendingApproval, Workspace } from "./core.ts";
 import { BRIEF_SKELETON, isKebabCase, type Playbook, sha256 } from "./definitions.ts";
 
 /** The files of one Effort, all under `<agent dir>/team/efforts/<effort-id>/`. */
@@ -93,6 +93,8 @@ export interface ApprovalRecord {
 	playbook: string;
 	/** Of the `team/` folder, as `teamDigest` computes it. */
 	team: string;
+	/** The Workspace the approval added, with the commit the Effort started from. */
+	workspace?: Workspace;
 	at: string;
 }
 
@@ -120,13 +122,14 @@ export function teamDigest(dir: string): string {
 
 /**
  * Promote the snapshot the human approved to `brief.md`, copy the Playbook and
- * the Team in force beside it, and record the act. Everything the Effort reads
+ * the Team in force beside it, and record the act with the Workspace it
+ * added. Everything the Effort reads
  * from now on is these copies, so editing the human's own Team or Playbook
  * changes nothing here.
  */
 export function promoteBrief(
 	paths: EffortPaths,
-	promotion: { approval: PendingApproval; playbookFile: string; teamDir: string; at: string },
+	promotion: { approval: PendingApproval; playbookFile: string; teamDir: string; workspace?: Workspace; at: string },
 ): ApprovalRecord {
 	writeFileSync(paths.brief, promotion.approval.snapshot);
 	const playbook = readFileSync(promotion.playbookFile);
@@ -138,6 +141,7 @@ export function promoteBrief(
 		brief: sha256(promotion.approval.snapshot),
 		playbook: sha256(playbook),
 		team: teamDigest(paths.team),
+		...(promotion.workspace === undefined ? {} : { workspace: promotion.workspace }),
 		at: promotion.at,
 	};
 	appendFileSync(paths.approvals, `${JSON.stringify(record)}\n`);

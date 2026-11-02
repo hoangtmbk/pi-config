@@ -18,12 +18,13 @@ import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { versionWarning } from "./claude.ts";
-import { type EffortState, fold, openEffort, type PendingApproval, refuseRequest, step } from "./core.ts";
+import { trustFolder, versionWarning } from "./claude.ts";
+import { type EffortState, fold, openEffort, type PendingApproval, refuseRequest, step, type Workspace } from "./core.ts";
 import { listTeams, loadTeam, type Playbook, sha256, type Team, type TeamRoots } from "./definitions.ts";
 import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
 import { appendLines, checkRecords, createEffort, type EffortPaths, promoteBrief, readLines, validateBrief } from "./records.ts";
 import { repoRoot } from "./repo.ts";
+import { addWorkspace } from "./workspace.ts";
 import {
 	ADOPT_PLAYBOOK,
 	APPROVE,
@@ -225,20 +226,48 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			}
 		}
 		const at = now().toISOString();
-		const result = step(state, { kind: "answer", id: item.id, answer: answer === APPROVE ? "approved" : "sent-back", note, at });
+		const answered = { kind: "answer", id: item.id, answer: answer === APPROVE ? "approved" : "sent-back", note, at } as const;
+		let result = step(state, answered);
 		if (!result.ok) {
 			ctx.ui.notify(result.refusal, "error");
 			return;
 		}
+		// The core is pure, so the answer is known to stand before the Workspace changes the human's repo.
+		let workspace: Workspace | undefined;
+		if (answer === APPROVE) {
+			const added = addEffortWorkspace(state, found.team);
+			if ("error" in added) {
+				ctx.ui.notify(`The Brief of Effort \`${state.effortId}\` (request \`${item.id}\`) can't be approved yet: ${added.error}. Nothing was approved; answer it again from \`/team pending\` once that is fixed.`, "error");
+				return;
+			}
+			workspace = added.workspace;
+			result = step(state, { ...answered, workspace });
+			if (!result.ok) throw new Error(`the Effort core refused an answer it had just accepted: ${result.refusal}`);
+		}
 		// The records are written before the line that approves them, so the log never claims an approval its records lack.
 		for (const action of result.actions) {
-			if (action.kind === "promote-brief") promoteBrief(held.paths, { approval: action.approval, playbookFile: found.playbook.filePath, teamDir: found.team.dir, at });
+			if (action.kind === "promote-brief") promoteBrief(held.paths, { approval: action.approval, playbookFile: found.playbook.filePath, teamDir: found.team.dir, workspace, at });
 		}
 		appendLines(held.paths, result.append);
-		if (answer === APPROVE) ctx.ui.notify(`Approved the Brief of Effort \`${state.effortId}\`: ${held.paths.brief}, sha256 ${item.sha256}.`, "info");
+		if (answer === APPROVE) {
+			const where = workspace ? ` Workspace: ${workspace.path} on \`${workspace.branch}\`, from \`${workspace.from}\` at ${workspace.base}.` : "";
+			ctx.ui.notify(`Approved the Brief of Effort \`${state.effortId}\`: ${held.paths.brief}, sha256 ${item.sha256}.${where}`, "info");
+		}
 		for (const action of result.actions) {
 			if (action.kind === "wake-lead") wakeLead("team-pending", action.text);
 		}
+	}
+
+	/**
+	 * What Brief approval sets up before any Teammate starts: folder trust for
+	 * the repo in Claude Code's config, then the Workspace of the Team's kind.
+	 * Trust comes first, since it changes nothing git would refuse to redo.
+	 */
+	function addEffortWorkspace(state: EffortState, team: Team): { workspace: Workspace } | { error: string } {
+		if (team.workspace === undefined) return { error: `Team \`${team.name}\` names no \`workspace\` kind in its team.md` };
+		const untrusted = trustFolder(paths.claudeConfigPath, state.repo);
+		if (untrusted) return untrusted;
+		return addWorkspace(team.workspace, state.repo, state.effortId);
 	}
 
 	/** `team_request_approval` at the Effort's checkpoint: check the Brief, snapshot it and add it to `/team pending`. */
