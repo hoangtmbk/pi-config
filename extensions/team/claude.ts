@@ -11,9 +11,10 @@
  */
 
 import { execFile, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Inbox } from "./core.ts";
 import type { PermissionMode, Role } from "./definitions.ts";
@@ -125,6 +126,21 @@ export function launchBackground(claudePath: string, cwd: string, args: string[]
 	});
 }
 
+/** Long enough for `claude stop` to end a background session. */
+const STOP_TIMEOUT_MS = 30_000;
+
+/**
+ * Stop a background session with `claude stop <short id>`, which keeps its
+ * conversation. Returns an error to show the Lead when it fails.
+ */
+export function stopBackground(claudePath: string, shortId: string): Promise<{ error: string } | undefined> {
+	return new Promise((resolve) => {
+		execFile(claudePath, ["stop", shortId], { timeout: STOP_TIMEOUT_MS, encoding: "utf8" }, (error, _stdout, stderr) => {
+			resolve(error ? { error: (stderr.trim() || error.message).split("\n")[0] } : undefined);
+		});
+	});
+}
+
 /** Long enough for a live session's inbox to take one message. */
 const SEND_TIMEOUT_MS = 10_000;
 
@@ -194,6 +210,8 @@ export interface TeammateLaunch {
 	prompt: string;
 	/** The first handoff pointer, run as the first turn. */
 	pointer: string;
+	/** The per-user copy of the Team's mod ({@link installMod}), loaded with `--plugin-dir` before the Role's own plugins. */
+	mod?: string;
 }
 
 /**
@@ -221,6 +239,7 @@ export function teammateArgs(launch: TeammateLaunch): string[] {
 		writeFileSync(mcp, `${JSON.stringify({ mcpServers: role.mcpServers }, null, 2)}\n`);
 		args.push("--mcp-config", mcp);
 	}
+	if (launch.mod !== undefined) args.push("--plugin-dir", launch.mod);
 	for (const plugin of role.plugins) args.push("--plugin-dir", plugin);
 	args.push("--name", launch.name, launch.pointer);
 	return args;
@@ -277,6 +296,53 @@ export function teammateSettings(from: SettingsFrom): Record<string, unknown> {
 		crossSessionInbound: "accept",
 		hooks,
 	};
+}
+
+/** The Team's mod as this extension ships it; Claude Code loads a copy ({@link installMod}). */
+export const BUNDLED_MOD = join(dirname(fileURLToPath(import.meta.url)), "mod");
+
+/**
+ * The inbox message the mod turns into a `/clear` rather than a turn. Its
+ * hooks module, `mod/hooks/register.ts`, spells it out too.
+ */
+export const CLEAR_MARKER = "__TEAM_CLEAR__";
+
+/** Claude Code writes this into a mod's folder when loading it, so it is never the bundle's content. */
+const WRITTEN_BY_LOADING = "tsconfig.json";
+
+/** The hash of the bundled content the copy was made from, kept in the copy. */
+const STAMP = ".bundled-sha256";
+
+/** Every file under `dir` but what loading writes, by path relative to it, sorted. */
+function modFiles(dir: string): string[] {
+	return readdirSync(dir, { recursive: true, withFileTypes: true })
+		.filter((entry) => entry.isFile() && entry.name !== WRITTEN_BY_LOADING && entry.name !== STAMP)
+		.map((entry) => relative(dir, join(entry.parentPath, entry.name)))
+		.sort();
+}
+
+/**
+ * Make the per-user copy of the Team's mod, `<agentDir>/team/mod`, and return
+ * its path for `--plugin-dir`. Loading a mod writes a tsconfig.json into its
+ * folder, which the extension's own folder may not allow, so Teammates load
+ * the copy. It is made again only when the bundled content's hash differs
+ * from the one stamped in it.
+ */
+export function installMod(agentDir: string, bundled = BUNDLED_MOD): string {
+	const copy = join(agentDir, "team", "mod");
+	const hash = createHash("sha256");
+	for (const file of modFiles(bundled)) hash.update(`${file}\0`).update(readFileSync(join(bundled, file))).update("\0");
+	const stamp = hash.digest("hex");
+	const stampPath = join(copy, STAMP);
+	if (existsSync(stampPath) && readFileSync(stampPath, "utf8") === stamp) return copy;
+	rmSync(copy, { recursive: true, force: true });
+	mkdirSync(copy, { recursive: true });
+	for (const file of modFiles(bundled)) {
+		mkdirSync(dirname(join(copy, file)), { recursive: true });
+		cpSync(join(bundled, file), join(copy, file));
+	}
+	writeFileSync(stampPath, stamp);
+	return copy;
 }
 
 function shellQuote(text: string): string {

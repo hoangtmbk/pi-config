@@ -257,10 +257,12 @@ describe("handing off", () => {
 
 		assert.ok(result.ok, result.ok ? "" : result.refusal);
 		assert.deepEqual(result.actions, [
+			{ kind: "write-task", slug: "design", folder: "001-architect-design" },
 			{
 				kind: "launch-teammate",
 				teammate: { id: "architect-1", role: "architect", name: "team-software-2026-11-02-architect-1" },
 				task: { slug: "design", folder: "001-architect-design" },
+				at: "2026-11-02T11:30:00.000Z",
 			},
 			{ kind: "write-plan" },
 		]);
@@ -276,8 +278,8 @@ describe("handing off", () => {
 		const result = run(designed, handoff("rename"));
 
 		assert.ok(result.ok, result.ok ? "" : result.refusal);
-		const [launch] = result.actions;
-		assert.deepEqual(launch.kind === "launch-teammate" ? [launch.teammate.id, launch.task.folder] : [], ["dev-1", "002-dev-rename"]);
+		const launch = result.actions.find((action) => action.kind === "launch-teammate");
+		assert.deepEqual(launch?.kind === "launch-teammate" ? [launch.teammate.id, launch.task.folder] : [], ["dev-1", "002-dev-rename"]);
 	});
 
 	it("refuses a Task that is already running", () => {
@@ -602,6 +604,343 @@ describe("a Teammate's permission mode", () => {
 	});
 });
 
+describe("staffing a handoff", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "design", role: "architect", goal: "Design the rename.", criteria: ["AC1"] },
+			{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] },
+			{ slug: "docs", role: "dev", goal: "Document it.", criteria: ["AC1"] },
+			{ slug: "tests", role: "qa", goal: "Test it.", criteria: ["AC1"] },
+			{ slug: "cleanup", role: "dev", goal: "Clean up.", criteria: ["AC1"] },
+		],
+		criteria: ["AC1"],
+		roles: ["architect", "dev", "qa"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+	const T0 = "2026-11-02T11:30:00.000Z";
+	const TASKS = "/agent/team/efforts/software-2026-11-02/tasks";
+
+	function handoff(slug: string, options: { at?: string; max?: number } = {}): Extract<EffortInput, { kind: "handoff" }> {
+		return { kind: "handoff", slug, at: options.at ?? T0, ...(options.max === undefined ? {} : { maxTeammates: options.max }) };
+	}
+
+	function inboxOf(id: string) {
+		return { socket: `/tmp/cc-socks/${id}.sock`, token: `token-${id}` };
+	}
+
+	/** Play `id`'s journal up to the end of its round: its SessionStart once, then a Stop with or without the result. */
+	function stops(lines: EffortLine[], id: string, written = true): EffortLine[] {
+		const state = fold(lines);
+		const teammate = state.teammates.find((each) => each.id === id);
+		assert.ok(teammate, `no Teammate ${id}`);
+		const due = currentResult(state, id);
+		const result = { path: `${TASKS}/${due?.folder}/result-${due?.round}.md`, written };
+		let cursor = teammate.cursor ?? 0;
+		let out = lines;
+		if (teammate.sessionId === undefined) {
+			cursor += 1;
+			out = applied(out, {
+				kind: "journal",
+				teammate: id,
+				cursor,
+				line: { from: "hook", at: T0, event: "SessionStart", payload: { session_id: `${id.padEnd(8, "0")}-0000-4000-8000-000000000001`, source: "startup" }, inbox: inboxOf(id) },
+				result,
+			});
+		}
+		return applied(out, { kind: "journal", teammate: id, cursor: cursor + 1, line: { from: "hook", at: T0, event: "Stop", payload: { last_assistant_message: "Done." } }, result });
+	}
+
+	/** Accept the round `id` just finished, taking whatever the acceptance unblocks. */
+	function accept(lines: EffortLine[], id: string, max?: number): Step {
+		const state = fold(lines);
+		const slug = state.teammates.find((each) => each.id === id)?.task ?? "";
+		const task = state.tasks[slug];
+		return run(lines, {
+			kind: "review",
+			slug,
+			verdict: "accept",
+			result: { path: `${TASKS}/${task?.folder}/result-${task?.round}.md`, written: true },
+			sendBackLimit: 2,
+			at: "2026-11-02T13:00:00.000Z",
+			...(max === undefined ? {} : { maxTeammates: max }),
+		});
+	}
+
+	function accepted(lines: EffortLine[], id: string, max?: number): EffortLine[] {
+		const result = accept(lines, id, max);
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		return [...lines, ...result.append];
+	}
+
+	it("reuses an idle Teammate of the Role whose Task is accepted, clearing it before the pointer goes, and launches nothing", () => {
+		const renamed = accepted(stops(applied(planned, handoff("rename")), "dev-1"), "dev-1");
+
+		const result = run(renamed, handoff("docs", { at: "2026-11-02T14:00:00.000Z" }));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append, [
+			{ type: "task-handed-off", slug: "docs", folder: "002-dev-docs", role: "dev", teammate: "dev-1", at: "2026-11-02T14:00:00.000Z", round: 1 },
+			{ type: "clear-requested", teammate: "dev-1", slug: "docs", at: "2026-11-02T14:00:00.000Z" },
+		]);
+		assert.deepEqual(result.actions, [
+			{ kind: "write-task", slug: "docs", folder: "002-dev-docs" },
+			{ kind: "clear-then-send", teammate: "dev-1", inbox: inboxOf("dev-1"), slug: "docs", folder: "002-dev-docs" },
+			{ kind: "write-plan" },
+		]);
+		assert.match(result.reply ?? "", /^reused dev-1 on Task `docs` \(tasks\/002-dev-docs\/task\.md\)/);
+		assert.equal(result.state.teammates.length, 1);
+		assert.equal(result.state.teammates[0].task, "docs");
+		assert.deepEqual(currentResult(result.state, "dev-1"), { slug: "docs", folder: "002-dev-docs", round: 1 });
+		assert.equal(taskStatus(result.state, "docs"), "running");
+	});
+
+	it("starts a new Teammate under the cap rather than take one mid-Task: running, in review or stopped short", () => {
+		const running = applied(planned, handoff("rename"));
+		const inReview = stops(running, "dev-1");
+		const short = stops(running, "dev-1", false);
+
+		for (const lines of [running, inReview, short]) {
+			const result = run(lines, handoff("docs"));
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			assert.match(result.reply ?? "", /^started dev-2 on Task `docs`/);
+			assert.ok(!result.actions.some((action) => action.kind === "clear-then-send"));
+			assert.deepEqual(
+				result.actions.map((action) => action.kind),
+				["write-task", "launch-teammate", "write-plan"],
+			);
+		}
+	});
+
+	it("counts every live Teammate toward the cap, busy, idle in review or stopped short, and queues past it saying why", () => {
+		const designing = applied(planned, handoff("design"));
+		const inReview = stops(applied(designing, handoff("rename")), "dev-1");
+		const full = stops(applied(inReview, handoff("tests")), "qa-1", false);
+
+		const result = run(full, handoff("docs"));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const why = "cap 3 reached; waits for 001, 002 and 003";
+		assert.deepEqual(result.append, [{ type: "task-queued", slug: "docs", folder: "004-dev-docs", role: "dev", why, at: T0 }]);
+		assert.deepEqual(result.actions, [{ kind: "write-task", slug: "docs", folder: "004-dev-docs" }, { kind: "write-plan" }]);
+		assert.match(result.reply ?? "", new RegExp(`^queued Task \`docs\` \\(tasks/004-dev-docs/task\\.md\\): ${why}\\.`));
+		assert.deepEqual(result.state.queue, [{ slug: "docs", folder: "004-dev-docs", role: "dev", why, at: T0 }]);
+		assert.equal(result.state.teammates.length, 3);
+		assert.equal(taskStatus(result.state, "docs"), "queued");
+	});
+
+	it("takes the cap from the input, defaulting to 3", () => {
+		const one = applied(planned, handoff("design", { max: 1 }));
+
+		const result = run(one, handoff("rename", { max: 1 }));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.match(result.reply ?? "", /^queued Task `rename`.*cap 1 reached; waits for 001\./);
+	});
+
+	it("refuses to hand off a queued Task again, saying it starts by itself", () => {
+		const queued = applied(applied(planned, handoff("design", { max: 1 })), handoff("rename", { max: 1 }));
+
+		assert.match(refusal(queued, handoff("rename", { max: 1 })), /`rename` is already queued.*starts by itself/);
+	});
+
+	it("at the cap, stops an idle Teammate of a Role with no queued Task to start one for this Role", () => {
+		const designed = accepted(stops(applied(planned, handoff("design", { max: 2 })), "architect-1"), "architect-1", 2);
+		const full = applied(designed, handoff("rename", { max: 2 }));
+
+		const result = run(full, handoff("tests", { max: 2, at: "2026-11-02T14:00:00.000Z" }));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append.map((line) => line.type), ["teammate-retired", "teammate-started", "task-handed-off"]);
+		assert.deepEqual(result.append[0], { type: "teammate-retired", teammate: "architect-1", at: "2026-11-02T14:00:00.000Z" });
+		assert.deepEqual(result.actions, [
+			{ kind: "write-task", slug: "tests", folder: "003-qa-tests" },
+			{ kind: "stop-teammate", teammate: "architect-1", shortId: "architec" },
+			{
+				kind: "launch-teammate",
+				teammate: { id: "qa-1", role: "qa", name: "team-software-2026-11-02-qa-1" },
+				task: { slug: "tests", folder: "003-qa-tests" },
+				at: "2026-11-02T14:00:00.000Z",
+			},
+			{ kind: "write-plan" },
+		]);
+		assert.match(result.reply ?? "", /^started qa-1 on Task `tests`.*stopped idle `architect-1`.*cap of 2/);
+		assert.deepEqual(
+			result.state.teammates.filter((teammate) => teammate.retiredAt === undefined).map((teammate) => teammate.id),
+			["dev-1", "qa-1"],
+		);
+	});
+
+	it("staggers starts at most one every 5 s, counting from the last start", () => {
+		const first = run(planned, handoff("design"));
+		assert.ok(first.ok);
+		const second = run([...planned, ...first.append], handoff("rename", { at: "2026-11-02T11:30:02.000Z" }));
+		assert.ok(second.ok);
+		const third = run([...planned, ...first.append, ...second.append], handoff("tests", { at: "2026-11-02T11:30:03.000Z" }));
+		assert.ok(third.ok);
+		const later = run([...planned, ...first.append, ...second.append, ...third.append], handoff("docs", { at: "2026-11-02T11:31:00.000Z", max: 4 }));
+		assert.ok(later.ok);
+
+		const launches = [first, second, third, later].map((result) => result.actions.find((action) => action.kind === "launch-teammate"));
+		assert.deepEqual(
+			launches.map((launch) => (launch?.kind === "launch-teammate" ? launch.at : undefined)),
+			["2026-11-02T11:30:00.000Z", "2026-11-02T11:30:05.000Z", "2026-11-02T11:30:10.000Z", "2026-11-02T11:31:00.000Z"],
+		);
+		assert.deepEqual(
+			fold([...planned, ...first.append, ...second.append, ...third.append]).teammates.map((teammate) => teammate.startedAt),
+			["2026-11-02T11:30:00.000Z", "2026-11-02T11:30:05.000Z", "2026-11-02T11:30:10.000Z"],
+		);
+	});
+
+	/** Start the next queued Task that can start now, as the shell asks after each acceptance. */
+	function drain(lines: EffortLine[], max?: number): Step {
+		return run(lines, { kind: "drain", at: "2026-11-02T13:00:05.000Z", ...(max === undefined ? {} : { maxTeammates: max }) });
+	}
+
+	it("accepts without starting anything itself: a queued Task waits for the drain that follows", () => {
+		const full = applied(applied(planned, handoff("rename", { max: 1 })), handoff("docs", { max: 1 }));
+
+		const result = accept(stops(full, "dev-1"), "dev-1", 1);
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append.map((line) => line.type), ["task-accepted"]);
+		assert.deepEqual(result.actions, [{ kind: "write-plan" }]);
+		assert.deepEqual(result.state.queue.map((each) => each.slug), ["docs"]);
+	});
+
+	it("starts a queued Task when its blocker clears: an accepted Teammate of its Role is reused for it", () => {
+		const full = applied(applied(planned, handoff("rename", { max: 1 })), handoff("docs", { max: 1 }));
+
+		const result = drain(accepted(stops(full, "dev-1"), "dev-1", 1), 1);
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append, [
+			{ type: "task-handed-off", slug: "docs", folder: "002-dev-docs", role: "dev", teammate: "dev-1", at: "2026-11-02T13:00:05.000Z", round: 1 },
+			{ type: "clear-requested", teammate: "dev-1", slug: "docs", at: "2026-11-02T13:00:05.000Z" },
+		]);
+		assert.deepEqual(result.state.queue, []);
+		assert.deepEqual(result.actions, [
+			{ kind: "clear-then-send", teammate: "dev-1", inbox: inboxOf("dev-1"), slug: "docs", folder: "002-dev-docs" },
+			{ kind: "write-plan" },
+		]);
+		assert.match(result.reply ?? "", /^Queued Task `docs` reused dev-1 \(tasks\/002-dev-docs\/task\.md\)/);
+	});
+
+	it("starts a queued Task of another Role by stopping the accepted Teammate, launching when the drain runs in the mode the handoff asked for", () => {
+		const full = applied(applied(planned, handoff("rename", { max: 1 })), { ...handoff("tests", { max: 1 }), mode: "acceptEdits" });
+
+		const result = drain(accepted(stops(full, "dev-1"), "dev-1", 1), 1);
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append.map((line) => line.type), ["teammate-retired", "teammate-started", "task-handed-off"]);
+		assert.deepEqual(
+			result.actions.map((action) => action.kind),
+			["stop-teammate", "launch-teammate", "write-plan"],
+		);
+		const launch = result.actions.find((action) => action.kind === "launch-teammate");
+		assert.equal(launch?.kind === "launch-teammate" ? launch.at : undefined, "2026-11-02T13:00:05.000Z");
+		assert.equal(result.state.teammates.find((teammate) => teammate.id === "qa-1")?.mode, "acceptEdits");
+		assert.match(result.reply ?? "", /^Queued Task `tests` started qa-1/);
+	});
+
+	it("keeps an idle Teammate whose Role has a Task queued rather than stop it for another Role, and a drain with nothing to start does nothing", () => {
+		const queued = applied(applied(applied(planned, handoff("rename", { max: 1 })), handoff("tests", { max: 1 })), handoff("docs", { max: 1 }));
+		const first = drain(accepted(stops(queued, "dev-1"), "dev-1", 1), 1);
+		assert.ok(first.ok, first.ok ? "" : first.refusal);
+
+		const second = run([...accepted(stops(queued, "dev-1"), "dev-1", 1), ...first.append], { kind: "drain", at: "2026-11-02T13:00:06.000Z", maxTeammates: 1 });
+
+		assert.equal(first.state.tasks.docs.teammate, "dev-1");
+		assert.ok(!first.actions.some((action) => action.kind === "stop-teammate"));
+		assert.ok(second.ok, second.ok ? "" : second.refusal);
+		assert.deepEqual([second.append, second.actions, second.reply], [[], [], undefined]);
+		assert.deepEqual(second.state.queue.map((each) => each.slug), ["tests"]);
+	});
+});
+
+describe("clearing between Tasks", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] },
+			{ slug: "docs", role: "dev", goal: "Document it.", criteria: ["AC1"] },
+		],
+		criteria: ["AC1"],
+		roles: ["dev"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+	const DIR = "/agent/team/efforts/software-2026-11-02/tasks/001-dev-rename";
+	const INBOX = { socket: "/tmp/cc-socks/4242.sock", token: "inbox-token" };
+	const FIRST = "8f3c2a1b-0000-4000-8000-000000000001";
+	const SECOND = "0b1c2d3e-0000-4000-8000-000000000002";
+
+	function hook(cursor: number, event: string, payload: Record<string, unknown>, written = false): Extract<EffortInput, { kind: "journal" }> {
+		return {
+			kind: "journal",
+			teammate: "dev-1",
+			cursor,
+			line: { from: "hook", at: `2026-11-02T12:0${cursor}:00.000Z`, event, payload, ...(event === "SessionStart" ? { inbox: INBOX } : {}) },
+			result: { path: `${DIR}/result-1.md`, written },
+		};
+	}
+
+	const running = applied(applied(planned, { kind: "handoff", slug: "rename", at: "2026-11-02T11:30:00.000Z" }), hook(1, "SessionStart", { session_id: FIRST, source: "startup" }));
+	const done = applied(running, hook(2, "Stop", { session_id: FIRST }, true));
+	const review = (verdict: "accept" | "send_back"): EffortInput => ({
+		kind: "review",
+		slug: "rename",
+		verdict,
+		feedback: "Still reads `colour`.",
+		result: { path: `${DIR}/result-1.md`, written: true },
+		sendBackLimit: 2,
+		at: "2026-11-02T13:00:00.000Z",
+	});
+	const clearing = applied(applied(done, review("accept")), { kind: "handoff", slug: "docs", at: "2026-11-02T14:00:00.000Z" });
+
+	it("clears for a different Task: once its SessionStart `clear` lands, records the new session id, keeps the short id and sends the pointer", () => {
+		assert.equal(fold(clearing).teammates[0].clearing, "docs");
+
+		const result = run(clearing, hook(3, "SessionStart", { session_id: SECOND, source: "clear" }));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append.map((line) => line.type), ["teammate-session"]);
+		assert.deepEqual(result.actions, [{ kind: "send-pointer", teammate: "dev-1", inbox: INBOX, slug: "docs", folder: "002-dev-docs", round: 1 }]);
+		const [teammate] = result.state.teammates;
+		assert.equal(teammate.sessionId, SECOND);
+		assert.equal(teammate.shortId, "8f3c2a1b");
+		assert.equal(teammate.clearing, undefined);
+	});
+
+	it("sends no pointer for a clear nobody asked for, nor for a SessionStart other than a clear while one is asked", () => {
+		const unasked = run(done, hook(3, "SessionStart", { session_id: SECOND, source: "clear" }));
+		const resumed = run(clearing, hook(3, "SessionStart", { session_id: FIRST, source: "resume" }));
+
+		assert.ok(unasked.ok && resumed.ok);
+		assert.deepEqual(unasked.actions, []);
+		assert.deepEqual(resumed.actions, []);
+		assert.equal(resumed.state.teammates[0].clearing, "docs");
+	});
+
+	it("never clears a send-back to the Teammate that did the Task with nothing in between", () => {
+		const result = run(done, review("send_back"));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.ok(!result.actions.some((action) => action.kind === "clear-then-send"));
+		assert.ok(!result.append.some((line) => line.type === "clear-requested"));
+	});
+
+	it("never clears mid-Task: a handoff for the Role while its Teammate works starts another", () => {
+		const result = run(running, { kind: "handoff", slug: "docs", at: "2026-11-02T12:30:00.000Z" });
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.ok(!result.actions.some((action) => action.kind === "clear-then-send"));
+		assert.equal(fold(running).teammates[0].task, "rename");
+		assert.equal(result.state.teammates[0].task, "rename");
+	});
+});
+
 describe("reporting", () => {
 	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
 	const planned = applied(approved, {
@@ -657,6 +996,25 @@ describe("reporting", () => {
 
 		const since = section(run(handed, report("2026-11-02T12:00:00.000Z")), "Since the last Report");
 		assert.deepEqual(since, ["11:30 handed Task `design` to architect-1"]);
+	});
+
+	it("tells of a Task queued at the cap and of a Teammate stopped to make room, but not of a clear asked for", () => {
+		const first = applied(planned, report("2026-11-02T11:15:00.000Z"));
+		const queued = applied(applied(first, { kind: "handoff", slug: "design", at: "2026-11-02T11:30:00.000Z", maxTeammates: 1 }), {
+			kind: "handoff",
+			slug: "rename",
+			at: "2026-11-02T11:31:00.000Z",
+			maxTeammates: 1,
+		});
+		const retired: EffortLine[] = [...queued, { type: "clear-requested", teammate: "architect-1", slug: "design", at: "2026-11-02T11:40:00.000Z" }, { type: "teammate-retired", teammate: "architect-1", at: "2026-11-02T11:45:00.000Z" }];
+
+		const since = section(run(retired, report("2026-11-02T12:00:00.000Z")), "Since the last Report");
+
+		assert.deepEqual(since, [
+			"11:30 handed Task `design` to architect-1",
+			"11:31 queued Task `rename`: cap 1 reached; waits for 001",
+			"11:45 stopped idle architect-1 to make room",
+		]);
 	});
 
 	it("refuses a Report before the Brief is approved, and coverage of a criterion the Brief doesn't have", () => {
