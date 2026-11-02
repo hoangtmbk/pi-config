@@ -22,8 +22,8 @@ import { Type } from "typebox";
 import { attachTarget, chooseAttach, pickerLabel } from "./attach.ts";
 import { renderTeamBlock, teamStatus } from "./block.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
-import { agentsList, launchBackground, sendToInbox, stopBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
-import { currentResult, type EffortAction, type EffortState, fold, type Inbox, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace } from "./core.ts";
+import { agentsList, CLEAR_MARKER, installMod, launchBackground, sendToInbox, stopBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
+import { currentResult, DEFAULT_MAX_TEAMMATES, type EffortAction, type EffortState, fold, type Inbox, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace } from "./core.ts";
 import { EVERY_ROLE, listTeams, loadTeam, type Playbook, readSnapshot, type Role, sha256, type Team, type TeamRoots } from "./definitions.ts";
 import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
 import { adoptable, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
@@ -124,7 +124,6 @@ interface ReportDetails {
 const BLOCK_KEY = "team";
 
 /** The cap on live Teammates when pi's settings name none. */
-const DEFAULT_MAX_TEAMMATES = 3;
 
 const HandoffParams = Type.Object({
 	slug: Type.String({ description: "The planned Task to hand off." }),
@@ -157,6 +156,8 @@ export interface TeamDeps {
 	now?: () => Date;
 	/** The pid this session leads an Effort as. Injected by tests standing in for another pi process, and by nothing else. */
 	pid?: number;
+	/** Waits out the stagger between Teammate starts. Injected by tests, and by nothing else. */
+	sleep?: (ms: number) => Promise<void>;
 	/** The environment `$TMUX` is read from, `process.env`. Injected by tests, and by nothing else. */
 	env?: Record<string, string | undefined>;
 	/** The `tmux` executable. Injected by tests, and by nothing else. */
@@ -191,6 +192,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	};
 	const now = deps.now ?? (() => new Date());
 	const pid = deps.pid ?? process.pid;
+	const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 	const env = deps.env ?? process.env;
 	const tmuxPath = deps.tmuxPath ?? "tmux";
 	const copy = deps.copy ?? copyToClipboard;
@@ -328,11 +330,24 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				if (!result.ok) break;
 				appendLines(held.paths, result.append);
 				state = result.state;
-				for (const action of result.actions) if (action.kind === "wake-lead") texts.push(action.text);
+				for (const action of result.actions) {
+					if (action.kind === "wake-lead") texts.push(action.text);
+					else if (action.kind === "send-pointer") sendPointer(held, action);
+				}
 			}
 		}
 		paintBlock();
 		return texts;
+	}
+
+	/** Send a cleared Teammate its new Task's pointer, waking the Lead if it doesn't get through. */
+	function sendPointer(held: HeldEffort, { teammate, inbox, slug, folder, round }: Extract<EffortAction, { kind: "send-pointer" }>): void {
+		void sendToInbox(inbox, handoffPointer(slug, join(held.paths.tasks, folder), round)).then((failed) => {
+			if (!failed) return;
+			wakeAboutTeammates([
+				`\`${teammate}\` cleared its context for Task \`${slug}\`, but the Task's pointer couldn't reach its inbox (${failed.error}), so it isn't working on it. Stop and tell the human.`,
+			]);
+		});
 	}
 
 	/** Wake the Lead about its Teammates now, or with everything else once its run settles. */
@@ -691,6 +706,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			}),
 			prompt: teammatePrompt({ teammateId: teammate.id, role: role.name, brief: held.paths.brief, clarifications: held.paths.clarifications, tasks: held.paths.tasks }, role.prompt),
 			pointer,
+			mod: installMod(paths.agentDir),
 		});
 	}
 
@@ -700,14 +716,105 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			if (action.kind === "write-plan") writePlan(held.paths, result.state);
 			else if (action.kind === "launch-teammate") await launch(action);
 			else if (action.kind === "stop-teammate") {
-				// `claude stop` keeps the conversation, so the human can still read it; one already idle-stopped needs none.
-				const stopped = await stopBackground(paths.claudePath, action.shortId);
-				const agents = stopped && (await agentsList(paths.claudePath));
-				const name = result.state.teammates.find((teammate) => teammate.id === action.teammate)?.name;
-				if (stopped && (!(agents instanceof Map) || (name !== undefined && agents.has(name)))) throw new Error(`Teammate \`${action.teammate}\` couldn't be stopped with \`claude stop ${action.shortId}\` (${stopped.error}), so nothing was re-planned. Stop and tell the human.`);
+				const stopped = await stopTeammate(result.state, action);
+				if (stopped) throw new Error(`Teammate \`${action.teammate}\` couldn't be stopped with \`claude stop ${action.shortId}\` (${stopped.error}), so nothing was re-planned. Stop and tell the human.`);
 			}
 		}
 		appendLines(held.paths, result.append);
+	}
+
+	/**
+	 * Stop a Teammate with `claude stop`, which keeps its conversation for the
+	 * human to read. One already idle-stopped needs none: a failed stop counts
+	 * only while `claude agents --json` still lists it, or can't be read.
+	 */
+	async function stopTeammate(state: EffortState, action: Extract<EffortAction, { kind: "stop-teammate" }>): Promise<{ error: string } | undefined> {
+		const stopped = await stopBackground(paths.claudePath, action.shortId);
+		if (!stopped) return undefined;
+		const agents = await agentsList(paths.claudePath);
+		const name = state.teammates.find((teammate) => teammate.id === action.teammate)?.name;
+		return !(agents instanceof Map) || (name !== undefined && agents.has(name)) ? stopped : undefined;
+	}
+
+	/**
+	 * Carry out a staffing step, from a handoff or a drain: write the Task,
+	 * stop and start Teammates, record it all, then clear a reused Teammate.
+	 * The clear is on record before its marker goes, since the `SessionStart`
+	 * it causes is what sends the Task's pointer.
+	 */
+	async function staffTask(held: HeldEffort, result: Extract<Step, { ok: true }>, body?: string): Promise<void> {
+		const { roles, playbook } = snapshotOf(held);
+		const stopped: string[] = [];
+		for (const action of result.actions) {
+			if (action.kind === "write-task" && body !== undefined) writeTask(held.paths, action.folder, body);
+			else if (action.kind === "write-plan") writePlan(held.paths, result.state);
+			else if (action.kind === "stop-teammate") {
+				const failed = await stopTeammate(result.state, action);
+				if (failed) throw new Error(`Idle Teammate \`${action.teammate}\` didn't stop (${failed.error}), so no Teammate starts in its place; stop and tell the human.`);
+				stopped.push(action.teammate);
+			} else if (action.kind === "launch-teammate") {
+				const failed = await launchTeammate(held, result.state, action, roles, playbook);
+				if (failed) {
+					// The idle Teammate stopped for it is gone either way.
+					appendLines(
+						held.paths,
+						result.append.filter((line) => line.type === "teammate-retired" && stopped.includes(line.teammate)),
+					);
+					throw new Error(`Teammate \`${action.teammate.id}\` didn't start, so Task \`${action.task.slug}\` is still ${body === undefined ? "queued" : "planned"}: ${failed}`);
+				}
+			}
+		}
+		appendLines(held.paths, result.append);
+		for (const action of result.actions) {
+			if (action.kind !== "clear-then-send") continue;
+			const failed = await sendToInbox(action.inbox, CLEAR_MARKER);
+			if (failed) {
+				throw new Error(
+					`Task \`${action.slug}\` is handed to \`${action.teammate}\`, but the clear couldn't reach its inbox (${failed.error}), so it isn't working on it. Stop and tell the human.`,
+				);
+			}
+		}
+	}
+
+	/**
+	 * Start the queued Tasks a freed Teammate makes room for, one staffing step
+	 * at a time, and return what each step did. One that fails stays queued,
+	 * and the Lead hears why rather than losing what came before.
+	 */
+	async function startQueued(held: HeldEffort, state: EffortState, ctx: ExtensionContext): Promise<string[]> {
+		const said: string[] = [];
+		for (;;) {
+			const drained = step(state, { kind: "drain", at: now().toISOString(), maxTeammates: maxTeammates() });
+			if (!drained.ok || drained.reply === undefined) break;
+			try {
+				await listenForTeammates(held, ctx);
+				await staffTask(held, drained);
+			} catch (error) {
+				said.push(`A queued Task didn't start: ${error instanceof Error ? error.message : String(error)}`);
+				break;
+			}
+			said.push(drained.reply);
+			state = drained.state;
+		}
+		if (said.length > 0) wakeAboutTeammates(applyJournals(held));
+		return said;
+	}
+
+	/** Launch a Teammate once its stagger is up, returning why it didn't start. */
+	async function launchTeammate(
+		held: HeldEffort,
+		state: EffortState,
+		{ teammate, task, at }: Extract<EffortAction, { kind: "launch-teammate" }>,
+		roles: Role[],
+		playbook: Playbook,
+	): Promise<string | undefined> {
+		const role = roles.find((each) => each.name === teammate.role);
+		if (!role) return `the Team snapshot of Effort \`${held.effortId}\` has no Role \`${teammate.role}\`; stop and tell the human.`;
+		if (!state.workspace) return `Effort \`${held.effortId}\` has no Workspace; stop and tell the human.`;
+		const wait = Date.parse(at) - now().getTime();
+		if (wait > 0) await sleep(wait);
+		const args = launchArgs(held, teammate, role, playbook, handoffPointer(task.slug, join(held.paths.tasks, task.folder), 1));
+		return (await launchBackground(paths.claudePath, state.workspace.path, args))?.error;
 	}
 
 	/** One adoption in `/team pending`: approve, send back with a note, or leave it for later. */
@@ -899,8 +1006,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			const result = step(state, { kind: "plan", tasks: params.tasks, criteria, roles: roles.map((role) => role.name), reason: params.reason, at: now().toISOString() });
 			if (!result.ok) throw new Error(result.refusal);
 			await carryOut(held, result, async () => {});
+			// A Teammate stopped with its dropped Task makes room for a queued one.
+			const started = result.actions.some((action) => action.kind === "stop-teammate") ? await startQueued(held, result.state, ctx) : [];
 			paintBlock();
-			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
+			return { content: [{ type: "text", text: [result.reply ?? "", ...started].join(" ") }], details: undefined };
 		},
 	});
 
@@ -908,51 +1017,32 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		name: "team_handoff",
 		label: "Hand off",
 		description: [
-			"Hand a planned Task to a new Teammate of its Role, launched as a Claude Code background session in the Effort's Workspace.",
+			"Hand a planned Task to a Teammate of its Role, which the extension staffs: it reuses an idle Teammate of the Role (clearing its context first), else starts one as a Claude Code background session in the Effort's Workspace while under the human's `maxTeammates`, else stops an idle Teammate no queued Task needs and starts one, else queues the Task until a Teammate frees up.",
 			"`body` becomes the Task's `task.md`: make it self-contained, listing the Effort's `brief.md` and `clarifications.md` among its inputs, since the Teammate has no earlier conversation.",
-			"Returns which Teammate started. Refused until the human approves the Brief, for a Task already handed off (running, in review, sent back or accepted), and for `isolated`, which isn't built yet.",
+			"Returns which Teammate was started or reused, or that the Task is queued and why. Refused until the human approves the Brief, for a Task already handed off or queued (running, in review, sent back or accepted), and for `isolated`, which isn't built yet.",
 		].join(" "),
 		promptSnippet: "Hand a planned Task to a Teammate once the Brief is approved",
 		parameters: HandoffParams,
 		defaultActive: false,
+		// Each handoff staffs against the Teammates the one before it started.
+		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { held, state } = approvedEffort("team_handoff", ctx);
 			if (params.isolated) {
 				throw new Error(`Task \`${params.slug}\` can't be handed off isolated yet: a Task with a worktree of its own isn't built. Hand it off without \`isolated\`, into the Effort's Workspace.`);
 			}
 			const { roles, playbook } = snapshotOf(held);
-			const result = step(state, { kind: "handoff", slug: params.slug, at: now().toISOString(), mode: launchMode(state, params.slug, roles, playbook) });
-			if (!result.ok) throw new Error(result.refusal);
-			const workspace = state.workspace;
-			if (!workspace) throw new Error(`Effort \`${held.effortId}\` has no Workspace, so no Teammate starts; stop and tell the human.`);
-			await listenForTeammates(held, ctx);
-			await carryOut(held, result, async ({ teammate, task }) => {
-				const role = roles.find((each) => each.name === teammate.role);
-				if (!role) throw new Error(`The Team snapshot of Effort \`${held.effortId}\` has no Role \`${teammate.role}\`, so no Teammate starts; stop and tell the human.`);
-				const taskDir = writeTask(held.paths, task.folder, params.body);
-				const args = teammateArgs({
-					name: teammate.name,
-					role,
-					mode: modeInForce(playbook, role),
-					effortDir: held.paths.dir,
-					dir: join(held.paths.teammates, teammate.id),
-					settings: teammateSettings({
-						effortDir: held.paths.dir,
-						teammateId: teammate.id,
-						allow: [role.name, EVERY_ROLE].flatMap((key) => playbook.roles[key]?.allow ?? []),
-						deny: [role.name, EVERY_ROLE].flatMap((key) => playbook.roles[key]?.deny ?? []),
-						ask: playbook.escalate.flatMap((entry) => entry.ask),
-						records: protectedRecords(held.paths),
-					}),
-					prompt: teammatePrompt(
-						{ teammateId: teammate.id, role: role.name, brief: held.paths.brief, clarifications: held.paths.clarifications, tasks: held.paths.tasks },
-						role.prompt,
-					),
-					pointer: handoffPointer(task.slug, taskDir, 1),
-				});
-				const launched = await launchBackground(paths.claudePath, workspace.path, args);
-				if (launched) throw new Error(`Teammate \`${teammate.id}\` didn't start, so Task \`${task.slug}\` is still planned: ${launched.error}`);
+			const result = step(state, {
+				kind: "handoff",
+				slug: params.slug,
+				at: now().toISOString(),
+				mode: launchMode(state, params.slug, roles, playbook),
+				maxTeammates: maxTeammates(),
 			});
+			if (!result.ok) throw new Error(result.refusal);
+			if (!state.workspace) throw new Error(`Effort \`${held.effortId}\` has no Workspace, so no Teammate starts; stop and tell the human.`);
+			await listenForTeammates(held, ctx);
+			await staffTask(held, result, params.body);
 			// Its hooks can ring before it is recorded as started, so its journal is read once it is.
 			wakeAboutTeammates(applyJournals(held));
 			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
@@ -964,7 +1054,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		label: "Review",
 		description: [
 			"Decide on the newest result of a handed-off Task, once its Teammate has written it and you were woken about it.",
-			"`accept` marks the Task accepted in plan.md.",
+			"`accept` marks the Task accepted in plan.md, and starts any queued Task its Teammate frees room for.",
 			"`send_back` writes `feedback` to the Task's `feedback-<n>.md` and sends its Teammate a pointer to it; the Teammate writes `result-<n+1>.md` and you are woken again.",
 			"Refused while the round's result isn't written, for an accepted Task, and for a send-back past the Playbook's `sendBackLimit`, when you escalate to the human instead.",
 		].join(" "),
@@ -1012,7 +1102,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 					);
 				}
 			}
-			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
+			const started = verdict === "accept" ? await startQueued(held, result.state, ctx) : [];
+			return { content: [{ type: "text", text: [result.reply ?? "", ...started].join(" ") }], details: undefined };
 		},
 	});
 

@@ -34,6 +34,15 @@
  *   session plays each time an authorized user message lands in its inbox,
  *   with that message as its pointer. A `UserPromptSubmit` without a payload
  *   reports the message as its prompt.
+ * - Each `--plugin-dir` a session was launched with is loaded as Claude Code
+ *   loads a mod: the `modules` its `hooks/hooks.json` names are imported and
+ *   their `register` called. Every user message in the inbox goes through the
+ *   `session.receive` handlers first, and one a handler consumes plays no
+ *   replies. A handler's `$.command.run({ command: "clear" })` clears as
+ *   `/clear` does: `SessionEnd` with reason `clear`, a new session id, then
+ *   `SessionStart` with source `clear`, through the settings' hook commands;
+ *   its `FAKE_CLAUDE_AGENTS` record takes the new session id and keeps its
+ *   short id.
  * - `FAKE_CLAUDE_ATTACH_OUT`: a file each `attach` appends one JSON line to:
  *   its argv and the device and inode its stdin, stdout and stderr are open
  *   on, so a test can tell whether it was handed the terminal pi runs on.
@@ -69,10 +78,14 @@ interface Session {
 	socket: string;
 	token: string;
 	settings: string | undefined;
+	/** The `--plugin-dir` folders, loaded as mods. */
+	plugins: string[];
 }
 
 /** A session in `FAKE_CLAUDE_AGENTS`: what resuming it needs, and what `agents --json` says of it. */
 interface Agent extends Session {
+	/** The session id since its last `/clear`; `id` stays the first, as its short id does. */
+	sessionId?: string;
 	name: string | undefined;
 	live: boolean;
 	status: string;
@@ -97,7 +110,7 @@ async function main(): Promise<void> {
 
 	if (argv[0] === "agents" && argv[1] === "--json") {
 		const agents = registry().filter((agent) => agent.live);
-		process.stdout.write(`${JSON.stringify(agents.map((agent) => ({ id: agent.id.slice(0, 8), sessionId: agent.id, name: agent.name, status: agent.status, state: agent.state, ...(agent.waitingFor === undefined ? {} : { waitingFor: agent.waitingFor }) })))}\n`);
+		process.stdout.write(`${JSON.stringify(agents.map((agent) => ({ id: agent.id.slice(0, 8), sessionId: agent.sessionId ?? agent.id, name: agent.name, status: agent.status, state: agent.state, ...(agent.waitingFor === undefined ? {} : { waitingFor: agent.waitingFor }) })))}\n`);
 		process.exit(0);
 	}
 
@@ -112,17 +125,17 @@ async function main(): Promise<void> {
 	}
 
 	if (argv[0] === "--bg" && argv[1] === "--resume") {
-		const agent = registry().find((each) => each.id === argv[2]);
+		const agent = registry().find((each) => (each.sessionId ?? each.id) === argv[2]);
 		if (!agent) {
 			process.stderr.write(`fake claude: no session ${argv[2]} to resume\n`);
 			process.exit(1);
 		}
 		rmSync(agent.socket, { force: true });
 		const sockets = process.env.FAKE_CLAUDE_SOCKETS;
-		const session: Session = { ...agent, socket: sockets ? join(sockets, `${randomBytes(4).toString("hex")}.sock`) : agent.socket, token: `inbox-${randomBytes(4).toString("hex")}` };
-		record({ ...agent, ...session, live: true, status: "running", state: "idle" });
+		const session: Session = { ...agent, id: agent.sessionId ?? agent.id, socket: sockets ? join(sockets, `${randomBytes(4).toString("hex")}.sock`) : agent.socket, token: `inbox-${randomBytes(4).toString("hex")}` };
+		record({ ...agent, socket: session.socket, token: session.token, live: true, status: "running", state: "idle" });
 		if (sockets) await openInbox(session);
-		play(undefined, session, "", [{ event: "SessionStart", payload: { source: "resume" } }]);
+		playSteps([{ event: "SessionStart", payload: { source: "resume" } }], session, "");
 		play(process.env.FAKE_CLAUDE_REPLIES, session, argv[3] ?? "");
 		process.stdout.write("fake claude: background session resumed\n");
 		process.exit(0);
@@ -150,6 +163,7 @@ async function main(): Promise<void> {
 				socket: sockets ? join(sockets, `${randomBytes(4).toString("hex")}.sock`) : `/tmp/cc-socks/${process.pid}.sock`,
 				token: `inbox-${id.slice(0, 8)}`,
 				settings: launch.settings,
+				plugins: argv.flatMap((arg, index) => (arg === "--plugin-dir" && argv[index + 1] !== undefined ? [argv[index + 1]] : [])),
 			};
 			const name = argv.indexOf("--name") === -1 ? undefined : argv[argv.indexOf("--name") + 1];
 			record({ ...session, name, live: true, status: "running", state: "idle" });
@@ -229,7 +243,7 @@ function serveInbox(session: Session): void {
 		connection.on("data", (chunk: string) => {
 			buffered += chunk;
 		});
-		connection.on("end", () => {
+		connection.on("end", async () => {
 			const lines = buffered.split("\n").filter(Boolean);
 			const auth = parsed(lines[0]);
 			const authorized = auth?.type === "auth" && auth.token === session.token;
@@ -240,7 +254,8 @@ function serveInbox(session: Session): void {
 			for (const line of lines.slice(1)) {
 				const message = parsed(line) as { type?: string; message?: { content?: unknown } } | undefined;
 				if (message?.type === "user" && typeof message.message?.content === "string") {
-					play(process.env.FAKE_CLAUDE_REPLIES, session, message.message.content);
+					const content = message.message.content;
+					if (!(await consumed(session, content))) play(process.env.FAKE_CLAUDE_REPLIES, session, content);
 				}
 			}
 		});
@@ -250,6 +265,42 @@ function serveInbox(session: Session): void {
 	setInterval(() => {
 		if (!existsSync(session.socket) || !alive(owner)) process.exit(0);
 	}, 200);
+}
+
+/** A mod's `session.receive` handler, as Claude Code calls it. */
+type Receive = ($: unknown, event: { text: string }, next: (event: { text: string }) => unknown) => unknown;
+
+/** Run the message through the session's mods; true when one consumed it. */
+async function consumed(session: Session, text: string): Promise<boolean> {
+	const handlers: Receive[] = [];
+	for (const plugin of session.plugins) {
+		const hooks = join(plugin, "hooks", "hooks.json");
+		if (!existsSync(hooks)) continue;
+		for (const module of (JSON.parse(readFileSync(hooks, "utf8")) as { modules?: string[] }).modules ?? []) {
+			const loaded = (await import(join(plugin, "hooks", module))) as { register?: (on: (event: string, handler: Receive) => void) => void };
+			loaded.register?.((event, handler) => {
+				if (event === "session.receive") handlers.push(handler);
+			});
+		}
+	}
+	const $ = {
+		command: {
+			async run({ command }: { command: string }): Promise<void> {
+				if (command !== "clear") throw new Error(`fake claude: no scripted command /${command}`);
+				playSteps([{ event: "SessionEnd", payload: { reason: "clear" } }], session, "");
+				const before = registry().find((each) => (each.sessionId ?? each.id) === session.id);
+				session.id = randomUUID();
+				if (before) record({ ...before, sessionId: session.id });
+				playSteps([{ event: "SessionStart", payload: { source: "clear" } }], session, "");
+			},
+		},
+	};
+	const through = (index: number, event: { text: string }): unknown => {
+		const handler = handlers[index];
+		return handler === undefined ? undefined : handler($, event, (next) => through(index + 1, next));
+	};
+	const result = (await through(0, { text })) as { consumed?: unknown } | undefined;
+	return result?.consumed !== undefined;
 }
 
 function parsed(line: string | undefined): Record<string, unknown> | undefined {
@@ -271,9 +322,12 @@ function alive(pid: number): boolean {
 }
 
 /** Play a script of steps against the session's settings and pointer. */
-function play(script: string | undefined, session: Session, pointer: string, given?: HookStep[]): void {
-	if (!script && !given) return;
-	const steps = given ?? (JSON.parse(readFileSync(script ?? "", "utf8")) as HookStep[]);
+function play(script: string | undefined, session: Session, pointer: string): void {
+	if (script) playSteps(JSON.parse(readFileSync(script, "utf8")) as HookStep[], session, pointer);
+}
+
+/** Play steps against the session's settings and pointer. */
+function playSteps(steps: HookStep[], session: Session, pointer: string): void {
 	const settings = JSON.parse(session.settings ?? "{}") as { hooks?: Record<string, { matcher?: string; hooks: { command: string }[] }[]> };
 	const inbox = { CLAUDE_CODE_MESSAGING_SOCKET: session.socket, CLAUDE_CODE_MESSAGING_TOKEN: session.token };
 	for (const step of steps) {
@@ -292,7 +346,7 @@ function play(script: string | undefined, session: Session, pointer: string, giv
 			}
 		}
 		if (step.event === "SessionEnd" && payload.reason !== "clear" && payload.reason !== "resume") {
-			const agent = registry().find((each) => each.id === session.id);
+			const agent = registry().find((each) => (each.sessionId ?? each.id) === session.id);
 			if (agent) end(agent);
 		}
 	}

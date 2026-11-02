@@ -80,10 +80,26 @@ the criterion ids it covers. It refuses a list that leaves one of the Brief's cr
 names a Role the Team doesn't have. Planning again replaces the list, and `plan.md` in the Effort
 is rewritten as a view of it; editing `plan.md` changes nothing.
 
-`team_handoff` writes the Task's folder, `tasks/<nnn>-<role>-<slug>/task.md`, and starts a new
-Teammate of the Task's Role (`builder-1`, `builder-2`, …) as `claude --bg` in the Workspace,
-named `team-<effort-id>-<teammate-id>`. The launch passes the Role's flags, the mode in force
-(the Playbook's for the Role, then the Role's own, then `auto`) and, from `teammates/<id>/`:
+`team_handoff` writes the Task's folder, `tasks/<nnn>-<role>-<slug>/task.md`, and staffs the
+Task with no judgment from the Lead, down a ladder:
+
+1. **Reuse** an idle Teammate of the Task's Role whose Task is accepted. Its context is cleared
+   first (below), so it starts the new Task fresh, under the same short id.
+2. **Start** a new Teammate of the Role (`builder-1`, `builder-2`, …) while fewer than
+   `maxTeammates` are live.
+3. **Swap**: at the cap, stop (`claude stop`) an idle Teammate whose Task is accepted and whose
+   Role has no queued Task, and start one in its place.
+4. **Queue** the Task, saying why (`cap 3 reached; waits for 001, 002 and 003`). `team_review`
+   starts queued Tasks, in handoff order, when an acceptance frees a Teammate.
+
+Every live Teammate counts toward the cap, working or idle. `maxTeammates` is a pi setting
+(default 3), read after `/reload`. Starts are at least 5 s apart. The reply says which Teammate
+was started or reused, or that the Task is queued and why. A Teammate fills one Role for life.
+
+A new Teammate starts as `claude --bg` in the Workspace, named
+`team-<effort-id>-<teammate-id>`. The launch passes the Role's flags, the mode in force
+(the Playbook's for the Role, then the Role's own, then `auto`), the Team's mod with
+`--plugin-dir` (below) and, from `teammates/<id>/`:
 
 - `settings.json`, which adds to your own settings: the Teammate's hooks, `crossSessionInbound:
   "accept"`, the Playbook's allow and deny rules for the Role and for `*`, every `escalate` rule
@@ -96,8 +112,21 @@ named `team-<effort-id>-<teammate-id>`. The launch passes the Role's flags, the 
 - `mcp.json`, when the Role has `mcpServers`.
 
 The Effort directory is added with `--add-dir`, `EnterPlanMode` is always disallowed, and the
-first turn is a pointer to `task.md`. A launch that fails leaves the Task planned. A Task that
-needs a worktree of its own (`isolated`) is refused.
+first turn is a pointer to `task.md`. A launch that fails leaves the Task planned (or queued). A
+Task that needs a worktree of its own (`isolated`) is refused.
+
+### Clearing between Tasks
+
+A Teammate is cleared exactly when it is handed a different Task from the one in its context:
+never on a send-back of its own Task, and never mid-Task. The clear is one write-ahead step in
+`effort.jsonl`: the reuse is recorded, the clear marker goes over the Teammate's inbox, the
+Teammate's `SessionStart` with source `clear` records its new session id, and then the Task's
+pointer is sent. The short id stays, so a human attached to it stays attached.
+
+The Team's mod (`mod/` here) runs inside every Teammate: it consumes the clear marker and runs
+`/clear`. Claude Code writes a `tsconfig.json` into a mod's folder when loading it, so the
+extension loads it from a copy in `~/.pi/agent/team/mod/`, refreshed whenever the bundled
+content changes.
 
 ### What a Teammate tells the Lead
 

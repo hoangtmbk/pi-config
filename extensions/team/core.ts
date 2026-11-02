@@ -75,7 +75,23 @@ export interface HandedTask {
 }
 
 /** Where a Task of the plan stands, as `plan.md` shows it. */
-export type TaskStatus = "planned" | "running" | "in review" | "sent back" | "accepted" | "dropped";
+export type TaskStatus = "planned" | "queued" | "running" | "in review" | "sent back" | "accepted" | "dropped";
+
+/**
+ * A Task handed off while the Effort is at its cap of live Teammates, waiting
+ * to start by itself when one frees up. Its folder is numbered and written at
+ * handoff, like any other.
+ */
+export interface QueuedTask {
+	slug: string;
+	folder: string;
+	role: string;
+	/** Why it waits, as the Team block shows it: `cap 3 reached; waits for 002 and 003`. */
+	why: string;
+	/** The permission mode the handoff asked for, which a Teammate started for it launches in. */
+	mode?: string;
+	at: string;
+}
 
 /** A Claude Code background session the Effort started, filling one Role for life. */
 export interface Teammate {
@@ -103,6 +119,10 @@ export interface Teammate {
 	activity?: "busy" | "idle";
 	/** How its last turn ended, while idle: `round 1 done`, `stopped short`. */
 	doing?: string;
+	/** The slug of the Task it was reused for, while its context is cleared and before the Task's pointer is sent. */
+	clearing?: string;
+	/** When it was stopped to make room under the cap; it no longer counts, nor is it reused. */
+	retiredAt?: string;
 	/** The short id the human last attached to through pi's `/team` menu. */
 	attached?: string;
 	/** Set when a new session gave it a new short id the human hasn't attached to through pi: the block marks it `(new)`. */
@@ -173,6 +193,12 @@ export type EffortLine =
 	| { type: "teammate-stopped"; teammate: string; cursor: number; slug: string; message: string; at: string }
 	/** A hook reported a permission mode other than the one last known: the mode the Teammate actually got. */
 	| { type: "teammate-mode"; teammate: string; cursor: number; mode: string; at: string }
+	/** A handoff found the Effort at its cap of live Teammates: the Task waits, its folder written. */
+	| ({ type: "task-queued" } & QueuedTask)
+	/** An idle Teammate whose Task is accepted was reused for Task `slug`: its context is cleared before the pointer goes. */
+	| { type: "clear-requested"; teammate: string; slug: string; at: string }
+	/** An idle Teammate whose Task is accepted was stopped to make room under the cap. */
+	| { type: "teammate-retired"; teammate: string; at: string }
 	/** The human used the `/team` menu on a Teammate: the short id they were given, which clears its `(new)` mark. Reads no journal line. */
 	| { type: "teammate-attached"; teammate: string; shortId: string; at: string }
 	/** A send-back gave the Task to a new Teammate, since its own had ended. */
@@ -234,6 +260,8 @@ export interface EffortState {
 	tasks: Record<string, HandedTask>;
 	/** Every Teammate started, oldest first. */
 	teammates: Teammate[];
+	/** Tasks handed off while at the cap, in handoff order: each starts by itself when a Teammate frees up. */
+	queue: QueuedTask[];
 	/** The last Report's number; 0 before the first. */
 	reports: number;
 	/** The lines a Report tells of since the last one, oldest first. */
@@ -279,8 +307,12 @@ export type EffortInput =
 			modes: readonly { role: string; mode: string }[];
 			at: string;
 	  }
-	/** `team_handoff` of a planned Task, with the permission mode the Teammate launches in. */
-	| { kind: "handoff"; slug: string; at: string; mode?: string }
+	/**
+	 * `team_handoff` of a planned Task, with the permission mode a Teammate
+	 * started for it launches in and the cap of live Teammates (pi's
+	 * `maxTeammates` setting, {@link DEFAULT_MAX_TEAMMATES} by default).
+	 */
+	| { kind: "handoff"; slug: string; at: string; mode?: string; maxTeammates?: number }
 	/**
 	 * Line `cursor` of `teammate`'s journal (counted from 1), with whether the
 	 * result its current Task is due to write ({@link currentResult}) is on disk.
@@ -301,6 +333,13 @@ export type EffortInput =
 			mode?: string;
 			at: string;
 	  }
+	/**
+	 * Start the first queued Task the staffing ladder can staff now, with the
+	 * cap of live Teammates. The shell asks after each acceptance, once the
+	 * acceptance is on record, and again while one starts: each start is its
+	 * own step, so a launch that fails leaves only its own Task queued.
+	 */
+	| { kind: "drain"; at: string; maxTeammates?: number }
 	/** The human used the `/team` menu on a Teammate: attached here, in a tmux window, or took the command. */
 	| { kind: "attach"; teammate: string; at: string };
 
@@ -312,8 +351,20 @@ export type EffortAction =
 	| { kind: "wake-lead"; text: string }
 	/** Write `plan.md` as a view of the state's plan. */
 	| { kind: "write-plan" }
-	/** Write the Task's folder and `task.md`, then launch the Teammate on it. */
-	| { kind: "launch-teammate"; teammate: Omit<Teammate, "task" | "startedAt">; task: { slug: string; folder: string } }
+	/** Write the Task's folder and `task.md` from the plan. */
+	| { kind: "write-task"; slug: string; folder: string }
+	/** Launch the Teammate on the Task, not before `at`: starts are staggered {@link STAGGER_MS} apart. */
+	| { kind: "launch-teammate"; teammate: Omit<Teammate, "task" | "startedAt">; task: { slug: string; folder: string }; at: string }
+	/** Stop the Teammate's background session, `claude stop <short id>`. */
+	| { kind: "stop-teammate"; teammate: string; shortId: string }
+	/**
+	 * Send the Teammate the clear marker over its inbox, which the mod turns
+	 * into a `/clear`; the Task's pointer follows once its `SessionStart`
+	 * with source `clear` is read ({@link EffortAction} `send-pointer`).
+	 */
+	| { kind: "clear-then-send"; teammate: string; inbox: Inbox; slug: string; folder: string }
+	/** Send the Teammate the pointer to round `round` of the Task over its inbox. */
+	| { kind: "send-pointer"; teammate: string; inbox: Inbox; slug: string; folder: string; round: number }
 	/**
 	 * Write `feedback` as `feedback-<round>.md` in the Task's folder, then send
 	 * the Teammate a pointer to it over its inbox, with no clear: it keeps its
@@ -341,7 +392,7 @@ export function openEffort(opened: { effortId: string; team: string; repo: strin
 }
 
 /** Lines a Report doesn't tell of: they only carry what other lines say. */
-const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached"]);
+const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested"]);
 
 /** Fold one line into the state, keeping what the next Report tells of. */
 function apply(state: EffortState, line: EffortLine): EffortState {
@@ -384,17 +435,41 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		}
 		case "task-handed-off": {
 			const { type: _type, slug, ...handed } = line;
-			return { ...state, tasks: { ...state.tasks, [slug]: handed } };
+			// A reused Teammate takes the Task into a fresh context, so how its last one ended no longer applies.
+			const teammates = state.teammates.map((teammate) => {
+				if (teammate.id !== line.teammate || teammate.task === slug) return teammate;
+				const { activity: _activity, doing: _doing, ...rest } = teammate;
+				return { ...rest, task: slug };
+			});
+			return { ...state, teammates, tasks: { ...state.tasks, [slug]: handed }, queue: state.queue.filter((queued) => queued.slug !== slug) };
 		}
+		case "task-queued": {
+			const { type: _type, ...queued } = line;
+			return { ...state, queue: [...state.queue, queued] };
+		}
+		case "clear-requested":
+			return { ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, clearing: line.slug } : teammate)) };
+		case "teammate-retired":
+			return { ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, retiredAt: line.at } : teammate)) };
 		case "teammate-session": {
 			const before = state.teammates.find((teammate) => teammate.id === line.teammate)?.shortId;
-			return withTeammate(state, line, {
+			const changed = withTeammate(state, line, {
 				sessionId: line.sessionId,
 				shortId: line.shortId,
 				...(line.inbox === undefined ? {} : { inbox: line.inbox }),
 				// A short id that replaces another is a new attach target, marked until the human attaches to it.
 				...(before !== undefined && before !== line.shortId ? { newShortId: true } : {}),
 			});
+			if (line.source !== "clear") return changed;
+			// The clear asked for has happened.
+			return {
+				...changed,
+				teammates: changed.teammates.map((teammate) => {
+					if (teammate.id !== line.teammate) return teammate;
+					const { clearing: _clearing, ...rest } = teammate;
+					return rest;
+				}),
+			};
 		}
 		case "teammate-attached":
 			return {
@@ -420,7 +495,7 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "teammate-mode":
 			return withTeammate(state, line, { observedMode: line.mode });
 		case "task-dropped":
-			return withTask(state, line.slug, { dropped: line.at });
+			return { ...withTask(state, line.slug, { dropped: line.at }), queue: state.queue.filter((queued) => queued.slug !== line.slug) };
 		case "task-reassigned":
 			return withTask(state, line.slug, { teammate: line.teammate });
 		case "teammate-ended":
@@ -463,7 +538,7 @@ export function fold(lines: readonly EffortLine[]): EffortState {
 		throw new Error(`effort.jsonl must start with an \`effort-opened\` line, not ${first ? `\`${first.type}\`` : "nothing"}`);
 	}
 	const { type: _type, at: _at, ...opened } = first;
-	return rest.reduce(apply, { ...opened, pending: [], requests: 0, tasks: {}, teammates: [], reports: 0, sinceReport: [], decided: [], found: [] });
+	return rest.reduce(apply, { ...opened, pending: [], requests: 0, tasks: {}, teammates: [], queue: [], reports: 0, sinceReport: [], decided: [], found: [] });
 }
 
 /** Take one input: the lines it appends and what the shell must do, or why it is refused. */
@@ -486,6 +561,8 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return journal(state, input);
 		case "review":
 			return review(state, input);
+		case "drain":
+			return drain(state, input);
 		case "report":
 			return report(state, input);
 		case "attach":
@@ -643,6 +720,11 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 			else if (kept.role !== handed.role) problems.push(`Task \`${slug}\` is accepted in Role \`${handed.role}\`, so it keeps that Role`);
 		} else if (!kept || kept.role !== handed.role) dropping.push(slug);
 	}
+	// A queued Task has no Teammate yet: dropped, it just leaves the queue.
+	const unqueuing = state.queue.filter((queued) => {
+		const kept = tasks.find((task) => task.slug === queued.slug);
+		return !kept || kept.role !== queued.role;
+	});
 	if (problems.length > 0) {
 		return { ok: false, refusal: `The plan for Effort \`${state.effortId}\` can't be taken until these are fixed:\n${problems.map((problem) => `- ${problem}`).join("\n")}` };
 	}
@@ -667,6 +749,15 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 				: `Dropped Task \`${slug}\`${stopped}.`,
 		);
 	}
+	for (const queued of unqueuing) {
+		const replanned = tasks.find((task) => task.slug === queued.slug);
+		append.push({ type: "task-dropped", slug: queued.slug, at: input.at });
+		notes.push(
+			replanned
+				? `Dropped queued Task \`${queued.slug}\`: it is planned again in Role \`${replanned.role}\`, and \`team_handoff\` hands it off afresh in a new folder.`
+				: `Dropped queued Task \`${queued.slug}\`.`,
+		);
+	}
 	const reply = [
 		`${state.plan ? "Replaced" : "Wrote"} the plan of Effort \`${state.effortId}\`: ${tasks.length} Task${tasks.length === 1 ? "" : "s"}, covering ${quoted(input.criteria)}. Hand each off with \`team_handoff\` when it is ready.`,
 		...notes,
@@ -674,10 +765,16 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 	return took(state, append, [...actions, { kind: "write-plan" }], reply);
 }
 
+/** How many Teammates may be live at once when pi's `maxTeammates` setting is absent. */
+export const DEFAULT_MAX_TEAMMATES = 3;
+
+/** The least time between two Teammate launches, so a burst of handoffs doesn't start them all at once. */
+export const STAGGER_MS = 5000;
+
 /**
- * Hand a planned Task to a fresh Teammate of its Role. The Task folder is
- * numbered in handoff order and named `<nnn>-<role>-<slug>`; the Teammate is
- * the next of its Role, `dev-1`, `dev-2`, …
+ * Hand a planned Task off. Its folder is numbered in handoff order and named
+ * `<nnn>-<role>-<slug>`, and written whether the Task starts now or queues;
+ * {@link staff} then decides who takes it.
  */
 function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handoff" }>): Step {
 	const early = beforeBrief(state, "team_handoff");
@@ -701,24 +798,131 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 			refusal: `Task \`${input.slug}\` is already ${status}, with \`${handed.teammate}\`; a Task is handed off once, and \`team_review\` sends it back for another round once its result is written.`,
 		};
 	}
-	const n = state.teammates.filter((teammate) => teammate.role === task.role).length + 1;
-	const id = `${task.role}-${n}`;
-	const name = `team-${state.effortId}-${id}`;
+	const queued = state.queue.find((each) => each.slug === input.slug);
+	if (queued) {
+		return {
+			ok: false,
+			refusal: `Task \`${input.slug}\` is already queued (${queued.why}); it starts by itself when a Teammate frees up, so don't hand it off again.`,
+		};
+	}
 	const folder = `${String(nextFolder(state)).padStart(3, "0")}-${task.role}-${task.slug}`;
+	const wanted: QueuedTask = { slug: task.slug, folder, role: task.role, why: "", at: input.at, ...(input.mode === undefined ? {} : { mode: input.mode }) };
+	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
+	const staffed = staff(state, wanted, max);
+	const pointer = `Task \`${task.slug}\` (tasks/${folder}/task.md)`;
+	if (staffed) {
+		return took(
+			state,
+			staffed.append,
+			[{ kind: "write-task", slug: task.slug, folder }, ...staffed.actions, { kind: "write-plan" }],
+			`${staffed.who} on ${pointer}.${staffed.note ? ` ${staffed.note}` : ""}`,
+		);
+	}
+	const why = waitReason(state, max);
 	return took(
 		state,
-		[
-			{ type: "teammate-started", id, role: task.role, name, task: task.slug, startedAt: input.at, ...(input.mode === undefined ? {} : { mode: input.mode }) },
-			{ type: "task-handed-off", slug: task.slug, folder, role: task.role, teammate: id, at: input.at, round: 1 },
-		],
-		[{ kind: "launch-teammate", teammate: { id, role: task.role, name }, task: { slug: task.slug, folder } }, { kind: "write-plan" }],
-		`started ${id} on Task \`${task.slug}\` (tasks/${folder}/task.md).`,
+		[{ type: "task-queued", ...wanted, why }],
+		[{ kind: "write-task", slug: task.slug, folder }, { kind: "write-plan" }],
+		`queued ${pointer}: ${why}. It starts by itself when a Teammate frees up, and \`team_review\` says so when an acceptance starts it.`,
 	);
 }
 
-/** The number of the next Task folder: one past the highest yet, since a dropped Task handed off again takes a new one. */
+/** The number of the next Task folder: one past the highest yet, queued ones included, since a dropped Task handed off again takes a new one. */
 function nextFolder(state: EffortState): number {
-	return Math.max(0, ...Object.values(state.tasks).map((task) => Number.parseInt(task.folder, 10) || 0)) + 1;
+	return Math.max(0, ...[...Object.values(state.tasks), ...state.queue].map((task) => Number.parseInt(task.folder, 10) || 0)) + 1;
+}
+
+/** Live Teammates: started, not stopped to make room, and not ended by a drop or a crash. */
+function live(state: EffortState): Teammate[] {
+	return state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined);
+}
+
+/** Whether `teammate` is between Tasks: its Task is accepted and it hasn't been given another. */
+function free(state: EffortState, teammate: Teammate): boolean {
+	return state.tasks[teammate.task]?.accepted !== undefined && teammate.clearing === undefined;
+}
+
+/**
+ * The staffing ladder, for a Task about to start: reuse an idle Teammate of
+ * its Role whose Task is accepted (cleared first, never mid-Task); else start
+ * a new one under the cap; else, at the cap, stop a free Teammate of a Role
+ * with no Task queued and start one in its place. Undefined when none applies,
+ * and the Task queues. A queued Task taken here leaves the queue.
+ */
+function staff(state: EffortState, task: QueuedTask, max: number): { append: EffortLine[]; actions: EffortAction[]; who: string; note?: string } | undefined {
+	const handed = { type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, at: task.at, round: 1 } as const;
+	const reused = live(state).find((teammate) => teammate.role === task.role && teammate.inbox !== undefined && free(state, teammate));
+	if (reused?.inbox) {
+		return {
+			append: [
+				{ ...handed, teammate: reused.id },
+				{ type: "clear-requested", teammate: reused.id, slug: task.slug, at: task.at },
+			],
+			actions: [{ kind: "clear-then-send", teammate: reused.id, inbox: reused.inbox, slug: task.slug, folder: task.folder }],
+			who: `reused ${reused.id}`,
+			note: "Its context is cleared first, then it gets the Task's pointer.",
+		};
+	}
+	if (live(state).length < max) return start(state, task);
+	const roles = new Set(state.queue.filter((queued) => queued.slug !== task.slug).map((queued) => queued.role));
+	const idle = live(state).find((teammate) => teammate.shortId !== undefined && free(state, teammate) && !roles.has(teammate.role));
+	if (!idle?.shortId) return undefined;
+	const retired: EffortLine = { type: "teammate-retired", teammate: idle.id, at: task.at };
+	const started = start(apply(state, retired), task);
+	return {
+		append: [retired, ...started.append],
+		actions: [{ kind: "stop-teammate", teammate: idle.id, shortId: idle.shortId }, ...started.actions],
+		who: started.who,
+		note: `It stopped idle \`${idle.id}\`, whose Task is accepted, to stay within the cap of ${max} live Teammates.`,
+	};
+}
+
+/** Start the next Teammate of the Task's Role on it, no sooner than {@link STAGGER_MS} after the last start. */
+function start(state: EffortState, task: QueuedTask): { append: EffortLine[]; actions: EffortAction[]; who: string } {
+	const id = `${task.role}-${state.teammates.filter((teammate) => teammate.role === task.role).length + 1}`;
+	const name = `team-${state.effortId}-${id}`;
+	const last = Math.max(...state.teammates.map((teammate) => Date.parse(teammate.startedAt)));
+	const at = new Date(Math.max(Date.parse(task.at), last + STAGGER_MS)).toISOString();
+	return {
+		append: [
+			{ type: "teammate-started", id, role: task.role, name, task: task.slug, startedAt: at, ...(task.mode === undefined ? {} : { mode: task.mode }) },
+			{ type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate: id, at: task.at, round: 1 },
+		],
+		actions: [{ kind: "launch-teammate", teammate: { id, role: task.role, name }, task: { slug: task.slug, folder: task.folder }, at }],
+		who: `started ${id}`,
+	};
+}
+
+/** Why a Task can't start now: the cap, and the folder numbers of the live Teammates' unaccepted Tasks. */
+function waitReason(state: EffortState, max: number): string {
+	const busy = live(state)
+		.map((teammate) => state.tasks[teammate.task])
+		.filter((task) => task !== undefined && task.accepted === undefined)
+		.map((task) => task?.folder.slice(0, 3) ?? "")
+		.sort();
+	const list = busy.length > 1 ? `${busy.slice(0, -1).join(", ")} and ${busy.at(-1)}` : busy[0];
+	return `cap ${max} reached; ${list === undefined ? "waits for a Teammate to free up" : `waits for ${list}`}`;
+}
+
+/**
+ * Start the first queued Task, in handoff order, that the staffing ladder can
+ * staff now; one it can't stays queued. Nothing to start is a step with no
+ * lines and no reply.
+ */
+function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }>): Step {
+	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
+	for (const queued of state.queue) {
+		// It starts now, whenever it was queued.
+		const staffed = staff(state, { ...queued, at: input.at }, max);
+		if (!staffed) continue;
+		return took(
+			state,
+			staffed.append,
+			[...staffed.actions, { kind: "write-plan" }],
+			`Queued Task \`${queued.slug}\` ${staffed.who} (tasks/${queued.folder}/task.md).${staffed.note ? ` ${staffed.note}` : ""}`,
+		);
+	}
+	return took(state, [], []);
 }
 
 /**
@@ -767,7 +971,12 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 			// The short id is the launch session's first eight characters; a clear or a resume keeps it.
 			const shortId = teammate.shortId ?? sessionId.slice(0, 8);
 			const source = text(payload.source) ?? "startup";
-			return took(state, [{ type: "teammate-session", ...at_, source, sessionId, shortId, ...(line.inbox === undefined ? {} : { inbox: line.inbox }), at }], []);
+			const session: EffortLine = { type: "teammate-session", ...at_, source, sessionId, shortId, ...(line.inbox === undefined ? {} : { inbox: line.inbox }), at };
+			// The clear a reuse asked for has happened: the reused Teammate gets its new Task's pointer in the fresh context.
+			const task = teammate.clearing === undefined ? undefined : state.tasks[teammate.clearing];
+			const inbox = line.inbox ?? teammate.inbox;
+			if (source !== "clear" || teammate.clearing === undefined || task === undefined || inbox === undefined) return took(state, [session], []);
+			return took(state, [session], [{ kind: "send-pointer", teammate: teammate.id, inbox, slug: teammate.clearing, folder: task.folder, round: task.round }]);
 		}
 		case "UserPromptSubmit":
 			return took(state, [{ type: "prompt-landed", ...at_, prompt: text(payload.prompt) ?? "", at }], []);
@@ -931,9 +1140,12 @@ function restaff(state: EffortState, input: Extract<EffortInput, { kind: "review
  */
 export function taskStatus(state: EffortState, slug: string): TaskStatus {
 	const task = state.tasks[slug];
-	if (!task) return "planned";
-	// A dropped Task planned again waits for a fresh handoff.
-	if (task.dropped !== undefined) return state.plan?.some((planned) => planned.slug === slug) ? "planned" : "dropped";
+	if (!task || task.dropped !== undefined) {
+		if (state.queue.some((queued) => queued.slug === slug)) return "queued";
+		// A dropped Task planned again waits for a fresh handoff.
+		if (!task || state.plan?.some((planned) => planned.slug === slug)) return "planned";
+		return "dropped";
+	}
 	if (task.accepted !== undefined) return "accepted";
 	if (task.reported === task.round) return "in review";
 	return task.round > 1 ? "sent back" : "running";
@@ -955,6 +1167,10 @@ function told(line: EffortLine): string | undefined {
 			return `${line.reason === undefined ? "planned" : "re-planned"} ${line.tasks.length} Task${line.tasks.length === 1 ? "" : "s"}`;
 		case "task-handed-off":
 			return `handed Task \`${line.slug}\` to ${line.teammate}`;
+		case "task-queued":
+			return `queued Task \`${line.slug}\`: ${line.why}`;
+		case "teammate-retired":
+			return `stopped idle ${line.teammate} to make room`;
 		case "task-done":
 			return `${line.teammate} finished round ${line.round} of Task \`${line.slug}\``;
 		case "teammate-stopped":

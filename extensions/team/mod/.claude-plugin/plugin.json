@@ -1,0 +1,1 @@
+{ "name": "team", "version": "0.1.0", "description": "The team extension's mod for Teammates: clears a Teammate's context when the Lead's inbox message carries __TEAM_CLEAR__" }

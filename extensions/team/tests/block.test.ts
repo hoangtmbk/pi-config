@@ -231,6 +231,41 @@ describe("team_status data", () => {
 		assert.deepEqual(teamStatus(state, { adoptionsPending: 0 }).tasks, { accepted: 1, planned: 2 });
 	});
 
+	it("lists the queued Tasks with their Role and why, and drops a Teammate stopped to make room", () => {
+		const capped = (input: EffortInput): EffortInput => ({ ...input, maxTeammates: 1 }) as EffortInput;
+		const queued = through([REQUEST, APPROVE, PLAN, capped(handoff("design")), capped(handoff("ttl"))]);
+		const waiting = teamStatus(fold(queued), { adoptionsPending: 0 });
+
+		assert.deepEqual(waiting.queued, [{ task: "002-dev-ttl", role: "dev", why: "cap 1 reached; waits for 001" }]);
+		assert.deepEqual(
+			waiting.teammates.map((row) => row.id),
+			["architect-1"],
+		);
+
+		const swapped = fold(
+			through([
+				...[REQUEST, APPROVE, PLAN, capped(handoff("design")), capped(handoff("ttl"))],
+				hook("architect-1", 1, "SessionStart", { source: "startup", permission_mode: "auto" }),
+				hook("architect-1", 2, "Stop", { permission_mode: "auto" }, true),
+				{ kind: "review", slug: "design", verdict: "accept", result: { path: "/e/result-1.md", written: true }, sendBackLimit: 2, at: "2026-11-02T10:50:00.000Z" },
+				{ kind: "drain", at: "2026-11-02T10:50:00.000Z", maxTeammates: 1 },
+			]),
+		);
+		const status = teamStatus(swapped, { adoptionsPending: 0 });
+
+		assert.deepEqual(status.queued, []);
+		assert.deepEqual(
+			status.teammates.map((row) => [row.id, row.task]),
+			[["dev-1", "002-dev-ttl"]],
+		);
+	});
+
+	it("is working once a Task is queued, though none has started", () => {
+		const capped = through([REQUEST, APPROVE, PLAN, { ...handoff("design"), maxTeammates: 0 } as EffortInput]);
+
+		assert.equal(teamStatus(fold(capped), { adoptionsPending: 0 }).phase, "working");
+	});
+
 	it("counts the Reports written", () => {
 		const report = (at: string): EffortInput => ({ kind: "report", headline: "On track.", criteria: ["AC1"], modes: [], at });
 
