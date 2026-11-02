@@ -17,6 +17,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { renderTeamBlock, teamStatus } from "./block.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
@@ -37,12 +38,16 @@ import {
 	readJournal,
 	readLead,
 	readLines,
+	readReports,
+	reportMarkdown,
 	validateBrief,
 	writeFeedback,
 	writePlan,
+	writeReport,
 	writeTask,
 } from "./records.ts";
 import { repoRoot } from "./repo.ts";
+import { REPORT_OVERLAY, type ReportChrome, ReportView, type ReportTui } from "./reports-view.ts";
 import { addWorkspace } from "./workspace.ts";
 import {
 	ADOPT_PLAYBOOK,
@@ -67,7 +72,7 @@ import { handoffPointer, sendBackPointer, teammatePrompt } from "./teammate.ts";
 /** The Lead's tools while this session runs Team setup. */
 const SETUP_TOOLS = ["team_request_approval"];
 /** The Lead's tools while this session holds an Effort. */
-const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff", "team_review", "team_status"];
+const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report"];
 /** Every Lead tool: registered at load, and switched on only by what the session runs. */
 const LEAD_TOOLS = [...new Set([...SETUP_TOOLS, ...EFFORT_TOOLS])];
 
@@ -87,7 +92,32 @@ const PlanParams = Type.Object({
 		}),
 		{ description: "The whole Task list." },
 	),
+	reason: Type.Optional(Type.String({ description: "When re-planning: why the plan changed, in a sentence. It goes into the next Report." })),
 });
+
+const ReportParams = Type.Object({
+	headline: Type.String({ description: "Where the Effort stands, in a sentence or two." }),
+	coverage: Type.Optional(
+		Type.Array(
+			Type.Object({
+				criterion: Type.String({ description: "A Brief acceptance-criterion id, such as `AC1`." }),
+				note: Type.String({ description: "How the plan or the accepted work covers it so far." }),
+			}),
+			{ description: "Brief coverage, criterion by criterion, as you see it." },
+		),
+	),
+	found: Type.Optional(
+		Type.Array(Type.String(), { description: "Work found since the last Report that is outside the Brief: kept as suggestions for the final Report, never started." }),
+	),
+});
+
+/** What a `team_report` result carries for the human's view of it in chat; the Lead reads only its short `content`. */
+interface ReportDetails {
+	n: number;
+	path: string;
+	headline: string;
+	markdown: string;
+}
 
 /** The Team block's key among pi's widgets. */
 const BLOCK_KEY = "team";
@@ -681,6 +711,51 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				ctx.ui.notify(`Adopted Effort \`${effortId}\` (${held.paths.dir}): this session is its Lead now.`, "info");
 			},
 		},
+		report: {
+			async run(_args, ctx) {
+				if (!effort) {
+					ctx.ui.notify("No Effort is open in this session, so there is nothing to report on; `/team start <team>` opens one.", "error");
+					return;
+				}
+				if (!effortState(effort).brief) {
+					ctx.ui.notify(`Effort \`${effort.effortId}\` has no approved Brief yet, so there is nothing to report against.`, "error");
+					return;
+				}
+				wakeLead(
+					"team-report-request",
+					`The human asked for a Report on Effort \`${effort.effortId}\`. Write one with \`team_report\` now, covering everything since the last Report: where the Effort stands, Brief coverage criterion by criterion, and any work found outside the Brief.`,
+				);
+				ctx.ui.notify(`Asked the Lead for a Report on Effort \`${effort.effortId}\`.`, "info");
+			},
+		},
+		reports: {
+			async run(_args, ctx) {
+				if (!effort) {
+					ctx.ui.notify("No Effort is open in this session, so there are no Reports to read; `/team resume` adopts one.", "error");
+					return;
+				}
+				const held = effort;
+				const written = readReports(held.paths);
+				if (written.length === 0) {
+					ctx.ui.notify(`No Reports yet for Effort \`${held.effortId}\`.`, "info");
+					return;
+				}
+				const label = (each: (typeof written)[number]) => [`Report ${each.n}`, each.time, each.headline].filter((part) => part).join(" · ");
+				const picked = await ctx.ui.select(`Reports of Effort \`${held.effortId}\`, newest first:`, written.map(label));
+				const chosen = written.find((each) => label(each) === picked);
+				if (!chosen) return;
+				// Only pi's terminal can draw an overlay; elsewhere the file is where to read it.
+				if (ctx.mode !== "tui") {
+					ctx.ui.notify(`Report ${chosen.n} is ${chosen.path}.`, "info");
+					return;
+				}
+				await ctx.ui.custom<void>(
+					(tui, theme, _keybindings, done) =>
+						new ReportView(tui as unknown as ReportTui, theme as unknown as ReportChrome, `Report ${chosen.n} · ${held.effortId}`, chosen.markdown, () => done()),
+					{ overlay: true, overlayOptions: REPORT_OVERLAY },
+				);
+			},
+		},
 	};
 	const valid = Object.keys(subcommands)
 		.map((name) => `\`${name}\``)
@@ -729,7 +804,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			const { held, state } = approvedEffort("team_plan", ctx);
 			const { roles } = snapshotOf(held);
 			const criteria = briefCriteria(readFileSync(held.paths.brief, "utf8"));
-			const result = step(state, { kind: "plan", tasks: params.tasks, criteria, roles: roles.map((role) => role.name), at: now().toISOString() });
+			const result = step(state, { kind: "plan", tasks: params.tasks, criteria, roles: roles.map((role) => role.name), reason: params.reason, at: now().toISOString() });
 			if (!result.ok) throw new Error(result.refusal);
 			await carryOut(held, result, async () => {});
 			paintBlock();
@@ -859,8 +934,49 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		},
 	});
 
+	pi.registerTool({
+		name: "team_report",
+		label: "Report",
+		description: [
+			"Write the next Report to the human: your headline and Brief coverage, with the sections the extension adds from the Effort's log (what happened since the last Report, the plan, what waits on the human, what was decided for them, Teammate modes, work found outside the Brief).",
+			"Write the plan Report once you have planned, and another whenever the human asks with `/team report` or the Effort reaches a milestone.",
+			"Saved as `reports/<nnn>.md` and shown to the human in chat; you get back only where it went. Refused until the human approves the Brief.",
+		].join(" "),
+		promptSnippet: "Write a Report to the human: where the Effort stands and Brief coverage",
+		parameters: ReportParams,
+		defaultActive: false,
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			if (!effort) throw new Error("No Effort is open in this session, so there is nothing to report on; the human opens one with `/team start <team>`.");
+			const held = effort;
+			const state = effortState(held);
+			const criteria = state.brief ? briefCriteria(readFileSync(held.paths.brief, "utf8")) : [];
+			// The Role modes go only into the plan Report, and need the snapshot only then.
+			const snapshot = state.brief && state.reports === 0 ? snapshotOf(held) : undefined;
+			const modes = snapshot ? snapshot.roles.map((role) => ({ role: role.name, mode: modeInForce(snapshot.playbook, role) })) : [];
+			const result = step(state, { kind: "report", headline: params.headline, coverage: params.coverage, found: params.found, criteria, modes, at: now().toISOString() });
+			if (!result.ok) throw new Error(result.refusal);
+			let details: ReportDetails | undefined;
+			for (const action of result.actions) {
+				if (action.kind !== "write-report") continue;
+				const markdown = reportMarkdown(held.effortId, action.report);
+				details = { n: action.report.n, path: writeReport(held.paths, markdown, action.report.n), headline: action.report.headline, markdown };
+			}
+			appendLines(held.paths, result.append);
+			paintBlock();
+			return { content: [{ type: "text", text: result.reply ?? "" }], details };
+		},
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as ReportDetails | undefined;
+			if (!details) return new Text(result.content.map((part) => (part.type === "text" ? part.text : "")).join("\n"), 0, 0);
+			if (expanded) return new Text(details.markdown.trimEnd(), 0, 0);
+			// Collapsed, it is one line however narrow the chat is: the Report's number and headline.
+			const line = `${theme.fg("accent", theme.bold(`Report ${details.n}`))} · ${details.headline} ${theme.fg("dim", "(expand to read it)")}`;
+			return { render: (width: number) => [truncateToWidth(line, width)], invalidate() {} };
+		},
+	});
+
 	pi.registerCommand("team", {
-		description: "Run a Team on one Effort: /team start [team], /team setup <team>, /team pending, /team resume [effort]",
+		description: "Run a Team on one Effort: /team start [team], /team setup <team>, /team pending, /team resume [effort], /team report, /team reports",
 		async handler(args, ctx) {
 			const [name, ...rest] = args.trim().split(/\s+/).filter(Boolean);
 			if (name === undefined) {

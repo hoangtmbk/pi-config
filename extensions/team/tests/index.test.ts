@@ -42,8 +42,31 @@ interface Dialog {
 interface RegisteredTool {
 	name: string;
 	defaultActive?: boolean;
-	execute(id: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: unknown): Promise<{ content: { type: string; text: string }[] }>;
+	execute(id: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: unknown): Promise<ToolResult>;
+	renderResult?(result: ToolResult, options: { expanded: boolean; isPartial: boolean }, theme: unknown, context: unknown): Drawn;
 }
+
+/** What a tool returns: `content` is what the Lead reads, `details` only the human's view. */
+interface ToolResult {
+	content: { type: string; text: string }[];
+	details?: unknown;
+}
+
+/** Anything pi draws: a tool result's view, or an overlay. */
+interface Drawn {
+	render(width: number): string[];
+	handleInput?(data: string): void;
+}
+
+/** An overlay the extension opened, drawn and handed keys as the human would, and whether it has closed. */
+interface Overlay {
+	view: Drawn;
+	options: unknown;
+	closed: boolean;
+}
+
+/** pi's theme with its colours taken out, so what the extension draws reads as plain text. */
+const PLAIN_THEME = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 
 /** A widget the extension set above the editor, or cleared with `lines` undefined. */
 interface Widget {
@@ -80,6 +103,8 @@ function fakePi(
 		/** The pid the extension takes the Lead as, standing in for another pi process. */
 		pid?: number;
 		hasUI?: boolean;
+		/** pi's run mode; `tui` unless set. */
+		mode?: string;
 	} = {},
 ) {
 	const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
@@ -94,6 +119,7 @@ function fakePi(
 	const carried = options.entries ?? [];
 	const sessionFile = options.sessionFile ?? join(roots.scratch, "session.jsonl");
 	const widgets: Widget[] = [];
+	const overlays: Overlay[] = [];
 	const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
 	const pi = {
 		on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
@@ -135,6 +161,7 @@ function fakePi(
 	}
 	const ctx = {
 		hasUI: options.hasUI ?? true,
+		mode: options.mode ?? "tui",
 		cwd: options.cwd ?? roots.scratch,
 		isIdle: () => !options.streaming,
 		sessionManager: {
@@ -163,6 +190,17 @@ function fakePi(
 			setWidget(key: string, lines: string[] | undefined, widgetOptions?: { placement?: string }) {
 				widgets.push({ key, lines, placement: widgetOptions?.placement });
 			},
+			custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Drawn, customOptions: unknown) {
+				return new Promise((resolve) => {
+					const tui = { terminal: { rows: 40, columns: 100 }, requestRender() {} };
+					const overlay: Overlay = { view: { render: () => [] }, options: customOptions, closed: false };
+					overlay.view = factory(tui, PLAIN_THEME, undefined, (value) => {
+						overlay.closed = true;
+						resolve(value);
+					});
+					overlays.push(overlay);
+				});
+			},
 		},
 	} as unknown as ExtensionCommandContext;
 
@@ -177,6 +215,8 @@ function fakePi(
 		entries,
 		/** Every widget the extension set or cleared, oldest first. */
 		widgets,
+		/** Every overlay the extension opened, oldest first. */
+		overlays,
 		activeTools: () => [...activeTools],
 		claude,
 		/** Queue the human's answers to the next dialogs, in order. */
@@ -206,6 +246,33 @@ function fakePi(
 			const result = await tool.execute("call-1", params, undefined, undefined, ctx);
 			return result.content.map((part) => part.text).join("\n");
 		},
+		/** Call one of the Lead's tools and keep its whole result, the human's view of it included. */
+		async result(name: string, params: Record<string, unknown>): Promise<ToolResult> {
+			const tool = tools.get(name);
+			assert.ok(tool, `expected a \`${name}\` tool`);
+			return tool.execute("call-1", params, undefined, undefined, ctx);
+		},
+		/** Draw a tool's result the way pi does in chat, collapsed unless `expanded`, as plain lines. */
+		drawResult(name: string, result: ToolResult, expanded: boolean, width = 100): string[] {
+			const render = tools.get(name)?.renderResult;
+			assert.ok(render, `\`${name}\` draws its result with pi's generic view`);
+			return render(result, { expanded, isPartial: false }, PLAIN_THEME, ctx)
+				.render(width)
+				.map((line) => line.trimEnd());
+		},
+		/**
+		 * Run `/team <args>` while it waits on an overlay: resolves once the
+		 * command opened one, with the command still running until it closes.
+		 */
+		async teamOpening(args: string): Promise<{ overlay: Overlay; done: Promise<void> }> {
+			const command = commands.get("team");
+			assert.ok(command, "expected a `team` command");
+			const before = overlays.length;
+			const done = command.handler(args, ctx);
+			for (let tick = 0; tick < 200 && overlays.length === before; tick++) await new Promise((resolve) => setImmediate(resolve));
+			assert.ok(overlays.length > before, `\`/team ${args}\` opened no overlay`);
+			return { overlay: overlays[before], done };
+		},
 	};
 }
 
@@ -224,8 +291,8 @@ describe("/team", () => {
 		await pi.team("");
 
 		assert.deepEqual(pi.notifications, [
-			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `resume`.", type: "error" },
-			{ message: "`/team` needs a subcommand. Subcommands: `start`, `setup`, `pending`, `resume`.", type: "error" },
+			{ message: "Unknown `/team` subcommand `launch`. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`.", type: "error" },
+			{ message: "`/team` needs a subcommand. Subcommands: `start`, `setup`, `pending`, `resume`, `report`, `reports`.", type: "error" },
 		]);
 	});
 });
@@ -670,7 +737,7 @@ describe("/team start on a Team with no adopted Playbook", () => {
 
 		assert.match(pi.notifications.at(-1)?.message ?? "", /^Team `software` picked: .*Playbook: adopted 2026-11-02T10:00:00\.000Z.* Effort `software-2026-11-02` opened/);
 		assert.equal(pi.sent.at(-1)?.customType, "team-intake");
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report"]);
 	});
 
 	it("goes back through setup when the adopted Playbook was edited by hand", async () => {
@@ -753,7 +820,7 @@ describe("intake: `/team start` on a Team with an adopted Playbook", () => {
 		for (const needed of [join(dir, "brief.draft.md"), sha(INTAKE_PLAYBOOK), `repo: ${repo}`, "Constraints", "small-diffs", "**AC1**", "`team_request_approval`", "`brief`"]) {
 			assert.ok(woken?.content.includes(needed), `the intake prompt doesn't mention ${needed}:\n${woken?.content}`);
 		}
-		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status"]);
+		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report"]);
 	});
 
 	it("gives each Effort its own id, so a second one the same day is numbered", async () => {
@@ -1276,7 +1343,7 @@ function crewBrief(repo: string): string {
  * A session whose `crew` Effort has its Brief approved: a user Team whose
  * Roles set every launch flag between them, on {@link CREW_PLAYBOOK}.
  */
-async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown> } = {}) {
+async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown>; mode?: string } = {}) {
 	const roots = tempRoots();
 	const plugin = join(roots.scratch, "plugins", "lint");
 	writeUserTeam(roots, "crew", {
@@ -1300,7 +1367,7 @@ async function crewApproved(options: { bgExit?: number; hooks?: FakeHookStep[]; 
 	});
 	adopt(roots, "crew", CREW_PLAYBOOK);
 	const repo = gitRepo(roots);
-	const pi = fakePi(roots, { cwd: repo, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies, settings: options.settings });
+	const pi = fakePi(roots, { cwd: repo, bgExit: options.bgExit, hooks: options.hooks, replies: options.replies, settings: options.settings, mode: options.mode });
 	await pi.team("start crew");
 	const dir = effortDir(roots, CREW_EFFORT_ID);
 	writeFileSync(join(dir, "brief.draft.md"), crewBrief(repo));
@@ -1941,6 +2008,155 @@ describe("the Team block", () => {
 	});
 });
 
+/** The crew Effort planned, its plan Report written, and `rename-key` handed off. */
+async function crewReported() {
+	const crew = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+	await crew.pi.call("team_plan", { tasks: CREW_PLAN });
+	await crew.pi.call("team_report", { headline: "Planned three Tasks.", coverage: [{ criterion: "AC1", note: "`rename-key` covers it." }] });
+	await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+	return crew;
+}
+
+describe("reporting: team_report", () => {
+	it("writes the plan Report as reports/001.md with the logged sections, and tells the Lead only where it went", async () => {
+		const { pi, dir } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		const reply = await pi.call("team_report", {
+			headline: "Planned three Tasks.",
+			coverage: [
+				{ criterion: "AC1", note: "`rename-key` covers it." },
+				{ criterion: "AC2", note: "`check-old-configs` covers it." },
+			],
+		});
+
+		assert.equal(reply, "Report 1 of Effort `crew-2026-11-02` is written as reports/001.md. The human sees it in chat, so don't repeat it.");
+		const written = readFileSync(join(dir, "reports", "001.md"), "utf8");
+		for (const needed of [
+			"# Report 1 · Effort `crew-2026-11-02`",
+			"Planned three Tasks.",
+			"## Brief coverage",
+			"- AC1: `rename-key` covers it.",
+			"## Since the last Report",
+			"planned 3 Tasks",
+			"## Plan",
+			"## Teammate modes",
+			"- builder: acceptEdits",
+			"- reviewer: dontAsk",
+		]) {
+			assert.ok(written.includes(needed), `reports/001.md doesn't say ${needed}:\n${written}`);
+		}
+		assert.equal(written.includes("## Waiting on you"), false, `an empty section is left out:\n${written}`);
+	});
+
+	it("writes the next Report as reports/002.md, covering only what happened since the first", async () => {
+		const { pi, dir } = await crewReported();
+
+		await pi.call("team_report", { headline: "`rename-key` is with builder-1." });
+
+		assert.deepEqual(readdirSync(join(dir, "reports")).sort(), ["001.md", "002.md"]);
+		const second = readFileSync(join(dir, "reports", "002.md"), "utf8");
+		assert.ok(second.includes("# Report 2"), second);
+		assert.ok(second.includes("handed Task `rename-key` to builder-1"), second);
+		assert.equal(second.includes("planned 3 Tasks"), false, second);
+		assert.equal(second.includes("## Teammate modes"), false, second);
+		assert.equal(second.includes("## Brief coverage"), false, `no coverage was given:\n${second}`);
+	});
+
+	it("shows in chat collapsed to its headline, and whole when expanded", async () => {
+		const { pi } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		const result = await pi.result("team_report", { headline: "Planned three Tasks.", coverage: [{ criterion: "AC1", note: "`rename-key` covers it." }] });
+
+		const collapsed = pi.drawResult("team_report", result, false);
+		assert.equal(collapsed.length, 1, collapsed.join("\n"));
+		assert.match(collapsed[0], /Report 1 · Planned three Tasks\./);
+		const expanded = pi.drawResult("team_report", result, true).join("\n");
+		for (const needed of ["Planned three Tasks.", "AC1: `rename-key` covers it.", "Teammate modes", "builder: acceptEdits"]) {
+			assert.ok(expanded.includes(needed), `the expanded Report doesn't say ${needed}:\n${expanded}`);
+		}
+	});
+
+	it("is refused before the human approves the Brief, writing nothing", async () => {
+		const { roots, pi } = intakeSession();
+		await pi.team("start software");
+
+		await assert.rejects(pi.call("team_report", { headline: "Nothing yet." }), /no approved Brief yet/);
+		assert.equal(existsSync(join(effortDir(roots), "reports")), false);
+	});
+
+	it("counts the Reports in the Team block and in `team_status`", async () => {
+		const { pi } = await crewReported();
+
+		assert.match(teamBlock(pi)?.at(-2) ?? "", /reports 1 {2}\/team reports/);
+		assert.equal(JSON.parse(await pi.call("team_status", {})).reports, 1);
+	});
+});
+
+describe("/team report", () => {
+	it("wakes the Lead to write a Report covering everything since the last one", async () => {
+		const { pi } = await crewReported();
+
+		await pi.team("report");
+
+		const woken = pi.sent.at(-1);
+		assert.equal(woken?.customType, "team-report-request");
+		assert.equal(woken?.triggerTurn, true);
+		assert.match(woken?.content ?? "", /`team_report`/);
+		assert.match(woken?.content ?? "", /since the last Report/);
+	});
+
+	it("says there is nothing to report on without an Effort whose Brief is approved", async () => {
+		const pi = fakePi(tempRoots());
+
+		await pi.team("report");
+
+		assert.deepEqual(pi.sent, []);
+		assert.equal(pi.notifications.at(-1)?.type, "error");
+		assert.match(pi.notifications.at(-1)?.message ?? "", /No Effort/);
+	});
+});
+
+describe("/team reports", () => {
+	it("lists the Reports newest first and opens the chosen one in an overlay, closed with escape", async () => {
+		const { pi } = await crewReported();
+		await pi.call("team_report", { headline: "`rename-key` is with builder-1." });
+		pi.answer("Report 1 · 10:00 · Planned three Tasks.");
+
+		const { overlay, done } = await pi.teamOpening("reports");
+
+		assert.deepEqual(pi.dialogs.at(-1)?.options, ["Report 2 · 10:00 · `rename-key` is with builder-1.", "Report 1 · 10:00 · Planned three Tasks."]);
+		const drawn = overlay.view.render(100).join("\n");
+		assert.ok(drawn.includes("# Report 1 · Effort `crew-2026-11-02`"), drawn);
+		assert.ok(drawn.includes("builder: acceptEdits"), drawn);
+		assert.equal(overlay.closed, false);
+		overlay.view.handleInput?.("\x1b");
+		await done;
+		assert.equal(overlay.closed, true);
+	});
+
+	it("says when there are none yet", async () => {
+		const { pi } = await crewApproved();
+
+		await pi.team("reports");
+
+		assert.deepEqual(pi.notifications.at(-1), { message: "No Reports yet for Effort `crew-2026-11-02`.", type: "info" });
+	});
+
+	it("names the chosen Report's file outside pi's terminal, where there is no overlay to open", async () => {
+		const { pi, dir } = await crewApproved({ mode: "rpc" });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_report", { headline: "Planned three Tasks." });
+		pi.answer("Report 1 · 10:00 · Planned three Tasks.");
+
+		await pi.team("reports");
+
+		assert.deepEqual(pi.overlays, []);
+		assert.deepEqual(pi.notifications.at(-1), { message: `Report 1 is ${join(dir, "reports", "001.md")}.`, type: "info" });
+	});
+});
+
 describe("the package manifest", () => {
 	it("loads the team extension beside the others", () => {
 		const manifest = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")) as { pi: { extensions: string[] } };
@@ -2098,7 +2314,7 @@ describe("re-attaching: `pi -c`, `/resume` back and `/reload`", () => {
 			assert.equal(lead.stoppedAt, undefined);
 			assert.equal(typeof lead.port, "number");
 			assert.equal(lead.sessionFile, join(roots.scratch, "session.jsonl"));
-			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status"]);
+			assert.deepEqual(again.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report"]);
 			assert.deepEqual(again.entries, []);
 			assert.deepEqual(again.notifications, [{ message: `This session leads Effort \`${EFFORT_ID}\` (${dir}) again.`, type: "info" }]);
 			assert.deepEqual(again.sent, []);

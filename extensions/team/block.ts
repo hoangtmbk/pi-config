@@ -115,7 +115,7 @@ export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockD
 		teammates: state.teammates.map((teammate) => teammateRow(state, teammate)),
 		queued: [],
 		waitingOnYou: state.pending.length + extras.adoptionsPending,
-		reports: 0,
+		reports: state.reports,
 	};
 }
 
@@ -194,7 +194,9 @@ function queuedLines(data: TeamBlockData): string[] {
 
 function footerLine(data: TeamBlockData): string[] {
 	const waiting = data.waitingOnYou > 0 ? `▲ ${data.waitingOnYou} waiting on you  /team pending` : "nothing waiting on you";
-	return [`${waiting}   reports ${data.reports}`];
+	// Where to read them, once there are any.
+	const reports = data.reports > 0 ? `reports ${data.reports}  /team reports` : `reports ${data.reports}`;
+	return [`${waiting}   ${reports}`];
 }
 
 /** Each cell padded to the widest in the column. */
