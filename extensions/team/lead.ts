@@ -13,7 +13,8 @@
 
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, rmSync, writeSync } from "node:fs";
 import { join } from "node:path";
-import { type EffortPaths, effortPaths, effortsDir, type LeadRecord, type NoLiveLead, readLead, writeLead } from "./records.ts";
+import { fold } from "./core.ts";
+import { type EffortPaths, effortPaths, effortsDir, type LeadRecord, type NoLiveLead, readLead, readLines, writeLead } from "./records.ts";
 
 /** The session taking or leaving the Lead: the pi process it runs in, and its session file. */
 export interface Leader {
@@ -116,9 +117,14 @@ function effortIds(agentDir: string): string[] {
 		.sort();
 }
 
-/** The Efforts `/team resume` can adopt: those with no live Lead. */
+/** The Efforts `/team resume` can adopt: those not yet ended, with no live Lead. */
 export function adoptable(agentDir: string): string[] {
-	return effortIds(agentDir).filter((id) => !liveLead(effortPaths(agentDir, id)));
+	return effortIds(agentDir).filter((id) => !liveLead(effortPaths(agentDir, id)) && !hasEnded(effortPaths(agentDir, id)));
+}
+
+/** Whether the Effort is over, signed off or cancelled: one that has ended is never led again. */
+export function hasEnded(paths: EffortPaths): boolean {
+	return existsSync(paths.log) && fold(readLines(paths)).ended !== undefined;
 }
 
 /** The Effort whose `lead.json` names this session file, for a session that carries no pointer to it: a fork of its Lead's first entries. */

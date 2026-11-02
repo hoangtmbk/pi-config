@@ -1693,6 +1693,176 @@ describe("a Teammate's lifecycle", () => {
 });
 
 
+describe("the final Report and sign-off", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "design", role: "architect", goal: "Design the rename.", criteria: ["AC2"] },
+			{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] },
+		],
+		criteria: ["AC1", "AC2"],
+		roles: ["architect", "dev"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+	const plannedReport = applied(planned, { kind: "report", headline: "Planned.", criteria: ["AC1", "AC2"], modes: [], found: ["The docs misspell the key too."], at: "2026-11-02T11:15:00.000Z" });
+	const handed = applied(applied(plannedReport, { kind: "handoff", slug: "design", at: "2026-11-02T11:20:00.000Z" }), { kind: "handoff", slug: "rename", at: "2026-11-02T11:21:00.000Z" });
+	// architect-1's session started and gave it a short id; dev-1's hasn't yet.
+	const running: EffortLine[] = [...handed, { type: "teammate-session", teammate: "architect-1", cursor: 1, source: "startup", sessionId: "s-1", shortId: "abc123", at: "2026-11-02T11:22:00.000Z" }];
+	const CHANGE = { id: "qa-first", summary: "QA reviews the design before devs start.", oldText: "design-first", newText: "design-and-qa-first" };
+	const WORKTREES = [
+		{ path: "/work/app/.claude/worktrees/team-software-2026-11-02", branch: "team/software-2026-11-02", dirty: false },
+		{ path: "/work/app/.claude/worktrees/team-software-2026-11-02-task-002", branch: "team/software-2026-11-02-task-002", dirty: true },
+	];
+	const EVIDENCE = [
+		{ criterion: "AC1", note: "renamed in `config.ts`, tests in `config.test.ts` pass" },
+		{ criterion: "AC2", note: "design accepted in `001-architect-design/result-1.md`" },
+	];
+
+	function finalReport(at: string, extra: Partial<Extract<EffortInput, { kind: "report" }>> = {}): Extract<EffortInput, { kind: "report" }> {
+		return {
+			kind: "report",
+			headline: "Done: the key is renamed.",
+			coverage: EVIDENCE,
+			criteria: ["AC1", "AC2"],
+			modes: [],
+			final: { checkpoints: ["design-review"], changes: [CHANGE], worktrees: WORKTREES },
+			at,
+			...extra,
+		};
+	}
+
+	function written(result: Step) {
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "write-report");
+		assert.ok(action?.kind === "write-report", "expected a write-report action");
+		return action.report;
+	}
+
+	function signOffRequest(at = "2026-11-02T12:01:00.000Z"): Extract<EffortInput, { kind: "request-sign-off" }> {
+		return { kind: "request-sign-off", path: "/agent/team/efforts/software-2026-11-02/reports/002.md", sha256: "d".repeat(64), snapshot: "# Final Report 2", changes: [{ change: CHANGE, sha256: "e".repeat(64) }], at };
+	}
+
+	const reported = applied(running, finalReport("2026-11-02T12:00:00.000Z"));
+	const asked = applied(reported, signOffRequest());
+
+	it("refuses a final Report that leaves a criterion without evidence, or proposes a change twice", () => {
+		assert.match(refusal(running, finalReport("2026-11-02T12:00:00.000Z", { coverage: [EVIDENCE[0]] })), /`AC2`/);
+		assert.match(refusal(running, finalReport("2026-11-02T12:00:00.000Z", { coverage: [EVIDENCE[0], { criterion: "AC2", note: " " }] })), /`AC2`/);
+		const twice = finalReport("2026-11-02T12:00:00.000Z", { final: { checkpoints: [], changes: [CHANGE, CHANGE], worktrees: [] } });
+		assert.match(refusal(running, twice), /`qa-first`.*once/);
+		const unkebab = finalReport("2026-11-02T12:00:00.000Z", { final: { checkpoints: [], changes: [{ ...CHANGE, id: "QA First" }], worktrees: [] } });
+		assert.match(refusal(running, unkebab), /kebab-case/);
+	});
+
+	it("maps every criterion to evidence and lists every checkpoint, all found work, each proposed change and the worktrees", () => {
+		const report = written(run(running, finalReport("2026-11-02T12:00:00.000Z")));
+		assert.equal(report.final, true);
+		assert.deepEqual(report.coverage, EVIDENCE);
+		const section = (title: string) => report.sections.find((each) => each.title === title)?.lines;
+		assert.deepEqual(section("Checkpoints"), [
+			`Playbook: adopted before the Effort opened (sha256 ${"a".repeat(64)})`,
+			`Brief: \`r1\` approved at 11:00 UTC (sha256 ${"b".repeat(64)})`,
+			"`design-review`: never asked",
+		]);
+		assert.deepEqual(section("Found work"), ["The docs misspell the key too."]);
+		assert.deepEqual(section("Proposed Playbook changes"), [
+			"`qa-first`: QA reviews the design before devs start.",
+			"Each is adopted or declined on its own in `/team pending`. An adopted one is the Playbook of the next Effort; this Effort keeps its snapshot.",
+		]);
+		assert.deepEqual(section("Worktrees"), [
+			"/work/app/.claude/worktrees/team-software-2026-11-02 (`team/software-2026-11-02`): clean, removed at sign-off; the branch is kept",
+			"/work/app/.claude/worktrees/team-software-2026-11-02-task-002 (`team/software-2026-11-02-task-002`): has uncommitted changes, so it is kept; the branch is kept",
+		]);
+	});
+
+	it("asks for sign-off and for each proposed Playbook change separately", () => {
+		const state = fold(asked);
+		assert.deepEqual(
+			state.pending.map((item) => [item.id, item.checkpoint, item.change?.id]),
+			[
+				["r2", "sign-off", undefined],
+				["r3", "playbook-change", "qa-first"],
+			],
+		);
+		assert.match(refusal(running, signOffRequest()), /final Report/);
+		assert.match(refusal(running, request("c".repeat(64))), /already approved/);
+		assert.match(refusal(reported, { ...request("c".repeat(64)), checkpoint: "sign-off" }), /final Report.*`final: true`/);
+	});
+
+	it("refuses sign-off while a proposed Playbook change is unanswered", () => {
+		assert.match(refusal(asked, { kind: "answer", id: "r2", answer: "approved", at: "2026-11-02T12:10:00.000Z" }), /`r3`/);
+	});
+
+	it("adopts or declines a Playbook change without waking the Lead", () => {
+		const adopted = run(asked, { kind: "answer", id: "r3", answer: "approved", at: "2026-11-02T12:05:00.000Z" });
+		assert.ok(adopted.ok);
+		assert.deepEqual(
+			adopted.actions.map((action) => action.kind),
+			["adopt-playbook-change"],
+		);
+		const declined = run(asked, { kind: "answer", id: "r3", answer: "declined", at: "2026-11-02T12:05:00.000Z" });
+		assert.ok(declined.ok);
+		assert.deepEqual(declined.actions, []);
+		assert.deepEqual(declined.state.pending.map((item) => item.id), ["r2"]);
+		assert.match(refusal(asked, { kind: "answer", id: "r3", answer: "sent-back", note: "no", at: "2026-11-02T12:05:00.000Z" }), /adopted or declined/);
+		assert.match(refusal(asked, { kind: "answer", id: "r2", answer: "declined", at: "2026-11-02T12:05:00.000Z" }), /Playbook change/);
+	});
+
+	it("signing off records the act, stops every live Teammate and ends the Effort", () => {
+		const changed = applied(asked, { kind: "answer", id: "r3", answer: "declined", at: "2026-11-02T12:05:00.000Z" });
+		const result = run(changed, { kind: "answer", id: "r2", answer: "approved", at: "2026-11-02T12:10:00.000Z" });
+		assert.ok(result.ok);
+		assert.deepEqual(result.actions, [
+			{ kind: "record-sign-off", approval: fold(changed).pending[0], at: "2026-11-02T12:10:00.000Z" },
+			{ kind: "stop-teammate", teammate: "architect-1", shortId: "abc123" },
+			{ kind: "stop-teammate", teammate: "dev-1", shortId: "team-software-2026-11-02-dev-1" },
+			{ kind: "end-effort", how: "signed-off" },
+		]);
+		assert.deepEqual(result.state.ended, { how: "signed-off", at: "2026-11-02T12:10:00.000Z" });
+		assert.ok(result.state.teammates.every((teammate) => teammate.ended?.how === "stopped"));
+		assert.deepEqual(result.state.pending, []);
+	});
+
+	it("a send-back at sign-off wakes the Lead with the note, keeps the Teammates and drops the proposed changes", () => {
+		const result = run(asked, { kind: "answer", id: "r2", answer: "sent-back", note: "AC1 has no test for the old key.", at: "2026-11-02T12:10:00.000Z" });
+		assert.ok(result.ok);
+		assert.equal(result.actions.length, 1);
+		const [wake] = result.actions;
+		assert.ok(wake?.kind === "wake-lead");
+		assert.match(wake.text, /AC1 has no test for the old key\./);
+		assert.match(wake.text, /`final: true`/);
+		assert.equal(result.state.ended, undefined);
+		assert.ok(result.state.teammates.every((teammate) => teammate.ended === undefined));
+		assert.deepEqual(result.state.pending, []);
+
+		const next = run([...asked, ...result.append], { kind: "report", headline: "Re-planning.", criteria: ["AC1", "AC2"], modes: [], at: "2026-11-02T12:20:00.000Z" });
+		assert.deepEqual(written(next).sections.find((each) => each.title === "Since the last Report")?.lines, [
+			"12:01 asked for your sign-off (`r2`)",
+			"12:01 proposed Playbook change `qa-first` (`r3`)",
+			"12:10 you sent back the final Report (`r2`): AC1 has no test for the old key.",
+		]);
+	});
+
+	it("cancelling stops every live Teammate and ends the Effort without sign-off", () => {
+		const result = run(asked, { kind: "cancel", at: "2026-11-02T12:30:00.000Z" });
+		assert.ok(result.ok);
+		assert.deepEqual(
+			result.actions.map((action) => action.kind),
+			["stop-teammate", "stop-teammate", "end-effort"],
+		);
+		assert.deepEqual(result.state.ended, { how: "cancelled", at: "2026-11-02T12:30:00.000Z" });
+		assert.deepEqual(result.state.pending, []);
+	});
+
+	it("takes nothing more once the Effort has ended", () => {
+		const ended = applied(asked, { kind: "cancel", at: "2026-11-02T12:30:00.000Z" });
+		assert.match(refusal(ended, { kind: "cancel", at: "2026-11-02T12:31:00.000Z" }), /ended.*cancelled/);
+		assert.match(refusal(ended, finalReport("2026-11-02T12:31:00.000Z")), /ended/);
+		assert.match(refusal(ended, { kind: "handoff", slug: "rename", at: "2026-11-02T12:31:00.000Z" }), /ended/);
+	});
+});
+
 describe("an isolated Task", () => {
 	const WORKSPACE = { kind: "git-worktree", path: "/work/app/.claude/worktrees/team-software-2026-11-02", branch: "team/software-2026-11-02", base: "c".repeat(40), from: "main" } as const;
 	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", workspace: WORKSPACE, at: "2026-11-02T11:00:00.000Z" });

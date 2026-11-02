@@ -11,7 +11,8 @@
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { EVERY_ROLE, PERMISSION_MODES, type PermissionMode, type Playbook, parsePlaybook, playbookPaths, type Role, type Team } from "./definitions.ts";
+import type { PlaybookChange } from "./core.ts";
+import { EVERY_ROLE, PERMISSION_MODES, type PermissionMode, type Playbook, parsePlaybook, playbookPaths, type Role, sha256, type Team } from "./definitions.ts";
 import { availableTeams, findTeam } from "./start.ts";
 
 /** The checkpoint id the Lead names to ask for a Playbook's adoption. */
@@ -252,12 +253,49 @@ export function pendingAdoptionTitle(item: PendingAdoption): string {
  * approved sha and the time, and drop the draft it came from.
  */
 export function adoptPlaybook(agentDir: string, item: PendingAdoption, now: Date): string {
-	const paths = playbookPaths(agentDir, item.team);
+	const adopted = writeAdopted(agentDir, item.team, item.snapshot, item.sha256, now);
+	rmSync(playbookPaths(agentDir, item.team).draft, { force: true });
+	return adopted;
+}
+
+/** Write `text` as the Team's adopted Playbook, with its adoption record; returns its path. */
+function writeAdopted(agentDir: string, team: string, text: string | Buffer, sha: string, now: Date): string {
+	const paths = playbookPaths(agentDir, team);
 	mkdirSync(paths.dir, { recursive: true });
-	writeFileSync(paths.adopted, item.snapshot);
-	writeFileSync(paths.adoptedJson, `${JSON.stringify({ sha256: item.sha256, adoptedAt: now.toISOString() }, null, "\t")}\n`);
-	rmSync(paths.draft, { force: true });
+	writeFileSync(paths.adopted, text);
+	writeFileSync(paths.adoptedJson, `${JSON.stringify({ sha256: sha, adoptedAt: now.toISOString() }, null, "\t")}\n`);
 	return paths.adopted;
+}
+
+/**
+ * A Playbook's text with a proposed change made: its one `oldText` replaced
+ * by `newText`, still a Playbook the extension reads. Why not, otherwise.
+ */
+export function changedPlaybook(playbook: Playbook, change: PlaybookChange, roleNames: readonly string[]): { text: string } | { error: string } {
+	const text = readFileSync(playbook.filePath, "utf8");
+	const at = text.indexOf(change.oldText);
+	if (at === -1) return { error: `its \`oldText\` isn't in the Playbook ${playbook.filePath}; quote the passage to replace exactly` };
+	if (text.indexOf(change.oldText, at + 1) !== -1) return { error: `its \`oldText\` is in the Playbook ${playbook.filePath} more than once; quote enough of the passage that it is there once` };
+	const changed = text.slice(0, at) + change.newText + text.slice(at + change.oldText.length);
+	const { problems } = parsePlaybook(playbook.filePath, { source: "user", roleNames }, Buffer.from(changed));
+	if (problems.length > 0) return { error: `the Playbook it makes isn't one the extension reads: ${problems.map((problem) => problem.reason).join("; ")}` };
+	return { text: changed };
+}
+
+/**
+ * Adopt a Playbook change the human approved in the final Report: made to
+ * the Team's adopted Playbook now, which the next Effort opens on. The
+ * Effort that proposed it keeps its own snapshot. Refused, changing nothing,
+ * when the Team's Playbook isn't adopted as it was or the change no longer applies.
+ */
+export function adoptPlaybookChange(agentDir: string, team: Team, change: PlaybookChange, now: Date): { adopted: string; sha256: string } | { error: string } {
+	if (team.adoption.state !== "adopted") {
+		return { error: `the \`${team.name}\` Playbook is ${team.adoption.state === "edited" ? "edited by hand since it was adopted" : "not adopted"}, so there is no adopted Playbook to change; run \`/team setup ${team.name}\` to adopt one` };
+	}
+	const made = changedPlaybook(team.adoption.playbook, change, team.roles.map((role) => role.name));
+	if ("error" in made) return made;
+	const sha = sha256(made.text);
+	return { adopted: writeAdopted(agentDir, team.name, made.text, sha, now), sha256: sha };
 }
 
 /** What the Lead is told when the human adopts the Playbook it asked about. */
