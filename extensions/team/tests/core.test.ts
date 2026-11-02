@@ -966,6 +966,57 @@ describe("clearing between Tasks", () => {
 		assert.equal(fold(running).teammates[0].task, "rename");
 		assert.equal(result.state.teammates[0].task, "rename");
 	});
+
+	it("starts its Teammate afresh, not cleared, at its next Task once an approved Brief change alters its Role's launch options; its old session's end is no crash", () => {
+		const done_ = applied(running, hook(2, "Stop", { session_id: FIRST }, true));
+		const asked = applied(done_, {
+			kind: "request-approval",
+			checkpoint: "brief-change",
+			path: "/agent/team/efforts/software-2026-11-02/brief.draft.md",
+			sha256: "c".repeat(64),
+			snapshot: "---\n---\n",
+			affects: [],
+			at: "2026-11-02T12:10:00.000Z",
+		});
+		const changed = applied(asked, { kind: "answer", id: "r2", answer: "approved", refresh: ["dev"], at: "2026-11-02T12:11:00.000Z" });
+		assert.equal(fold(changed).teammates[0].freshDue, true);
+		const accepted = applied(changed, review("accept"));
+
+		const result = run(accepted, { kind: "handoff", slug: "docs", at: "2026-11-02T14:00:00.000Z" });
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.match(result.reply ?? "", /^started dev-1 afresh on Task `docs`/);
+		assert.deepEqual(
+			result.actions.filter((action) => action.kind === "stop-teammate" || action.kind === "launch-teammate" || action.kind === "clear-then-send"),
+			[
+				{ kind: "stop-teammate", teammate: "dev-1", shortId: "8f3c2a1b" },
+				{ kind: "launch-teammate", teammate: { id: "dev-1", role: "dev", name: "team-software-2026-11-02-dev-1" }, task: { slug: "docs", folder: "002-dev-docs" }, at: "2026-11-02T14:00:00.000Z" },
+			],
+		);
+		const relaunched = [...accepted, ...result.append];
+		assert.deepEqual(fold(relaunched).teammates.map(({ id, task, freshDue, relaunching }) => ({ id, task, freshDue, relaunching })), [{ id: "dev-1", task: "docs", freshDue: undefined, relaunching: true }]);
+
+		const old = run(relaunched, hook(3, "SessionEnd", { session_id: FIRST, reason: "other" }));
+		assert.ok(old.ok && old.append.length === 0 && old.actions.length === 0, "the stopped session's end is no crash");
+
+		const fresh = run(relaunched, hook(3, "SessionStart", { session_id: SECOND, source: "startup" }));
+		assert.ok(fresh.ok, fresh.ok ? "" : fresh.refusal);
+		const [teammate] = fresh.state.teammates;
+		assert.deepEqual({ shortId: teammate.shortId, newShortId: teammate.newShortId, relaunching: teammate.relaunching }, { shortId: "0b1c2d3e", newShortId: true, relaunching: undefined });
+		const late = run([...relaunched, ...fresh.append], hook(4, "SessionEnd", { session_id: FIRST, reason: "other" }));
+		assert.ok(late.ok && late.append.length === 0, "an end of the old session after the new one started is no crash either");
+	});
+
+	it("clears as before at the next Task when an approved Brief change leaves its Role's launch options alone", () => {
+		const done_ = applied(running, hook(2, "Stop", { session_id: FIRST }, true));
+		const asked = applied(done_, { kind: "request-approval", checkpoint: "brief-change", path: "/agent/team/efforts/software-2026-11-02/brief.draft.md", sha256: "c".repeat(64), snapshot: "---\n---\n", affects: [], at: "2026-11-02T12:10:00.000Z" });
+		const changed = applied(asked, { kind: "answer", id: "r2", answer: "approved", at: "2026-11-02T12:11:00.000Z" });
+
+		const result = run(applied(changed, review("accept")), { kind: "handoff", slug: "docs", at: "2026-11-02T14:00:00.000Z" });
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.match(result.reply ?? "", /^reused dev-1 on Task `docs`/);
+	});
 });
 
 describe("a Teammate's held requests", () => {

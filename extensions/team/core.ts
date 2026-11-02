@@ -24,6 +24,13 @@ export const SIGN_OFF = "sign-off";
 export const PLAYBOOK_CHANGE = "playbook-change";
 
 /**
+ * A change to the approved Brief: the Lead drafts it in `brief.draft.md` and
+ * names the planned Tasks it affects, which are held until the human answers.
+ * Approved, the draft becomes `brief.md`.
+ */
+export const BRIEF_CHANGE = "brief-change";
+
+/**
  * A change the Lead proposes to the Team's Playbook in the final Report: the
  * one passage `oldText` replaced by `newText`. Adopted, it applies to the
  * Playbook the next Effort adopts; the running Effort keeps its snapshot.
@@ -45,9 +52,12 @@ export function changeSnapshot(change: PlaybookChange): string {
 export interface PendingApproval {
 	/** Unique within the Effort: `r1`, `r2`, … */
 	id: string;
-	checkpoint: typeof BRIEF | typeof SIGN_OFF | typeof PLAYBOOK_CHANGE;
+	/** One of the fixed checkpoints, or, once the Brief is approved, a Playbook checkpoint id or an `escalate` id. */
+	checkpoint: string;
 	/** For a Playbook change, the change itself. */
 	change?: PlaybookChange;
+	/** For a Brief change, the slugs of the planned Tasks it holds until the human answers. */
+	affects?: string[];
 	/** The draft the snapshot was taken from. */
 	path: string;
 	/** Of `snapshot`'s UTF-8 bytes. */
@@ -182,6 +192,10 @@ export interface Teammate {
 	ended?: { how: "stopped" | "crashed"; at: string };
 	/** What its last turn failed on, while it waits to be continued: set by a `StopFailure`, cleared once it goes on. */
 	limit?: TeammateLimit;
+	/** Set when an approved Brief change alters its Role's launch options: its next Task starts in a fresh session, never mid-Task. */
+	freshDue?: true;
+	/** Set from its fresh session's launch until that session's `SessionStart`, which gives it its new short id. */
+	relaunching?: true;
 }
 
 /**
@@ -269,7 +283,16 @@ export type EffortLine =
 	/** The Lead asked the human to approve a snapshot. */
 	| ({ type: "approval-requested" } & PendingApproval)
 	/** The human answered a request in `/team pending`. */
-	| { type: "approval-answered"; id: string; answer: Answer; note?: string; workspace?: Workspace; at: string }
+	| {
+			type: "approval-answered";
+			id: string;
+			answer: Answer;
+			note?: string;
+			workspace?: Workspace;
+			/** For an approved Brief change, the Roles whose launch options it alters: their Teammates get a fresh session at their next Task boundary. */
+			refresh?: string[];
+			at: string;
+	  }
 	/** The Lead wrote its whole Task list, replacing any before it. */
 	| { type: "plan-written"; tasks: PlannedTask[]; reason?: string; at: string }
 	/** A Teammate was launched. */
@@ -313,6 +336,13 @@ export type EffortLine =
 	| { type: "clear-requested"; teammate: string; slug: string; at: string }
 	/** An idle Teammate whose Task is accepted was stopped to make room under the cap. */
 	| { type: "teammate-retired"; teammate: string; at: string }
+	/**
+	 * An idle Teammate whose Role's launch options an approved Brief change
+	 * altered was stopped and launched afresh, under the same id and name, for
+	 * Task `task`, in permission mode `mode`. Its next `SessionStart` gives it
+	 * a new short id.
+	 */
+	| { type: "teammate-relaunched"; teammate: string; task: string; mode?: string; at: string }
 	/** The human used the `/team` menu on a Teammate: the short id they were given, which clears its `(new)` mark. Reads no journal line. */
 	| { type: "teammate-attached"; teammate: string; shortId: string; at: string }
 	/** A send-back gave the Task to a new Teammate, since its own had ended. */
@@ -538,8 +568,10 @@ export interface EffortState {
 	repo: string;
 	/** The sha256 of the Playbook in force when the Effort was opened. */
 	playbook: string;
-	/** Set once the human approves the Brief; until then no Teammate starts. */
+	/** Set once the human approves the Brief; until then no Teammate starts. An approved Brief change moves it on. */
 	brief?: { sha256: string; approvedAt: string; request: string };
+	/** The Tasks a Brief change holds, from its request until the human approves one; a send-back keeps them held. */
+	briefHold?: { request: string; slugs: string[] };
 	/** Added when the Brief is approved. */
 	workspace?: Workspace;
 	/** What waits on the human, oldest first. */
@@ -587,9 +619,13 @@ export interface EffortState {
 /** A new input to the core. */
 export type EffortInput =
 	/** `team_request_approval`, with the draft already validated and snapshotted. */
-	| { kind: "request-approval"; checkpoint: string; path: string; sha256: string; snapshot: string; at: string }
-	/** The human's answer to a pending item, with the Workspace the shell added for an approved Brief. */
-	| { kind: "answer"; id: string; answer: Answer; note?: string; workspace?: Workspace; at: string }
+	| { kind: "request-approval"; checkpoint: string; path: string; sha256: string; snapshot: string; affects?: string[]; checkpoints?: string[]; at: string }
+	/**
+	 * The human's answer to a pending item, with the Workspace the shell added
+	 * for an approved Brief, and for an approved Brief change the Roles whose
+	 * launch options it alters.
+	 */
+	| { kind: "answer"; id: string; answer: Answer; note?: string; workspace?: Workspace; refresh?: string[]; at: string }
 	/** A Lead tool that would start a Teammate. */
 	| { kind: "start-teammate"; tool: "team_plan" | "team_handoff" | "team_review" }
 	/**
@@ -701,6 +737,10 @@ export type EffortInput =
 export type EffortAction =
 	/** Write the approved Brief as `brief.md`, snapshot the Team and the Playbook, and record the act. */
 	| { kind: "promote-brief"; approval: PendingApproval; at: string }
+	/** Write the approved Brief change as `brief.md` and record the act; the Playbook and Team snapshots stay as they are. */
+	| { kind: "promote-brief-change"; approval: PendingApproval; at: string }
+	/** Record the approval at a Playbook checkpoint or an `escalate` id, with the sha256 of what was approved. */
+	| { kind: "record-checkpoint"; approval: PendingApproval; at: string }
 	/** Start a turn of the Lead's model with this text. */
 	| { kind: "wake-lead"; text: string }
 	/** Write `plan.md` as a view of the state's plan. */
@@ -794,6 +834,8 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			const replaced = state.pending.filter(replaces).map((item) => item.id);
 			return {
 				...state,
+				// A Brief change holds its Tasks from the moment it is asked, in place of any change before it.
+				...(approval.checkpoint === BRIEF_CHANGE ? { briefHold: { request: approval.id, slugs: approval.affects ?? [] } } : {}),
 				pending: [...state.pending.filter((item) => !replaces(item)), approval],
 				requests: state.requests + 1,
 				asked: [
@@ -815,6 +857,18 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 					asked,
 					brief: { sha256: answered.sha256, approvedAt: line.at, request: answered.id },
 					...(line.workspace === undefined ? {} : { workspace: line.workspace }),
+				};
+			}
+			if (line.answer === "approved" && answered?.checkpoint === BRIEF_CHANGE) {
+				const { briefHold: _briefHold, ...rest } = state;
+				const refresh = line.refresh ?? [];
+				return {
+					...rest,
+					pending,
+					asked,
+					brief: { sha256: answered.sha256, approvedAt: line.at, request: answered.id },
+					// Each live Teammate of a Role whose launch options changed gets a fresh session at its next Task boundary.
+					teammates: state.teammates.map((teammate) => (refresh.includes(teammate.role) && teammate.retiredAt === undefined && !teammate.ended ? { ...teammate, freshDue: true } : teammate)),
 				};
 			}
 			return { ...state, pending, asked };
@@ -845,15 +899,34 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			return { ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, clearing: line.slug } : teammate)) };
 		case "teammate-retired":
 			return { ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, retiredAt: line.at } : teammate)) };
+		case "teammate-relaunched":
+			return {
+				...state,
+				teammates: state.teammates.map((teammate) => {
+					if (teammate.id !== line.teammate) return teammate;
+					// What the old session knew goes with it: the new one starts from its launch, with no session rules.
+					const { freshDue: _fresh, inbox: _inbox, activity: _activity, doing: _doing, limit: _limit, rules: _rules, clearing: _clearing, observedMode: _observed, mode: _mode, ...rest } = teammate;
+					return { ...rest, task: line.task, startedAt: line.at, relaunching: true, ...(line.mode === undefined ? {} : { mode: line.mode }) };
+				}),
+			};
 		case "teammate-session": {
 			const before = state.teammates.find((teammate) => teammate.id === line.teammate)?.shortId;
-			const changed = withTeammate(state, line, {
+			const started = withTeammate(state, line, {
 				sessionId: line.sessionId,
 				shortId: line.shortId,
 				...(line.inbox === undefined ? {} : { inbox: line.inbox }),
 				// A short id that replaces another is a new attach target, marked until the human attaches to it.
 				...(before !== undefined && before !== line.shortId ? { newShortId: true } : {}),
 			});
+			// A fresh session's start ends its relaunch.
+			const changed = {
+				...started,
+				teammates: started.teammates.map((teammate) => {
+					if (teammate.id !== line.teammate || !teammate.relaunching) return teammate;
+					const { relaunching: _relaunching, ...rest } = teammate;
+					return rest;
+				}),
+			};
 			if (line.source !== "clear") return changed;
 			// The clear asked for has happened.
 			return {
@@ -1220,6 +1293,11 @@ export function holdText(hold: ModelHold): string {
 	return `${hold.kind === "opus" ? "an Opus" : "a Sonnet"} limit${hold.reset === undefined ? "" : ` ${untilText(hold.reset, hold.at)}`}`;
 }
 
+/** Why Task `slug` waits on a Brief change the human hasn't approved, when one holds it. */
+function briefHeld(state: EffortState, slug: string): string | undefined {
+	return state.briefHold?.slugs.includes(slug) ? `held: Brief change ${state.briefHold.request}` : undefined;
+}
+
 /** Why a Task of a held Role waits. */
 function heldWhy(hold: ModelHold): string {
 	return `held: ${hold.kind === "consent" ? "usage-credit confirm" : `${LIMIT_NAMES[hold.kind]} limit`}${hold.reset === undefined ? "" : ` ${untilText(hold.reset, hold.at)}`}`;
@@ -1498,31 +1576,67 @@ function took(state: EffortState, append: EffortLine[], actions: EffortAction[],
  * The shell asks this before it reads the draft, so a request that would be
  * refused anyway is refused for the reason that matters.
  */
-export function refuseRequest(state: EffortState, checkpoint: string): string | undefined {
+export function refuseRequest(state: EffortState, checkpoint: string, asked: { affects?: readonly string[]; checkpoints?: readonly string[] } = {}): string | undefined {
 	if (state.ended) return endedText(state, state.ended);
 	if (checkpoint === SIGN_OFF || checkpoint === PLAYBOOK_CHANGE) {
 		return `Sign-off of Effort \`${state.effortId}\` comes from the final Report: write it with \`team_report\` and \`final: true\`, which asks for sign-off and offers each proposed Playbook change.`;
 	}
-	if (checkpoint !== BRIEF) {
+	if (asked.affects !== undefined && checkpoint !== BRIEF_CHANGE) {
+		return `\`affects\` names the Tasks a Brief change holds, so it goes only with checkpoint \`${BRIEF_CHANGE}\`, not \`${checkpoint}\`.`;
+	}
+	if (checkpoint === BRIEF) {
+		if (state.brief) {
+			return `The Brief of Effort \`${state.effortId}\` is already approved (sha256 ${state.brief.sha256}, ${state.brief.approvedAt}), and an approved Brief is never edited; ask for a Brief change at checkpoint \`${BRIEF_CHANGE}\` instead.`;
+		}
+		return undefined;
+	}
+	if (!state.brief) {
 		return `Effort \`${state.effortId}\` has no checkpoint \`${checkpoint}\` open; the one checkpoint before Teammates start is \`${BRIEF}\`.`;
 	}
-	if (state.brief) {
-		return `The Brief of Effort \`${state.effortId}\` is already approved (sha256 ${state.brief.sha256}, ${state.brief.approvedAt}), and an approved Brief is never edited.`;
+	if (checkpoint === BRIEF_CHANGE) {
+		const planned = state.plan?.map((task) => task.slug) ?? [];
+		if (asked.affects === undefined) {
+			return `A Brief change needs \`affects\`: the slugs of the planned Tasks it holds until the human answers (${planned.length > 0 ? `the planned ones are ${quoted(planned)}` : "nothing is planned yet"}), or \`[]\` when it holds none.`;
+		}
+		const unknown = asked.affects.filter((slug) => !planned.includes(slug));
+		if (unknown.length > 0) {
+			return `A Brief change holds only planned Tasks, and Effort \`${state.effortId}\` has no planned ${quoted(unknown)}; ${planned.length > 0 ? `the planned ones are ${quoted(planned)}` : "nothing is planned yet"}.`;
+		}
+		return undefined;
 	}
-	return undefined;
+	if (asked.checkpoints?.includes(checkpoint)) return undefined;
+	const open = [BRIEF_CHANGE, ...(asked.checkpoints ?? [])];
+	return `Effort \`${state.effortId}\` has no checkpoint \`${checkpoint}\`; the ones it asks at are ${quoted(open)}, and sign-off comes from the final Report.`;
+}
+
+/** What a request at `checkpoint` is called in replies and Reports. */
+function requestName(item: Pick<PendingApproval, "checkpoint">): string {
+	if (item.checkpoint === BRIEF) return "the Brief";
+	if (item.checkpoint === BRIEF_CHANGE) return "a Brief change";
+	return `checkpoint \`${item.checkpoint}\``;
 }
 
 function requestApproval(state: EffortState, input: Extract<EffortInput, { kind: "request-approval" }>): Step {
-	const refusal = refuseRequest(state, input.checkpoint);
+	const refusal = refuseRequest(state, input.checkpoint, input);
 	if (refusal !== undefined) return { ok: false, refusal };
-	const replaced = state.pending.find((item) => item.checkpoint === BRIEF);
+	const replaced = state.pending.find((item) => item.checkpoint === input.checkpoint);
 	const id = `r${state.requests + 1}`;
-	const { kind: _kind, ...asked } = input;
-	const line: EffortLine = { type: "approval-requested", id, ...asked, checkpoint: BRIEF };
+	const { kind: _kind, checkpoints: _checkpoints, affects, ...asked } = input;
+	const line: EffortLine = { type: "approval-requested", id, ...asked, ...(input.checkpoint === BRIEF_CHANGE ? { affects: [...(affects ?? [])] } : {}) };
+	const holds = affects ?? [];
 	const reply = [
-		`Asked the human to approve the Brief of Effort \`${state.effortId}\` as request \`${id}\`: ${input.path} (sha256 ${input.sha256}).`,
+		input.checkpoint === BRIEF
+			? `Asked the human to approve the Brief of Effort \`${state.effortId}\` as request \`${id}\`: ${input.path} (sha256 ${input.sha256}).`
+			: `Asked the human to approve ${requestName(input)} of Effort \`${state.effortId}\` as request \`${id}\`: ${input.path} (sha256 ${input.sha256}).`,
 		replaced ? `It replaces request \`${replaced.id}\`, which the human hadn't answered.` : undefined,
-		"They answer it in `/team pending`; approving promotes exactly this snapshot, so later edits to the draft don't count. Stop here and wait for their answer.",
+		input.checkpoint === BRIEF_CHANGE
+			? holds.length > 0
+				? `It holds Task${holds.length === 1 ? "" : "s"} ${quoted(holds)} until they answer: a handoff queues, a queued one waits and a review waits, while every other Task goes on.`
+				: "It holds no Task, so every Task goes on."
+			: undefined,
+		input.checkpoint === BRIEF
+			? "They answer it in `/team pending`; approving promotes exactly this snapshot, so later edits to the draft don't count. Stop here and wait for their answer."
+			: "They answer it in `/team pending`; approving approves exactly this snapshot, so later edits to the draft don't count. Go on with what it doesn't hold, and wait for their answer before what it does.",
 	]
 		.filter((part) => part !== undefined)
 		.join(" ");
@@ -1551,6 +1665,8 @@ function answer(state: EffortState, input: Extract<EffortInput, { kind: "answer"
 			? took(state, [line], [{ kind: "adopt-playbook-change", approval: { ...item, change }, at: input.at }], `Adopted Playbook change \`${change.id}\` for the next Effort.`)
 			: took(state, [line], [], `Declined Playbook change \`${change.id}\`.`);
 	}
+	if (item.checkpoint === BRIEF_CHANGE) return answerBriefChange(state, item, input);
+	if (item.checkpoint !== BRIEF) return answerCheckpoint(state, item, input);
 	const line: EffortLine = {
 		type: "approval-answered",
 		id: input.id,
@@ -1580,6 +1696,85 @@ function answer(state: EffortState, input: Extract<EffortInput, { kind: "answer"
 		{
 			kind: "wake-lead",
 			text: `The human sent back the Brief of Effort \`${state.effortId}\` (request \`${item.id}\`) with this note:\n\n${input.note ?? ""}\n\nRevise ${item.path} with them, then ask again with \`team_request_approval\` at checkpoint \`${BRIEF}\`.`,
+		},
+	]);
+}
+
+/**
+ * A Brief change. Approving it makes the snapshot the Brief, releases the
+ * Tasks it held, and marks each live Teammate of a Role in `refresh` (whose
+ * launch options it changed) for a fresh session at its next Task boundary.
+ * A send-back wakes the Lead with the note and keeps the Tasks held, since
+ * the change they wait on is still unsettled.
+ */
+function answerBriefChange(state: EffortState, item: PendingApproval, input: Extract<EffortInput, { kind: "answer" }>): Step {
+	const holds = item.affects ?? [];
+	const refresh = input.answer === "approved" ? (input.refresh ?? []) : [];
+	const line: EffortLine = {
+		type: "approval-answered",
+		id: item.id,
+		answer: input.answer,
+		...(input.note === undefined ? {} : { note: input.note }),
+		...(refresh.length > 0 ? { refresh: [...refresh] } : {}),
+		at: input.at,
+	};
+	const tasks = holds.length === 0 ? undefined : `Task${holds.length === 1 ? "" : "s"} ${quoted(holds)}`;
+	const one = holds.length === 1;
+	if (input.answer === "approved") {
+		const renewed = live(state).filter((teammate) => refresh.includes(teammate.role)).map((teammate) => teammate.id);
+		const fresh =
+			refresh.length === 0
+				? undefined
+				: `The launch options of Role${refresh.length === 1 ? "" : "s"} ${quoted(refresh)} changed, so ${
+						renewed.length === 0
+							? "their next Teammates start with the new ones"
+							: `${quoted(renewed)} ${renewed.length === 1 ? "starts" : "each start"} in a fresh session at its next Task, never mid-Task, keeping ${renewed.length === 1 ? "its" : "their"} id`
+					}.`;
+		return took(state, [line], [
+			{ kind: "promote-brief-change", approval: item, at: input.at },
+			{
+				kind: "wake-lead",
+				text: [
+					`The human approved the Brief change of Effort \`${state.effortId}\` (request \`${item.id}\`, sha256 ${item.sha256}). It is now brief.md in the Effort's directory.`,
+					tasks ? `${tasks} ${one ? "is" : "are"} released: a queued one starts by itself.` : undefined,
+					fresh,
+				]
+					.filter((part) => part !== undefined)
+					.join(" "),
+			},
+		]);
+	}
+	return took(state, [line], [
+		{
+			kind: "wake-lead",
+			text: [
+				`The human sent back the Brief change of Effort \`${state.effortId}\` (request \`${item.id}\`) with this note:\n\n${input.note ?? ""}\n`,
+				tasks ? `${tasks} ${one ? "stays" : "stay"} held until a Brief change is approved; every other Task goes on.` : undefined,
+				`Revise ${item.path} with them, then ask again with \`team_request_approval\` at checkpoint \`${BRIEF_CHANGE}\`.`,
+			]
+				.filter((part) => part !== undefined)
+				.join(" "),
+		},
+	]);
+}
+
+/**
+ * An approval at one of the Playbook's checkpoints or \`escalate\` ids. It
+ * holds nothing; approving records the file with its sha, and either answer
+ * wakes the Lead.
+ */
+function answerCheckpoint(state: EffortState, item: PendingApproval, input: Extract<EffortInput, { kind: "answer" }>): Step {
+	const line: EffortLine = { type: "approval-answered", id: item.id, answer: input.answer, ...(input.note === undefined ? {} : { note: input.note }), at: input.at };
+	if (input.answer === "approved") {
+		return took(state, [line], [
+			{ kind: "record-checkpoint", approval: item, at: input.at },
+			{ kind: "wake-lead", text: `The human approved checkpoint \`${item.checkpoint}\` of Effort \`${state.effortId}\` (request \`${item.id}\`): ${item.path}, sha256 ${item.sha256}.` },
+		]);
+	}
+	return took(state, [line], [
+		{
+			kind: "wake-lead",
+			text: `The human sent back checkpoint \`${item.checkpoint}\` of Effort \`${state.effortId}\` (request \`${item.id}\`, ${item.path}) with this note:\n\n${input.note ?? ""}\n\nWork it in, then ask again with \`team_request_approval\` at checkpoint \`${item.checkpoint}\`.`,
 		},
 	]);
 }
@@ -1847,6 +2042,15 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 			`queued ${pointer}: ${pauses.map(pauseText).join(", and ")}. It starts by itself once every pause is lifted (${pauses.map(lifter).join("; ")}).`,
 		);
 	}
+	const briefHold = briefHeld(state, task.slug);
+	if (briefHold) {
+		return took(
+			state,
+			[{ type: "task-queued", ...wanted, why: briefHold }],
+			[{ kind: "write-task", slug: task.slug, folder }, { kind: "write-plan" }],
+			`queued ${pointer}: held by Brief change \`${state.briefHold?.request}\`, which the human hasn't approved, while other Tasks go on. It starts by itself once they approve a Brief change.`,
+		);
+	}
 	const hold = holdOn(state, task.role);
 	if (hold) {
 		return took(
@@ -1900,6 +2104,7 @@ function staff(state: EffortState, task: QueuedTask, max: number): { append: Eff
 	const handed = { type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, at: task.at, round: 1 } as const;
 	// An isolated Task needs a Teammate launched in its own worktree, so it never reuses one.
 	const reused = task.isolated ? undefined : live(state).find((teammate) => teammate.role === task.role && teammate.inbox !== undefined && free(state, teammate));
+	if (reused?.freshDue && reused.shortId) return relaunch(state, reused, task);
 	if (reused?.inbox) {
 		return {
 			append: [
@@ -1922,6 +2127,29 @@ function staff(state: EffortState, task: QueuedTask, max: number): { append: Eff
 		actions: [{ kind: "stop-teammate", teammate: idle.id, shortId: idle.shortId }, ...started.actions],
 		who: started.who,
 		note: `It stopped idle \`${idle.id}\`, whose Task is accepted, to stay within the cap of ${max} live Teammates.`,
+	};
+}
+
+/**
+ * Start a free Teammate afresh on the Task, since an approved Brief change
+ * altered its Role's launch options: its old session is stopped (its
+ * conversation kept), and a new one launched under the same id and name, at
+ * a Task boundary, never mid-Task.
+ */
+function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask): { append: EffortLine[]; actions: EffortAction[]; who: string; note: string } {
+	const last = Math.max(...state.teammates.map((each) => Date.parse(each.startedAt)));
+	const at = new Date(Math.max(Date.parse(task.at), last + STAGGER_MS)).toISOString();
+	return {
+		append: [
+			{ type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate: teammate.id, at: task.at, round: 1 },
+			{ type: "teammate-relaunched", teammate: teammate.id, task: task.slug, ...(task.mode === undefined ? {} : { mode: task.mode }), at },
+		],
+		actions: [
+			{ kind: "stop-teammate", teammate: teammate.id, shortId: teammate.shortId ?? teammate.name },
+			{ kind: "launch-teammate", teammate: { id: teammate.id, role: teammate.role, name: teammate.name }, task: { slug: task.slug, folder: task.folder }, at },
+		],
+		who: `started ${teammate.id} afresh`,
+		note: `An approved Brief change altered Role \`${teammate.role}\`'s launch options, so its old session is stopped (its conversation kept) and a new one starts with them; it keeps its id, with a new short id.`,
 	};
 }
 
@@ -1965,7 +2193,7 @@ function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }
 	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
 	if (heldPauses(state).length > 0) return took(state, [], []);
 	for (const queued of state.queue) {
-		if (holdOn(state, queued.role)) continue;
+		if (holdOn(state, queued.role) || briefHeld(state, queued.slug)) continue;
 		// It starts now, whenever it was queued.
 		const staffed = staff(state, { ...queued, at: input.at }, max);
 		if (!staffed) continue;
@@ -1983,7 +2211,7 @@ function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }
 		state.queue.flatMap((queued): EffortLine[] => {
 			if (queued.why !== "paused" && !queued.why.startsWith("held:")) return [];
 			const hold = holdOn(state, queued.role);
-			const now = hold ? heldWhy(hold) : why;
+			const now = briefHeld(state, queued.slug) ?? (hold ? heldWhy(hold) : why);
 			return now === queued.why ? [] : [{ type: "task-requeued", slug: queued.slug, why: now, at: input.at }];
 		}),
 		[],
@@ -2033,8 +2261,8 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 		case "SessionStart": {
 			const sessionId = text(payload.session_id);
 			if (sessionId === undefined) return took(state, [], []);
-			// The short id is the launch session's first eight characters; a clear or a resume keeps it.
-			const shortId = teammate.shortId ?? sessionId.slice(0, 8);
+			// The short id is the launch session's first eight characters; a clear or a resume keeps it, and a fresh session's launch replaces it.
+			const shortId = teammate.relaunching || teammate.shortId === undefined ? sessionId.slice(0, 8) : teammate.shortId;
 			const source = text(payload.source) ?? "startup";
 			const session: EffortLine = { type: "teammate-session", ...at_, source, sessionId, shortId, ...(line.inbox === undefined ? {} : { inbox: line.inbox }), at };
 			// The clear a reuse asked for has happened: the reused Teammate gets its new Task's pointer in the fresh context.
@@ -2114,6 +2342,9 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 function sessionEnded(state: EffortState, teammate: Teammate, input: Extract<EffortInput, { kind: "journal" }>): Step {
 	const reason = text(input.line.payload?.reason) ?? "other";
 	if (reason === "clear" || reason === "resume" || teammate.ended !== undefined) return took(state, [], []);
+	// The old session of a Teammate started afresh ends as the new one starts: that is no crash.
+	const ended = text(input.line.payload?.session_id);
+	if (teammate.relaunching || (ended !== undefined && teammate.sessionId !== undefined && ended !== teammate.sessionId)) return took(state, [], []);
 	const task = state.tasks[teammate.task];
 	const open = task !== undefined && task.teammate === teammate.id && task.accepted === undefined && task.dropped === undefined;
 	const text_ = open
@@ -2430,6 +2661,12 @@ function review(state: EffortState, input: Extract<EffortInput, { kind: "review"
 	if (task.dropped !== undefined) {
 		return { ok: false, refusal: `Task \`${input.slug}\` was dropped from the plan, so there is nothing to review; plan it again with \`team_plan\` and hand it off afresh.` };
 	}
+	if (briefHeld(state, input.slug)) {
+		return {
+			ok: false,
+			refusal: `Task \`${input.slug}\` is held by Brief change \`${state.briefHold?.request}\`, which the human hasn't answered, so its result waits: it is reviewed against the Brief they settle on. Review the other Tasks meanwhile.`,
+		};
+	}
 	if (!input.result.written) {
 		return {
 			ok: false,
@@ -2608,11 +2845,17 @@ function told(line: EffortLine, state: EffortState): string | undefined {
 		case "approval-requested":
 			if (line.checkpoint === SIGN_OFF) return `asked for your sign-off (\`${line.id}\`)`;
 			if (line.checkpoint === PLAYBOOK_CHANGE) return `proposed Playbook change \`${line.change?.id}\` (\`${line.id}\`)`;
+			if (line.checkpoint === BRIEF_CHANGE) return `asked you to approve a Brief change (\`${line.id}\`)${line.affects && line.affects.length > 0 ? `, holding ${quoted(line.affects)}` : ""}`;
+			if (line.checkpoint !== BRIEF) return `asked you to approve checkpoint \`${line.checkpoint}\` (\`${line.id}\`)`;
 			return `asked you to approve the Brief (\`${line.id}\`)`;
 		case "approval-answered": {
 			const asked = state.asked?.find((each) => each.id === line.id);
 			if (asked?.checkpoint === PLAYBOOK_CHANGE) return `you ${line.answer === "approved" ? "adopted" : "declined"} Playbook change \`${asked.change}\` (\`${line.id}\`)`;
 			if (asked?.checkpoint === SIGN_OFF) return line.answer === "approved" ? `you signed off (\`${line.id}\`)` : `you sent back the final Report (\`${line.id}\`): ${line.note ?? ""}`;
+			if (asked?.checkpoint === BRIEF_CHANGE) return line.answer === "approved" ? `you approved a Brief change (\`${line.id}\`)` : `you sent back a Brief change (\`${line.id}\`): ${line.note ?? ""}`;
+			if (asked !== undefined && asked.checkpoint !== BRIEF) {
+				return line.answer === "approved" ? `you approved checkpoint \`${asked.checkpoint}\` (\`${line.id}\`)` : `you sent back checkpoint \`${asked.checkpoint}\` (\`${line.id}\`): ${line.note ?? ""}`;
+			}
 			return line.answer === "approved" ? `you approved the Brief (\`${line.id}\`)` : `you sent back \`${line.id}\`: ${line.note ?? ""}`;
 		}
 		case "plan-written":
@@ -2725,7 +2968,12 @@ function finalProblems(coverage: readonly { criterion: string; note: string }[],
 }
 
 /** What each checkpoint is called in the final Report. */
-const CHECKPOINT_NAMES: Record<PendingApproval["checkpoint"], string> = { [BRIEF]: "Brief", [SIGN_OFF]: "Sign-off", [PLAYBOOK_CHANGE]: "Playbook change" };
+const CHECKPOINT_NAMES: Record<string, string> = { [BRIEF]: "Brief", [BRIEF_CHANGE]: "Brief change", [SIGN_OFF]: "Sign-off", [PLAYBOOK_CHANGE]: "Playbook change" };
+
+/** A checkpoint's name in the final Report: a Playbook checkpoint or \`escalate\` id goes by its id. */
+function checkpointName(checkpoint: string): string {
+	return CHECKPOINT_NAMES[checkpoint] ?? `\`${checkpoint}\``;
+}
 
 /** How an asked request ended, as the final Report tells it. */
 function outcomeText(asked: Asked): string {
@@ -2749,7 +2997,7 @@ function finalSections(state: EffortState, final: FinalFacts): ReportSection[] {
 			title: "Checkpoints",
 			lines: [
 				`Playbook: adopted before the Effort opened (sha256 ${state.playbook})`,
-				...asked.map((each) => `${CHECKPOINT_NAMES[each.checkpoint]}: \`${each.id}\` ${outcomeText(each)} (sha256 ${each.sha256})`),
+				...asked.map((each) => `${checkpointName(each.checkpoint)}: \`${each.id}\` ${outcomeText(each)} (sha256 ${each.sha256})`),
 				...final.checkpoints.filter((id) => !askedAt.has(id)).map((id) => `\`${id}\`: never asked`),
 			],
 		},
@@ -2850,7 +3098,9 @@ function reportSections(state: EffortState, modes: readonly { role: string; mode
 						? `\`${item.id}\`: sign off the final Report, ${item.path} (sha256 ${item.sha256}), in \`/team pending\``
 						: item.checkpoint === PLAYBOOK_CHANGE
 							? `\`${item.id}\`: adopt or decline Playbook change \`${item.change?.id}\`, in \`/team pending\``
-							: `\`${item.id}\`: approve the Brief, ${item.path} (sha256 ${item.sha256}), in \`/team pending\``,
+							: item.checkpoint === BRIEF
+								? `\`${item.id}\`: approve the Brief, ${item.path} (sha256 ${item.sha256}), in \`/team pending\``
+								: `\`${item.id}\`: approve ${requestName(item)}, ${item.path} (sha256 ${item.sha256})${item.affects && item.affects.length > 0 ? `, holding ${quoted(item.affects)}` : ""}, in \`/team pending\``,
 				),
 				...waitingInTerminal(state).map((held) => `\`${held.request}\`: ${terminalText(held)}`),
 				...openEscalations(state).map((escalation) => `\`${escalation.id}\`: ${escalationText(escalation, state)}, escalated: ${escalation.summary} Answer it in \`/team pending\``),
