@@ -11,6 +11,7 @@
  * is one appended line and the state is only ever what the lines fold to.
  */
 
+import { CONSENT_FAMILY, classify, type Family, familyOf, LIMIT_FAMILY, type LimitKind, type TransientWhy } from "./limits.ts";
 import { answersText, askedText, askText, closedText, type HeldRequest, type HookDecision, isCallOf, isQuestion, type RequestAnswer, requestKind, settledText, takeAnswer, terminalText } from "./requests.ts";
 
 /** The one checkpoint an Effort has before its Brief is approved. */
@@ -179,7 +180,64 @@ export interface Teammate {
 	 * Teammate of its Role. An idle stop is not this: a send wakes it.
 	 */
 	ended?: { how: "stopped" | "crashed"; at: string };
+	/** What its last turn failed on, while it waits to be continued: set by a `StopFailure`, cleared once it goes on. */
+	limit?: TeammateLimit;
 }
+
+/**
+ * What a Teammate's last turn failed on: a usage limit, a usage-credit confirm
+ * nobody answered, a failure that clears by itself (retried on the ladder), or
+ * one the Lead is told of.
+ */
+export interface TeammateLimit {
+	kind: LimitKind | TransientWhy | "consent" | "unknown";
+	/** When the limit resets, when Claude Code said. */
+	reset?: string;
+	/** Claude Code's own auto-wait continues it at the reset: the Effort sends it nothing while this holds. */
+	armed?: true;
+	/** Retries the ladder has sent it so far, for a failure that clears by itself. */
+	tries?: number;
+	/** When the ladder's next retry goes; absent while one is out, and once the ladder is used up. */
+	next?: string;
+	at: string;
+}
+
+/** A model family's usage limit, or a usage-credit confirm, holding the Roles on that family: their new Tasks queue. */
+export interface ModelHold {
+	family: Family;
+	kind: "opus" | "sonnet" | "consent";
+	/** The Roles on the family when it was set, from the Team snapshot's models. */
+	roles: string[];
+	/** When it lifts; absent for a usage-credit confirm, which lifts once the human answers it. */
+	reset?: string;
+	/** For a usage-credit confirm: the Teammate whose terminal it waits in. */
+	teammate?: string;
+	at: string;
+}
+
+/** A usage limit the human decides on, in `/team pending`. */
+export interface UsageItem {
+	/** `u<n>`, numbered per Effort. */
+	id: string;
+	/** `far-reset`: the usage pause lifts more than a day away, or Claude Code didn't say when; stay paused or cancel. `retries`: a Teammate still fails after the retry ladder; retry again or leave it to the Lead. */
+	why: "far-reset" | "retries";
+	kind: TeammateLimit["kind"];
+	teammate?: string;
+	reset?: string;
+	at: string;
+}
+
+/** The choices a usage item offers, by why it was raised. */
+export const USAGE_CHOICES = { "far-reset": ["stay", "cancel"], retries: ["retry", "leave"] } as const;
+
+/** The waits between the retries of a failure that clears by itself: 1, 2 and 5 minutes; a failure after the last is the human's. */
+export const RETRY_MS: readonly number[] = [60_000, 120_000, 300_000];
+
+/** How long after a limit's reset a Teammate it stopped is sent `continue`, so the reset has surely happened. */
+export const GRACE_MS = 120_000;
+
+/** A usage pause whose reset is further than this asks the human whether to stay paused or cancel. */
+export const FAR_RESET_MS = 24 * 3_600_000;
 
 /** A Teammate's inbox socket, which Claude Code gives its hooks in the environment. */
 export interface Inbox {
@@ -275,12 +333,28 @@ export type EffortLine =
 	| { type: "resumed"; by: PauseSetter; at: string }
 	/** A Task queued while paused waits on, once the Effort runs, for this reason instead. */
 	| { type: "task-requeued"; slug: string; why: string; at: string }
+	/** A usage reading: a Teammate's status line, or `get_usage`. */
+	| ({ type: "usage-read" } & UsageReading)
 	/** A `PermissionRequest` the Teammate's hook holds open for the first answer, the Lead's or the human's in the terminal. */
 	| ({ type: "request-held"; cursor: number } & Omit<HeldRequest, "state">)
 	/** The terminal settled a held request: answered there, denied there, or left there once the hook's hold ran out. */
 	| { type: "request-settled"; teammate: string; cursor: number; request: string; how: "answered-in-terminal" | "denied-in-terminal" | "expired"; at: string }
 	/** The Lead answered a held request through its hook, adding `rule` for the Teammate's session. Reads no journal line. */
 	| { type: "request-answered"; teammate: string; request: string; task?: string; decision: HookDecision; rule?: string; at: string }
+	/** A `StopFailure`: the Teammate's turn failed on a usage limit or an error, and it waits idle. */
+	| { type: "teammate-limited"; teammate: string; cursor: number; limit: TeammateLimit; at: string }
+	/** A `Notification` that Claude Code's auto-wait continued the Teammate, or a prompt landed on it: it goes on. */
+	| { type: "limit-cleared"; teammate: string; cursor: number; at: string }
+	/** The extension sent a limited Teammate `continue`: a retry on the ladder (its count now `tries`), or after its limit reset. Reads no journal line. */
+	| { type: "teammate-continued"; teammate: string; why: "retry" | "reset"; tries?: number; at: string }
+	/** A model family's limit, or a usage-credit confirm, holds the Roles on that family. */
+	| ({ type: "model-held" } & ModelHold)
+	/** The family's hold lifted. */
+	| { type: "model-released"; family: Family; at: string }
+	/** A usage limit asks the human to decide, in `/team pending`. */
+	| ({ type: "usage-escalated" } & UsageItem)
+	/** The human answered usage item `id`. */
+	| { type: "usage-answered"; id: string; choice: string; at: string }
 	/** The Effort is over: the human signed off its final Report, or cancelled it. Nothing more is taken. */
 	| { type: "effort-ended"; how: Ended["how"]; at: string }
 	/** The Lead moved a held request, or a stopped-short Teammate's prose question, to the human's pending items. */
@@ -350,6 +424,61 @@ export interface Asked {
 	outcome?: { how: Answer | "replaced" | "dropped"; at: string; note?: string };
 }
 
+/** One of the account's usage windows, as a reading gives it. */
+export interface UsageWindow {
+	/** How much of it is used, 0 to 100. */
+	percent: number;
+	/** When it resets, ISO; absent when the reading doesn't say. */
+	resetsAt?: string;
+}
+
+/**
+ * One usage reading: a Teammate's status line, or the `get_usage` control
+ * request when no status line is fresh. A window the reading doesn't give is
+ * absent, never 0.
+ */
+export interface UsageReading {
+	source: "status-line" | "get-usage";
+	/** When it was taken: the status line file's modification time, or when `get_usage` answered. */
+	at: string;
+	/** The Teammate whose status line it is. */
+	teammate?: string;
+	/** The Claude Code session the status line is of. */
+	sessionId?: string;
+	/** Whether it came with the account's rate limits: a subscription's does, an API key's never. */
+	rateLimits: boolean;
+	fiveHour?: UsageWindow;
+	sevenDay?: UsageWindow;
+	/** The session's input and output tokens so far. */
+	tokens?: number;
+	/** The session's estimate so far, at API prices, in USD. */
+	costUsd?: number;
+	/** How full the session's context window is, 0 to 100. */
+	ctx?: number;
+}
+
+/** What one session has spent: its latest figures, and what earlier figures it reset from had reached. */
+export interface SessionSpend {
+	tokens: number;
+	costUsd: number;
+	/** The sum of the figures a drop showed to be reset: they were spent too. */
+	banked: { tokens: number; costUsd: number };
+}
+
+/** What the usage readings fold to. */
+export interface UsageState {
+	/** The freshest account reading: the newest with rate limits, or the newest of all while none has them. */
+	latest: UsageReading;
+	/** Each window as the first reading that gave it had it, for the change since the Effort began. */
+	first: { fiveHour?: UsageWindow; sevenDay?: UsageWindow };
+	/** Whether any reading came with rate limits; never, with an API key. */
+	rateLimits: boolean;
+	/** Each Teammate's latest status line: when it was taken, and how full its context was. */
+	statusLines: Record<string, { at: string; ctx?: number }>;
+	/** What each Teammate spent, by session id. */
+	spend: Record<string, Record<string, SessionSpend>>;
+}
+
 /** Who set a pause, the only one who lifts it: the human, the Lead, or a usage limit. */
 export type PauseSetter = "human" | "lead" | "usage";
 
@@ -357,6 +486,10 @@ export type PauseSetter = "human" | "lead" | "usage";
 export interface Pause {
 	by: PauseSetter;
 	reason?: string;
+	/** For the usage pause: the limit that set it. */
+	kind?: "session" | "weekly";
+	/** For the usage pause: when it lifts, when Claude Code said. */
+	reset?: string;
 	/** When it started. */
 	at: string;
 }
@@ -431,10 +564,18 @@ export interface EffortState {
 	found: Logged[];
 	/** The pauses that hold, by setter; absent before the first pause. */
 	pauses?: Partial<Record<PauseSetter, Pause>>;
+	/** What the usage readings say; absent before the first. */
+	usage?: UsageState;
 	/** Every request a Teammate's hook held for an answer, by request id, oldest first. */
 	teammateRequests: Record<string, HeldRequest>;
 	/** Everything the Lead escalated to the human, by id, oldest first; absent before the first. */
 	escalations?: Record<string, Escalation>;
+	/** The model-family holds, by family; absent before the first. */
+	holds?: Partial<Record<Family, ModelHold>>;
+	/** The usage items waiting on the human, oldest first; absent before the first. */
+	usageItems?: UsageItem[];
+	/** How many usage items have been raised, which numbers the next one. */
+	usageAsked?: number;
 	/** Every approval requested, oldest first, with how it was answered; absent before the first. */
 	asked?: Asked[];
 	/** The number of the last Report while it is the final one, which sign-off is asked for. */
@@ -478,6 +619,8 @@ export type EffortInput =
 			modes: readonly { role: string; mode: string }[];
 			/** For the final Report, which maps every criterion to evidence: what the shell gathered. */
 			final?: FinalFacts;
+			/** The Lead's own cost so far, in USD, as pi reports it, which the shell reads. */
+			leadCostUsd?: number;
 			at: string;
 	  }
 	/**
@@ -500,7 +643,17 @@ export type EffortInput =
 	 * Line `cursor` of `teammate`'s journal (counted from 1), with whether the
 	 * result its current Task is due to write ({@link currentResult}) is on disk.
 	 */
-	| { kind: "journal"; teammate: string; cursor: number; line: JournalLine; result: { path: string; written: boolean } }
+	| {
+			kind: "journal";
+			teammate: string;
+			cursor: number;
+			line: JournalLine;
+			result: { path: string; written: boolean };
+			/** The machine's UTC offset in minutes, which a limit's reset naming no time zone is read in; UTC when absent. */
+			tz?: number;
+			/** Each Role's model, from the Team snapshot, which a model-family limit holds Roles by. */
+			models?: Record<string, string>;
+	  }
 	/**
 	 * `team_review` of a handed-off Task, with whether its current round's
 	 * result is on disk and the Playbook's `sendBackLimit`, which the shell reads.
@@ -529,6 +682,8 @@ export type EffortInput =
 	| { kind: "pause"; by: "human" | "lead"; reason?: string; at: string }
 	/** `/team resume` from the human in a session holding the Effort, or `team_resume` from the Lead: each lifts only its own pause. */
 	| { kind: "resume"; by: "human" | "lead"; at: string }
+	/** A usage reading the shell took: a Teammate's `statusline.json`, or `get_usage`. */
+	| { kind: "usage"; reading: UsageReading }
 	/** `team_answer` of a held request. */
 	| ({ kind: "answer-request"; at: string } & RequestAnswer)
 	/** `team_escalate`: a held `request`, or a stopped-short `teammate`'s prose `question`, moved to the human with the Lead's summary. */
@@ -536,7 +691,11 @@ export type EffortInput =
 	/** The human's answer to an escalated item in `/team pending`. */
 	| { kind: "answer-escalation"; id: string; decision?: "allow" | "deny"; reason?: string; answers?: Record<string, string | string[]>; text?: string; at: string }
 	/** `team_send`: a short prose message to a Teammate. */
-	| { kind: "send"; teammate: string; message: string; at: string };
+	| { kind: "send"; teammate: string; message: string; at: string }
+	/** The shell's clock, every minute while an Effort is held: lifts usage pauses and holds at their reset, and continues limited Teammates when due. */
+	| { kind: "tick"; at: string }
+	/** The human's answer to usage item `id`, one of its {@link USAGE_CHOICES}. */
+	| { kind: "answer-usage"; id: string; choice: string; at: string };
 
 /** Work the core leaves to the shell. */
 export type EffortAction =
@@ -588,6 +747,8 @@ export type EffortAction =
 	| ({ kind: "remove-task-workspace"; slug: string } & TaskWorktree)
 	/** Send the decision to the hook holding `request`, which prints it for Claude Code. */
 	| { kind: "answer-hook"; request: string; teammate: string; decision: HookDecision }
+	/** Send a limited Teammate `continue` over its inbox. */
+	| { kind: "send-continue"; teammate: string; inbox: Inbox }
 	/** Check the final Report still has the sha256 signed off, and record the act in `approvals.jsonl`. */
 	| { kind: "record-sign-off"; approval: PendingApproval; at: string }
 	/** Apply the approved change to the Team's adopted Playbook, for the next Effort, and record the act. */
@@ -609,7 +770,7 @@ export function openEffort(opened: { effortId: string; team: string; repo: strin
 }
 
 /** Lines a Report doesn't tell of: they only carry what other lines say. */
-const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested", "request-held", "request-answered"]);
+const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested", "usage-read", "request-held", "request-answered"]);
 
 /** Fold one line into the state, keeping what the next Report tells of. */
 function apply(state: EffortState, line: EffortLine): EffortState {
@@ -714,7 +875,7 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 				}),
 			};
 		case "prompt-landed":
-			return withTeammate(state, line, { activity: "busy", doing: undefined });
+			return landed(withTeammate(state, line, { activity: "busy", doing: undefined }), line.teammate);
 		case "permission-denied":
 			return withTeammate(state, line, {});
 		case "task-sent-back": {
@@ -728,7 +889,7 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "merge-failed":
 			return merged(state, line.slug);
 		case "teammate-stopped":
-			return endRequests(withTeammate(state, line, { activity: "idle", doing: "stopped short" }), line.teammate);
+			return withLimit(endRequests(withTeammate(state, line, { activity: "idle", doing: "stopped short" }), line.teammate), line.teammate, undefined);
 		case "teammate-mode":
 			return withTeammate(state, line, { observedMode: line.mode });
 		case "task-dropped":
@@ -756,6 +917,10 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			return { ...state, queue: state.queue.map((queued) => (queued.slug === line.slug ? { ...queued, why: line.why } : queued)) };
 		case "report-written":
 			return state;
+		case "usage-read": {
+			const { type: _type, ...reading } = line;
+			return { ...state, usage: withReading(state.usage, reading) };
+		}
 		case "request-held": {
 			const { type: _type, cursor: _cursor, ...held } = line;
 			return { ...withTeammate(state, line, {}), teammateRequests: { ...state.teammateRequests, [line.request]: { ...held, state: "held" } } };
@@ -783,16 +948,132 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "message-sent":
 			return state;
 		case "task-done": {
-			const advanced = endRequests(withTeammate(state, line, { activity: "idle", doing: `round ${line.round} done` }), line.teammate);
+			const advanced = withLimit(endRequests(withTeammate(state, line, { activity: "idle", doing: `round ${line.round} done` }), line.teammate), line.teammate, undefined);
 			const task = advanced.tasks[line.slug];
 			return task ? { ...advanced, tasks: { ...advanced.tasks, [line.slug]: { ...task, reported: line.round } } } : advanced;
 		}
+		case "teammate-limited":
+			return withLimit(endRequests(withTeammate(state, line, { activity: "idle", doing: limitDoing(line.limit) }), line.teammate), line.teammate, line.limit);
+		case "limit-cleared":
+			return withLimit(withTeammate(state, line, {}), line.teammate, undefined);
+		case "teammate-continued": {
+			const limit = state.teammates.find((teammate) => teammate.id === line.teammate)?.limit;
+			if (line.why === "reset" || limit === undefined) return withLimit(state, line.teammate, undefined);
+			const { next: _next, ...rest } = limit;
+			return withLimit(state, line.teammate, { ...rest, tries: line.tries ?? 0 });
+		}
+		case "model-held": {
+			const { type: _type, ...hold } = line;
+			return { ...state, holds: { ...state.holds, [line.family]: hold } };
+		}
+		case "model-released": {
+			const { [line.family]: _lifted, ...rest } = state.holds ?? {};
+			return { ...state, holds: rest };
+		}
+		case "usage-escalated": {
+			const { type: _type, ...item } = line;
+			return { ...state, usageItems: [...(state.usageItems ?? []), item], usageAsked: (state.usageAsked ?? 0) + 1 };
+		}
+		case "usage-answered":
+			return { ...state, usageItems: (state.usageItems ?? []).filter((item) => item.id !== line.id) };
 	}
 }
+
+/** The state with `teammate`'s limit set to `limit`, or cleared. */
+function withLimit(state: EffortState, teammate: string, limit: TeammateLimit | undefined): EffortState {
+	return {
+		...state,
+		teammates: state.teammates.map((each) => {
+			if (each.id !== teammate) return each;
+			const { limit: _limit, ...rest } = each;
+			return limit === undefined ? rest : { ...rest, limit };
+		}),
+	};
+}
+
+/** A prompt landed on `teammate`: its auto-wait, if armed, is spent, and a limit that isn't retried on the ladder is over. */
+function landed(state: EffortState, teammate: string): EffortState {
+	const limit = state.teammates.find((each) => each.id === teammate)?.limit;
+	if (limit === undefined) return state;
+	if (!TRANSIENT.has(limit.kind)) return withLimit(state, teammate, undefined);
+	const { armed: _armed, ...rest } = limit;
+	return withLimit(state, teammate, rest);
+}
+
+/** The failures that clear by themselves, retried on the ladder. */
+const TRANSIENT: ReadonlySet<TeammateLimit["kind"]> = new Set(["throttle", "overloaded", "server_error"]);
+
+/** How a limited Teammate's turn ended, as the Team block shows it. */
+function limitDoing(limit: TeammateLimit): string {
+	if (limit.kind === "consent") return "usage credits unconfirmed";
+	if (limit.kind === "unknown") return "turn failed";
+	if (TRANSIENT.has(limit.kind)) return `${limit.kind.replace("_", " ")}, retrying`;
+	return `${LIMIT_NAMES[limit.kind as LimitKind]} limit`;
+}
+
+/** A limited turn, as a Report tells it. */
+function limitTold(limit: TeammateLimit): string {
+	if (limit.kind === "consent") return "waits for a usage-credit confirm in its terminal";
+	if (limit.kind === "unknown") return "failed its turn";
+	if (TRANSIENT.has(limit.kind)) return `hit ${limit.kind.replace("_", " ")}${limit.next === undefined ? "" : `, retry ${(limit.tries ?? 0) + 1} at ${clock(limit.next)}`}`;
+	return `hit its ${LIMIT_NAMES[limit.kind as LimitKind]} limit${limit.reset === undefined ? "" : `, ${untilText(limit.reset, limit.at)}`}`;
+}
+
+/** A limit as replies and the Team block name it. */
+const LIMIT_NAMES: Record<LimitKind, string> = { session: "session", weekly: "weekly", opus: "Opus", sonnet: "Sonnet" };
 
 /** The asked requests `ids` given `outcome`, once: an outcome is never rewritten. */
 function settle(asked: readonly Asked[], ids: readonly string[], outcome: NonNullable<Asked["outcome"]>): Asked[] {
 	return asked.map((each) => (ids.includes(each.id) && each.outcome === undefined ? { ...each, outcome } : each));
+}
+
+/** The usage state with one more reading folded in. */
+function withReading(usage: UsageState | undefined, reading: UsageReading): UsageState {
+	const before = usage ?? { latest: reading, first: {}, rateLimits: false, statusLines: {}, spend: {} };
+	const latest = before.latest;
+	const fresher = usage === undefined || (reading.rateLimits ? !latest.rateLimits || reading.at >= latest.at : !latest.rateLimits && reading.at >= latest.at);
+	const next: UsageState = {
+		...before,
+		latest: fresher ? reading : latest,
+		first: { fiveHour: before.first.fiveHour ?? reading.fiveHour, sevenDay: before.first.sevenDay ?? reading.sevenDay },
+		rateLimits: before.rateLimits || reading.rateLimits,
+	};
+	if (next.first.fiveHour === undefined) delete next.first.fiveHour;
+	if (next.first.sevenDay === undefined) delete next.first.sevenDay;
+	const teammate = reading.teammate;
+	if (reading.source !== "status-line" || teammate === undefined) return next;
+	next.statusLines = { ...before.statusLines, [teammate]: { at: reading.at, ...(reading.ctx === undefined ? {} : { ctx: reading.ctx }) } };
+	if (reading.sessionId !== undefined && (reading.tokens !== undefined || reading.costUsd !== undefined)) {
+		const sessions = before.spend[teammate] ?? {};
+		const was = sessions[reading.sessionId] ?? { tokens: 0, costUsd: 0, banked: { tokens: 0, costUsd: 0 } };
+		const tokens = reading.tokens ?? was.tokens;
+		const costUsd = reading.costUsd ?? was.costUsd;
+		// A figure that drops was reset, so what it had reached was spent too.
+		const banked = { tokens: was.banked.tokens + (tokens < was.tokens ? was.tokens : 0), costUsd: was.banked.costUsd + (costUsd < was.costUsd ? was.costUsd : 0) };
+		next.spend = { ...before.spend, [teammate]: { ...sessions, [reading.sessionId]: { tokens, costUsd, banked } } };
+	}
+	return next;
+}
+
+/** Whether a Teammate's status line was read under a minute before `now`, in ms: then `get_usage` isn't needed. */
+export function freshStatusLine(state: EffortState, now: number): boolean {
+	return Object.values(state.usage?.statusLines ?? {}).some((each) => now - Date.parse(each.at) < USAGE_FRESH_MS);
+}
+
+/** A status line younger than this is fresh; `get_usage` is asked at most this often. */
+export const USAGE_FRESH_MS = 60_000;
+
+/**
+ * Take a usage reading. A status line no newer than the last one read of its
+ * Teammate adds nothing, so the same file read twice is kept once.
+ */
+function usage(state: EffortState, input: Extract<EffortInput, { kind: "usage" }>): Step {
+	const { reading } = input;
+	if (reading.source === "status-line") {
+		const last = reading.teammate === undefined ? undefined : state.usage?.statusLines[reading.teammate];
+		if (reading.teammate === undefined || (last !== undefined && reading.at <= last.at)) return took(state, [], []);
+	}
+	return took(state, [{ type: "usage-read", ...reading }], []);
 }
 
 /** The state with handed-off Task `slug` changed by `change`. */
@@ -885,6 +1166,8 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return pause(state, input);
 		case "resume":
 			return resume(state, input);
+		case "usage":
+			return usage(state, input);
 		case "answer-request":
 			return answerRequest(state, input);
 		case "escalate":
@@ -893,6 +1176,10 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return answerEscalation(state, input);
 		case "send":
 			return send(state, input);
+		case "tick":
+			return tick(state, input);
+		case "answer-usage":
+			return answerUsage(state, input);
 	}
 }
 
@@ -906,7 +1193,7 @@ const SETTER_NAMES: Record<PauseSetter, string> = { human: "the human", lead: "t
 
 /** A pause, as a reply names it: who set it, since when, and why. */
 function pauseText(pause: Pause): string {
-	return `paused by ${SETTER_NAMES[pause.by]} since ${clock(pause.at)} UTC${pause.reason === undefined ? "" : `: ${pause.reason}`}`;
+	return `paused by ${SETTER_NAMES[pause.by]} since ${clock(pause.at)} UTC${pause.reason === undefined ? "" : `: ${pause.reason}`}${pause.reset === undefined ? "" : `, ${untilText(pause.reset, pause.at)}`}`;
 }
 
 /** Who lifts a pause and how. */
@@ -914,6 +1201,37 @@ function lifter(pause: Pause): string {
 	if (pause.by === "human") return "only the human lifts it, with `/team resume`";
 	if (pause.by === "lead") return "only the Lead lifts it, with `team_resume`";
 	return "it lifts at its reset";
+}
+
+/** When a limit lifts, as replies and the Team block name it: `until 15:45 UTC`, with the date when it isn't the day of `from`. */
+export function untilText(reset: string, from: string): string {
+	const day = reset.slice(0, 10) === from.slice(0, 10) ? "" : `${reset.slice(0, 10)} `;
+	return `until ${day}${clock(reset)} UTC`;
+}
+
+/** The hold on `role`'s model family, when one holds it. */
+export function holdOn(state: EffortState, role: string): ModelHold | undefined {
+	return Object.values(state.holds ?? {}).find((hold) => hold?.roles.includes(role));
+}
+
+/** A hold, as a reply names it: `an Opus limit until 15:45 UTC`. */
+export function holdText(hold: ModelHold): string {
+	if (hold.kind === "consent") return `a usage-credit confirm waiting in ${hold.teammate ?? "a Teammate"}'s terminal, which only the human answers`;
+	return `${hold.kind === "opus" ? "an Opus" : "a Sonnet"} limit${hold.reset === undefined ? "" : ` ${untilText(hold.reset, hold.at)}`}`;
+}
+
+/** Why a Task of a held Role waits. */
+function heldWhy(hold: ModelHold): string {
+	return `held: ${hold.kind === "consent" ? "usage-credit confirm" : `${LIMIT_NAMES[hold.kind]} limit`}${hold.reset === undefined ? "" : ` ${untilText(hold.reset, hold.at)}`}`;
+}
+
+/** A usage item, as `/team pending` and the Report name it. */
+export function usageText(item: UsageItem, teammates: readonly Teammate[] = []): string {
+	if (item.why === "far-reset") {
+		return `the usage pause on a ${item.kind} limit lifts ${item.reset === undefined ? "at a time Claude Code didn't say" : `${untilText(item.reset, item.at).replace(/^until /, "at ")}, more than a day away`}: stay paused, or cancel the Effort`;
+	}
+	const task = teammates.find((each) => each.id === item.teammate)?.task;
+	return `${item.teammate ?? "a Teammate"} still fails with ${item.kind.replace("_", " ")} after ${RETRY_MS.length} retries${task === undefined ? "" : ` on Task \`${task}\``}: retry again, or leave it to the Lead`;
 }
 
 /** Set the human's or the Lead's pause: no new Task starts while it holds, and running Teammates finish their Task. */
@@ -1523,6 +1841,15 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 			`queued ${pointer}: ${pauses.map(pauseText).join(", and ")}. It starts by itself once every pause is lifted (${pauses.map(lifter).join("; ")}).`,
 		);
 	}
+	const hold = holdOn(state, task.role);
+	if (hold) {
+		return took(
+			state,
+			[{ type: "task-queued", ...wanted, why: heldWhy(hold) }],
+			[{ kind: "write-task", slug: task.slug, folder }, { kind: "write-plan" }],
+			`queued ${pointer}: Role \`${task.role}\` is held by ${holdText(hold)}, while other Roles go on. It starts by itself once the hold lifts.`,
+		);
+	}
 	const staffed = staff(state, wanted, max);
 	if (staffed) {
 		return took(
@@ -1632,6 +1959,7 @@ function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }
 	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
 	if (heldPauses(state).length > 0) return took(state, [], []);
 	for (const queued of state.queue) {
+		if (holdOn(state, queued.role)) continue;
 		// It starts now, whenever it was queued.
 		const staffed = staff(state, { ...queued, at: input.at }, max);
 		if (!staffed) continue;
@@ -1642,11 +1970,16 @@ function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }
 			`Queued Task \`${queued.slug}\` ${staffed.who} (tasks/${queued.folder}/task.md).${staffed.note ? ` ${staffed.note}` : ""}`,
 		);
 	}
-	// A Task queued while paused still waits once the Effort runs: it gets the reason it waits for now, with no reply.
+	// A Task queued while paused or held still waits once the Effort runs: it gets the reason it waits for now, with no reply.
 	const why = waitReason(state, max);
 	return took(
 		state,
-		state.queue.filter((queued) => queued.why === "paused").map((queued) => ({ type: "task-requeued", slug: queued.slug, why, at: input.at })),
+		state.queue.flatMap((queued): EffortLine[] => {
+			if (queued.why !== "paused" && !queued.why.startsWith("held:")) return [];
+			const hold = holdOn(state, queued.role);
+			const now = hold ? heldWhy(hold) : why;
+			return now === queued.why ? [] : [{ type: "task-requeued", slug: queued.slug, why: now, at: input.at }];
+		}),
 		[],
 	);
 }
@@ -1704,14 +2037,24 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 			if (source !== "clear" || teammate.clearing === undefined || task === undefined || inbox === undefined) return took(state, [session], []);
 			return took(state, [session], [{ kind: "send-pointer", teammate: teammate.id, inbox, slug: teammate.clearing, folder: task.folder, round: task.round }]);
 		}
-		case "UserPromptSubmit":
-			return took(state, [{ type: "prompt-landed", ...at_, prompt: text(payload.prompt) ?? "", at }], []);
+		case "UserPromptSubmit": {
+			// A prompt landing on a Teammate waiting on a usage-credit confirm means the human answered it in its terminal.
+			const confirmed = teammate.limit?.kind === "consent" && state.holds?.[CONSENT_FAMILY]?.teammate === teammate.id;
+			return took(state, [{ type: "prompt-landed", ...at_, prompt: text(payload.prompt) ?? "", at }, ...(confirmed ? [{ type: "model-released", family: CONSENT_FAMILY, at } as const] : [])], []);
+		}
 		case "PermissionDenied": {
 			const reason = text(payload.reason);
 			return took(state, [{ type: "permission-denied", ...at_, tool: text(payload.tool_name) ?? "", ...(reason === undefined ? {} : { reason }), at }], []);
 		}
-		case "Stop":
-			return stopped(state, teammate, input);
+		case "Stop": {
+			const done = stopped(state, teammate, input);
+			const lifts = done.ok ? wentThrough(state, teammate, at) : [];
+			return done.ok && lifts.length > 0 ? took(state, [...done.append, ...lifts], done.actions, done.reply) : done;
+		}
+		case "StopFailure":
+			return limitHit(state, teammate, input);
+		case "Notification":
+			return notified(state, teammate, input);
 		case "PermissionRequest": {
 			const request = line.request;
 			if (request === undefined || state.teammateRequests[request] !== undefined) return took(state, [], []);
@@ -1770,6 +2113,265 @@ function sessionEnded(state: EffortState, teammate: Teammate, input: Extract<Eff
 		? `\`${teammate.id}\`'s session ended (${reason}) during round ${task.round} of Task \`${teammate.task}\`, so it is gone for this Effort. A send-back of the Task with \`team_review\` goes to another Teammate of Role \`${teammate.role}\`, carrying its folder; or drop it with \`team_plan\`; or stop and tell the human.`
 		: `\`${teammate.id}\`'s session ended (${reason}), so it is gone for this Effort. It had no open Task.`;
 	return took(state, [{ type: "teammate-crashed", teammate: teammate.id, cursor: input.cursor, reason, at: input.line.at }], [{ kind: "wake-lead", text: text_ }]);
+}
+
+/** The Roles on `family`, by the Team snapshot's models, with the limited Teammate's own. */
+function rolesOn(family: Family, teammate: Teammate, models: Record<string, string> | undefined): string[] {
+	const roles = Object.entries(models ?? {}).flatMap(([role, model]) => (familyOf(model) === family ? [role] : []));
+	return roles.includes(teammate.role) ? roles : [...roles, teammate.role];
+}
+
+/** Whether a limit at `reset` replaces one already holding until `held`: the later reset wins, and one Claude Code named beats one it didn't. */
+function later(reset: string | undefined, held: { reset?: string } | undefined): boolean {
+	if (held === undefined) return true;
+	if (reset === undefined) return false;
+	return held.reset === undefined || reset > held.reset;
+}
+
+/** The next usage item's id. */
+function usageId(state: EffortState): string {
+	return `u${(state.usageAsked ?? 0) + 1}`;
+}
+
+/**
+ * A `StopFailure`, classified by {@link classify}. A session or weekly limit
+ * sets the usage pause and a model family's limit holds the Roles on it,
+ * waking nobody: the Lead's own turns spend the same account. A failure that
+ * clears by itself goes on the retry ladder. A usage-credit confirm holds the
+ * Fable Roles until the human answers it in the Teammate's terminal, and
+ * anything else goes to the Lead.
+ */
+function limitHit(state: EffortState, teammate: Teammate, input: Extract<EffortInput, { kind: "journal" }>): Step {
+	const { cursor, line } = input;
+	const at = line.at;
+	const message = text(line.payload?.last_assistant_message);
+	const failure = classify(text(line.payload?.error), message, at, input.tz ?? 0);
+	const limited = (limit: TeammateLimit): EffortLine => ({ type: "teammate-limited", teammate: teammate.id, cursor, limit, at });
+	const task = state.tasks[teammate.task] === undefined ? {} : { task: teammate.task };
+	switch (failure.kind) {
+		case "unknown":
+			return took(
+				state,
+				[limited({ kind: "unknown", at })],
+				[
+					{
+						kind: "wake-lead",
+						text: `\`${teammate.id}\`'s turn on Task \`${teammate.task}\` failed${failure.error === undefined ? "" : ` (${failure.error})`}, and the extension can't settle it by itself. Its last message:\n\n${message || "(none)"}\n\nDecide what comes next, or tell the human. Never change its model or confirm usage credits for it.`,
+					},
+				],
+			);
+		case "transient": {
+			const tries = teammate.limit !== undefined && TRANSIENT.has(teammate.limit.kind) ? (teammate.limit.tries ?? 0) : 0;
+			const wait = RETRY_MS[tries];
+			if (wait !== undefined) return took(state, [limited({ kind: failure.why, tries, next: new Date(Date.parse(at) + wait).toISOString(), at })], []);
+			const open = state.usageItems?.some((item) => item.why === "retries" && item.teammate === teammate.id);
+			return took(state, [limited({ kind: failure.why, tries, at }), ...(open ? [] : [{ type: "usage-escalated", id: usageId(state), why: "retries", kind: failure.why, teammate: teammate.id, at } as const])], []);
+		}
+		case "consent": {
+			const held = state.holds?.[CONSENT_FAMILY];
+			const roles = rolesOn(CONSENT_FAMILY, teammate, input.models);
+			return took(
+				state,
+				[
+					limited({ kind: "consent", at }),
+					...(held ? [] : [{ type: "model-held", family: CONSENT_FAMILY, kind: "consent", roles, teammate: teammate.id, at } as const]),
+					...(held ? [] : [{ type: "decided-for-you", what: `held the Fable Roles (${roles.join(", ")}) while ${teammate.id} waits for a usage-credit confirm`, ...task, at } as const]),
+				],
+				[
+					{
+						kind: "wake-lead",
+						text: `\`${teammate.id}\` hit a limit on Task \`${teammate.task}\`, and Claude Code's prompt to confirm usage credits went unanswered. Only the human confirms usage credits, in its terminal (\`/team\`, then attach): tell them. Never confirm them yourself, nor change its model. New Tasks for ${quoted(roles)} wait until it is answered.`,
+					},
+				],
+			);
+		}
+		case "limit": {
+			const limit: TeammateLimit = { kind: failure.limit, ...(failure.reset === undefined ? {} : { reset: failure.reset }), ...(failure.armed ? { armed: true as const } : {}), at };
+			const until = failure.reset === undefined ? "" : `, ${untilText(failure.reset, at)}`;
+			const family = LIMIT_FAMILY[failure.limit];
+			if (family !== undefined) {
+				if (!later(failure.reset, state.holds?.[family])) return took(state, [limited(limit)], []);
+				const roles = rolesOn(family, teammate, input.models);
+				return took(
+					state,
+					[
+						limited(limit),
+						{ type: "model-held", family, kind: failure.limit as "opus" | "sonnet", roles, ...(failure.reset === undefined ? {} : { reset: failure.reset }), at },
+						{ type: "decided-for-you", what: `held the ${LIMIT_NAMES[failure.limit]} Roles (${roles.join(", ")}) on ${teammate.id}'s ${LIMIT_NAMES[failure.limit]} limit${until}`, ...task, at },
+					],
+					[],
+				);
+			}
+			if (!later(failure.reset, state.pauses?.usage)) return took(state, [limited(limit)], []);
+			const kind = failure.limit as "session" | "weekly";
+			const far = failure.reset === undefined || Date.parse(failure.reset) - Date.parse(at) > FAR_RESET_MS;
+			const asked = state.usageItems?.some((item) => item.why === "far-reset");
+			return took(
+				state,
+				[
+					limited(limit),
+					{ type: "paused", by: "usage", kind, reason: `${kind} limit`, ...(failure.reset === undefined ? {} : { reset: failure.reset }), at },
+					{ type: "decided-for-you", what: `paused the Effort on ${teammate.id}'s ${kind} limit${until}`, ...task, at },
+					...(far && !asked ? [{ type: "usage-escalated", id: usageId(state), why: "far-reset", kind, teammate: teammate.id, ...(failure.reset === undefined ? {} : { reset: failure.reset }), at } as const] : []),
+				],
+				[],
+			);
+		}
+	}
+}
+
+/** Whether a limit of `kind` still holds `role`: the usage pause for the account's limits, the family's hold for a model's. */
+function stillHeld(state: EffortState, kind: TeammateLimit["kind"], role: string): boolean {
+	if (kind === "session" || kind === "weekly") return state.pauses?.usage !== undefined;
+	const family = LIMIT_FAMILY[kind as LimitKind];
+	return family !== undefined && state.holds?.[family]?.roles.includes(role) === true;
+}
+
+/** The limits a turn that went through shows are over: a usage pause, or the hold on its Role, that Claude Code gave no reset for. */
+function wentThrough(state: EffortState, teammate: Teammate, at: string): EffortLine[] {
+	const lifts: EffortLine[] = [];
+	if (state.pauses?.usage !== undefined && state.pauses.usage.reset === undefined) lifts.push({ type: "resumed", by: "usage", at });
+	for (const hold of Object.values(state.holds ?? {})) {
+		if (hold && hold.kind !== "consent" && hold.reset === undefined && hold.roles.includes(teammate.role)) lifts.push({ type: "model-released", family: hold.family, at });
+	}
+	return lifts;
+}
+
+/** `continue` for each Teammate in `teammates`, after its limit reset. */
+function continueAll(teammates: readonly Teammate[], why: string, at: string): { append: EffortLine[]; actions: EffortAction[] } {
+	return {
+		append: teammates.flatMap((each): EffortLine[] => [
+			{ type: "teammate-continued", teammate: each.id, why: "reset", at },
+			{ type: "decided-for-you", what: `sent \`continue\` to ${each.id}, ${why}`, task: each.task, at },
+		]),
+		actions: teammates.flatMap((each): EffortAction[] => (each.inbox ? [{ kind: "send-continue", teammate: each.id, inbox: each.inbox }] : [])),
+	};
+}
+
+/** A limited Teammate the Effort may send `continue`: live, still idle, reachable, and with no auto-wait of Claude Code's armed. */
+/** Whether a usage limit holds anything back that the shell's clock lets go: the usage pause, a model hold, or a Teammate a limit stopped. */
+export function usageHolds(state: EffortState): boolean {
+	return state.pauses?.usage !== undefined || Object.keys(state.holds ?? {}).length > 0 || live(state).some((each) => each.limit !== undefined);
+}
+
+function continuable(state: EffortState): Teammate[] {
+	return live(state).filter((each) => each.limit !== undefined && each.limit.armed === undefined && each.activity === "idle" && each.inbox !== undefined);
+}
+
+/**
+ * A `Notification`. `quota_auto_resume_fired`: Claude Code's auto-wait
+ * continued the Teammate, so its limit has reset; the pause or hold it set
+ * lifts, and every other Teammate idle on the same limit gets `continue`.
+ * A stale or disabled auto-wait is disarmed, and the reset's grace takes over.
+ */
+function notified(state: EffortState, teammate: Teammate, input: Extract<EffortInput, { kind: "journal" }>): Step {
+	const { cursor, line } = input;
+	const at = line.at;
+	const type = text(line.payload?.notification_type);
+	const limit = teammate.limit;
+	if (limit === undefined) return took(state, [], []);
+	if (type === "quota_auto_resume_stale" || type === "quota_auto_resume_disabled") {
+		if (limit.armed === undefined) return took(state, [], []);
+		const { armed: _armed, ...disarmed } = limit;
+		return took(state, [{ type: "teammate-limited", teammate: teammate.id, cursor, limit: disarmed, at }], []);
+	}
+	if (type !== "quota_auto_resume_fired") return took(state, [], []);
+	const account = limit.kind === "session" || limit.kind === "weekly";
+	const family = LIMIT_FAMILY[limit.kind as LimitKind];
+	const lifts: EffortLine[] = [
+		{ type: "limit-cleared", teammate: teammate.id, cursor, at },
+		...(account && state.pauses?.usage ? [{ type: "resumed", by: "usage", at } as const] : []),
+		...(family !== undefined && state.holds?.[family] ? [{ type: "model-released", family, at } as const] : []),
+	];
+	const after = lifts.reduce(apply, state);
+	const same = (other: TeammateLimit["kind"]) => (account ? other === "session" || other === "weekly" : other === limit.kind);
+	const others = continuable(after).filter((each) => each.id !== teammate.id && each.limit !== undefined && same(each.limit.kind) && !stillHeld(after, each.limit.kind, each.role));
+	const continued = continueAll(others, `since Claude Code's auto-resume fired for ${teammate.id}`, at);
+	return took(state, [...lifts, ...continued.append], continued.actions);
+}
+
+/**
+ * The shell's clock: the usage pause and model holds lift at their reset; a
+ * Teammate on the retry ladder gets `continue` when its retry is due; and
+ * one on a usage limit gets it ~2 min after the reset, once nothing holds it.
+ * None of it goes to a Teammate whose auto-wait is armed.
+ */
+function tick(state: EffortState, input: Extract<EffortInput, { kind: "tick" }>): Step {
+	const now = Date.parse(input.at);
+	const at = input.at;
+	const lifts: EffortLine[] = [];
+	const usage = state.pauses?.usage;
+	if (usage?.reset !== undefined && Date.parse(usage.reset) <= now) lifts.push({ type: "resumed", by: "usage", at });
+	for (const hold of Object.values(state.holds ?? {})) {
+		if (hold?.reset !== undefined && Date.parse(hold.reset) <= now) lifts.push({ type: "model-released", family: hold.family, at });
+	}
+	const after = lifts.reduce(apply, state);
+	const append = [...lifts];
+	const actions: EffortAction[] = [];
+	const due: Teammate[] = [];
+	for (const teammate of continuable(after)) {
+		const limit = teammate.limit;
+		if (limit === undefined || !teammate.inbox) continue;
+		if (TRANSIENT.has(limit.kind)) {
+			if (limit.next === undefined || Date.parse(limit.next) > now) continue;
+			const tries = (limit.tries ?? 0) + 1;
+			append.push(
+				{ type: "teammate-continued", teammate: teammate.id, why: "retry", tries, at },
+				{ type: "decided-for-you", what: `retried ${teammate.id} after ${limit.kind.replace("_", " ")} (${tries} of ${RETRY_MS.length})`, task: teammate.task, at },
+			);
+			actions.push({ kind: "send-continue", teammate: teammate.id, inbox: teammate.inbox });
+		} else if (limit.kind in LIMIT_NAMES) {
+			const reset = limit.reset === undefined || Date.parse(limit.reset) + GRACE_MS <= now;
+			if (reset && !stillHeld(after, limit.kind, teammate.role)) due.push(teammate);
+		}
+	}
+	const continued = continueAll(due, "since its limit reset", at);
+	return took(state, [...append, ...continued.append], [...actions, ...continued.actions]);
+}
+
+/**
+ * The human's answer to a usage item. A far reset: `stay` keeps the usage
+ * pause, `cancel` cancels the Effort as `/team cancel` does: every Teammate
+ * stops and it ends without sign-off. A run-out retry ladder: `retry` sends `continue` and starts the
+ * ladder again, `leave` hands the Teammate to the Lead.
+ */
+function answerUsage(state: EffortState, input: Extract<EffortInput, { kind: "answer-usage" }>): Step {
+	const item = state.usageItems?.find((each) => each.id === input.id);
+	if (!item) return { ok: false, refusal: `No usage item \`${input.id}\` waits on you in Effort \`${state.effortId}\`.` };
+	const choices: readonly string[] = USAGE_CHOICES[item.why];
+	if (!choices.includes(input.choice)) return { ok: false, refusal: `Usage item \`${item.id}\` takes ${quoted(choices)}, not \`${input.choice}\`.` };
+	const answered: EffortLine = { type: "usage-answered", id: item.id, choice: input.choice, at: input.at };
+	const teammate = state.teammates.find((each) => each.id === item.teammate);
+	switch (input.choice) {
+		case "stay":
+			return took(state, [answered], [], `The Effort stays paused on its ${item.kind} limit; it lifts at its reset.`);
+		case "cancel": {
+			// It is `/team cancel`: every Teammate stops and the Effort ends without sign-off.
+			const ended = step(state, { kind: "cancel", at: input.at });
+			if (!ended.ok) return ended;
+			return took(state, [answered, ...ended.append], ended.actions, `${ended.reply} It was waiting out its ${item.kind} limit.`);
+		}
+		case "retry":
+			if (!teammate?.inbox || teammate.ended !== undefined) return took(state, [answered], [], `\`${item.teammate ?? "The Teammate"}\` can't be reached any more, so nothing was sent.`);
+			return took(
+				state,
+				[answered, { type: "teammate-continued", teammate: teammate.id, why: "retry", tries: 0, at: input.at }],
+				[{ kind: "send-continue", teammate: teammate.id, inbox: teammate.inbox }],
+				`Sent \`continue\` to ${teammate.id}; if it fails again, the retry ladder starts over.`,
+			);
+		default:
+			return took(
+				state,
+				[answered],
+				[
+					{
+						kind: "wake-lead",
+						text: `\`${item.teammate ?? "A Teammate"}\` still fails with ${item.kind.replace("_", " ")} after ${RETRY_MS.length} retries${teammate === undefined ? "" : ` on Task \`${teammate.task}\``}, and the human left it to you: wait, re-plan, or tell the human. Never change its model.`,
+					},
+				],
+				"Left it to the Lead.",
+			);
+	}
 }
 
 /**
@@ -2045,6 +2647,12 @@ function told(line: EffortLine, state: EffortState): string | undefined {
 			return `${line.teammate} was denied \`${line.tool}\`${line.reason === undefined ? "" : `: ${line.reason}`}`;
 		case "request-settled":
 			return settledText(line.teammate, line.request, line.how);
+		case "teammate-limited":
+			return `${line.teammate} ${limitTold(line.limit)}`;
+		case "model-released":
+			return `the ${line.family === "opus" ? "Opus" : line.family === "sonnet" ? "Sonnet" : "Fable"} hold lifted`;
+		case "usage-answered":
+			return `you answered \`${line.id}\`: ${line.choice}`;
 		default:
 			return undefined;
 	}
@@ -2076,7 +2684,7 @@ function report(state: EffortState, input: Extract<EffortInput, { kind: "report"
 	const found: EffortLine[] = (input.found ?? []).map((what) => what.trim()).filter((what) => what !== "").map((what) => ({ type: "found-work", what, at: input.at }));
 	const now = found.reduce(apply, state);
 	const n = state.reports + 1;
-	const logged = reportSections(now, n === 1 ? input.modes : undefined).filter((each) => each.lines.length > 0);
+	const logged = [...reportSections(now, n === 1 ? input.modes : undefined), { title: "Usage", lines: usageLines(now, input.leadCostUsd) }].filter((each) => each.lines.length > 0);
 	// The final Report tells all found work, not only what is new, so its own section replaces the logged one.
 	const sections = input.final ? [...logged.filter((each) => each.title !== "Found work"), ...finalSections(now, input.final)] : logged;
 	const written: Report = { n, at: input.at, headline, coverage, sections, ...(input.final ? { final: true as const } : {}) };
@@ -2161,6 +2769,60 @@ function finalSections(state: EffortState, final: FinalFacts): ReportSection[] {
 	];
 }
 
+/** `412k`, `1.2M`: a token count as a Report gives it. */
+function tokenCount(tokens: number): string {
+	if (tokens < 1000) return String(Math.round(tokens));
+	if (tokens < 1_000_000) return `${Math.round(tokens / 1000)}k`;
+	return `${(tokens / 1_000_000).toFixed(1)}M`;
+}
+
+function dollars(usd: number): string {
+	return `$${usd.toFixed(2)}`;
+}
+
+/** Where a reading came from, as the Report and the Team block name it. */
+export function usageSource(reading: UsageReading): string {
+	return reading.source === "status-line" ? `${reading.teammate}'s status line` : "get_usage";
+}
+
+/**
+ * The Report's usage: the freshest account reading with its change since the
+ * Effort began, each Role's tokens and estimate summed across its Teammates'
+ * sessions, and the Lead's own cost. Empty with no reading and no Lead cost.
+ */
+function usageLines(state: EffortState, leadCostUsd: number | undefined): string[] {
+	const lines: string[] = [];
+	const usage = state.usage;
+	if (usage !== undefined) {
+		const window = (label: string, now: UsageWindow | undefined, first: UsageWindow | undefined): string => {
+			if (now === undefined) return `${label} n/a`;
+			const reset = first?.resetsAt !== undefined && now.resetsAt !== undefined && first.resetsAt !== now.resetsAt;
+			const change = first === undefined ? "" : reset ? " (reset since the Effort began)" : ` (${now.percent - first.percent >= 0 ? "+" : ""}${Math.round(now.percent - first.percent)} since the Effort began)`;
+			return `${label} ${Math.round(now.percent)}%${change}`;
+		};
+		const { latest } = usage;
+		lines.push(`Account, from ${usageSource(latest)} at ${clock(latest.at)} UTC: ${window("5h", latest.fiveHour, usage.first.fiveHour)} · ${window("week", latest.sevenDay, usage.first.sevenDay)}. It includes your own use outside the Team.`);
+		const byRole = new Map<string, { tokens: number; costUsd: number }>();
+		for (const teammate of state.teammates) {
+			const sessions = Object.values(usage.spend[teammate.id] ?? {});
+			if (sessions.length === 0) continue;
+			const sum = byRole.get(teammate.role) ?? { tokens: 0, costUsd: 0 };
+			for (const each of sessions) {
+				sum.tokens += each.tokens + each.banked.tokens;
+				sum.costUsd += each.costUsd + each.banked.costUsd;
+			}
+			byRole.set(teammate.role, sum);
+		}
+		if (byRole.size > 0) {
+			const roles = [...byRole].sort(([a], [b]) => a.localeCompare(b)).map(([role, sum]) => `${role} ${tokenCount(sum.tokens)} tokens ≈ ${dollars(sum.costUsd)}`);
+			const label = usage.rateLimits ? "*API-price equivalent, not your bill.*" : "No reading has `rate_limits`, as with an API key, so the estimate is the nearest thing to a charge.";
+			lines.push(`By Role: ${roles.join(" · ")}. ${label}`);
+		}
+	}
+	if (leadCostUsd !== undefined && leadCostUsd > 0) lines.push(`The Lead: ${dollars(leadCostUsd)}, as pi reports it.`);
+	return lines;
+}
+
 /** The logged sections, from `since` the last Report; the plan Report passes each Role's mode. */
 function reportSections(state: EffortState, modes: readonly { role: string; mode: string }[] | undefined): ReportSection[] {
 	const since = state.sinceReport;
@@ -2185,6 +2847,7 @@ function reportSections(state: EffortState, modes: readonly { role: string; mode
 				),
 				...waitingInTerminal(state).map((held) => `\`${held.request}\`: ${terminalText(held)}`),
 				...openEscalations(state).map((escalation) => `\`${escalation.id}\`: ${escalationText(escalation, state)}, escalated: ${escalation.summary} Answer it in \`/team pending\``),
+				...(state.usageItems ?? []).map((item) => `\`${item.id}\`: ${usageText(item, state.teammates)}, in \`/team pending\``),
 			],
 		},
 		{ title: "Decided for you", lines: of("decided-for-you").map((line) => `${clock(line.at)} ${line.what}${line.task === undefined ? "" : ` (Task \`${line.task}\`)`}`) },

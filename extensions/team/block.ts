@@ -25,7 +25,7 @@
  */
 
 import { sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
-import { type EffortState, heldPauses, openEscalations, type PauseSetter, type Teammate, waitingInTerminal } from "./core.ts";
+import { type EffortState, heldPauses, openEscalations, type PauseSetter, type Teammate, type UsageWindow, usageSource, waitingInTerminal } from "./core.ts";
 
 /** The widest the frame may get, borders included. */
 export const MAX_WIDTH = 96;
@@ -74,8 +74,34 @@ export interface QueuedTask {
 export interface PauseRow {
 	by: PauseSetter;
 	reason?: string;
+	/** For the usage pause: the limit that set it. */
+	kind?: "session" | "weekly";
+	/** For the usage pause: when it lifts, as an ISO time, when Claude Code said. */
+	reset?: string;
 	/** When it started, as an ISO time. */
 	since: string;
+}
+
+/** A model family's limit, or a usage-credit confirm, holding the Roles on that family while other Roles go on. */
+export interface HoldRow {
+	kind: "opus" | "sonnet" | "consent";
+	roles: string[];
+	/** When it lifts, as an ISO time; absent for a usage-credit confirm. */
+	reset?: string;
+	/** For a usage-credit confirm: the Teammate whose terminal it waits in. */
+	teammate?: string;
+}
+
+/** The account's usage, from the freshest reading. */
+export interface UsageRow {
+	/** The 5-hour window; absent when the reading doesn't give it. */
+	fiveHour?: UsageWindow;
+	/** The weekly window; absent when the reading doesn't give it. */
+	sevenDay?: UsageWindow;
+	/** Where the reading came from: a Teammate's status line, or `get_usage`. */
+	source: string;
+	/** When it was taken, ISO. */
+	at: string;
 }
 
 /** What the Team block shows, and what `team_status` returns. */
@@ -96,6 +122,10 @@ export interface TeamBlockData {
 	reports: number;
 	/** The pauses that hold, the human's first; absent while the Effort runs. No new Task starts while any holds. */
 	pauses?: PauseRow[];
+	/** The account's usage; absent until a first reading. */
+	usage?: UsageRow;
+	/** The model-family holds; absent while none holds. A held Role's Tasks queue until it lifts. */
+	holds?: HoldRow[];
 }
 
 /** How the block is drawn. */
@@ -120,29 +150,62 @@ export interface StatusExtras {
  */
 export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockData {
 	const handed = Object.keys(state.tasks).length > 0 || state.queue.length > 0;
+	const teammates = state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined).map((teammate) => teammateRow(state, teammate));
 	return {
 		effortId: state.effortId,
 		team: state.team,
 		phase: !state.brief ? "intake" : handed ? "working" : "planning",
 		tasks: { accepted: Object.values(state.tasks).filter((task) => task.accepted !== undefined).length, planned: state.plan?.length ?? 0 },
 		// A Teammate stopped to make room, or that ended (stopped with its dropped Task, or crashed), is gone for this Effort.
-		teammates: state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined).map((teammate) => teammateRow(state, teammate)),
+		teammates,
 		queued: state.queue.map((queued) => ({ task: queued.folder, role: queued.role, why: queued.why })),
-		waitingOnYou: state.pending.length + waitingInTerminal(state).length + openEscalations(state).length + extras.adoptionsPending,
+		waitingOnYou: state.pending.length + waitingInTerminal(state).length + openEscalations(state).length + extras.adoptionsPending + (state.usageItems?.length ?? 0),
 		reports: state.reports,
 		...pauseRows(state),
+		...usageRow(state, teammates.length),
+		...holdRows(state),
 	};
+}
+
+/** The freshest reading; one `get_usage` took while no Teammate is live says so. */
+function usageRow(state: EffortState, live: number): { usage?: UsageRow } {
+	const reading = state.usage?.latest;
+	if (!reading) return {};
+	const source = reading.source === "get-usage" && live === 0 ? `${usageSource(reading)} (no Teammate live)` : usageSource(reading);
+	return { usage: { ...(reading.fiveHour ? { fiveHour: reading.fiveHour } : {}), ...(reading.sevenDay ? { sevenDay: reading.sevenDay } : {}), source, at: reading.at } };
 }
 
 function pauseRows(state: EffortState): { pauses?: PauseRow[] } {
 	const held = heldPauses(state);
 	if (held.length === 0) return {};
-	return { pauses: held.map((pause) => ({ by: pause.by, ...(pause.reason === undefined ? {} : { reason: pause.reason }), since: pause.at })) };
+	return {
+		pauses: held.map((pause) => ({
+			by: pause.by,
+			...(pause.reason === undefined ? {} : { reason: pause.reason }),
+			...(pause.kind === undefined ? {} : { kind: pause.kind }),
+			...(pause.reset === undefined ? {} : { reset: pause.reset }),
+			since: pause.at,
+		})),
+	};
+}
+
+function holdRows(state: EffortState): { holds?: HoldRow[] } {
+	const holds = Object.values(state.holds ?? {}).filter((hold) => hold !== undefined);
+	if (holds.length === 0) return {};
+	return {
+		holds: holds.map((hold) => ({
+			kind: hold.kind,
+			roles: hold.roles,
+			...(hold.reset === undefined ? {} : { reset: hold.reset }),
+			...(hold.teammate === undefined ? {} : { teammate: hold.teammate }),
+		})),
+	};
 }
 
 function teammateRow(state: EffortState, teammate: Teammate): TeammateRow {
 	const mode = teammate.observedMode ?? teammate.mode;
 	const drifted = teammate.observedMode !== undefined && teammate.mode !== undefined && teammate.observedMode !== teammate.mode;
+	const ctx = state.usage?.statusLines[teammate.id]?.ctx;
 	return {
 		id: teammate.id,
 		role: teammate.role,
@@ -151,6 +214,7 @@ function teammateRow(state: EffortState, teammate: Teammate): TeammateRow {
 		activity: teammate.activity ?? "starting",
 		task: state.tasks[teammate.task]?.folder ?? teammate.task,
 		...(teammate.activity === "idle" && teammate.doing !== undefined ? { doing: teammate.doing } : {}),
+		...(ctx === undefined ? {} : { ctx }),
 		...(mode === undefined ? {} : { mode }),
 		...(drifted ? { launchMode: teammate.mode } : {}),
 	};
@@ -160,7 +224,7 @@ function teammateRow(state: EffortState, teammate: Teammate): TeammateRow {
 type Section = (data: TeamBlockData, now: number, options: BlockOptions, width: number) => string[];
 
 /** The block's body, top to bottom. */
-const SECTIONS: Section[] = [statusLine, pauseLines, teammateRows, queuedLines, footerLine];
+const SECTIONS: Section[] = [statusLine, pauseLines, holdLines, usageLine, teammateRows, queuedLines, footerLine];
 
 /** The framed Team block. */
 export function renderTeamBlock(data: TeamBlockData, now: number, options: BlockOptions): string[] {
@@ -188,13 +252,67 @@ function statusLine(data: TeamBlockData): string[] {
 const SETTERS: Record<PauseSetter, string> = { human: "you", lead: "the Lead", usage: "a usage limit" };
 
 /** A line per pause under the status line: who set it, since when and why; the human's says how to lift it. */
-function pauseLines(data: TeamBlockData): string[] {
+function pauseLines(data: TeamBlockData, now: number): string[] {
 	return (data.pauses ?? []).map((pause) => {
-		const why = pause.reason === undefined ? "" : `: ${oneLine(pause.reason)}`;
+		const resets = pause.reset === undefined ? "" : `, resets ${clockAt(pause.reset, now)}`;
+		const why = pause.reason === undefined ? "" : `: ${oneLine(pause.reason)}${resets}`;
 		const lift = pause.by === "human" ? "   /team resume" : "";
 		// The block repaints on events, not on a timer, so it shows a clock time rather than an age.
 		return `  by ${SETTERS[pause.by]} since ${pause.since.slice(11, 16)} UTC${why}${lift}`;
 	});
+}
+
+/** What holds each model family's Roles, as the human reads it. */
+const HOLDS: Record<HoldRow["kind"], string> = { opus: "an Opus limit", sonnet: "a Sonnet limit", consent: "a usage-credit confirm" };
+
+/** A line per model hold: the Roles it holds, on what, and until when, or where the confirm waits. */
+function holdLines(data: TeamBlockData, now: number): string[] {
+	return (data.holds ?? []).map((hold) => {
+		const until = hold.reset === undefined ? "" : ` until ${clockAt(hold.reset, now)}`;
+		const where = hold.teammate === undefined ? "" : ` in ${oneLine(hold.teammate)}'s terminal`;
+		return `held  ${oneLine(hold.roles.join(", "))} on ${HOLDS[hold.kind]}${until}${where}`;
+	});
+}
+
+/** A time as the block shows it: the UTC clock time, with its date when that is not today's. */
+function clockAt(at: string, now: number): string {
+	const day = at.slice(0, 10) === new Date(now).toISOString().slice(0, 10) ? "" : `${at.slice(0, 10)} `;
+	return `${day}${at.slice(11, 16)} UTC`;
+}
+
+/**
+ * The account's usage, shown whether or not a Teammate is live: each window,
+ * or `n/a` when the reading doesn't give it, and when it resets, as a time
+ * today or a weekday and time otherwise, in UTC like the pause lines; then
+ * where the reading came from and how old it is.
+ */
+function usageLine(data: TeamBlockData, now: number): string[] {
+	const usage = data.usage;
+	if (!usage) return [];
+	const windows = [usageWindow("5h", usage.fiveHour, now), usageWindow("week", usage.sevenDay, now)].join(" · ");
+	return [`${windows}  · ${oneLine(usage.source)}, ${age(now - Date.parse(usage.at))} ago`];
+}
+
+function usageWindow(label: string, window: UsageWindow | undefined, now: number): string {
+	if (!window) return `${label} n/a`;
+	const resets = window.resetsAt === undefined ? "" : ` ↻${resetClock(Date.parse(window.resetsAt), now)}`;
+	return `${label} ${Math.round(window.percent)}%${resets}`;
+}
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/** `HH:MM` UTC for a time today, `Ddd HH:MM` for another day. */
+function resetClock(at: number, now: number): string {
+	const date = new Date(at);
+	const time = date.toISOString().slice(11, 16);
+	return date.toISOString().slice(0, 10) === new Date(now).toISOString().slice(0, 10) ? time : `${WEEKDAYS[date.getUTCDay()]} ${time}`;
+}
+
+/** An age: seconds under a minute, minutes under an hour, then hours and minutes. */
+function age(ms: number): string {
+	if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))}s`;
+	if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+	return `${Math.floor(ms / 3_600_000)}h ${Math.round((ms % 3_600_000) / 60_000)}m`;
 }
 
 /**
