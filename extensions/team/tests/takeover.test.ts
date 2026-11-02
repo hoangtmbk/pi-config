@@ -300,3 +300,54 @@ describe("handing a Teammate back", () => {
 		assert.ok(result.ok && result.actions.some((action) => action.kind === "mark-takeover" && !action.on));
 	});
 });
+
+describe("a Takeover and a fresh session an approved Brief change asks for (#112)", () => {
+	/** `state` with dev-1 due a fresh session at its next Task, as an approved Brief change that alters its Role's launch options leaves it. */
+	const freshDue = (state: ReturnType<typeof fold>) => ({ ...state, teammates: state.teammates.map((teammate) => ({ ...teammate, freshDue: true as const })) });
+	const ok = (result: Step) => {
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		return result;
+	};
+
+	it("never starts a Teammate the human holds afresh; its next Task after the hand-back does", () => {
+		const holding = freshDue(fold(applied(freed, mod(3, "prompt.submit", { text: "now tidy the README" }))));
+		const queued = ok(step(holding, { kind: "handoff", slug: "docs", at: AT, maxTeammates: 1 }));
+		assert.deepEqual(queued.append.map((each) => each.type), ["task-queued"]);
+
+		const back = ok(step(queued.state, handback()));
+		const drained = ok(step(back.state, { kind: "drain", at: "2026-11-02T12:46:00.000Z", maxTeammates: 1 }));
+
+		assert.ok(drained.append.some((each) => each.type === "teammate-relaunched" && each.teammate === "dev-1"));
+		assert.ok(!drained.actions.some((action) => action.kind === "clear-then-send"));
+	});
+
+	/** dev-1, free, with a card its old session's terminal killed the hook of, started afresh on `docs`: its new session hasn't started yet. */
+	const relaunched = (() => {
+		const held = applied(freed, hook(3, "PermissionRequest", { tool_name: "Bash", tool_input: { command: "rm -rf dist" } }, { request: "req-0000000a" }));
+		const denied = applied(held, hook(4, "denied-in-terminal", {}, { request: "req-0000000a" }));
+		const folder = fold(denied).tasks.docs?.folder ?? "002-dev-docs";
+		return [
+			...denied,
+			{ type: "task-handed-off", slug: "docs", folder, role: "dev", teammate: "dev-1", at: AT, round: 1 },
+			{ type: "teammate-relaunched", teammate: "dev-1", task: "docs", at: AT },
+		] satisfies EffortLine[];
+	})();
+
+	it("takes no input from the old session of a Teammate being started afresh as a Takeover", () => {
+		const typed = run(relaunched, mod(5, "prompt.submit", { text: "one more thing" }));
+
+		assert.deepEqual(typed.ok && typed.append, []);
+		assert.equal(typed.ok && typed.state.teammates[0]?.takeover, undefined);
+	});
+
+	it("leaves the old session's unanswered card behind: the new session going on is no No", () => {
+		const started = applied(relaunched, hook(5, "SessionStart", { source: "startup", session_id: "9a9a9a9a-0000-4000-8000-000000000003" }));
+		const stopped = run(started, hook(6, "Stop", { session_id: "9a9a9a9a-0000-4000-8000-000000000003" }));
+
+		assert.equal(stopped.ok && stopped.state.teammates[0]?.takeover, undefined);
+		assert.ok(stopped.ok && !stopped.append.some((each) => each.type === "takeover-started"));
+		// The human typing in the new session does take it over.
+		const typed = run(started, mod(6, "prompt.submit", { text: "use the other store" }));
+		assert.ok(typed.ok && typed.state.teammates[0]?.takeover);
+	});
+});

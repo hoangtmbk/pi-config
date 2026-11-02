@@ -4077,3 +4077,239 @@ describe("ending an Effort: the final Report and sign-off", () => {
 		assert.match(pi.notifications.at(-1)?.message ?? "", /holds no Effort, so there is nothing to cancel/);
 	});
 });
+
+/** {@link crewBrief} with AC2 changed, and `frontmatter` lines added: a Brief change the Lead drafts. */
+function changedBrief(repo: string, frontmatter: string[] = [], playbook = CREW_PLAYBOOK): string {
+	return crewBrief(repo, playbook, frontmatter).replace("Old configs still load.", "Old configs still load, with a warning.");
+}
+
+/** The crew Effort, approved and planned, with every Teammate working each Task it gets. */
+async function crewPlanned(options: Parameters<typeof crewApproved>[0] = {}) {
+	const crew = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }, ...WORKS], replies: WORKS, ...options });
+	await crew.pi.call("team_plan", { tasks: STAFF_PLAN });
+	return crew;
+}
+
+describe("Brief changes: team_request_approval at `brief-change`", () => {
+	it("holds only the Tasks it affects: a handoff of one queues until the human answers, while the others hand off", async () => {
+		const { pi, dir, repo } = await crewPlanned();
+		writeFileSync(join(dir, "brief.draft.md"), changedBrief(repo));
+
+		const asked = await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: ["survey"] });
+
+		assert.match(asked, /Brief change of Effort `crew-2026-11-02` as request `r2`/);
+		assert.match(asked, /holds Task `survey`/);
+		const held = await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
+		assert.match(held, /^queued Task `survey` \(tasks\/001-scout-survey\/task\.md\): held by Brief change `r2`/);
+		const started = await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		assert.match(started, /^started builder-1 on Task `rename-key`/);
+		assert.equal(pi.claude.launches().length, 1);
+		await until(() => teammateWakes(pi.sent).length === 1, "the unaffected Task runs to its result");
+	});
+
+	it("approval promotes the draft to brief.md, records it with its sha and releases the held Tasks", async () => {
+		const { pi, dir, repo } = await crewPlanned();
+		const text = changedBrief(repo);
+		writeFileSync(join(dir, "brief.draft.md"), text);
+		await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: ["survey"] });
+		await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
+		const woken = pi.sent.length;
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		assert.equal(readFileSync(join(dir, "brief.md"), "utf8"), text);
+		const record = approvals(dir).at(-1);
+		assert.deepEqual({ act: record?.act, request: record?.request, brief: record?.brief, affects: record?.affects }, { act: "brief-change", request: "r2", brief: sha(text), affects: ["survey"] });
+		const wake = pi.sent.slice(woken).find((message) => message.customType === "team-pending");
+		assert.match(wake?.content ?? "", /approved the Brief change of Effort `crew-2026-11-02` \(request `r2`, sha256 [0-9a-f]{64}\)/);
+		assert.match(wake?.content ?? "", /Task `survey` is released/);
+		assert.equal(pi.claude.launches().length, 1);
+		assert.match(pi.claude.launches()[0]?.argv.join(" ") ?? "", /--name team-crew-2026-11-02-scout-1/);
+		// The Effort's records still check: a later Lead tool reads them.
+		assert.match(await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" }), /^started builder-1/);
+	});
+
+	it("a held Task's result waits for the answer: team_review is refused until the change is approved", async () => {
+		const { pi, dir, repo } = await renameReported();
+		await until(() => teammateWakes(pi.sent).length === 1, "rename-key has a result");
+		writeFileSync(join(dir, "brief.draft.md"), changedBrief(repo));
+		await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: ["rename-key"] });
+
+		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /Task `rename-key` is held by Brief change `r2`/);
+
+		pi.answer("Approve");
+		await pi.team("pending");
+		assert.match(await pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /^Accepted Task `rename-key`/);
+	});
+
+	it("a send-back wakes the Lead with the note and keeps the Tasks held", async () => {
+		const { pi, dir, repo } = await crewPlanned();
+		writeFileSync(join(dir, "brief.draft.md"), changedBrief(repo));
+		await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: ["survey"] });
+		const woken = pi.sent.length;
+
+		pi.answer("Send back with a note", "Keep AC2 as it was.");
+		await pi.team("pending");
+
+		const wake = pi.sent.slice(woken).find((message) => message.customType === "team-pending");
+		assert.match(wake?.content ?? "", /sent back the Brief change of Effort `crew-2026-11-02` \(request `r2`\) with this note:\n\nKeep AC2 as it was\./);
+		assert.match(wake?.content ?? "", /Task `survey` stays held/);
+		assert.match(await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" }), /held by Brief change `r2`/);
+		assert.equal(approvals(dir).some((record) => record.act === "brief-change"), false);
+		assert.notEqual(readFileSync(join(dir, "brief.md"), "utf8"), changedBrief(repo));
+	});
+});
+
+describe("Brief changes: overrides", () => {
+	afterEach(() => {
+		for (const fake of holding.splice(0)) fake.release();
+	});
+
+	it("a grant an approved Brief change adds can be cited by team_answer for a floor request", async () => {
+		const crew = await crewApproved({
+			playbook: FLOOR_PLAYBOOK,
+			hooks: [
+				{ event: "SessionStart", payload: { source: "startup", session_id: "c0ffee12-0000-4000-8000-000000000001" } },
+				{ event: "UserPromptSubmit", payload: { prompt: "New Task `rename-key`" } },
+				{ event: "PreToolUse", payload: { tool_name: "Bash", tool_input: { command: "gh pr create --fill" } } },
+			],
+		});
+		const { pi, dir, repo } = crew;
+		holding.push(pi.claude);
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		const held = () => effortLines(dir).filter((line) => line.type === "request-held");
+		await until(() => held().length === 1, "the Lead holds the floor request");
+		const request = String(held()[0]?.request);
+		await assert.rejects(pi.call("team_answer", { request, decision: "allow", reason: "The PR the human reviews.", grant: "open-pr" }), /`push-effort-branch`, `delivery`/);
+
+		const grant = ["overrides:", "  - rule: open-pr", '    change: "add grant: open the pull request the Delivery asks for"', "    reason: The human reviews every change as a PR."];
+		writeFileSync(join(dir, "brief.draft.md"), changedBrief(repo, grant, FLOOR_PLAYBOOK));
+		await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: [] });
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		await pi.call("team_answer", { request, decision: "allow", reason: "The PR the human reviews.", grant: "open-pr" });
+		const [hook] = pi.claude.held();
+		await until(() => hook?.exitCode() !== undefined, "the held hook exits");
+		assert.deepEqual(JSON.parse(hook?.output() ?? ""), { hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
+	});
+
+	it("refuses a Brief change whose override names a rule id the Effort's Playbook lacks, and nothing reaches the human", async () => {
+		const { pi, dir, repo } = await crewPlanned();
+		const unknown = ["overrides:", "  - rule: no-such-rule", "    change: skip", "    reason: It never fits."];
+		writeFileSync(join(dir, "brief.draft.md"), changedBrief(repo, unknown));
+
+		await assert.rejects(pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: ["survey"] }), /Brief change [\s\S]* can't be asked about[\s\S]*`no-such-rule`/);
+
+		await pi.team("pending");
+		assert.equal(pi.notifications.at(-1)?.message, "Nothing is waiting on you.");
+		assert.match(await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" }), /^started scout-1/);
+	});
+});
+
+describe("approvals at a Playbook checkpoint or `escalate` id", () => {
+	const CHECKPOINT_PLAYBOOK = CREW_PLAYBOOK.replace("---\npermissions:", "---\ncheckpoints:\n  - id: design-review\n    when: the design is written\npermissions:");
+
+	it("records an approved checkpoint with the sha of the file asked about, and wakes the Lead", async () => {
+		const { pi, dir } = await crewPlanned({ playbook: CHECKPOINT_PLAYBOOK });
+		const design = join(dir, "design.md");
+		writeFileSync(design, "# Design\n\nRename in place.\n");
+		await assert.rejects(pi.call("team_request_approval", { checkpoint: "no-such-checkpoint", path: design }), /no checkpoint `no-such-checkpoint`.*`brief-change`, `design-review`, `history-rewrite`, `lockfile`/s);
+		await assert.rejects(pi.call("team_request_approval", { checkpoint: "design-review", path: design, affects: [] }), /`affects` .* only with checkpoint `brief-change`/);
+		assert.match(await pi.call("team_request_approval", { checkpoint: "design-review", path: design }), /checkpoint `design-review` of Effort `crew-2026-11-02` as request `r2`/);
+		const woken = pi.sent.length;
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		const record = approvals(dir).at(-1);
+		assert.deepEqual({ ...record, at: undefined }, { act: "checkpoint", checkpoint: "design-review", request: "r2", path: design, sha256: sha("# Design\n\nRename in place.\n"), at: undefined });
+		const wake = pi.sent.slice(woken).find((message) => message.customType === "team-pending");
+		assert.match(wake?.content ?? "", /approved checkpoint `design-review`/);
+	});
+
+	it("an `escalate` id is asked like a checkpoint, and a send-back wakes the Lead with the note and records nothing", async () => {
+		const { pi, dir } = await crewPlanned({ playbook: CHECKPOINT_PLAYBOOK });
+		const plan = join(dir, "rebase-plan.md");
+		writeFileSync(plan, "# Rebase onto main\n");
+		await pi.call("team_request_approval", { checkpoint: "history-rewrite", path: plan });
+		const woken = pi.sent.length;
+
+		pi.answer("Send back with a note", "Merge instead.");
+		await pi.team("pending");
+
+		const wake = pi.sent.slice(woken).find((message) => message.customType === "team-pending");
+		assert.match(wake?.content ?? "", /sent back checkpoint `history-rewrite` .*with this note:\n\nMerge instead\./s);
+		assert.equal(approvals(dir).some((record) => record.act === "checkpoint"), false);
+	});
+});
+
+/** The Brief change that gives Role `builder` model `sonnet`: a change to its launch options. */
+const BUILDER_ON_SONNET = ["roles:", "  builder:", "    model: sonnet"];
+
+describe("Brief changes: fresh sessions", () => {
+	it("a change to a Role's launch options starts its Teammate afresh at its next Task, never mid-Task, keeping its id and marking its short id (new)", async () => {
+		const { pi, dir, repo } = await crewPlanned();
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		const [first] = effortLines(dir).filter((line) => line.type === "teammate-session");
+		writeFileSync(join(dir, "brief.draft.md"), changedBrief(repo, BUILDER_ON_SONNET));
+		await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: [] });
+		const woken = pi.sent.length;
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		const wake = pi.sent.slice(woken).find((message) => message.customType === "team-pending");
+		assert.match(wake?.content ?? "", /`builder-1` starts in a fresh session at its next Task/);
+		assert.equal(pi.claude.launches().length, 1, "nothing restarts mid-Task");
+		assert.deepEqual(pi.claude.calls().filter((argv) => argv[0] === "stop"), []);
+
+		await until(() => teammateWakes(pi.sent).length === 1, "rename-key has a result");
+		await pi.call("team_review", { slug: "rename-key", verdict: "accept" });
+		const reply = await pi.call("team_handoff", { slug: "update-docs", body: "# Docs\n" });
+
+		assert.match(reply, /^started builder-1 afresh on Task `update-docs` \(tasks\/002-builder-update-docs\/task\.md\)/);
+		assert.deepEqual(pi.claude.calls().filter((argv) => argv[0] === "stop"), [["stop", first.shortId]]);
+		assert.equal(pi.claude.launches().length, 2);
+		const argv = pi.claude.launches()[1]?.argv ?? [];
+		assert.equal(argv[argv.indexOf("--model") + 1], "sonnet");
+		assert.equal(argv[argv.indexOf("--effort") + 1], "high", "what the change leaves alone stays");
+		assert.equal(argv[argv.indexOf("--name") + 1], BUILDER_1);
+		await until(() => teammateWakes(pi.sent).length === 2, "update-docs has a result");
+		const sessions = effortLines(dir).filter((line) => line.type === "teammate-session");
+		assert.equal(sessions.length, 2);
+		assert.notEqual(sessions[1].shortId, first.shortId);
+		assert.equal(effortLines(dir).filter((line) => line.type === "teammate-started").length, 1, "the id is kept");
+		assert.ok(
+			teamBlock(pi)?.some((line) => line.includes("builder-1") && line.includes(`${sessions[1].shortId} (new)`)),
+			JSON.stringify(teamBlock(pi)),
+		);
+		assert.equal(effortLines(dir).some((line) => line.type === "teammate-crashed"), false);
+	});
+
+	it("a Brief change that leaves the launch options alone reuses the Teammate with a clear", async () => {
+		const { pi, dir, repo } = await crewPlanned();
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		writeFileSync(join(dir, "brief.draft.md"), changedBrief(repo, ["roles:", "  builder:", "    model: opus"]));
+		await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: [] });
+		pi.answer("Approve");
+		await pi.team("pending");
+		await until(() => teammateWakes(pi.sent).length === 1, "rename-key has a result");
+		await pi.call("team_review", { slug: "rename-key", verdict: "accept" });
+
+		assert.match(await pi.call("team_handoff", { slug: "update-docs", body: "# Docs\n" }), /^reused builder-1 on Task `update-docs`/);
+		assert.equal(pi.claude.launches().length, 1);
+	});
+
+	it("a Brief that sets launch options for a Role the Team doesn't have is refused at the request", async () => {
+		const { pi, dir, repo } = await crewPlanned();
+		writeFileSync(join(dir, "brief.draft.md"), changedBrief(repo, ["roles:", "  tester:", "    model: sonnet"]));
+
+		await assert.rejects(
+			pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: [] }),
+			/`roles` names `tester`, which isn't a Role of the Team; the Roles are `builder`, `reviewer`, `scout`/,
+		);
+	});
+});
