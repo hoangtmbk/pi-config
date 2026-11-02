@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, type JournalLine, openEffort, openMerges, type Step, step, taskStatus, workdir } from "../core.ts";
+import { currentResult, type EffortInput, type EffortLine, type EffortState, fold, heldPauses, type JournalLine, openEffort, openMerges, type Step, step, taskStatus, waitingInTerminal, workdir } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -968,6 +968,225 @@ describe("clearing between Tasks", () => {
 	});
 });
 
+describe("a Teammate's held requests", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const started = applied(
+		applied(approved, {
+			kind: "plan",
+			tasks: [{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] }],
+			criteria: ["AC1"],
+			roles: ["dev"],
+			at: "2026-11-02T11:10:00.000Z",
+		}),
+		{ kind: "handoff", slug: "rename", at: "2026-11-02T11:30:00.000Z" },
+	);
+	const RESULT = "/agent/team/efforts/software-2026-11-02/tasks/001-dev-rename/result-1.md";
+	const SESSION = "8f3c2a1b-0000-4000-8000-000000000001";
+	const BASH = { command: "npm publish --dry-run", description: "Check the package contents" };
+	const QUESTIONS = {
+		questions: [
+			{ question: "Which store should the renamed key live in?", header: "Store", multiSelect: false, options: [{ label: "Redis", description: "Shared" }, { label: "Memory", description: "Per process" }] },
+			{ question: "Which callers should move now?", header: "Callers", multiSelect: true, options: [{ label: "api", description: "" }, { label: "worker", description: "" }] },
+		],
+	};
+
+	function line(cursor: number, event: string, extra: Partial<JournalLine> = {}, payload?: Record<string, unknown>): Extract<EffortInput, { kind: "journal" }> {
+		return {
+			kind: "journal",
+			teammate: "dev-1",
+			cursor,
+			line: { from: "hook", at: `2026-11-02T11:4${cursor}:00.000Z`, event, ...(payload === undefined ? {} : { payload: { session_id: SESSION, hook_event_name: event, ...payload } }), ...extra },
+			result: { path: RESULT, written: false },
+		};
+	}
+
+	function asked(cursor: number, request: string, tool = "Bash", input: Record<string, unknown> = BASH): Extract<EffortInput, { kind: "journal" }> {
+		return line(cursor, "PermissionRequest", { request } as Partial<JournalLine>, { tool_name: tool, tool_input: input });
+	}
+
+	function answer(request: string, extra: Partial<Extract<EffortInput, { kind: "answer-request" }>>): Extract<EffortInput, { kind: "answer-request" }> {
+		return { kind: "answer-request", request, at: "2026-11-02T11:50:00.000Z", ...extra };
+	}
+
+	/** The decision a successful answer sends the hook holding the request. */
+	function decision(result: Step): unknown {
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "answer-hook");
+		assert.ok(action?.kind === "answer-hook", "expected an answer-hook action");
+		return action.decision;
+	}
+
+	function wake(result: Step): string {
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "wake-lead");
+		assert.ok(action?.kind === "wake-lead", "expected the Lead to be woken");
+		return action.text;
+	}
+
+	const held = applied(started, asked(1, "req-0000000a"));
+
+	it("wakes the Lead with a permission request: who asks, on which Task, for what, and that the terminal can answer first", () => {
+		const text = wake(run(started, asked(1, "req-0000000a")));
+
+		assert.match(text, /`dev-1` asks permission to use `Bash` on Task `rename` \(`req-0000000a`\)/);
+		assert.match(text, /npm publish --dry-run/);
+		assert.match(text, /team_answer/);
+		assert.match(text, /live in dev-1's terminal; the first answer wins/);
+	});
+
+	it("sends an allow or a deny to the hook holding the request, each with the Lead's reason", () => {
+		assert.deepEqual(decision(run(held, answer("req-0000000a", { decision: "allow", reason: "a dry run publishes nothing" }))), { behavior: "allow" });
+		assert.deepEqual(decision(run(held, answer("req-0000000a", { decision: "deny", reason: "publishing is the human's call" }))), {
+			behavior: "deny",
+			message: "publishing is the human's call",
+		});
+	});
+
+	it("passes a rule only as a session-scoped rule for the request's tool, and keeps it on the Teammate with its Task", () => {
+		const result = run(held, answer("req-0000000a", { decision: "allow", reason: "dry runs are harmless", rule: "Bash(npm publish --dry-run:*)" }));
+
+		assert.deepEqual(decision(result), {
+			behavior: "allow",
+			updatedPermissions: [{ type: "addRules", rules: [{ toolName: "Bash", ruleContent: "npm publish --dry-run:*" }], behavior: "allow", destination: "session" }],
+		});
+		assert.ok(result.ok);
+		assert.deepEqual(result.state.teammates[0].rules, [{ rule: "Bash(npm publish --dry-run:*)", task: "rename" }]);
+	});
+
+	it("refuses an answer without a decision or a reason, a rule on a deny or for another tool, and answers to a permission request", () => {
+		assert.match(refusal(held, answer("req-0000000a", { reason: "fine" })), /allow or deny/);
+		assert.match(refusal(held, answer("req-0000000a", { decision: "allow" })), /reason/);
+		assert.match(refusal(held, answer("req-0000000a", { decision: "deny", reason: "no", rule: "Bash(npm:*)" })), /only with an allow/);
+		assert.match(refusal(held, answer("req-0000000a", { decision: "allow", reason: "ok", rule: "Edit(src/**)" })), /`Bash`/);
+		assert.match(refusal(held, answer("req-0000000a", { decision: "allow", reason: "ok", rule: "Bash(" })), /`Bash\(npm test:\*\)`/);
+		assert.match(refusal(held, answer("req-0000000a", { answers: { x: "y" } })), /AskUserQuestion/);
+	});
+
+	it("refuses a request no hook holds, naming the ones that are held", () => {
+		assert.match(refusal(held, answer("req-ffffffff", { decision: "allow", reason: "ok" })), /`req-0000000a`/);
+		assert.match(refusal(started, answer("req-ffffffff", { decision: "allow", reason: "ok" })), /no request is held/);
+	});
+
+	it("wakes the Lead with an AskUserQuestion's questions and their options, one or any", () => {
+		const text = wake(run(started, asked(1, "req-0000000b", "AskUserQuestion", QUESTIONS)));
+
+		assert.match(text, /`dev-1` asks on Task `rename` \(`req-0000000b`\)/);
+		assert.match(text, /"Which store should the renamed key live in\?" \(one of `Redis`, `Memory`\)/);
+		assert.match(text, /"Which callers should move now\?" \(any of `api`, `worker`\)/);
+		assert.match(text, /answers/);
+	});
+
+	it("answers an AskUserQuestion as an allow with every original field unchanged plus answers keyed by the exact question text", () => {
+		const question = applied(started, asked(1, "req-0000000b", "AskUserQuestion", QUESTIONS));
+		const answers = { "Which store should the renamed key live in?": "Redis", "Which callers should move now?": ["api", "worker"] };
+
+		assert.deepEqual(decision(run(question, answer("req-0000000b", { answers }))), { behavior: "allow", updatedInput: { ...QUESTIONS, answers } });
+	});
+
+	it("refuses answers that miss a question, name one it didn't ask, or give one label where it allows many and back", () => {
+		const question = applied(started, asked(1, "req-0000000b", "AskUserQuestion", QUESTIONS));
+		const store = "Which store should the renamed key live in?";
+		const callers = "Which callers should move now?";
+
+		assert.match(refusal(question, answer("req-0000000b", { answers: { [store]: "Redis" } })), /Which callers should move now\?/);
+		assert.match(refusal(question, answer("req-0000000b", { answers: { [store]: "Redis", [callers]: ["api"], "Which store?": "Redis" } })), /"Which store\?"/);
+		assert.match(refusal(question, answer("req-0000000b", { answers: { [store]: "Redis", [callers]: "api" } })), /list of labels/);
+		assert.match(refusal(question, answer("req-0000000b", { answers: { [store]: ["Redis"], [callers]: ["api"] } })), /one label/);
+		assert.match(refusal(question, answer("req-0000000b", { decision: "allow", reason: "ok" })), /answers/);
+	});
+
+	it("refuses a second answer: the first answer wins", () => {
+		const answered = applied(held, answer("req-0000000a", { decision: "allow", reason: "a dry run publishes nothing" }));
+
+		assert.match(refusal(answered, answer("req-0000000a", { decision: "deny", reason: "changed my mind" })), /already answered: you answered it/);
+	});
+
+	it("drops the Lead's pending decision when a PostToolUse shows the request was answered in the terminal, by tool call id or by tool and input", () => {
+		const byId = applied(started, line(1, "PermissionRequest", { request: "req-0000000a" } as Partial<JournalLine>, { tool_name: "Bash", tool_input: BASH, tool_use_id: "toolu_01" }));
+		const settledById = run(byId, line(2, "PostToolUse", {}, { tool_name: "Bash", tool_input: BASH, tool_use_id: "toolu_01", tool_response: {} }));
+		const settledByInput = run(held, line(2, "PostToolUse", {}, { tool_name: "Bash", tool_input: BASH, tool_response: {} }));
+
+		for (const [lines, result] of [
+			[byId, settledById],
+			[held, settledByInput],
+		] as const) {
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			assert.deepEqual(result.actions, []);
+			assert.match(refusal([...lines, ...result.append], answer("req-0000000a", { decision: "allow", reason: "ok" })), /already answered: the human answered it in dev-1's terminal/);
+		}
+	});
+
+	it("ignores a PostToolUse for a call no request held, and one after the Lead's own answer", () => {
+		const other = run(held, line(2, "PostToolUse", {}, { tool_name: "Bash", tool_input: { command: "npm test" }, tool_response: {} }));
+		const answered = applied(held, answer("req-0000000a", { decision: "allow", reason: "ok" }));
+		const after = run(answered, line(2, "PostToolUse", {}, { tool_name: "Bash", tool_input: BASH, tool_response: {} }));
+
+		assert.ok(other.ok && after.ok);
+		assert.deepEqual([other.append, after.append], [[], []]);
+		assert.match(refusal([...answered, ...after.append], answer("req-0000000a", { decision: "deny", reason: "no" })), /you answered it/);
+	});
+
+	it("records a held hook killed by the terminal as denied in the terminal, refusing the Lead's answer after it", () => {
+		const denied = applied(held, line(2, "denied-in-terminal", { request: "req-0000000a" } as Partial<JournalLine>));
+
+		assert.match(refusal(denied, answer("req-0000000a", { decision: "allow", reason: "ok" })), /already answered: the human denied it in dev-1's terminal/);
+	});
+
+	it("takes a PostToolUse after the kill as the human's allow in the terminal", () => {
+		const denied = applied(held, line(2, "denied-in-terminal", { request: "req-0000000a" } as Partial<JournalLine>));
+		const ran = applied(denied, line(3, "PostToolUse", {}, { tool_name: "Bash", tool_input: BASH, tool_response: {} }));
+
+		assert.match(refusal(ran, answer("req-0000000a", { decision: "deny", reason: "no" })), /already answered: the human answered it in dev-1's terminal/);
+	});
+
+	describe("one whose hook gave up holding it", () => {
+		const expired = applied(held, line(2, "hold-expired", { request: "req-0000000a" } as Partial<JournalLine>));
+
+		it("waits on the human as an 'answer in dev-1's terminal' item, until the Teammate goes on", () => {
+			assert.deepEqual(
+				waitingInTerminal(fold(expired)).map((each) => [each.request, each.teammate, each.tool]),
+				[["req-0000000a", "dev-1", "Bash"]],
+			);
+			assert.match(refusal(expired, answer("req-0000000a", { decision: "allow", reason: "ok" })), /only the human can answer it now, in dev-1's terminal/);
+
+			const answered = applied(expired, line(3, "PostToolUse", {}, { tool_name: "Bash", tool_input: BASH, tool_response: {} }));
+			const stopped = applied(expired, line(3, "Stop", {}, { last_assistant_message: "I stopped." }));
+			assert.deepEqual([waitingInTerminal(fold(answered)), waitingInTerminal(fold(stopped))], [[], []]);
+		});
+
+		it("shows in a Report's Waiting on you, with the attach command", () => {
+			const result = run(expired, { kind: "report", headline: "On track.", criteria: ["AC1"], modes: [], at: "2026-11-02T12:00:00.000Z" });
+
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			const action = result.actions.find((each) => each.kind === "write-report");
+			assert.ok(action?.kind === "write-report");
+			assert.deepEqual(action.report.sections.find((each) => each.title === "Waiting on you")?.lines, [
+				"`req-0000000a`: answer dev-1's `Bash` prompt in dev-1's terminal (`/team attach dev-1`)",
+			]);
+		});
+	});
+
+	it("logs every answer, rule and grant with its Task for the next Report's Decided for you", () => {
+		const question = applied(held, asked(2, "req-0000000b", "AskUserQuestion", QUESTIONS));
+		const answered = applied(
+			applied(question, answer("req-0000000a", { decision: "allow", reason: "the Brief asks for a dry run", rule: "Bash(npm publish --dry-run:*)", grant: "publish-dry-run" })),
+			answer("req-0000000b", { answers: { "Which store should the renamed key live in?": "Redis", "Which callers should move now?": ["api", "worker"] } }),
+		);
+
+		const result = run(answered, { kind: "report", headline: "On track.", criteria: ["AC1"], modes: [], at: "2026-11-02T12:00:00.000Z" });
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "write-report");
+		assert.ok(action?.kind === "write-report");
+		assert.deepEqual(action.report.sections.find((each) => each.title === "Decided for you")?.lines, [
+			"11:50 allowed dev-1's `Bash` `npm publish --dry-run`: the Brief asks for a dry run (Task `rename`)",
+			"11:50 added session rule `Bash(npm publish --dry-run:*)` for dev-1 (Task `rename`)",
+			"11:50 used grant `publish-dry-run` for dev-1's `Bash` (Task `rename`)",
+			'11:50 answered dev-1\'s "Which store should the renamed key live in?": Redis; "Which callers should move now?": api, worker (Task `rename`)',
+		]);
+	});
+});
+
 describe("reporting", () => {
 	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
 	const planned = applied(approved, {
@@ -1176,6 +1395,149 @@ describe("attaching to a Teammate", () => {
 	it("refuses a Teammate it doesn't know, or one with no short id to attach to yet", () => {
 		assert.match(refusal(opened, { kind: "attach", teammate: "qa-1", at: "2026-11-02T11:40:00.000Z" }), /no Teammate `qa-1`/);
 		assert.match(refusal(started, { kind: "attach", teammate: "dev-1", at: "2026-11-02T11:40:00.000Z" }), /`dev-1` has no short id yet/);
+	});
+});
+
+describe("pauses", () => {
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
+	const planned = applied(approved, {
+		kind: "plan",
+		tasks: [
+			{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] },
+			{ slug: "docs", role: "dev", goal: "Document it.", criteria: ["AC1"] },
+			{ slug: "tests", role: "qa", goal: "Test it.", criteria: ["AC1"] },
+		],
+		criteria: ["AC1"],
+		roles: ["dev", "qa"],
+		at: "2026-11-02T11:10:00.000Z",
+	});
+	const T1 = "2026-11-02T12:00:00.000Z";
+	const T2 = "2026-11-02T12:30:00.000Z";
+	const USAGE: EffortLine = { type: "paused", by: "usage", reason: "session limit", at: "2026-11-02T12:10:00.000Z" };
+
+	function pause(by: "human" | "lead", reason?: string, at = T1): EffortInput {
+		return { kind: "pause", by, at, ...(reason === undefined ? {} : { reason }) };
+	}
+
+	function resume(by: "human" | "lead", at = T2): EffortInput {
+		return { kind: "resume", by, at };
+	}
+
+	function setters(lines: EffortLine[]): string[] {
+		return heldPauses(fold(lines)).map((each) => each.by);
+	}
+
+	it("keeps the human's, the Lead's and the usage pause apart: lifting one never lifts another, and the Effort runs only when none holds", () => {
+		assert.deepEqual(setters(planned), []);
+		const all = [...applied(applied(planned, pause("human")), pause("lead", "waiting on the API decision")), USAGE];
+		assert.deepEqual(heldPauses(fold(all)), [
+			{ by: "human", at: T1 },
+			{ by: "lead", reason: "waiting on the API decision", at: T1 },
+			{ by: "usage", reason: "session limit", at: "2026-11-02T12:10:00.000Z" },
+		]);
+
+		const leadLifted = applied(all, resume("lead"));
+		assert.deepEqual(setters(leadLifted), ["human", "usage"]);
+		const humanLifted = applied(leadLifted, resume("human"));
+		assert.deepEqual(setters(humanLifted), ["usage"]);
+		const usageLifted: EffortLine[] = [...humanLifted, { type: "resumed", by: "usage", at: "2026-11-02T13:00:00.000Z" }];
+		assert.deepEqual(setters(usageLifted), []);
+	});
+
+	it("lifts a pause only for whoever set it: the Lead can't lift the human's, nor the human the Lead's", () => {
+		assert.match(refusal(applied(planned, pause("human", "lunch")), resume("lead")), /isn't paused by you.*paused by the human.*only the human lifts it, with `\/team resume`/s);
+		assert.match(refusal(applied(planned, pause("lead", "checking the API")), resume("human")), /isn't paused by you.*paused by the Lead since 12:00 UTC: checking the API; only the Lead lifts it, with `team_resume`/s);
+		assert.match(refusal([...planned, USAGE], resume("lead")), /usage.*lifts at its reset/s);
+		assert.match(refusal(planned, resume("human")), /isn't paused by you, so there is nothing to resume/);
+	});
+
+	it("refuses a pause its setter already holds, and a Lead pause without a reason", () => {
+		assert.match(refusal(applied(planned, pause("human")), pause("human")), /already paused by you since 12:00 UTC/);
+		assert.match(refusal(planned, pause("lead")), /reason/);
+		assert.match(refusal(planned, pause("lead", "  ")), /reason/);
+	});
+
+	it("says on resume whether the Effort runs again or which pause still holds", () => {
+		const both = applied(applied(planned, pause("human")), pause("lead", "checking the API"));
+		const still = run(both, resume("human"));
+		assert.ok(still.ok, still.ok ? "" : still.refusal);
+		assert.deepEqual(still.append, [{ type: "resumed", by: "human", at: T2 }]);
+		assert.deepEqual(still.actions, []);
+		assert.match(still.reply ?? "", /still paused by the Lead since 12:00 UTC: checking the API, so nothing new starts/);
+
+		const free = run(applied(planned, pause("human")), resume("human"));
+		assert.ok(free.ok, free.ok ? "" : free.refusal);
+		assert.match(free.reply ?? "", /runs again/);
+	});
+
+	it("while paused, a handoff queues with `paused` as the reason even under the cap, and a running Teammate is neither stopped nor kept from finishing", () => {
+		const running = applied(planned, { kind: "handoff", slug: "rename", at: "2026-11-02T11:30:00.000Z" });
+		const paused = run(running, pause("human", "lunch"));
+		assert.ok(paused.ok, paused.ok ? "" : paused.refusal);
+		assert.deepEqual(paused.append, [{ type: "paused", by: "human", reason: "lunch", at: T1 }]);
+		assert.deepEqual(paused.actions, []);
+
+		const queued = run([...running, ...paused.append], { kind: "handoff", slug: "tests", at: "2026-11-02T12:05:00.000Z" });
+		assert.ok(queued.ok, queued.ok ? "" : queued.refusal);
+		assert.deepEqual(queued.append, [{ type: "task-queued", slug: "tests", folder: "002-qa-tests", role: "qa", why: "paused", at: "2026-11-02T12:05:00.000Z" }]);
+		assert.deepEqual(queued.actions, [{ kind: "write-task", slug: "tests", folder: "002-qa-tests" }, { kind: "write-plan" }]);
+		assert.match(queued.reply ?? "", /^queued Task `tests` \(tasks\/002-qa-tests\/task\.md\): paused by the human since 12:00 UTC: lunch\. It starts by itself once every pause is lifted/);
+
+		const lines = [...running, ...paused.append, ...queued.append];
+		const session = applied(lines, {
+			kind: "journal",
+			teammate: "dev-1",
+			cursor: 1,
+			line: { from: "hook", at: "2026-11-02T12:06:00.000Z", event: "SessionStart", payload: { session_id: "dev-1000-0000-4000-8000-000000000001", source: "startup" }, inbox: { socket: "/tmp/dev-1.sock", token: "t" } },
+			result: { path: "/r/result-1.md", written: false },
+		});
+		const done = run(session, {
+			kind: "journal",
+			teammate: "dev-1",
+			cursor: 2,
+			line: { from: "hook", at: "2026-11-02T12:07:00.000Z", event: "Stop", payload: { last_assistant_message: "Done." } },
+			result: { path: "/r/result-1.md", written: true },
+		});
+		assert.ok(done.ok, done.ok ? "" : done.refusal);
+		assert.equal(taskStatus(done.state, "rename"), "in review");
+		assert.ok(!done.actions.some((action) => action.kind === "stop-teammate"));
+	});
+
+	it("starts nothing on a drain while paused; once the last pause lifts, a drain starts queued Tasks through the ladder and gives the rest their real reason", () => {
+		const paused = applied(planned, pause("human"));
+		const queued = applied(applied(paused, { kind: "handoff", slug: "rename", at: "2026-11-02T12:01:00.000Z", maxTeammates: 1 }), {
+			kind: "handoff",
+			slug: "tests",
+			at: "2026-11-02T12:02:00.000Z",
+			maxTeammates: 1,
+		});
+		assert.deepEqual(fold(queued).queue.map((each) => each.why), ["paused", "paused"]);
+
+		const stalled = run(queued, { kind: "drain", at: "2026-11-02T12:03:00.000Z", maxTeammates: 1 });
+		assert.ok(stalled.ok, stalled.ok ? "" : stalled.refusal);
+		assert.deepEqual([stalled.append, stalled.actions, stalled.reply], [[], [], undefined]);
+
+		const resumed = applied(queued, resume("human"));
+		const first = run(resumed, { kind: "drain", at: "2026-11-02T12:31:00.000Z", maxTeammates: 1 });
+		assert.ok(first.ok, first.ok ? "" : first.refusal);
+		assert.match(first.reply ?? "", /^Queued Task `rename` started dev-1/);
+		assert.deepEqual(first.actions.map((action) => action.kind), ["launch-teammate", "write-plan"]);
+
+		const second = run([...resumed, ...first.append], { kind: "drain", at: "2026-11-02T12:31:01.000Z", maxTeammates: 1 });
+		assert.ok(second.ok, second.ok ? "" : second.refusal);
+		assert.equal(second.reply, undefined);
+		assert.deepEqual(second.actions, []);
+		assert.deepEqual(second.append, [{ type: "task-requeued", slug: "tests", why: "cap 1 reached; waits for 001", at: "2026-11-02T12:31:01.000Z" }]);
+		assert.deepEqual(second.state.queue.map((each) => [each.slug, each.why]), [["tests", "cap 1 reached; waits for 001"]]);
+	});
+
+	it("tells the next Report who paused and resumed, and why", () => {
+		const lines = applied(applied(applied(planned, pause("lead", "checking the API")), pause("human", "lunch", "2026-11-02T12:05:00.000Z")), resume("lead"));
+		const result = run(lines, { kind: "report", headline: "Held.", criteria: ["AC1"], modes: [], at: "2026-11-02T13:00:00.000Z" });
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "write-report");
+		const since = action?.kind === "write-report" ? action.report.sections.find((each) => each.title === "Since the last Report")?.lines : undefined;
+		assert.deepEqual(since?.slice(-3), ["12:00 the Lead paused the Effort: checking the API", "12:05 you paused the Effort: lunch", "12:30 the Lead lifted its pause"]);
 	});
 });
 

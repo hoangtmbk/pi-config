@@ -25,7 +25,7 @@
  */
 
 import { sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
-import type { EffortState, Teammate } from "./core.ts";
+import { type EffortState, heldPauses, type PauseSetter, type Teammate, waitingInTerminal } from "./core.ts";
 
 /** The widest the frame may get, borders included. */
 export const MAX_WIDTH = 96;
@@ -70,6 +70,14 @@ export interface QueuedTask {
 	why: string;
 }
 
+/** A pause that holds: who set it, the only one who lifts it, and why. */
+export interface PauseRow {
+	by: PauseSetter;
+	reason?: string;
+	/** When it started, as an ISO time. */
+	since: string;
+}
+
 /** What the Team block shows, and what `team_status` returns. */
 export interface TeamBlockData {
 	effortId: string;
@@ -86,6 +94,8 @@ export interface TeamBlockData {
 	waitingOnYou: number;
 	/** Reports written for the human. */
 	reports: number;
+	/** The pauses that hold, the human's first; absent while the Effort runs. No new Task starts while any holds. */
+	pauses?: PauseRow[];
 }
 
 /** How the block is drawn. */
@@ -118,9 +128,16 @@ export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockD
 		// A Teammate stopped to make room, or that ended (stopped with its dropped Task, or crashed), is gone for this Effort.
 		teammates: state.teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined).map((teammate) => teammateRow(state, teammate)),
 		queued: state.queue.map((queued) => ({ task: queued.folder, role: queued.role, why: queued.why })),
-		waitingOnYou: state.pending.length + extras.adoptionsPending,
+		waitingOnYou: state.pending.length + waitingInTerminal(state).length + extras.adoptionsPending,
 		reports: state.reports,
+		...pauseRows(state),
 	};
+}
+
+function pauseRows(state: EffortState): { pauses?: PauseRow[] } {
+	const held = heldPauses(state);
+	if (held.length === 0) return {};
+	return { pauses: held.map((pause) => ({ by: pause.by, ...(pause.reason === undefined ? {} : { reason: pause.reason }), since: pause.at })) };
 }
 
 function teammateRow(state: EffortState, teammate: Teammate): TeammateRow {
@@ -143,7 +160,7 @@ function teammateRow(state: EffortState, teammate: Teammate): TeammateRow {
 type Section = (data: TeamBlockData, now: number, options: BlockOptions, width: number) => string[];
 
 /** The block's body, top to bottom. */
-const SECTIONS: Section[] = [statusLine, teammateRows, queuedLines, footerLine];
+const SECTIONS: Section[] = [statusLine, pauseLines, teammateRows, queuedLines, footerLine];
 
 /** The framed Team block. */
 export function renderTeamBlock(data: TeamBlockData, now: number, options: BlockOptions): string[] {
@@ -163,7 +180,21 @@ export function renderTeamBlock(data: TeamBlockData, now: number, options: Block
 
 function statusLine(data: TeamBlockData): string[] {
 	const tasks = data.tasks.planned > 0 ? ` · ${data.tasks.accepted}/${data.tasks.planned} Tasks accepted` : "";
-	return [`● running  ·  ${oneLine(data.phase)}${tasks}`];
+	const state = data.pauses?.length ? "⏸ paused" : "● running";
+	return [`${state}  ·  ${oneLine(data.phase)}${tasks}`];
+}
+
+/** Who set each pause, as the human reads it. */
+const SETTERS: Record<PauseSetter, string> = { human: "you", lead: "the Lead", usage: "a usage limit" };
+
+/** A line per pause under the status line: who set it, since when and why; the human's says how to lift it. */
+function pauseLines(data: TeamBlockData): string[] {
+	return (data.pauses ?? []).map((pause) => {
+		const why = pause.reason === undefined ? "" : `: ${oneLine(pause.reason)}`;
+		const lift = pause.by === "human" ? "   /team resume" : "";
+		// The block repaints on events, not on a timer, so it shows a clock time rather than an age.
+		return `  by ${SETTERS[pause.by]} since ${pause.since.slice(11, 16)} UTC${why}${lift}`;
+	});
 }
 
 /**

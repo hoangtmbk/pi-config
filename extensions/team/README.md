@@ -17,7 +17,9 @@ an Effort and runs its intake up to the human approving its Brief. Planning and 
 /team start          the Lead proposes a Team from each Team's description
 /team setup <team>   Team setup: agree the Team's Playbook with the Lead, then adopt it
 /team pending        answer what waits on you: approve, send back with a note, or later
-/team resume         adopt an Effort no pi session leads (pick one, or name it)
+/team pause [reason] pause the held Effort: no new Task starts, running Teammates finish theirs
+/team resume         lift your pause on the held Effort; in a session holding none, adopt an
+                     Effort no pi session leads (pick one, or name it)
 /team report         ask the Lead for a Report on everything since the last one
 /team reports        pick a Report, newest first, and read it in an overlay
 /team attach [id]    attach to a Teammate's session (pick one, or name it); also just `/team`
@@ -70,8 +72,8 @@ From then on the Effort reads only those copies, so editing your Team or Playboo
 in it; a copy whose sha no longer matches its approval is reported and never used. A Brief can't
 be approved once its Playbook has been adopted again: start a new Effort.
 
-`team_plan`, `team_handoff`, `team_review` and `team_report` are switched on with the Effort, and
-refuse until the Brief is approved.
+`team_plan`, `team_handoff`, `team_review`, `team_report` and `team_answer` are switched on with the Effort, and
+refuse until the Brief is approved. `team_status`, `team_pause` and `team_resume` come on with them.
 
 ### Planning and handing off
 
@@ -159,6 +161,24 @@ is also read when the Lead's run settles, so a lost doorbell loses nothing.
 
 Wakes that come while the Lead is busy are sent together as one follow-up once its run settles.
 
+### Held requests
+
+A Teammate's permission prompt, an `AskUserQuestion` included, is held by its `PermissionRequest`
+hook: the hook journals it with a request id `req-<8 hex>`, keeps a socket open to the Lead
+bridge, and the Lead is woken with the tool and its input. The prompt stays live in the
+Teammate's terminal meanwhile, and the first answer wins. Nothing is allowed by default.
+
+- `team_answer` with `allow` or `deny` and a `reason` goes to the hook as its decision. An allow
+  may add a session `rule` for the same tool, such as `Bash(npm test:*)`, and name the `grant` it
+  relies on. An `AskUserQuestion` is answered with `answers`, keyed by each question's exact text.
+- The human answering in the terminal kills the hook, journalled as denied in the terminal; a
+  `PostToolUse` for the call after it shows it was allowed. Either way the Lead's answer is then
+  refused as already answered.
+- A hook that holds 3570 s without an answer gives the prompt back to the terminal. It waits in
+  `/team pending` as an item that attaches to the Teammate, and in the Report's Waiting on you.
+
+The next Report logs every answer, rule and grant under Decided for you, with the Task.
+
 ### Reviewing
 
 Once woken about a result, the Lead decides on it with `team_review`, which refuses while the
@@ -197,6 +217,17 @@ adds the logged sections from `effort.jsonl`, leaving out any with nothing in th
 The first Report, written once the plan is, is the plan Report. Each is saved as
 `reports/<nnn>.md` in the Effort directory, numbered from 001 and never overwritten, and shows in
 chat collapsed to its headline; the Lead gets back only where it went. The Team block counts them.
+
+### Pausing
+
+Three pauses hold independently: yours (`/team pause [reason]`), the Lead's (`team_pause`, with a
+reason) and a usage limit's. Each is lifted only by whoever set it: you with `/team resume`, the
+Lead with `team_resume`, a usage pause at its reset. The Effort runs only while none holds. While
+one does, no new Task starts and `team_handoff` queues the Task with `paused`, while running
+Teammates finish the Task they have. Once the last pause lifts, queued Tasks start through the
+staffing ladder; lifting your pause also tells the Lead what started. The Team block shows `⏸
+paused` with a line for each pause, who set it, since when and why, and the next Report says who
+paused and resumed.
 
 ## Attaching to a Teammate
 

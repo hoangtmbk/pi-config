@@ -23,7 +23,22 @@ import { attachTarget, chooseAttach, pickerLabel } from "./attach.ts";
 import { renderTeamBlock, teamStatus } from "./block.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
 import { agentsList, CLEAR_MARKER, installMod, launchBackground, sendToInbox, stopBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
-import { currentResult, DEFAULT_MAX_TEAMMATES, type EffortAction, type EffortState, fold, type Inbox, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace, workdir } from "./core.ts";
+import {
+	currentResult,
+	DEFAULT_MAX_TEAMMATES,
+	type EffortAction,
+	type EffortState,
+	fold,
+	type Inbox,
+	openEffort,
+	type PendingApproval,
+	refuseRequest,
+	type Step,
+	step,
+	type Workspace,
+	waitingInTerminal,
+	workdir,
+} from "./core.ts";
 import { EVERY_ROLE, listTeams, loadTeam, type Playbook, readSnapshot, type Role, sha256, type Team, type TeamRoots } from "./definitions.ts";
 import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
 import { adoptable, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
@@ -48,6 +63,7 @@ import {
 	writeTask,
 } from "./records.ts";
 import { repoRoot } from "./repo.ts";
+import { terminalText } from "./requests.ts";
 import { REPORT_OVERLAY, type ReportChrome, ReportView, type ReportTui } from "./reports-view.ts";
 import { addTaskWorkspace, addWorkspace, mergeTaskWorkspace, removeTaskWorkspace } from "./workspace.ts";
 import {
@@ -73,13 +89,17 @@ import { handoffPointer, restaffPointer, sendBackPointer, teammatePrompt } from 
 /** The Lead's tools while this session runs Team setup. */
 const SETUP_TOOLS = ["team_request_approval"];
 /** The Lead's tools while this session holds an Effort. */
-const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report"];
+const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer"];
 /** Every Lead tool: registered at load, and switched on only by what the session runs. */
 const LEAD_TOOLS = [...new Set([...SETUP_TOOLS, ...EFFORT_TOOLS])];
 
 const RequestApprovalParams = Type.Object({
 	checkpoint: Type.String({ description: "Which checkpoint: `brief` for an Effort's Brief, `adopt-playbook` during Team setup." }),
 	path: Type.String({ description: "The draft to approve: the Effort's `brief.draft.md`, or the Team setup's Playbook draft." }),
+});
+
+const PauseParams = Type.Object({
+	reason: Type.String({ description: "Why the Team holds, in a sentence; the human reads it in the Team block." }),
 });
 
 const PlanParams = Type.Object({
@@ -109,6 +129,23 @@ const ReportParams = Type.Object({
 	),
 	found: Type.Optional(
 		Type.Array(Type.String(), { description: "Work found since the last Report that is outside the Brief: kept as suggestions for the final Report, never started." }),
+	),
+});
+
+const DECISIONS = ["allow", "deny"] as const;
+
+const AnswerParams = Type.Object({
+	request: Type.String({ description: "The held request's id, `req-<8 hex>`, from the message that woke you about it." }),
+	decision: Type.Optional(Type.String({ description: "For a permission request: `allow` or `deny`. Leave it out when answering an AskUserQuestion." })),
+	reason: Type.Optional(Type.String({ description: "Why: the deny message the Teammate sees, and what the human reads in the next Report." })),
+	rule: Type.Optional(
+		Type.String({ description: "With `allow`: a session rule for the same tool, such as `Bash(npm test:*)`, so the Teammate isn't asked again this session." }),
+	),
+	grant: Type.Optional(Type.String({ description: "With `allow`: the grant in the Brief or Playbook the allow relies on, logged for the human." })),
+	answers: Type.Optional(
+		Type.Record(Type.String(), Type.Union([Type.String(), Type.Array(Type.String())]), {
+			description: "For an AskUserQuestion: each question's exact text to the label picked, or a list of labels for a multiSelect question.",
+		}),
 	),
 });
 
@@ -829,7 +866,12 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const said: string[] = [];
 		for (;;) {
 			const drained = step(state, { kind: "drain", at: now().toISOString(), maxTeammates: maxTeammates() });
-			if (!drained.ok || drained.reply === undefined) break;
+			if (!drained.ok) break;
+			if (drained.reply === undefined) {
+				// Nothing starts; the lines left say why each queued Task still waits, now that a pause no longer does.
+				appendLines(held.paths, drained.append);
+				break;
+			}
 			try {
 				await listenForTeammates(held, ctx);
 				await staffTask(held, drained);
@@ -842,6 +884,16 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		}
 		if (said.length > 0) wakeAboutTeammates(applyJournals(held));
 		return said;
+	}
+
+	/** Lift `by`'s own pause and start the queued Tasks it held back, saying what happened; refused while `by` holds none. */
+	async function liftPause(held: HeldEffort, by: "human" | "lead", ctx: ExtensionContext): Promise<{ ok: true; said: string } | { ok: false; refusal: string }> {
+		const result = step(effortState(held), { kind: "resume", by, at: now().toISOString() });
+		if (!result.ok) return result;
+		appendLines(held.paths, result.append);
+		const started = await startQueued(held, result.state, ctx);
+		paintBlock();
+		return { ok: true, said: [result.reply ?? "", ...started].join(" ") };
 	}
 
 	/** Launch a Teammate once its stagger is up, returning why it didn't start. */
@@ -913,20 +965,52 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		pending: {
 			async run(_args, ctx) {
 				const held = effort;
-				const briefs = held ? effortState(held).pending : [];
-				if (pending.length === 0 && briefs.length === 0) {
+				if (held) wakeAboutTeammates(applyJournals(held));
+				const state = held ? effortState(held) : undefined;
+				const briefs = state?.pending ?? [];
+				const terminal = state ? waitingInTerminal(state) : [];
+				if (pending.length === 0 && briefs.length === 0 && terminal.length === 0) {
 					ctx.ui.notify("Nothing is waiting on you.", "info");
 					return;
 				}
 				for (const item of [...pending]) await answerAdoption(item, ctx);
 				if (held) for (const item of briefs) await answerBrief(held, item, ctx);
+				for (const item of terminal) {
+					const attach = `Attach to ${item.teammate}`;
+					const answer = await ctx.ui.select(`\`${item.request}\` waited past its hook's hold: ${terminalText(item)}`, [attach, LATER]);
+					if (answer === attach) await attachTo(item.teammate, ctx);
+				}
+			},
+		},
+		pause: {
+			async run(args, ctx) {
+				if (!effort) {
+					ctx.ui.notify("This session holds no Effort, so there is nothing to pause; `/team start` opens one, and `/team resume` adopts one without a live Lead.", "error");
+					return;
+				}
+				const held = effort;
+				const result = step(effortState(held), { kind: "pause", by: "human", reason: args.join(" ") || undefined, at: now().toISOString() });
+				if (!result.ok) {
+					ctx.ui.notify(result.refusal, "info");
+					return;
+				}
+				appendLines(held.paths, result.append);
+				paintBlock();
+				ctx.ui.notify(result.reply ?? "", "info");
 			},
 		},
 		resume: {
 			async run(args, ctx) {
 				if (effort) {
 					// Only the human's pause is lifted here; adopting is for a session holding no Effort.
-					ctx.ui.notify(`Effort \`${effort.effortId}\` isn't paused by you, so there is nothing to resume.`, "info");
+					const held = effort;
+					const lifted = await liftPause(held, "human", ctx);
+					if (!lifted.ok) {
+						ctx.ui.notify(lifted.refusal, "info");
+						return;
+					}
+					ctx.ui.notify(lifted.said, "info");
+					wakeLead("team-resumed", `The human lifted their pause on Effort \`${held.effortId}\`. ${lifted.said}`);
 					return;
 				}
 				const candidates = adoptable(paths.agentDir);
@@ -1063,6 +1147,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		description: [
 			"Hand a planned Task to a Teammate of its Role, which the extension staffs: it reuses an idle Teammate of the Role (clearing its context first), else starts one as a Claude Code background session in the Effort's Workspace while under the human's `maxTeammates`, else stops an idle Teammate no queued Task needs and starts one, else queues the Task until a Teammate frees up.",
 			"`body` becomes the Task's `task.md`: make it self-contained, listing the Effort's `brief.md` and `clarifications.md` among its inputs, since the Teammate has no earlier conversation.",
+			"While the Effort is paused, by the human, by you or by a usage limit, the Task queues with `paused` and starts by itself once every pause is lifted.",
 			"Returns which Teammate was started or reused, or that the Task is queued and why. Refused until the human approves the Brief, and for a Task already handed off or queued (running, in review, sent back or accepted).",
 			"`isolated: true` gives the Task a worktree and branch of its own, cut from the Effort branch's tip beside the Workspace, for work that would clash with other Tasks' uncommitted files; its Teammate always starts fresh there. Say in `body` that only what it commits merges: accepting it merges its branch into the Effort branch.",
 		].join(" "),
@@ -1162,7 +1247,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		name: "team_status",
 		label: "Team status",
 		description: [
-			"The held Effort at a glance, as the human sees it in the Team block: the phase, Tasks accepted out of planned, each Teammate's state, Task, context use and permission mode (`acceptEdits≠auto` is drift from the mode it launched in), queued Tasks and why, and what waits on the human.",
+			"The held Effort at a glance, as the human sees it in the Team block: the phase, Tasks accepted out of planned, each Teammate's state, Task, context use and permission mode (`acceptEdits≠auto` is drift from the mode it launched in), queued Tasks and why, each pause that holds (who set it, why and since when), and what waits on the human.",
 			"Returns it as JSON. Changes nothing.",
 		].join(" "),
 		promptSnippet: "See the Effort's Teammates, Tasks and what waits on the human",
@@ -1183,6 +1268,46 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				}),
 			};
 			return { content: [{ type: "text", text: JSON.stringify(status, null, 2) }], details: status };
+		},
+	});
+
+	pi.registerTool({
+		name: "team_pause",
+		label: "Pause",
+		description: [
+			"Pause the Effort yourself, with a `reason` the human reads in the Team block: no new Task starts and handoffs queue, while running Teammates finish their Task.",
+			"Your pause is one of three that hold independently (the human's, yours, a usage limit's); the Effort runs only when none holds, and you lift only yours, with `team_resume`.",
+			"Refused while you already hold a pause.",
+		].join(" "),
+		promptSnippet: "Pause the Effort yourself, saying why",
+		parameters: PauseParams,
+		defaultActive: false,
+		async execute(_toolCallId, params) {
+			if (!effort) throw new Error("No Effort is open in this session, so there is nothing to pause; the human opens one with `/team start <team>`.");
+			const held = effort;
+			const result = step(effortState(held), { kind: "pause", by: "lead", reason: params.reason, at: now().toISOString() });
+			if (!result.ok) throw new Error(result.refusal);
+			appendLines(held.paths, result.append);
+			paintBlock();
+			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
+		},
+	});
+
+	pi.registerTool({
+		name: "team_resume",
+		label: "Resume",
+		description: [
+			"Lift your own pause, set with `team_pause`; once no pause holds, queued Tasks start through the staffing ladder and you get back what started.",
+			"Refused when you hold no pause: the human's pause is lifted only by the human, with `/team resume`, and a usage pause lifts at its reset.",
+		].join(" "),
+		promptSnippet: "Lift the pause you set with team_pause",
+		parameters: Type.Object({}),
+		defaultActive: false,
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			if (!effort) throw new Error("No Effort is open in this session, so there is nothing to resume; the human opens one with `/team start <team>`.");
+			const lifted = await liftPause(effort, "lead", ctx);
+			if (!lifted.ok) throw new Error(lifted.refusal);
+			return { content: [{ type: "text", text: lifted.said }], details: undefined };
 		},
 	});
 
@@ -1227,6 +1352,46 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		},
 	});
 
+	pi.registerTool({
+		name: "team_answer",
+		label: "Answer",
+		description: [
+			"Answer a Teammate's held request: a permission prompt or an AskUserQuestion its hook holds open while the prompt stays live in its terminal.",
+			"For a permission, `decision` is `allow` or `deny` with a `reason`; an allow may add a session `rule` for the same tool and name the `grant` it relies on.",
+			"For an AskUserQuestion, `answers` maps each question's exact text to a label, or a list of labels for a multiSelect question.",
+			"The first answer wins: refused once the human answered in the terminal, or the hook gave up holding it. Nothing is allowed by default, and the next Report logs what you decided.",
+		].join(" "),
+		promptSnippet: "Answer a Teammate's held permission request or AskUserQuestion: allow or deny, with a reason",
+		parameters: AnswerParams,
+		defaultActive: false,
+		async execute(_toolCallId, params) {
+			if (!effort) throw new Error("No Effort is open in this session, so no request waits on you; the human opens one with `/team start <team>`.");
+			const held = effort;
+			const decision = params.decision === undefined ? undefined : DECISIONS.find((each) => each === params.decision);
+			if (params.decision !== undefined && decision === undefined) throw new Error(`\`decision\` is \`allow\` or \`deny\`, not \`${params.decision}\`.`);
+			// What the terminal did meanwhile counts first: the first answer wins.
+			wakeAboutTeammates(applyJournals(held));
+			const answer = { kind: "answer-request" as const, request: params.request, decision, reason: params.reason, rule: params.rule, grant: params.grant, answers: params.answers, at: now().toISOString() };
+			const result = step(effortState(held), answer);
+			if (!result.ok) throw new Error(result.refusal);
+			const opened = await bridge?.catch(() => undefined);
+			for (const action of result.actions) {
+				if (action.kind !== "answer-hook" || opened?.answer(action.request, action.decision)) continue;
+				// The hook let go between the journal read and the answer: what it journalled says why.
+				wakeAboutTeammates(applyJournals(held));
+				const again = step(effortState(held), answer);
+				throw new Error(
+					again.ok
+						? `No hook holds \`${action.request}\` any more, so your answer can't reach it: it waits in ${action.teammate}'s terminal (\`/team attach ${action.teammate}\`). Stop and tell the human.`
+						: again.refusal,
+				);
+			}
+			appendLines(held.paths, result.append);
+			paintBlock();
+			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
+		},
+	});
+
 	/**
 	 * `/team` and `/team attach [id]`: pick a Teammate with a session, unless
 	 * one is named, then use the menu on it. Using the menu records the short id
@@ -1268,7 +1433,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	}
 
 	pi.registerCommand("team", {
-		description: "Run a Team on one Effort: /team start [team], /team setup <team>, /team pending, /team resume [effort], /team report, /team reports, /team attach [teammate] (or just /team)",
+		description: "Run a Team on one Effort: /team start [team], /team setup <team>, /team pending, /team pause [reason], /team resume [effort], /team report, /team reports, /team attach [teammate] (or just /team)",
 		async handler(args, ctx) {
 			// Bare `/team` is the attach picker: getting to a Teammate is what it is reached for most.
 			const [name = "attach", ...rest] = args.trim().split(/\s+/).filter(Boolean);

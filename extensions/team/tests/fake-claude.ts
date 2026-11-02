@@ -24,7 +24,14 @@
  *   session's working directory, `{task}` in its name standing for the Task
  *   folder the pointer names, and commits just that file when a message is
  *   given. Each session gets a session id of its own unless a payload names
- *   one.
+ *   one. A step with `hold: true` starts each hook command without
+ *   waiting for it, as Claude Code waits on a held `PermissionRequest` while
+ *   its prompt stays live: the step after it plays at once, standing for
+ *   whatever the human does in the terminal meanwhile.
+ * - `FAKE_CLAUDE_HELD_OUT`: a file each held hook command appends one JSON
+ *   line to: its process group, the event, and the files its stdout and exit
+ *   code land in once it exits. Killing the group with SIGTERM is what Claude
+ *   Code does when the human answers the prompt in the terminal.
  * - `FAKE_CLAUDE_SOCKETS`: a short folder a session with hooks opens its inbox
  *   socket in. The socket is real: a small server process outlives the
  *   launch, as the real session does, and stops once the test process
@@ -68,9 +75,9 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, fstatSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fstatSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 const argv = process.argv.slice(2);
 
@@ -219,7 +226,7 @@ function fileOf(flag: string): string | undefined {
 }
 
 /** One scripted step of a started session. */
-type HookStep = { event: string; payload?: Record<string, unknown> } | { write: "result" } | { edit: string; commit?: string };
+type HookStep = { event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string };
 
 /** Start the session's inbox server, detached so it outlives this launch, and wait until it listens. */
 async function openInbox(session: Session): Promise<void> {
@@ -355,6 +362,10 @@ function playSteps(steps: HookStep[], session: Session, pointer: string): void {
 		for (const group of settings.hooks?.[step.event] ?? []) {
 			if (group.matcher !== undefined && group.matcher !== payload.tool_name) continue;
 			for (const hook of group.hooks) {
+				if (step.hold) {
+					holdHook(hook.command, payload, session.cwd, { ...process.env, ...inbox });
+					continue;
+				}
 				execFileSync("sh", ["-c", hook.command], { cwd: session.cwd, input: JSON.stringify(payload), env: { ...process.env, ...inbox }, stdio: ["pipe", "ignore", "inherit"] });
 			}
 		}
@@ -363,4 +374,25 @@ function playSteps(steps: HookStep[], session: Session, pointer: string): void {
 			if (agent) end(agent);
 		}
 	}
+}
+
+/**
+ * Start a hook command in a process group of its own and leave it running,
+ * its stdout and exit code going to files `FAKE_CLAUDE_HELD_OUT` names.
+ */
+function holdHook(command: string, payload: Record<string, unknown>, cwd: string, env: NodeJS.ProcessEnv): void {
+	const heldOut = process.env.FAKE_CLAUDE_HELD_OUT;
+	if (heldOut === undefined) throw new Error("fake claude: a held hook needs FAKE_CLAUDE_HELD_OUT");
+	const dir = mkdtempSync(join(dirname(heldOut), "held-"));
+	const input = join(dir, "payload.json");
+	const out = join(dir, "stdout");
+	const exit = join(dir, "exit");
+	writeFileSync(input, JSON.stringify(payload));
+	const stdin = openSync(input, "r");
+	const stdout = openSync(out, "w");
+	const child = spawn("sh", ["-c", 'sh -c "$1"; echo $? > "$2"', "sh", command, exit], { cwd, env, detached: true, stdio: [stdin, stdout, "ignore"] });
+	closeSync(stdin);
+	closeSync(stdout);
+	child.unref();
+	appendFileSync(heldOut, `${JSON.stringify({ pid: child.pid, event: payload.hook_event_name, out, exit })}\n`);
 }
