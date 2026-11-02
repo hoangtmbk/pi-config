@@ -753,7 +753,7 @@ export type EffortInput =
 			kind: "recover";
 			/** The `--name`s `claude agents --json` lists; absent when it couldn't be read. */
 			agents?: readonly string[];
-			/** Ids of the Teammates with lines in their journals. */
+			/** Ids of the Teammates whose launched session wrote to their journal: any line for a new one, a `SessionStart` past its cursor, other than a clear, for one started afresh. */
 			journaled?: readonly string[];
 			/** Where each open merge stands in git, by slug; absent for one git couldn't tell. */
 			merges?: Record<string, MergeEvidence>;
@@ -761,8 +761,13 @@ export type EffortInput =
 			promoted?: readonly { request: string; brief: string; workspace?: Workspace }[];
 			at: string;
 	  }
-	/** After a restart, once the journals are replayed: what was sent and never landed is sent again. `sent` names the Tasks whose pointer the replay sent. */
-	| { kind: "reconcile"; sent?: readonly string[]; at: string };
+	/**
+	 * After a restart, once the journals are replayed: what was sent and never
+	 * landed is sent again. `sent` names the Tasks whose pointer the replay
+	 * sent; `agents` the `--name`s `claude agents --json` lists, absent when it
+	 * couldn't be read.
+	 */
+	| { kind: "reconcile"; sent?: readonly string[]; agents?: readonly string[]; at: string };
 
 /** Where an open merge stands in git: in the Effort branch (by merge commit `commit`, absent when it had nothing new), cut short with `MERGE_HEAD` left behind, or never begun. */
 export type MergeEvidence = { state: "merged"; commit?: string } | { state: "half-done" } | { state: "not-started" };
@@ -949,7 +954,7 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "teammate-retired":
 			return { ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, retiredAt: line.at } : teammate)) };
 		case "teammate-relaunched":
-			return {
+			return launched({
 				...state,
 				teammates: state.teammates.map((teammate) => {
 					if (teammate.id !== line.teammate) return teammate;
@@ -957,7 +962,7 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 					const { freshDue: _fresh, inbox: _inbox, activity: _activity, doing: _doing, limit: _limit, rules: _rules, clearing: _clearing, observedMode: _observed, mode: _mode, ...rest } = teammate;
 					return { ...rest, task: line.task, startedAt: line.at, relaunching: true, ...(line.mode === undefined ? {} : { mode: line.mode }) };
 				}),
-			};
+			}, line.teammate);
 		case "teammate-session": {
 			const before = state.teammates.find((teammate) => teammate.id === line.teammate)?.shortId;
 			const started = withTeammate(state, line, {
@@ -2928,8 +2933,10 @@ function recover(state: EffortState, input: Extract<EffortInput, { kind: "recove
 }
 
 function recoverLaunch(state: EffortState, id: string, intent: { name: string; lines: EffortLine[] }, input: Extract<EffortInput, { kind: "recover" }>): Step {
-	if (input.agents?.includes(intent.name) || input.journaled?.includes(id)) return took(state, intent.lines, [{ kind: "write-plan" }]);
-	if (input.agents === undefined) {
+	// A Teammate started afresh keeps its `--name`, so `claude agents --json` may list its old session: only its new session's journal says it is in.
+	const afresh = intent.lines.some((line) => line.type === "teammate-relaunched");
+	if ((!afresh && input.agents?.includes(intent.name)) || input.journaled?.includes(id)) return took(state, intent.lines, [{ kind: "write-plan" }]);
+	if (input.agents === undefined && !afresh) {
 		return took(state, [], [], `\`${id}\` may not have started: its launch as \`${intent.name}\` was under way when pi stopped, \`claude agents --json\` couldn't be read, and it hasn't written to its journal. It is checked again at the next restart; until then nothing of its launch is on record.`);
 	}
 	const handed = intent.lines.find((line) => line.type === "task-handed-off");
@@ -2942,6 +2949,8 @@ function recoverLaunch(state: EffortState, id: string, intent: { name: string; l
 		[
 			...(handed?.worktree ? [{ kind: "remove-task-workspace", slug, ...handed.worktree } as const] : []),
 			...(sentBack ? [{ kind: "discard-feedback", slug, folder, round: sentBack.round } as const] : []),
+			// plan.md may have been written with the launch's lines.
+			{ kind: "write-plan" },
 		],
 	);
 	if (!abandoned.ok) return abandoned;
@@ -2952,6 +2961,12 @@ function recoverLaunch(state: EffortState, id: string, intent: { name: string; l
 			: status === "queued"
 				? "it stays queued, and starts when a Teammate frees up"
 				: `send it back again with \`team_review\`; feedback-${sentBack?.round ?? 0}.md is removed`;
+	if (afresh) {
+		return {
+			...abandoned,
+			reply: `\`${id}\` wasn't started afresh before pi stopped: its new session never wrote to its journal, so nothing of its relaunch is on record. Its old session was stopped for it (its conversation kept), and it is still due a fresh start. Task \`${slug}\` is still ${status}; ${next}.`,
+		};
+	}
 	return { ...abandoned, reply: `\`${id}\` didn't start before pi stopped: \`claude agents --json\` doesn't list \`${intent.name}\` and it never wrote to its journal, so nothing of its launch is on record. Task \`${slug}\` is still ${status}; ${next}.` };
 }
 
@@ -2980,13 +2995,21 @@ function reconcile(state: EffortState, input: Extract<EffortInput, { kind: "reco
 		const task = teammate.clearing === undefined ? undefined : state.tasks[teammate.clearing];
 		if (teammate.clearing !== undefined && task && teammate.inbox) actions.push({ kind: "clear-then-send", teammate: teammate.id, inbox: teammate.inbox, slug: teammate.clearing, folder: task.folder });
 	}
+	// Started afresh with no `SessionStart` from its new session: while `claude agents --json` lists it, that is still to come.
+	const unstarted = live(state).filter((teammate) => teammate.relaunching && input.agents !== undefined && !input.agents.includes(teammate.name));
 	for (const [slug, round] of Object.entries(state.undelivered ?? {})) {
 		const task = state.tasks[slug];
 		const teammate = state.teammates.find((each) => each.id === task?.teammate);
 		if (!task || !teammate || teammate.ended || teammate.retiredAt !== undefined || teammate.clearing === slug || input.sent?.includes(slug)) continue;
 		actions.push({ kind: "redeliver", teammate: teammate.id, slug, folder: task.folder, round });
 	}
-	return took(state, [], actions);
+	const reply = unstarted
+		.map(
+			(teammate) =>
+				`\`${teammate.id}\` was started afresh on Task \`${teammate.task}\` before pi stopped, but its new session never started: \`claude agents --json\` doesn't list \`${teammate.name}\` and it never wrote to its journal, so nobody works the Task. Stop and tell the human.`,
+		)
+		.join("\n");
+	return took(state, [], actions, reply === "" ? undefined : reply);
 }
 
 /**

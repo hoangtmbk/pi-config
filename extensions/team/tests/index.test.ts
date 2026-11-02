@@ -4091,6 +4091,55 @@ describe("restarting: picking an Effort up after pi comes back", () => {
 		assert.deepEqual(await printed(hook), { hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Not across a restart." } } });
 		assert.deepEqual(again.sent, [], "nothing new to wake the Lead about");
 	});
+
+	/** builder-1 started afresh on `update-docs` after a Brief change, and pi killed just after writing that launch's intent; with the journal's line count before it. */
+	async function relaunchKilled() {
+		const crew = await crewPlanned();
+		const { pi, dir, repo } = crew;
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		writeFileSync(join(dir, "brief.draft.md"), changedBrief(repo, BUILDER_ON_SONNET));
+		await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: [] });
+		pi.answer("Approve");
+		await pi.team("pending");
+		await until(() => teammateWakes(pi.sent).length === 1, "rename-key has a result");
+		await pi.call("team_review", { slug: "rename-key", verdict: "accept" });
+		const journal = join(dir, "teammates", "builder-1", "events.jsonl");
+		const before = readFileSync(journal, "utf8").split("\n").filter(Boolean).length;
+		await pi.call("team_handoff", { slug: "update-docs", body: "# Docs\n" });
+		await until(() => teammateWakes(pi.sent).length === 2, "update-docs has a result");
+		await pi.emit("session_shutdown", { reason: "quit" });
+		const lines = readFileSync(join(dir, "effort.jsonl"), "utf8").split("\n").filter(Boolean);
+		const last = lines.map((line) => JSON.parse(line).type).lastIndexOf("launch-intended");
+		writeFileSync(join(dir, "effort.jsonl"), `${lines.slice(0, last + 1).join("\n")}\n`);
+		return { ...crew, journal, before };
+	}
+
+	it("takes a Teammate started afresh in from its new session's SessionStart, once, and doesn't start it again", async () => {
+		const { roots, repo, pi, dir } = await relaunchKilled();
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.equal(pi.claude.launches().length, 2, "no third session");
+		assert.equal(counted(dir, "teammate-relaunched"), 1);
+		assert.equal(counted(dir, "launch-abandoned"), 0);
+		assert.equal(counted(dir, "teammate-session"), 2);
+		assert.equal(counted(dir, "task-done"), 2, "its new session's journal is replayed: update-docs has its result");
+	});
+
+	it("abandons a fresh start its new session never journaled, though `claude agents --json` lists the name its old session had too", async () => {
+		const { roots, repo, pi, dir, journal, before } = await relaunchKilled();
+		writeFileSync(journal, `${readFileSync(journal, "utf8").split("\n").filter(Boolean).slice(0, before).join("\n")}\n`);
+		assert.ok(pi.claude.agents().some((agent) => agent.name === BUILDER_1));
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.equal(counted(dir, "launch-abandoned"), 1);
+		assert.equal(counted(dir, "teammate-relaunched"), 0);
+		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## update-docs\n(?:.*\n)*?- Status: planned/);
+		assert.match(awayWakes(again.sent)[0]?.content ?? "", /`builder-1` wasn't started afresh before pi stopped/);
+	});
 });
 
 /** {@link crewBrief} with AC2 changed, and `frontmatter` lines added: a Brief change the Lead drafts. */

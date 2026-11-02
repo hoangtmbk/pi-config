@@ -566,7 +566,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			away.push(...(await recoverIntents(held, names)));
 			const sent: string[] = [];
 			away.push(...applyJournals(held, undefined, sent));
-			away.push(...(await resend(held, sent)));
+			away.push(...(await resend(held, sent, names)));
 			await tickEffort();
 		} catch (error) {
 			away.push(`Picking Effort \`${held.effortId}\` up after the restart stopped short: ${error instanceof Error ? error.message : String(error)}. Stop and tell the human.`);
@@ -592,7 +592,12 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 */
 	async function recoverIntents(held: HeldEffort, names: string[] | undefined): Promise<string[]> {
 		const state = effortState(held);
-		const journaled = Object.keys(state.launching ?? {}).filter((id) => readJournal(held.paths, id, 0).length > 0);
+		// A Teammate started afresh already has a journal: only a SessionStart past its cursor, other than a clear, is its new session's.
+		const journaled = Object.keys(state.launching ?? {}).filter((id) => {
+			const known = state.teammates.find((teammate) => teammate.id === id);
+			const lines = readJournal(held.paths, id, known?.cursor ?? 0);
+			return known === undefined ? lines.length > 0 : lines.some(({ line }) => line.event === "SessionStart" && line.payload?.source !== "clear");
+		});
 		const merges = Object.fromEntries(
 			openMerges(state).flatMap(({ slug, branch }) => {
 				const evidence = state.workspace && mergeEvidence(state.workspace.path, branch);
@@ -637,11 +642,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * never came, and send again a pointer that never landed, unless the replay
 	 * sent it (`sent`). Returns what the Lead must hear.
 	 */
-	async function resend(held: HeldEffort, sent: string[]): Promise<string[]> {
+	async function resend(held: HeldEffort, sent: string[], names: string[] | undefined): Promise<string[]> {
 		const state = effortState(held);
-		const result = step(state, { kind: "reconcile", sent, at: now().toISOString() });
+		const result = step(state, { kind: "reconcile", sent, ...(names ? { agents: names } : {}), at: now().toISOString() });
 		if (!result.ok) return [result.refusal];
-		const texts: string[] = [];
+		const texts: string[] = result.reply === undefined ? [] : [result.reply];
 		for (const action of result.actions) {
 			if (action.kind === "clear-then-send") {
 				const failed = await sendToInbox(action.inbox, CLEAR_MARKER);

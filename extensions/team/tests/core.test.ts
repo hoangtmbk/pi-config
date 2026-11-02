@@ -2894,6 +2894,48 @@ describe("recovering after a restart", () => {
 		});
 	});
 
+	describe("a relaunch", () => {
+		// dev-1 did `rename`; an approved Brief change then altered its Role's launch options, so `docs` starts it afresh.
+		const running = applied(applied(planned, { kind: "handoff", slug: "rename", at: T0 }), hook("dev-1", 1, "SessionStart", { session_id: SESSION, source: "startup" }));
+		const done = applied(running, hook("dev-1", 2, "Stop", { session_id: SESSION }, true));
+		const asked = applied(done, { kind: "request-approval", checkpoint: "brief-change", path: "/agent/team/efforts/software-2026-11-02/brief.draft.md", sha256: "c".repeat(64), snapshot: "---\n---\n", affects: [], at: "2026-11-02T12:10:00.000Z" });
+		const changed = applied(asked, { kind: "answer", id: "r2", answer: "approved", refresh: ["dev"], at: "2026-11-02T12:11:00.000Z" });
+		const accepted = applied(changed, { kind: "review", slug: "rename", verdict: "accept", result: { path: `${TASKS}/001-dev-rename/result-1.md`, written: true }, sendBackLimit: 2, at: "2026-11-02T13:00:00.000Z" });
+		const handoff = run(accepted, { kind: "handoff", slug: "docs", at: "2026-11-02T14:00:00.000Z" });
+		assert.ok(handoff.ok, handoff.ok ? "" : handoff.refusal);
+		const intended: EffortLine[] = [...accepted, { type: "launch-intended", teammate: "dev-1", name: NAME, lines: handoff.append, at: "2026-11-02T14:00:00.000Z" }];
+
+		it("that went in closes on its `teammate-relaunched` line, so a restart after it recovers nothing", () => {
+			const result = recover([...intended, ...handoff.append], { agents: [NAME], journaled: ["dev-1"] });
+
+			assert.deepEqual([result.append, result.actions], [[], []]);
+		});
+
+		it("is in once its new session journals, whatever `claude agents --json` says: the `--name` it lists is the old session's too", () => {
+			const listed = recover(intended, { agents: [NAME], journaled: [] });
+			const journaled = recover(intended, { agents: [], journaled: ["dev-1"] });
+
+			assert.deepEqual(listed.append.map((line) => line.type), ["launch-abandoned"]);
+			assert.equal(taskStatus(listed.state, "docs"), "planned");
+			const [kept] = listed.state.teammates;
+			assert.deepEqual({ freshDue: kept.freshDue, relaunching: kept.relaunching }, { freshDue: true, relaunching: undefined });
+			assert.match(wakes(listed)[0]?.text ?? "", /^`dev-1` wasn't started afresh before pi stopped: its new session never wrote to its journal.*still due a fresh start.*Task `docs` is still planned; hand it off again with `team_handoff`\.$/);
+			assert.deepEqual(journaled.append, handoff.append);
+			assert.equal(journaled.state.teammates[0].relaunching, true);
+		});
+
+		it("whose new session never started wakes the Lead once the journals are replayed, and waits while `claude agents --json` lists it", () => {
+			const relaunched = [...intended, ...handoff.append];
+			const missing = run(relaunched, { kind: "reconcile", agents: [], at: BACK });
+			const starting = run(relaunched, { kind: "reconcile", agents: [NAME], at: BACK });
+			const unread = run(relaunched, { kind: "reconcile", at: BACK });
+
+			assert.ok(missing.ok && starting.ok && unread.ok);
+			assert.match(missing.reply ?? "", /^`dev-1` was started afresh on Task `docs` before pi stopped, but its new session never started.*Stop and tell the human\.$/);
+			assert.deepEqual([starting.actions, starting.reply, unread.actions, unread.reply], [[], undefined, [], undefined]);
+		});
+	});
+
 	describe("reconciling after the journals are replayed", () => {
 		const running = applied(applied(planned, { kind: "handoff", slug: "rename", at: T0 }), hook("dev-1", 1, "SessionStart", { session_id: SESSION, source: "startup" }));
 		const done = applied(running, hook("dev-1", 2, "Stop", {}, true));
