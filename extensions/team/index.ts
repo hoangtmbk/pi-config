@@ -15,9 +15,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { renderTeamBlock, teamStatus } from "./block.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
 import { launchBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
 import { currentResult, type EffortAction, type EffortState, fold, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace } from "./core.ts";
@@ -63,7 +64,7 @@ import { handoffPointer, teammatePrompt } from "./teammate.ts";
 /** The Lead's tools while this session runs Team setup. */
 const SETUP_TOOLS = ["team_request_approval"];
 /** The Lead's tools while this session holds an Effort. */
-const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff"];
+const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff", "team_status"];
 /** Every Lead tool: registered at load, and switched on only by what the session runs. */
 const LEAD_TOOLS = [...new Set([...SETUP_TOOLS, ...EFFORT_TOOLS])];
 
@@ -84,6 +85,12 @@ const PlanParams = Type.Object({
 		{ description: "The whole Task list." },
 	),
 });
+
+/** The Team block's key among pi's widgets. */
+const BLOCK_KEY = "team";
+
+/** The cap on live Teammates when pi's settings name none. */
+const DEFAULT_MAX_TEAMMATES = 3;
 
 const HandoffParams = Type.Object({
 	slug: Type.String({ description: "The planned Task to hand off." }),
@@ -142,6 +149,9 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	// Whether the Lead's model is in a run, and what wakes about Teammates wait for it to settle.
 	let busy = false;
 	let waiting: string[] = [];
+	// Where the Team block goes, when pi has a UI, and the lines it last showed.
+	let surface: ExtensionUIContext | undefined;
+	let shown: string[] | undefined;
 
 	function syncLeadTools(): void {
 		const others = pi.getActiveTools().filter((name) => !LEAD_TOOLS.includes(name));
@@ -150,6 +160,30 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 	function effortState(held: HeldEffort): EffortState {
 		return fold(readLines(held.paths));
+	}
+
+	/**
+	 * Redraw the Team block from the held Effort's lines, or take it away when
+	 * the session holds none. Called wherever the Effort or what waits on the
+	 * human can have changed; an unchanged block isn't handed to pi again.
+	 */
+	function paintBlock(): void {
+		if (!surface) return;
+		const lines = effort ? renderTeamBlock(teamStatus(effortState(effort), { adoptionsPending: pending.length }), now().getTime(), { maxTeammates: maxTeammates() }) : undefined;
+		if (lines === shown || (lines && shown && lines.length === shown.length && lines.every((line, index) => line === shown?.[index]))) return;
+		shown = lines;
+		surface.setWidget(BLOCK_KEY, lines, { placement: "aboveEditor" });
+	}
+
+	/** pi's `maxTeammates` setting, which reaches a running session only after `/reload`. */
+	function maxTeammates(): number {
+		const set = (pi.getSettings() as Record<string, unknown>).maxTeammates;
+		return typeof set === "number" && Number.isInteger(set) && set >= 1 ? set : DEFAULT_MAX_TEAMMATES;
+	}
+
+	/** Where the Team block goes: nowhere in print and JSON modes, where `hasUI` is false. */
+	function showBlockIn(ctx: ExtensionContext): void {
+		if (ctx.hasUI) surface = ctx.ui;
 	}
 
 	/**
@@ -215,6 +249,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				for (const action of result.actions) if (action.kind === "wake-lead") texts.push(action.text);
 			}
 		}
+		paintBlock();
 		return texts;
 	}
 
@@ -236,7 +271,17 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		wakeAboutTeammates(texts);
 	});
 
+	pi.on("session_start", (_event, ctx) => {
+		showBlockIn(ctx);
+		// A session started again has whatever it showed behind it, so the block is drawn afresh.
+		shown = undefined;
+		paintBlock();
+	});
+
 	pi.on("session_shutdown", async () => {
+		// The block shows only while this session holds the Effort.
+		if (shown) surface?.setWidget(BLOCK_KEY, undefined, { placement: "aboveEditor" });
+		shown = undefined;
 		const open = bridge;
 		bridge = undefined;
 		await open?.then(
@@ -285,6 +330,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		pi.appendEntry("team-effort", { effortId, effortDir: files.dir });
 		effort = { effortId, paths: files };
 		syncLeadTools();
+		paintBlock();
 		ctx.ui.notify(openedText(picked, effortId, files), "info");
 		wakeLead("team-intake", intakePrompt({ effortId, paths: files, team, playbook, repo: repo.root }));
 	}
@@ -417,6 +463,13 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		return found;
 	}
 
+	/** The mode a Teammate handed `slug` launches in, when the plan and the snapshot name its Role: drift is measured against it. */
+	function launchMode(state: EffortState, slug: string, roles: Role[], playbook: Playbook): string | undefined {
+		const planned = state.plan?.find((task) => task.slug === slug);
+		const role = planned && roles.find((each) => each.name === planned.role);
+		return role ? modeInForce(playbook, role) : undefined;
+	}
+
 	/** Carry out a step's actions in order, then append its lines: records are written before the line that claims them. */
 	async function carryOut(held: HeldEffort, result: Extract<Step, { ok: true }>, launch: (action: Extract<EffortAction, { kind: "launch-teammate" }>) => Promise<void>): Promise<void> {
 		for (const action of result.actions) {
@@ -507,12 +560,15 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const path = resolve(ctx.cwd, params.path);
 			if (effort && params.checkpoint !== ADOPT_PLAYBOOK) {
-				return { content: [{ type: "text", text: requestBriefApproval(effort, params.checkpoint, path) }], details: undefined };
+				const text = requestBriefApproval(effort, params.checkpoint, path);
+				paintBlock();
+				return { content: [{ type: "text", text }], details: undefined };
 			}
 			const team = setup ? loadTeam(paths, setup.team) : undefined;
 			const item = requestAdoption(setup, team, params.checkpoint, path);
 			// A newer request for the same Team replaces the one the human hasn't answered.
 			pending = [...pending.filter((waiting) => waiting.team !== item.team), item];
+			paintBlock();
 			return { content: [{ type: "text", text: adoptionRequested(item) }], details: undefined };
 		},
 	});
@@ -535,6 +591,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			const result = step(state, { kind: "plan", tasks: params.tasks, criteria, roles: roles.map((role) => role.name), at: now().toISOString() });
 			if (!result.ok) throw new Error(result.refusal);
 			await carryOut(held, result, async () => {});
+			paintBlock();
 			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
 		},
 	});
@@ -555,11 +612,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			if (params.isolated) {
 				throw new Error(`Task \`${params.slug}\` can't be handed off isolated yet: a Task with a worktree of its own isn't built. Hand it off without \`isolated\`, into the Effort's Workspace.`);
 			}
-			const result = step(state, { kind: "handoff", slug: params.slug, at: now().toISOString() });
+			const { roles, playbook } = snapshotOf(held);
+			const result = step(state, { kind: "handoff", slug: params.slug, at: now().toISOString(), mode: launchMode(state, params.slug, roles, playbook) });
 			if (!result.ok) throw new Error(result.refusal);
 			const workspace = state.workspace;
 			if (!workspace) throw new Error(`Effort \`${held.effortId}\` has no Workspace, so no Teammate starts; stop and tell the human.`);
-			const { roles, playbook } = snapshotOf(held);
 			await listenForTeammates(held, ctx);
 			await carryOut(held, result, async ({ teammate, task }) => {
 				const role = roles.find((each) => each.name === teammate.role);
@@ -594,6 +651,23 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		},
 	});
 
+	pi.registerTool({
+		name: "team_status",
+		label: "Team status",
+		description: [
+			"The held Effort at a glance, as the human sees it in the Team block: the phase, Tasks accepted out of planned, each Teammate's state, Task, context use and permission mode (`acceptEdits≠auto` is drift from the mode it launched in), queued Tasks and why, and what waits on the human.",
+			"Returns it as JSON. Changes nothing.",
+		].join(" "),
+		promptSnippet: "See the Effort's Teammates, Tasks and what waits on the human",
+		parameters: Type.Object({}),
+		defaultActive: false,
+		async execute() {
+			if (!effort) throw new Error("No Effort is open in this session, so there is no status to give; the human opens one with `/team start <team>`.");
+			const status = teamStatus(effortState(effort), { adoptionsPending: pending.length });
+			return { content: [{ type: "text", text: JSON.stringify(status, null, 2) }], details: status };
+		},
+	});
+
 	pi.registerCommand("team", {
 		description: "Run a Team on one Effort: /team start [team], /team setup <team>, /team pending",
 		async handler(args, ctx) {
@@ -607,7 +681,12 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				ctx.ui.notify(`Unknown \`/team\` subcommand \`${name}\`. Subcommands: ${valid}.`, "error");
 				return;
 			}
-			await subcommand.run(rest, ctx);
+			showBlockIn(ctx);
+			try {
+				await subcommand.run(rest, ctx);
+			} finally {
+				paintBlock();
+			}
 		},
 	});
 }
