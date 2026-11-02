@@ -11,15 +11,38 @@
  * the journal is the record, and the Lead reads it from its cursor, so a Lead
  * that isn't listening misses nothing.
  *
- * It prints nothing and exits 0, which lets every event through unchanged.
+ * For every event but one it prints nothing and exits 0, which lets the event
+ * through unchanged.
+ *
+ * A `PermissionRequest` (an AskUserQuestion included) is held instead: the
+ * journal line carries a request id, and the hook keeps a socket open to the
+ * Lead bridge with a `held` line naming it, which also rings the doorbell. The
+ * prompt stays live in the Teammate's terminal meanwhile, and the first answer
+ * wins:
+ *   - the Lead's `decision` line arrives: the hook prints it as the hook's
+ *     decision and exits 0;
+ *   - the human answers in the terminal: Claude Code kills the hook with
+ *     SIGTERM, journalled as `denied-in-terminal` (the hook can't tell which
+ *     answer the human gave; a PostToolUse follows if it was allowed);
+ *   - the hold time runs out, or no Lead is listening: journalled as
+ *     `hold-expired` with a doorbell, the hook exits 0 printing nothing and
+ *     the prompt is the human's alone. The hold time stops short of the hook's own timeout so the
+ *     hook, not Claude Code's kill, decides how the hold ended.
  */
 
+import { randomBytes } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { connect } from "node:net";
 import { join } from "node:path";
 
 /** How long the doorbell may take before the hook gives up on it; the journal line is already written. */
 const DOORBELL_TIMEOUT_MS = 2_000;
+
+/**
+ * How long a held PermissionRequest waits for the Lead: 30 s short of the
+ * hook's 3600 s timeout. `TEAM_HOOK_HOLD_MS` overrides it for tests.
+ */
+const HOLD_MS = Number(process.env.TEAM_HOOK_HOLD_MS) > 0 ? Number(process.env.TEAM_HOOK_HOLD_MS) : 3_570_000;
 
 const [effortDir, teammate] = process.argv.slice(2);
 
@@ -43,22 +66,29 @@ function parse(text) {
 }
 
 /** One journal line. A `SessionStart` also carries the inbox socket and token, which reach hooks only through the environment. */
-function journalLine(payload) {
+function journalLine(payload, request) {
 	const line = { from: "hook", at: new Date().toISOString(), event: payload?.hook_event_name, payload };
+	if (request) line.request = request;
 	const socket = process.env.CLAUDE_CODE_MESSAGING_SOCKET;
 	const token = process.env.CLAUDE_CODE_MESSAGING_TOKEN;
 	if (line.event === "SessionStart" && socket && token) line.inbox = { socket, token };
 	return `${JSON.stringify(line)}\n`;
 }
 
-function ringDoorbell() {
+/** The Lead bridge's port and token from `lead.json`, or undefined when there is no Lead to reach. */
+function readLead() {
 	let lead;
 	try {
 		lead = JSON.parse(readFileSync(join(effortDir, "lead.json"), "utf8"));
 	} catch {
-		return Promise.resolve();
+		return undefined;
 	}
-	if (typeof lead?.port !== "number" || typeof lead?.token !== "string") return Promise.resolve();
+	return typeof lead?.port === "number" && typeof lead?.token === "string" ? lead : undefined;
+}
+
+function ringDoorbell() {
+	const lead = readLead();
+	if (lead === undefined) return Promise.resolve();
 	return new Promise((resolve) => {
 		const socket = connect({ host: "127.0.0.1", port: lead.port });
 		const done = () => {
@@ -72,11 +102,64 @@ function ringDoorbell() {
 	});
 }
 
+/** One journal line about a held request's end, which has no payload of its own. */
+function heldLine(event, request) {
+	return `${JSON.stringify({ from: "hook", at: new Date().toISOString(), event, request })}\n`;
+}
+
+/** Hold the request open on the Lead bridge until the Lead decides, the human answers or the hold time runs out. */
+function hold(journal, request) {
+	let expiring = false;
+	const expire = async () => {
+		if (expiring) return;
+		expiring = true;
+		appendFileSync(journal, heldLine("hold-expired", request));
+		await ringDoorbell();
+		process.exit(0);
+	};
+	process.on("SIGTERM", () => {
+		appendFileSync(journal, heldLine("denied-in-terminal", request));
+		process.exit(143);
+	});
+	const lead = readLead();
+	if (lead === undefined) return expire();
+	setTimeout(expire, HOLD_MS);
+	const socket = connect({ host: "127.0.0.1", port: lead.port });
+	let buffered = "";
+	let connected = false;
+	socket.setEncoding("utf8");
+	// No Lead at the port gives the prompt back at once; a Lead that goes away
+	// after taking the request leaves it with the human until the hold time runs out.
+	socket.on("error", () => (connected ? socket.destroy() : expire()));
+	socket.on("connect", () => {
+		connected = true;
+		socket.write(`${JSON.stringify({ type: "held", token: lead.token, teammate, request })}\n`);
+	});
+	socket.on("data", (chunk) => {
+		buffered += chunk;
+		const lines = buffered.split("\n");
+		buffered = lines.pop() ?? "";
+		for (const text of lines) {
+			const line = parse(text);
+			if (line?.type !== "decision" || line.request !== request || typeof line.decision !== "object") continue;
+			process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: line.decision } }), () => process.exit(0));
+			return;
+		}
+	});
+}
+
 const payload = parse(await readStdin());
 if (effortDir && teammate) {
 	const dir = join(effortDir, "teammates", teammate);
 	mkdirSync(dir, { recursive: true });
-	appendFileSync(join(dir, "events.jsonl"), journalLine(payload));
-	await ringDoorbell();
-}
-process.exit(0);
+	const journal = join(dir, "events.jsonl");
+	if (payload?.hook_event_name === "PermissionRequest") {
+		const request = `req-${randomBytes(4).toString("hex")}`;
+		appendFileSync(journal, journalLine(payload, request));
+		hold(journal, request);
+	} else {
+		appendFileSync(journal, journalLine(payload));
+		await ringDoorbell();
+		process.exit(0);
+	}
+} else process.exit(0);

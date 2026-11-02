@@ -23,7 +23,21 @@ import { attachTarget, chooseAttach, pickerLabel } from "./attach.ts";
 import { renderTeamBlock, teamStatus } from "./block.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
 import { agentsList, CLEAR_MARKER, installMod, launchBackground, sendToInbox, stopBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
-import { currentResult, DEFAULT_MAX_TEAMMATES, type EffortAction, type EffortState, fold, type Inbox, openEffort, type PendingApproval, refuseRequest, type Step, step, type Workspace } from "./core.ts";
+import {
+	currentResult,
+	DEFAULT_MAX_TEAMMATES,
+	type EffortAction,
+	type EffortState,
+	fold,
+	type Inbox,
+	openEffort,
+	type PendingApproval,
+	refuseRequest,
+	type Step,
+	step,
+	type Workspace,
+	waitingInTerminal,
+} from "./core.ts";
 import { EVERY_ROLE, listTeams, loadTeam, type Playbook, readSnapshot, type Role, sha256, type Team, type TeamRoots } from "./definitions.ts";
 import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
 import { adoptable, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
@@ -48,6 +62,7 @@ import {
 	writeTask,
 } from "./records.ts";
 import { repoRoot } from "./repo.ts";
+import { terminalText } from "./requests.ts";
 import { REPORT_OVERLAY, type ReportChrome, ReportView, type ReportTui } from "./reports-view.ts";
 import { addWorkspace } from "./workspace.ts";
 import {
@@ -73,7 +88,7 @@ import { handoffPointer, restaffPointer, sendBackPointer, teammatePrompt } from 
 /** The Lead's tools while this session runs Team setup. */
 const SETUP_TOOLS = ["team_request_approval"];
 /** The Lead's tools while this session holds an Effort. */
-const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume"];
+const EFFORT_TOOLS = ["team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer"];
 /** Every Lead tool: registered at load, and switched on only by what the session runs. */
 const LEAD_TOOLS = [...new Set([...SETUP_TOOLS, ...EFFORT_TOOLS])];
 
@@ -113,6 +128,23 @@ const ReportParams = Type.Object({
 	),
 	found: Type.Optional(
 		Type.Array(Type.String(), { description: "Work found since the last Report that is outside the Brief: kept as suggestions for the final Report, never started." }),
+	),
+});
+
+const DECISIONS = ["allow", "deny"] as const;
+
+const AnswerParams = Type.Object({
+	request: Type.String({ description: "The held request's id, `req-<8 hex>`, from the message that woke you about it." }),
+	decision: Type.Optional(Type.String({ description: "For a permission request: `allow` or `deny`. Leave it out when answering an AskUserQuestion." })),
+	reason: Type.Optional(Type.String({ description: "Why: the deny message the Teammate sees, and what the human reads in the next Report." })),
+	rule: Type.Optional(
+		Type.String({ description: "With `allow`: a session rule for the same tool, such as `Bash(npm test:*)`, so the Teammate isn't asked again this session." }),
+	),
+	grant: Type.Optional(Type.String({ description: "With `allow`: the grant in the Brief or Playbook the allow relies on, logged for the human." })),
+	answers: Type.Optional(
+		Type.Record(Type.String(), Type.Union([Type.String(), Type.Array(Type.String())]), {
+			description: "For an AskUserQuestion: each question's exact text to the label picked, or a list of labels for a multiSelect question.",
+		}),
 	),
 });
 
@@ -888,13 +920,21 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		pending: {
 			async run(_args, ctx) {
 				const held = effort;
-				const briefs = held ? effortState(held).pending : [];
-				if (pending.length === 0 && briefs.length === 0) {
+				if (held) wakeAboutTeammates(applyJournals(held));
+				const state = held ? effortState(held) : undefined;
+				const briefs = state?.pending ?? [];
+				const terminal = state ? waitingInTerminal(state) : [];
+				if (pending.length === 0 && briefs.length === 0 && terminal.length === 0) {
 					ctx.ui.notify("Nothing is waiting on you.", "info");
 					return;
 				}
 				for (const item of [...pending]) await answerAdoption(item, ctx);
 				if (held) for (const item of briefs) await answerBrief(held, item, ctx);
+				for (const item of terminal) {
+					const attach = `Attach to ${item.teammate}`;
+					const answer = await ctx.ui.select(`\`${item.request}\` waited past its hook's hold: ${terminalText(item)}`, [attach, LATER]);
+					if (answer === attach) await attachTo(item.teammate, ctx);
+				}
 			},
 		},
 		pause: {
@@ -1257,6 +1297,46 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			// Collapsed, it is one line however narrow the chat is: the Report's number and headline.
 			const line = `${theme.fg("accent", theme.bold(`Report ${details.n}`))} · ${details.headline} ${theme.fg("dim", "(expand to read it)")}`;
 			return { render: (width: number) => [truncateToWidth(line, width)], invalidate() {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "team_answer",
+		label: "Answer",
+		description: [
+			"Answer a Teammate's held request: a permission prompt or an AskUserQuestion its hook holds open while the prompt stays live in its terminal.",
+			"For a permission, `decision` is `allow` or `deny` with a `reason`; an allow may add a session `rule` for the same tool and name the `grant` it relies on.",
+			"For an AskUserQuestion, `answers` maps each question's exact text to a label, or a list of labels for a multiSelect question.",
+			"The first answer wins: refused once the human answered in the terminal, or the hook gave up holding it. Nothing is allowed by default, and the next Report logs what you decided.",
+		].join(" "),
+		promptSnippet: "Answer a Teammate's held permission request or AskUserQuestion: allow or deny, with a reason",
+		parameters: AnswerParams,
+		defaultActive: false,
+		async execute(_toolCallId, params) {
+			if (!effort) throw new Error("No Effort is open in this session, so no request waits on you; the human opens one with `/team start <team>`.");
+			const held = effort;
+			const decision = params.decision === undefined ? undefined : DECISIONS.find((each) => each === params.decision);
+			if (params.decision !== undefined && decision === undefined) throw new Error(`\`decision\` is \`allow\` or \`deny\`, not \`${params.decision}\`.`);
+			// What the terminal did meanwhile counts first: the first answer wins.
+			wakeAboutTeammates(applyJournals(held));
+			const answer = { kind: "answer-request" as const, request: params.request, decision, reason: params.reason, rule: params.rule, grant: params.grant, answers: params.answers, at: now().toISOString() };
+			const result = step(effortState(held), answer);
+			if (!result.ok) throw new Error(result.refusal);
+			const opened = await bridge?.catch(() => undefined);
+			for (const action of result.actions) {
+				if (action.kind !== "answer-hook" || opened?.answer(action.request, action.decision)) continue;
+				// The hook let go between the journal read and the answer: what it journalled says why.
+				wakeAboutTeammates(applyJournals(held));
+				const again = step(effortState(held), answer);
+				throw new Error(
+					again.ok
+						? `No hook holds \`${action.request}\` any more, so your answer can't reach it: it waits in ${action.teammate}'s terminal (\`/team attach ${action.teammate}\`). Stop and tell the human.`
+						: again.refusal,
+				);
+			}
+			appendLines(held.paths, result.append);
+			paintBlock();
+			return { content: [{ type: "text", text: result.reply ?? "" }], details: undefined };
 		},
 	});
 

@@ -11,6 +11,8 @@
  * is one appended line and the state is only ever what the lines fold to.
  */
 
+import { askText, closedText, type HeldRequest, type HookDecision, isCallOf, type RequestAnswer, settledText, takeAnswer, terminalText } from "./requests.ts";
+
 /** The one checkpoint an Effort has before its Brief is approved. */
 export const BRIEF = "brief";
 
@@ -127,6 +129,8 @@ export interface Teammate {
 	attached?: string;
 	/** Set when a new session gave it a new short id the human hasn't attached to through pi: the block marks it `(new)`. */
 	newShortId?: boolean;
+	/** The session-scoped rules the Lead added for it, each with the Task it was added on. */
+	rules?: { rule: string; task?: string }[];
 	/**
 	 * Set once its session is over for the Effort: `stopped` with `claude stop`
 	 * when its Task was dropped, or `crashed` on a `SessionEnd` nobody asked
@@ -155,6 +159,8 @@ export interface JournalLine {
 	event?: string;
 	payload?: Record<string, unknown>;
 	inbox?: Inbox;
+	/** The id of a `PermissionRequest` the hook holds open, on that request's line and the lines that end its hold. */
+	request?: string;
 }
 
 /** One line of `effort.jsonl`. */
@@ -218,7 +224,13 @@ export type EffortLine =
 	/** `by` lifted its own pause. */
 	| { type: "resumed"; by: PauseSetter; at: string }
 	/** A Task queued while paused waits on, once the Effort runs, for this reason instead. */
-	| { type: "task-requeued"; slug: string; why: string; at: string };
+	| { type: "task-requeued"; slug: string; why: string; at: string }
+	/** A `PermissionRequest` the Teammate's hook holds open for the first answer, the Lead's or the human's in the terminal. */
+	| ({ type: "request-held"; cursor: number } & Omit<HeldRequest, "state">)
+	/** The terminal settled a held request: answered there, denied there, or left there once the hook's hold ran out. */
+	| { type: "request-settled"; teammate: string; cursor: number; request: string; how: "answered-in-terminal" | "denied-in-terminal" | "expired"; at: string }
+	/** The Lead answered a held request through its hook, adding `rule` for the Teammate's session. Reads no journal line. */
+	| { type: "request-answered"; teammate: string; request: string; task?: string; decision: HookDecision; rule?: string; at: string };
 
 /** Who set a pause, the only one who lifts it: the human, the Lead, or a usage limit. */
 export type PauseSetter = "human" | "lead" | "usage";
@@ -292,6 +304,8 @@ export interface EffortState {
 	found: Logged[];
 	/** The pauses that hold, by setter; absent before the first pause. */
 	pauses?: Partial<Record<PauseSetter, Pause>>;
+	/** Every request a Teammate's hook held for an answer, by request id, oldest first. */
+	teammateRequests: Record<string, HeldRequest>;
 }
 
 /** A new input to the core. */
@@ -367,7 +381,9 @@ export type EffortInput =
 	/** `/team pause` from the human, or `team_pause` from the Lead, which must give a reason. */
 	| { kind: "pause"; by: "human" | "lead"; reason?: string; at: string }
 	/** `/team resume` from the human in a session holding the Effort, or `team_resume` from the Lead: each lifts only its own pause. */
-	| { kind: "resume"; by: "human" | "lead"; at: string };
+	| { kind: "resume"; by: "human" | "lead"; at: string }
+	/** `team_answer` of a held request. */
+	| ({ kind: "answer-request"; at: string } & RequestAnswer);
 
 /** Work the core leaves to the shell. */
 export type EffortAction =
@@ -406,7 +422,9 @@ export type EffortAction =
 	/** Stop the Teammate's background session, `claude stop <short id>`, which keeps its conversation; its `--name` before it has a short id. */
 	| { kind: "stop-teammate"; teammate: string; shortId: string }
 	/** Write the Report as `reports/<nnn>.md`. */
-	| { kind: "write-report"; report: Report };
+	| { kind: "write-report"; report: Report }
+	/** Send the decision to the hook holding `request`, which prints it for Claude Code. */
+	| { kind: "answer-hook"; request: string; teammate: string; decision: HookDecision };
 
 export type Step =
 	| { ok: true; state: EffortState; append: EffortLine[]; actions: EffortAction[]; reply?: string }
@@ -418,7 +436,7 @@ export function openEffort(opened: { effortId: string; team: string; repo: strin
 }
 
 /** Lines a Report doesn't tell of: they only carry what other lines say. */
-const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested"]);
+const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested", "request-held", "request-answered"]);
 
 /** Fold one line into the state, keeping what the next Report tells of. */
 function apply(state: EffortState, line: EffortLine): EffortState {
@@ -517,7 +535,7 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "task-accepted":
 			return withTask(state, line.slug, { accepted: line.at });
 		case "teammate-stopped":
-			return withTeammate(state, line, { activity: "idle", doing: "stopped short" });
+			return endRequests(withTeammate(state, line, { activity: "idle", doing: "stopped short" }), line.teammate);
 		case "teammate-mode":
 			return withTeammate(state, line, { observedMode: line.mode });
 		case "task-dropped":
@@ -525,9 +543,9 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "task-reassigned":
 			return withTask(state, line.slug, { teammate: line.teammate });
 		case "teammate-ended":
-			return { ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, ended: { how: line.how, at: line.at } } : teammate)) };
+			return endRequests({ ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, ended: { how: line.how, at: line.at } } : teammate)) }, line.teammate);
 		case "teammate-crashed":
-			return withTeammate(state, line, { ended: { how: "crashed", at: line.at } });
+			return endRequests(withTeammate(state, line, { ended: { how: "crashed", at: line.at } }), line.teammate);
 		case "decided-for-you":
 		case "found-work": {
 			const { type, ...logged } = line;
@@ -545,8 +563,23 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			return { ...state, queue: state.queue.map((queued) => (queued.slug === line.slug ? { ...queued, why: line.why } : queued)) };
 		case "report-written":
 			return state;
+		case "request-held": {
+			const { type: _type, cursor: _cursor, ...held } = line;
+			return { ...withTeammate(state, line, {}), teammateRequests: { ...state.teammateRequests, [line.request]: { ...held, state: "held" } } };
+		}
+		case "request-settled":
+			return withRequest(withTeammate(state, line, {}), line.request, line.how);
+		case "request-answered": {
+			const answered = withRequest(state, line.request, "answered");
+			if (line.rule === undefined) return answered;
+			const rule = { rule: line.rule, ...(line.task === undefined ? {} : { task: line.task }) };
+			return {
+				...answered,
+				teammates: answered.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, rules: [...(teammate.rules ?? []), rule] } : teammate)),
+			};
+		}
 		case "task-done": {
-			const advanced = withTeammate(state, line, { activity: "idle", doing: `round ${line.round} done` });
+			const advanced = endRequests(withTeammate(state, line, { activity: "idle", doing: `round ${line.round} done` }), line.teammate);
 			const task = advanced.tasks[line.slug];
 			return task ? { ...advanced, tasks: { ...advanced.tasks, [line.slug]: { ...task, reported: line.round } } } : advanced;
 		}
@@ -567,6 +600,23 @@ function withTeammate(state: EffortState, line: { teammate: string; cursor: numb
 	};
 }
 
+/** The state with request `request` moved to `to`. */
+function withRequest(state: EffortState, request: string, to: HeldRequest["state"]): EffortState {
+	const held = state.teammateRequests[request];
+	return held ? { ...state, teammateRequests: { ...state.teammateRequests, [request]: { ...held, state: to } } } : state;
+}
+
+/** The state with `teammate`'s open requests ended: its turn ended, so none waits any more. */
+function endRequests(state: EffortState, teammate: string): EffortState {
+	const open = Object.values(state.teammateRequests).filter((held) => held.teammate === teammate && (held.state === "held" || held.state === "expired"));
+	return open.reduce((changed, held) => withRequest(changed, held.request, "ended"), state);
+}
+
+/** The requests only the human can answer now, in a Teammate's terminal, oldest first. */
+export function waitingInTerminal(state: EffortState): HeldRequest[] {
+	return Object.values(state.teammateRequests).filter((held) => held.state === "expired");
+}
+
 /** The state an Effort's lines fold to. The first line must open the Effort. */
 export function fold(lines: readonly EffortLine[]): EffortState {
 	const [first, ...rest] = lines;
@@ -574,7 +624,7 @@ export function fold(lines: readonly EffortLine[]): EffortState {
 		throw new Error(`effort.jsonl must start with an \`effort-opened\` line, not ${first ? `\`${first.type}\`` : "nothing"}`);
 	}
 	const { type: _type, at: _at, ...opened } = first;
-	return rest.reduce(apply, { ...opened, pending: [], requests: 0, tasks: {}, teammates: [], queue: [], reports: 0, sinceReport: [], decided: [], found: [] });
+	return rest.reduce(apply, { ...opened, pending: [], requests: 0, tasks: {}, teammates: [], queue: [], reports: 0, sinceReport: [], decided: [], found: [], teammateRequests: {} });
 }
 
 /** Take one input: the lines it appends and what the shell must do, or why it is refused. */
@@ -607,6 +657,8 @@ export function step(state: EffortState, input: EffortInput): Step {
 			return pause(state, input);
 		case "resume":
 			return resume(state, input);
+		case "answer-request":
+			return answerRequest(state, input);
 	}
 }
 
@@ -668,6 +720,35 @@ function resume(state: EffortState, input: Extract<EffortInput, { kind: "resume"
 		still.length === 0
 			? `Effort \`${state.effortId}\` runs again: queued Tasks start through the staffing ladder.`
 			: `Lifted your pause, but Effort \`${state.effortId}\` is still ${still.map(pauseText).join(", and ")}, so nothing new starts yet.`,
+	);
+}
+
+/**
+ * The Lead's `team_answer` of a held request, taken only while its hook holds
+ * it: the first answer wins. The answer, any rule and any grant it used join
+ * the decided-for-you log with the request's Task.
+ */
+function answerRequest(state: EffortState, input: Extract<EffortInput, { kind: "answer-request" }>): Step {
+	const held = state.teammateRequests[input.request];
+	if (!held) {
+		const open = Object.values(state.teammateRequests).filter((each) => each.state === "held").map((each) => each.request);
+		return {
+			ok: false,
+			refusal: `No request \`${input.request}\` waits on you: ${open.length === 0 ? "no request is held right now" : `the requests held now are ${quoted(open)}`}.`,
+		};
+	}
+	if (held.state !== "held") return { ok: false, refusal: closedText(held) };
+	const taken = takeAnswer(held, input);
+	if (typeof taken === "string") return { ok: false, refusal: taken };
+	const task = held.task === undefined ? {} : { task: held.task };
+	return took(
+		state,
+		[
+			{ type: "request-answered", teammate: held.teammate, request: held.request, ...task, decision: taken.decision, ...(taken.rule === undefined ? {} : { rule: taken.rule }), at: input.at },
+			...taken.logged.map((what): EffortLine => ({ type: "decided-for-you", what, ...task, at: input.at })),
+		],
+		[{ kind: "answer-hook", request: held.request, teammate: held.teammate, decision: taken.decision }],
+		`Answered \`${held.request}\`: ${held.teammate}'s hook has your ${taken.decision.behavior}, and the next Report logs it.`,
 	);
 }
 
@@ -1103,6 +1184,43 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 		}
 		case "Stop":
 			return stopped(state, teammate, input);
+		case "PermissionRequest": {
+			const request = line.request;
+			if (request === undefined || state.teammateRequests[request] !== undefined) return took(state, [], []);
+			const toolInput = payload.tool_input;
+			const toolUseId = text(payload.tool_use_id);
+			const held: HeldRequest = {
+				request,
+				teammate: teammate.id,
+				task: teammate.task,
+				tool: text(payload.tool_name) ?? "",
+				input: typeof toolInput === "object" && toolInput !== null && !Array.isArray(toolInput) ? (toolInput as Record<string, unknown>) : {},
+				...(toolUseId === undefined ? {} : { toolUseId }),
+				at,
+				state: "held",
+			};
+			const { state: _state, ...fields } = held;
+			return took(state, [{ type: "request-held", cursor, ...fields }], [{ kind: "wake-lead", text: askText(held) }]);
+		}
+		case "PostToolUse": {
+			// A call a held request asked for ran: the human answered it in the terminal first.
+			// A hook killed by the terminal looks like a deny until the call runs.
+			const tool = text(payload.tool_name);
+			const toolUseId = text(payload.tool_use_id);
+			const open = new Set<HeldRequest["state"]>(["held", "expired", "denied-in-terminal"]);
+			const answered = Object.values(state.teammateRequests).find(
+				(held) => held.teammate === teammate.id && open.has(held.state) && isCallOf(held, tool, payload.tool_input, toolUseId),
+			);
+			if (!answered) return took(state, [], []);
+			return took(state, [{ type: "request-settled", ...at_, request: answered.request, how: "answered-in-terminal", at }], []);
+		}
+		case "denied-in-terminal":
+		case "hold-expired": {
+			const held = line.request === undefined ? undefined : state.teammateRequests[line.request];
+			if (held?.state !== "held") return took(state, [], []);
+			const how = line.event === "hold-expired" ? "expired" : "denied-in-terminal";
+			return took(state, [{ type: "request-settled", ...at_, request: held.request, how, at }], []);
+		}
 		case "SessionEnd":
 			return sessionEnded(state, teammate, input);
 		default:
@@ -1302,6 +1420,8 @@ function told(line: EffortLine): string | undefined {
 			return line.by === "human" ? "you lifted your pause" : line.by === "lead" ? "the Lead lifted its pause" : "the usage pause lifted";
 		case "permission-denied":
 			return `${line.teammate} was denied \`${line.tool}\`${line.reason === undefined ? "" : `: ${line.reason}`}`;
+		case "request-settled":
+			return settledText(line.teammate, line.request, line.how);
 		default:
 			return undefined;
 	}
@@ -1355,7 +1475,13 @@ function reportSections(state: EffortState, modes: readonly { role: string; mode
 	return [
 		{ title: "Since the last Report", lines: since.flatMap((line) => { const text = told(line); return text === undefined || !("at" in line) ? [] : [`${clock(line.at)} ${text}`]; }) },
 		{ title: "Plan", lines: [...plan, ...reasons] },
-		{ title: "Waiting on you", lines: state.pending.map((item) => `\`${item.id}\`: approve the Brief, ${item.path} (sha256 ${item.sha256}), in \`/team pending\``) },
+		{
+			title: "Waiting on you",
+			lines: [
+				...state.pending.map((item) => `\`${item.id}\`: approve the Brief, ${item.path} (sha256 ${item.sha256}), in \`/team pending\``),
+				...waitingInTerminal(state).map((held) => `\`${held.request}\`: ${terminalText(held)}`),
+			],
+		},
 		{ title: "Decided for you", lines: of("decided-for-you").map((line) => `${clock(line.at)} ${line.what}${line.task === undefined ? "" : ` (Task \`${line.task}\`)`}`) },
 		{
 			title: "Teammate modes",
