@@ -178,7 +178,7 @@ const ReportParams = Type.Object({
 		),
 	),
 	found: Type.Optional(
-		Type.Array(Type.String(), { description: "Work found since the last Report that is outside the Brief: kept as suggestions for the final Report, never started." }),
+		Type.Array(Type.String(), { description: "Only new work found outside the Brief since the last Report, kept as suggestions for the final Report, never started. Each Report reply lists the found work already on record: don't repeat or reword any of it." }),
 	),
 	final: Type.Optional(
 		Type.Boolean({
