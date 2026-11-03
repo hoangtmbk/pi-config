@@ -255,7 +255,7 @@ export interface TeammateLaunch {
 	effortDir: string;
 	/** The Teammate's own folder, which the launch files are written to. */
 	dir: string;
-	/** The `--settings` file's object, added to the human's own settings. */
+	/** The `--settings` file's object, added to the human's own settings; its `env` gains `TEAM_LAUNCH`. */
 	settings: Record<string, unknown>;
 	/** The `--append-system-prompt-file` text. */
 	prompt: string;
@@ -270,13 +270,19 @@ export interface TeammateLaunch {
  * `--name` and the prompt come last: `--add-dir`, `--allowedTools`,
  * `--disallowedTools`, `--mcp-config` and `--plugin-dir` each take any number
  * of values, and would otherwise swallow the prompt as one more.
+ *
+ * The settings' `env` also carries the pointer as `TEAM_LAUNCH`: Claude Code
+ * raises the launch prompt through the mod's `prompt.submit` with the
+ * composer's origin, as it does a prompt the human types, and nothing else in
+ * the event tells them apart, so the mod knows the launch prompt by its text.
  */
 export function teammateArgs(launch: TeammateLaunch): string[] {
 	const { role } = launch;
 	mkdirSync(launch.dir, { recursive: true });
 	const settings = join(launch.dir, "settings.json");
 	const prompt = join(launch.dir, "prompt.md");
-	writeFileSync(settings, `${JSON.stringify(launch.settings, null, 2)}\n`);
+	const env = { ...(launch.settings.env as Record<string, string> | undefined), TEAM_LAUNCH: launch.pointer };
+	writeFileSync(settings, `${JSON.stringify({ ...launch.settings, env }, null, 2)}\n`);
 	writeFileSync(prompt, launch.prompt);
 	const args = ["--bg"];
 	if (role.model !== undefined) args.push("--model", role.model);

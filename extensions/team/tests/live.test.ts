@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { type Case, CASES, hookLines, journalLines, LiveEffort, MANUAL, parseArgs, runCases } from "../test.ts";
-import { fakeClaude, tempRoots } from "./harness.ts";
+import { type FakeHookStep, fakeClaude, tempRoots } from "./harness.ts";
 
 const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 const LIVE_RUNNER = "extensions/team/test.ts";
@@ -88,6 +88,40 @@ describe("running cases against the fake claude", () => {
 		assert.match(printed[0], /^FAIL {2}failing: deliberate/);
 		assert.match(printed[1], /^ok {4}passing/);
 		assert.ok(claude.calls().some((call) => call[0] === "stop"), `no claude stop in ${JSON.stringify(claude.calls())}`);
+	});
+
+	/** The launch prompt as Claude Code 2.1.317 raises it through the mods: with the composer's origin, as if the human typed it. */
+	const LAUNCH_PROMPT: FakeHookStep = { mod: "prompt.submit", input: { text: "{pointer}", origin: { kind: "composer" }, wait: false } };
+
+	it("runs the inbox case: the launch prompt, raised with the composer's origin, is not journalled as the human's", async () => {
+		const { live } = effort({ hooks: [{ event: "SessionStart" }, LAUNCH_PROMPT, { event: "UserPromptSubmit" }, { event: "Stop" }], replies: [{ event: "UserPromptSubmit" }, { event: "Stop" }] });
+		await live.open();
+		const printed: string[] = [];
+
+		const failures = await runCases(CASES.filter((each) => each.name === "inbox"), live, (line) => printed.push(line));
+		live.finish();
+
+		assert.equal(failures, 0, printed.join("\n"));
+	});
+
+	it("journals a prompt the human types after the launch prompt, and only that one", async () => {
+		const { claude, live } = effort({ hooks: [{ event: "SessionStart" }, LAUNCH_PROMPT, { event: "UserPromptSubmit" }, { event: "Stop" }] });
+		await live.open();
+		const teammate = await live.launch("Reply with exactly LIVE-ONE and nothing else, then stop. Use no tools.");
+		await teammate.stop(1);
+
+		await claude.terminal(teammate.name, [{ mod: "prompt.submit", input: { text: "use the other store", origin: { kind: "composer" }, wait: false } }]);
+
+		const human = await teammate.wait("the typed prompt journalled", (lines) => {
+			const mod = lines.filter((line) => line.from === "mod");
+			return mod.length > 0 ? mod : undefined;
+		});
+		await live.reap();
+		live.finish();
+		assert.deepEqual(
+			human.map((line) => ({ event: line.event, payload: line.payload })),
+			[{ event: "prompt.submit", payload: { text: "use the other store" } }],
+		);
 	});
 
 	it("runs the fragile-dependency case: version and get_usage", async () => {

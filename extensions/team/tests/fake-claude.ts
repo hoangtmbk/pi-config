@@ -65,6 +65,10 @@
  *   them. Their `$` has `env.get` (the `--settings` file's `env` over the
  *   process's), `process.run`, which runs the command with its `stdin`, and
  *   `command.register`; the engine's own behaviour beneath them does nothing.
+ *   `{pointer}` in the input's `text` stands for the session's pointer: a
+ *   launch step `{ mod: "prompt.submit", input: { text: "{pointer}", origin:
+ *   { kind: "composer" } } }` is the launch prompt as Claude Code 2.1.317
+ *   raises it, with the composer's origin, like a prompt the human typed.
  * - `claude --fake-terminal <json {name, steps}>` plays steps, as in
  *   `FAKE_CLAUDE_HOOKS`, on the session named `name`: the human at its
  *   terminal later on, after the launch returned.
@@ -439,7 +443,8 @@ function playSteps(steps: HookStep[], session: Session, pointer: string): void {
 	for (const step of steps) {
 		if (step.when !== undefined && !pointer.includes(step.when)) continue;
 		if ("mod" in step) {
-			execFileSync(process.execPath, [process.argv[1] ?? "", "--fake-mod", JSON.stringify({ session, event: step.mod, input: step.input })], { stdio: ["ignore", "ignore", "inherit"] });
+			const input = typeof step.input.text === "string" ? { ...step.input, text: step.input.text.replaceAll("{pointer}", pointer) } : step.input;
+			execFileSync(process.execPath, [process.argv[1] ?? "", "--fake-mod", JSON.stringify({ session, event: step.mod, input })], { stdio: ["ignore", "ignore", "inherit"] });
 			continue;
 		}
 		if ("statusLine" in step) {
