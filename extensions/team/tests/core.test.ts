@@ -2314,6 +2314,30 @@ describe("usage readings", () => {
 		assert.equal(report(lines, "2026-11-02T12:35:00.000Z")?.[0], "Account, from get_usage at 12:30 UTC: 5h 4% (reset since the Effort began) · week n/a. It includes your own use outside the Team.");
 	});
 
+	it("reads the same reset moment from two sources as no reset, and a later or past one as a reset", () => {
+		const get = (at: string, percent: number, resetsAt: string): EffortInput => ({ kind: "usage", reading: { source: "get-usage", at, rateLimits: true, fiveHour: { percent, resetsAt } } });
+		const first = statusLine("dev-1", "2026-11-09T00:30:00.000Z", { fiveHour: { percent: 12, resetsAt: "2026-11-09T02:00:00.000Z" } });
+		const head = (lines: EffortInput[]) => report(lines.reduce(applied, staffed), "2026-11-09T01:00:00.000Z")?.[0];
+
+		// The same moment, spelled two ways: a change, not a reset.
+		assert.equal(head([first, get("2026-11-09T00:50:00.000Z", 13, "2026-11-09T01:59:59.661968+00:00")]), "Account, from get_usage at 00:50 UTC: 5h 13% (+1 since the Effort began) · week n/a. It includes your own use outside the Team.");
+		// Moved later by hours: the window reset.
+		assert.match(head([first, get("2026-11-09T00:50:00.000Z", 3, "2026-11-09T07:00:00.000Z")]) ?? "", /5h 3% \(reset since the Effort began\)/);
+		// The reading is past the first reset time, whatever it says of the next.
+		assert.match(head([first, get("2026-11-09T02:10:00.000Z", 3, "2026-11-09T02:00:00.000Z")]) ?? "", /5h 3% \(reset since the Effort began\)/);
+		// An unparseable time is no evidence of a reset.
+		assert.match(head([first, get("2026-11-09T00:50:00.000Z", 14, "soon")]) ?? "", /5h 14% \(\+2 since the Effort began\)/);
+	});
+
+	it("leaves a Role with no spend yet out of the usage", () => {
+		const lines = [
+			statusLine("dev-1", "2026-11-02T11:30:00.000Z", { tokens: 40_000, costUsd: 0.5 }),
+			statusLine("architect-1", "2026-11-02T11:30:00.000Z", { tokens: 0, costUsd: 0 }),
+		].reduce(applied, staffed);
+
+		assert.deepEqual(report(lines, "2026-11-02T12:05:00.000Z")?.slice(1), ["By Role: dev 40k tokens ≈ $0.50. *API-price equivalent, not your bill.*"]);
+	});
+
 	it("sums each Role's tokens and estimate across session ids, a value that drops counting as a reset, labelled as not the bill", () => {
 		const lines = [
 			statusLine("dev-1", "2026-11-02T11:30:00.000Z", { tokens: 40_000, costUsd: 0.5 }),

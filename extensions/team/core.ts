@@ -3671,6 +3671,18 @@ export function usageSource(reading: UsageReading): string {
 }
 
 /**
+ * Whether a window reset since its first reading: its reset time moved later by
+ * more than the sources' rounding (they spell one moment differently), or the
+ * reading is past the first reset time. An unparseable time says nothing.
+ */
+function windowReset(firstResetsAt: string | undefined, nowResetsAt: string | undefined, readAt: string): boolean {
+	const first = Date.parse(firstResetsAt ?? "");
+	if (Number.isNaN(first)) return false;
+	const moved = Date.parse(nowResetsAt ?? "") - first;
+	return moved > 60 * 60 * 1000 || Date.parse(readAt) > first;
+}
+
+/**
  * The Report's usage: the freshest account reading with its change since the
  * Effort began, each Role's tokens and estimate summed across its Teammates'
  * sessions, and the Lead's own cost. Empty with no reading and no Lead cost.
@@ -3681,7 +3693,7 @@ function usageLines(state: EffortState, leadCostUsd: number | undefined): string
 	if (usage !== undefined) {
 		const window = (label: string, now: UsageWindow | undefined, first: UsageWindow | undefined): string => {
 			if (now === undefined) return `${label} n/a`;
-			const reset = first?.resetsAt !== undefined && now.resetsAt !== undefined && first.resetsAt !== now.resetsAt;
+			const reset = windowReset(first?.resetsAt, now.resetsAt, usage.latest.at);
 			const change = first === undefined ? "" : reset ? " (reset since the Effort began)" : ` (${now.percent - first.percent >= 0 ? "+" : ""}${Math.round(now.percent - first.percent)} since the Effort began)`;
 			return `${label} ${Math.round(now.percent)}%${change}`;
 		};
@@ -3696,6 +3708,7 @@ function usageLines(state: EffortState, leadCostUsd: number | undefined): string
 				sum.tokens += each.tokens + each.banked.tokens;
 				sum.costUsd += each.costUsd + each.banked.costUsd;
 			}
+			if (sum.tokens === 0) continue;
 			byRole.set(teammate.role, sum);
 		}
 		if (byRole.size > 0) {
