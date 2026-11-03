@@ -104,7 +104,7 @@ import {
 	writeTask,
 } from "./records.ts";
 import { repoRoot } from "./repo.ts";
-import { askedQuestions, terminalText } from "./requests.ts";
+import { askedInFull, askedQuestions, terminalText } from "./requests.ts";
 import { REPORT_OVERLAY, type ReportChrome, ReportView, type ReportTui } from "./reports-view.ts";
 import { addTaskWorkspace, addWorkspace, effortWorktrees, endWorktrees, mergeEvidence, mergeTaskWorkspace, removeTaskWorkspace } from "./workspace.ts";
 import {
@@ -1508,7 +1508,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			return text ? { text } : undefined;
 		}
 		if (escalation.kind === "permission") {
-			const picked = await ctx.ui.select([...head, `It asks for ${escalation.question}.`].join("\n"), [ALLOW, DENY, LATER]);
+			// The whole call, not the line the Report shows: the human decides on what would run.
+			const request = state.teammateRequests[escalation.id];
+			const asks = request ? askedInFull(request) : escalation.question;
+			const picked = await ctx.ui.select([...head, asks.includes("\n") ? `It asks for ${asks}` : `It asks for ${asks}.`].join("\n"), [ALLOW, DENY, LATER]);
 			if (picked !== ALLOW && picked !== DENY) return undefined;
 			const decision = picked === ALLOW ? "allow" : "deny";
 			const reason = await ctx.ui.input(decision === "deny" ? `Why not? ${escalation.teammate} reads it:` : "Why? The Lead and the next Report read it:");

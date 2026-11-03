@@ -2235,6 +2235,20 @@ describe("escalating to the human: team_escalate and /team pending", () => {
 		assert.equal(JSON.parse(await pi.call("team_status", {})).waitingOnYou, 0);
 	});
 
+	it("shows the human the whole multi-line command an escalated permission would run, not its first line (#122)", async () => {
+		const script = ["set -euo pipefail", "npm version patch", "npm publish", "git push --follow-tags"].join("\n");
+		const { pi, request, hook } = await asking({ tool_name: "Bash", tool_input: { command: script, description: "Release" } });
+		await pi.call("team_escalate", { request, summary: "Publishing is outside the Brief." });
+
+		pi.answer("Deny", "Not this release.");
+		await pi.team("pending");
+
+		const [asked] = pi.dialogs.slice(-2);
+		assert.equal(asked.kind, "select");
+		assert.ok(asked.title.includes(script), asked.title);
+		await printed(hook);
+	});
+
 	it("asks the human an escalated AskUserQuestion's own options, and keeps the answer in clarifications.md beside an unchanged brief.md", async () => {
 		const { pi, dir, request, hook } = await asking(FORMAT_QUESTIONS);
 		const brief = sha(readFileSync(join(dir, "brief.md")));

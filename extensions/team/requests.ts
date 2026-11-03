@@ -180,6 +180,17 @@ export function askedText(held: HeldRequest): string {
 	return `\`${held.tool}\` \`${gist(held.input)}\``;
 }
 
+/**
+ * What a held permission request would run, uncut, for the human deciding it
+ * in `/team pending`: {@link askedText} with the whole command, file or URL, or
+ * the whole input, on its own lines when it spans several.
+ */
+export function askedInFull(held: HeldRequest): string {
+	if (held.tool === QUESTION_TOOL) return askedText(held);
+	const whole = named(held.input) ?? JSON.stringify(held.input);
+	return whole.includes("\n") ? `\`${held.tool}\`, running:\n${whole}` : `\`${held.tool}\` \`${whole}\``;
+}
+
 /** What a request is, as a pending item names it: a `Bash` prompt, or a question. */
 export function requestKind(held: HeldRequest): string {
 	return held.tool === QUESTION_TOOL ? "question" : `\`${held.tool}\` prompt`;
