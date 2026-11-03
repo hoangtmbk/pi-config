@@ -3559,7 +3559,14 @@ function report(state: EffortState, input: Extract<EffortInput, { kind: "report"
 	if (problems.length > 0) {
 		return { ok: false, refusal: `The Report for Effort \`${state.effortId}\` can't be written until these are fixed:\n${problems.map((problem) => `- ${problem}`).join("\n")}` };
 	}
-	const found: EffortLine[] = (input.found ?? []).map((what) => what.trim()).filter((what) => what !== "").map((what) => ({ type: "found-work", what, at: input.at }));
+	// Found work is logged once: text already on record, or repeated within this Report, is dropped (trimmed, case-insensitive).
+	const onRecord = new Set(state.found.map((each) => each.what.trim().toLowerCase()));
+	const found: EffortLine[] = [];
+	for (const what of (input.found ?? []).map((each) => each.trim()).filter((each) => each !== "")) {
+		if (onRecord.has(what.toLowerCase())) continue;
+		onRecord.add(what.toLowerCase());
+		found.push({ type: "found-work", what, at: input.at });
+	}
 	const now = found.reduce(apply, state);
 	const n = state.reports + 1;
 	const usage = { title: "Usage", lines: usageLines(now, input.leadCostUsd) };
@@ -3573,8 +3580,14 @@ function report(state: EffortState, input: Extract<EffortInput, { kind: "report"
 		state,
 		[...found, { type: "report-written", n, ...(input.final ? { final: true as const } : {}), at: input.at }],
 		[{ kind: "write-report", report: written }],
-		`${input.final ? "The final Report" : "Report"} ${n} of Effort \`${state.effortId}\` is written as ${file}. The human sees it in chat, so don't repeat it.`,
+		`${input.final ? "The final Report" : "Report"} ${n} of Effort \`${state.effortId}\` is written as ${file}. The human sees it in chat, so don't repeat it.${input.final ? "" : foundOnRecord(now)}`,
 	);
+}
+
+/** The found work already on record, told to the Lead so the next Report's `found` has only new items; empty when there is none. */
+function foundOnRecord(state: EffortState): string {
+	if (state.found.length === 0) return "";
+	return `\nFound work already on record (${state.found.length}), don't report these again, not even reworded:\n${state.found.map((each) => `- ${each.what}`).join("\n")}`;
 }
 
 /** What keeps a final Report from being written: a criterion without evidence, or a proposed change that isn't well formed. */

@@ -1682,6 +1682,29 @@ describe("reporting", () => {
 		assert.deepEqual(section(third, "Found work"), ["2 found so far outside the Brief, kept as suggestions for the final Report; none new since the last Report."], "the running count stays in a Report with nothing new");
 	});
 
+	it("tells the Lead which found work is already on record, so it isn't reported again (#123)", () => {
+		const none = run(planned, report("2026-11-02T11:15:00.000Z"));
+		assert.ok(none.ok);
+		assert.doesNotMatch(none.reply ?? "", /on record/, "nothing to list before anything is found");
+
+		const first = run(planned, report("2026-11-02T11:15:00.000Z", { found: ["The cache key is also misspelt in docs."] }));
+		assert.ok(first.ok);
+		assert.match(first.reply ?? "", /Found work already on record \(1\), don't report these again, not even reworded:\n- The cache key is also misspelt in docs\./);
+
+		const second = run(applied(planned, report("2026-11-02T11:15:00.000Z", { found: ["The cache key is also misspelt in docs."] })), report("2026-11-02T12:00:00.000Z", { found: ["`old-config` has no tests."] }));
+		assert.ok(second.ok);
+		assert.match(second.reply ?? "", /on record \(2\)[^]*\n- The cache key is also misspelt in docs\.\n- `old-config` has no tests\./);
+	});
+
+	it("logs found work once when the same text comes again, ignoring case and spacing (#123)", () => {
+		const first = applied(planned, report("2026-11-02T11:15:00.000Z", { found: ["Docs misspell the key.", "  docs misspell the KEY.  "] }));
+		assert.equal(fold(first).found.length, 1, "twice in one Report is one item");
+		const second = run(first, report("2026-11-02T12:00:00.000Z", { found: [" DOCS MISSPELL THE KEY. "] }));
+		assert.ok(second.ok);
+		assert.equal(second.state.found.length, 1);
+		assert.deepEqual(section(second, "Found work"), ["1 found so far outside the Brief, kept as suggestions for the final Report; none new since the last Report."]);
+	});
+
 	it("lists what waits on the human whenever something does", () => {
 		const asked = applied([OPENED], request("b".repeat(64)));
 		const approved2 = applied(asked, { kind: "answer", id: "r1", answer: "approved", at: "2026-11-02T11:00:00.000Z" });
