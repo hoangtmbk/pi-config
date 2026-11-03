@@ -360,8 +360,13 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	let effort: HeldEffort | undefined;
 	// The Lead bridge the held Effort's hooks ring, open while this session is its Lead.
 	let bridge: Promise<Bridge> | undefined;
-	/** The Teammates being stopped and launched afresh right now, whose journals aren't read until that is on record. */
-	const relaunching = new Set<string>();
+	/**
+	 * The Teammates being stopped right now, some to be launched afresh, whose
+	 * journals aren't read until the lines that end or relaunch them are on
+	 * record: the `SessionEnd` their `claude stop` causes is then no crash, and
+	 * a new session's lines go to its new Task.
+	 */
+	const stopping = new Set<string>();
 	// Whether the Lead's model is working on a prompt, and what wakes about Teammates wait for it to settle.
 	let busy = false;
 	let waiting: string[] = [];
@@ -743,8 +748,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		let models: Record<string, string> | undefined | null = null;
 		for (const { id, cursor } of state.teammates) {
 			if (only !== undefined && id !== only) continue;
-			// A Teammate being started afresh is read once its relaunch is on record, so its new session's lines go to its new Task.
-			if (relaunching.has(id)) continue;
+			// A Teammate being stopped is read once the lines that end or relaunch it are on record.
+			if (stopping.has(id)) continue;
 			const sent = sentTo(held, state, id);
 			for (const read of readJournal(held.paths, id, cursor ?? 0)) {
 				const due = currentResult(state, id);
@@ -1241,28 +1246,47 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	}
 
 	/** Carry out a step's actions in order, then append its lines: records are written before the line that claims them. */
-	async function carryOut(held: HeldEffort, result: Extract<Step, { ok: true }>, launch: (action: Extract<EffortAction, { kind: "launch-teammate" }>) => Promise<void>): Promise<string[]> {
-		const notes: string[] = [];
-		for (const action of result.actions) {
-			if (action.kind === "write-plan") writePlan(held.paths, result.state);
-			else if (action.kind === "launch-teammate") await launch(action);
-			else if (action.kind === "stop-teammate") {
-				const stopped = await stopTeammate(result.state, action);
-				if (stopped) throw new Error(`Teammate \`${action.teammate}\` couldn't be stopped with \`claude stop ${action.shortId}\` (${stopped.error}), so nothing was re-planned. Stop and tell the human.`);
-			} else if (action.kind === "remove-task-workspace" && result.state.workspace) {
-				// Not forced, and from the Workspace so `branch -d` weighs the Effort branch: uncommitted or unmerged work stays.
-				const left = removeTaskWorkspace(result.state.workspace.path, action);
-				if (left) notes.push(`Task \`${action.slug}\`'s worktree \`${action.path}\` or branch \`${action.branch}\` is left in place, since git refused to remove it: ${left} Tell the human, who can merge or delete it.`);
+	function carryOut(held: HeldEffort, result: Extract<Step, { ok: true }>, launch: (action: Extract<EffortAction, { kind: "launch-teammate" }>) => Promise<void>): Promise<string[]> {
+		return whileStopping(result.actions, async () => {
+			const notes: string[] = [];
+			for (const action of result.actions) {
+				if (action.kind === "write-plan") writePlan(held.paths, result.state);
+				else if (action.kind === "launch-teammate") await launch(action);
+				else if (action.kind === "stop-teammate") {
+					const stopped = await stopTeammate(result.state, action);
+					if (stopped) throw new Error(`Teammate \`${action.teammate}\` couldn't be stopped with \`claude stop ${action.shortId}\` (${stopped.error}), so nothing was re-planned. Stop and tell the human.`);
+				} else if (action.kind === "remove-task-workspace" && result.state.workspace) {
+					// Not forced, and from the Workspace so `branch -d` weighs the Effort branch: uncommitted or unmerged work stays.
+					const left = removeTaskWorkspace(result.state.workspace.path, action);
+					if (left) notes.push(`Task \`${action.slug}\`'s worktree \`${action.path}\` or branch \`${action.branch}\` is left in place, since git refused to remove it: ${left} Tell the human, who can merge or delete it.`);
+				}
 			}
+			appendLines(held.paths, result.append);
+			return notes;
+		});
+	}
+
+	/**
+	 * Run `carry`, which stops the Teammates `actions` name before it appends
+	 * the lines that end them, holding their journals back until it is done
+	 * (see {@link stopping}).
+	 */
+	async function whileStopping<T>(actions: readonly EffortAction[], carry: () => Promise<T>): Promise<T> {
+		const ids = actions.flatMap((action) => (action.kind === "stop-teammate" && !stopping.has(action.teammate) ? [action.teammate] : []));
+		for (const id of ids) stopping.add(id);
+		try {
+			return await carry();
+		} finally {
+			for (const id of ids) stopping.delete(id);
 		}
-		appendLines(held.paths, result.append);
-		return notes;
 	}
 
 	/**
 	 * Stop a Teammate with `claude stop`, which keeps its conversation for the
 	 * human to read. One already idle-stopped needs none: a failed stop counts
-	 * only while `claude agents --json` still lists it, or can't be read.
+	 * only while `claude agents --json` still lists it, or can't be read. Its
+	 * `SessionEnd` reads as a crash unless the line that ends it is on record
+	 * by then: append that line first, or stop it {@link whileStopping}.
 	 */
 	async function stopTeammate(state: EffortState, action: Extract<EffortAction, { kind: "stop-teammate" }>): Promise<{ error: string } | undefined> {
 		const stopped = await stopBackground(paths.claudePath, action.shortId);
@@ -1278,16 +1302,9 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * The clear is on record before its marker goes, since the `SessionStart`
 	 * it causes is what sends the Task's pointer.
 	 */
-	async function staffTask(held: HeldEffort, result: Extract<Step, { ok: true }>, body?: string): Promise<void> {
-		// A launch under an id the Effort already has is a fresh session for that Teammate: its journal waits for the lines.
-		const known = new Set(effortState(held).teammates.map((teammate) => teammate.id));
-		const fresh = result.actions.flatMap((action) => (action.kind === "launch-teammate" && known.has(action.teammate.id) ? [action.teammate.id] : []));
-		for (const id of fresh) relaunching.add(id);
-		try {
-			await staffTaskNow(held, result, body);
-		} finally {
-			for (const id of fresh) relaunching.delete(id);
-		}
+	function staffTask(held: HeldEffort, result: Extract<Step, { ok: true }>, body?: string): Promise<void> {
+		// An idle Teammate stopped to make room, or to start afresh under its id, waits for the lines: its new session's go to its new Task.
+		return whileStopping(result.actions, () => staffTaskNow(held, result, body));
 	}
 
 	/** {@link staffTask}, past the journal hold. */
@@ -1435,12 +1452,14 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		// Cancelling ends the Effort as `/team cancel` does.
 		if (result.actions.some((action) => action.kind === "end-effort")) return carryOutEnd(held, state, result, ctx);
 		const texts: string[] = [];
-		for (const action of result.actions) {
-			if (action.kind !== "stop-teammate") continue;
-			const failed = await stopTeammate(result.state, action);
-			if (failed) texts.push(`\`${action.teammate}\` didn't stop with \`claude stop ${action.shortId}\` (${failed.error}); tell the human.`);
-		}
-		appendLines(held.paths, result.append);
+		await whileStopping(result.actions, async () => {
+			for (const action of result.actions) {
+				if (action.kind !== "stop-teammate") continue;
+				const failed = await stopTeammate(result.state, action);
+				if (failed) texts.push(`\`${action.teammate}\` didn't stop with \`claude stop ${action.shortId}\` (${failed.error}); tell the human.`);
+			}
+			appendLines(held.paths, result.append);
+		});
 		texts.unshift(...(await afterUsage(held, result)));
 		ctx.ui.notify(result.reply ?? "", "info");
 		wakeAboutTeammates(texts);
@@ -1677,12 +1696,14 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			if (action.kind === "record-sign-off") recordApproval(held.paths, { act: "sign-off", request: action.approval.id, report: action.approval.sha256, at: action.at });
 		}
 		const unstopped: string[] = [];
-		for (const action of result.actions) {
-			if (action.kind !== "stop-teammate") continue;
-			const failed = await stopTeammate(state, action);
-			if (failed) unstopped.push(`\`${action.teammate}\` (${failed.error})`);
-		}
-		appendLines(held.paths, result.append);
+		await whileStopping(result.actions, async () => {
+			for (const action of result.actions) {
+				if (action.kind !== "stop-teammate") continue;
+				const failed = await stopTeammate(state, action);
+				if (failed) unstopped.push(`\`${action.teammate}\` (${failed.error})`);
+			}
+			appendLines(held.paths, result.append);
+		});
 		for (const action of result.actions) {
 			if (action.kind === "wake-lead") wakeLead("team-pending", action.text);
 			else if (action.kind === "end-effort") await endEffort(held, state, result.reply ?? "", unstopped, ctx);

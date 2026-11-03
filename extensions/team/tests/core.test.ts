@@ -811,6 +811,24 @@ describe("staffing a handoff", () => {
 		);
 	});
 
+	it("takes the `SessionEnd` of the idle Teammate it stopped to make room as no crash, so the room isn't freed twice", () => {
+		const designed = accepted(stops(applied(planned, handoff("design", { max: 2 })), "architect-1"), "architect-1", 2);
+		const swapped = applied(applied(designed, handoff("rename", { max: 2 })), handoff("tests", { max: 2, at: "2026-11-02T14:00:00.000Z" }));
+		const cursor = (fold(swapped).teammates.find((each) => each.id === "architect-1")?.cursor ?? 0) + 1;
+
+		const ended = run(swapped, {
+			kind: "journal",
+			teammate: "architect-1",
+			cursor,
+			line: { from: "hook", at: "2026-11-02T14:00:01.000Z", event: "SessionEnd", payload: { reason: "other" } },
+			result: { path: "", written: false },
+		});
+
+		assert.ok(ended.ok, ended.ok ? "" : ended.refusal);
+		assert.deepEqual(ended.append, []);
+		assert.deepEqual(ended.actions, [], "no wake, and no queued Task starts in the room the swap took");
+	});
+
 	it("staggers starts at most one every 5 s, counting from the last start", () => {
 		const first = run(planned, handoff("design"));
 		assert.ok(first.ok);

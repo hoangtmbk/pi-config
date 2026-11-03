@@ -2672,6 +2672,10 @@ describe("a Teammate's lifecycle", () => {
 		assert.match(reply, /Dropped Task `rename-key`, and stopped `builder-1` with `claude stop`/);
 		assert.ok(pi.claude.calls().some((argv) => argv[0] === "stop" && argv[1] === session.shortId), JSON.stringify(pi.claude.calls()));
 		assert.equal(pi.claude.agents().find((agent) => agent.name === BUILDER_1)?.live, false);
+		await pi.call("team_status", {});
+		assert.deepEqual(effortLines(dir).filter((line) => line.type === "teammate-crashed"), [], "the SessionEnd of its own `claude stop` is no crash");
+		assert.deepEqual(effortLines(dir).filter((line) => line.type === "teammate-ended").map((line) => line.how), ["stopped"]);
+		assert.ok(!teammateWakes(pi.sent).some((wake) => /session ended/.test(wake.content)), "nobody is woken about the stop");
 		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## Dropped\n+- rename-key: was with `builder-1` \(tasks\/001-builder-rename-key\/\)/);
 		await assert.rejects(pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /rename-key/);
 	});
@@ -2823,6 +2827,13 @@ describe("staffing: the ladder and clearing between Tasks", () => {
 			[["stop", session.shortId]],
 		);
 		assert.equal(pi.claude.launches().length, 2);
+		// The stopped Teammate's SessionEnd lands while the swap is under way: it frees no room the swap hasn't taken already.
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		await pi.call("team_status", {});
+		assert.equal(pi.claude.launches().length, 2, "the queued Task starts once, within the cap");
+		assert.deepEqual(effortLines(dir).filter((line) => line.type === "teammate-started").map((line) => line.id), ["builder-1", "scout-1"]);
+		assert.deepEqual(effortLines(dir).filter((line) => line.type === "teammate-crashed"), []);
+		assert.ok(!teammateWakes(pi.sent).some((wake) => /session ended/.test(wake.content)), "nobody is woken about the stop");
 		assert.equal(pi.claude.launches()[1].argv.at(-1), newTaskPointer(dir, "survey", "002-scout-survey"));
 		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## survey\n[\s\S]*?- Status: [a-z ]+, with `scout-1` \(tasks\/002-scout-survey\/\)/);
 		assert.ok(!(teamBlock(pi) ?? []).some((line) => line.startsWith("│ builder-1")), "a stopped Teammate leaves the block");
@@ -4094,6 +4105,8 @@ describe("ending an Effort: the final Report and sign-off", () => {
 		const stops = pi.claude.calls().filter((argv) => argv[0] === "stop").map((argv) => argv[1]);
 		assert.deepEqual(stops.sort(), [...shortIds].sort());
 		assert.deepEqual(effortLines(dir).at(-1), { type: "effort-ended", how: "signed-off", at: NOW.toISOString() });
+		assert.deepEqual(effortLines(dir).filter((line) => line.type === "teammate-crashed"), [], "the SessionEnds of the sign-off's own stops are no crash");
+		assert.ok(!teammateWakes(pi.sent).some((wake) => /session ended/.test(wake.content)), "nobody is woken about the stops");
 		assert.equal(existsSync(workspace), false);
 		assert.equal(existsSync(clean.path), false);
 		assert.ok(existsSync(join(dirty.path, "notes.txt")));
@@ -4280,6 +4293,41 @@ describe("restarting: picking an Effort up after pi comes back", () => {
 
 		assert.equal(counted(dir, "task-done"), 1, "the doorbell after the replay applies nothing again");
 		assert.equal(again.sent.length, 1);
+	});
+
+	it("replays the SessionEnd of a Teammate it stopped to make room as no crash: no wake, and no Task starts past the cap", async () => {
+		const { roots, repo, pi, dir } = await crewApproved({ settings: { maxTeammates: 1 }, hooks: [{ event: "SessionStart", payload: { source: "startup" } }, ...WORKS], replies: WORKS });
+		await pi.call("team_plan", { tasks: STAFF_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
+		assert.match(await pi.call("team_review", { slug: "rename-key", verdict: "accept" }), /stopped idle `builder-1`/);
+		await pi.emit("session_shutdown", { reason: "quit" });
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.equal(counted(dir, "teammate-crashed"), 0);
+		assert.equal(pi.claude.launches().length, 2, "no Teammate starts past the cap");
+		assert.ok(!again.sent.some((message) => /session ended/.test(message.content)), again.sent.map((message) => message.content).join("\n---\n"));
+	});
+
+	it("reads the SessionEnd of a `claude stop` pi died during, before the drop it was for went on record, as the end it is", async () => {
+		const { roots, repo, pi, dir } = await renameReported();
+		await until(() => counted(dir, "task-done") === 1, "builder-1 reports round 1");
+		await pi.call("team_plan", { tasks: [{ slug: "rename-key-everywhere", role: "builder", goal: "Rename the key, docs too.", criteria: ["AC1"] }, { ...CREW_PLAN[1], dependsOn: ["rename-key-everywhere"] }, CREW_PLAN[2]] });
+		await pi.emit("session_shutdown", { reason: "quit" });
+		// pi died once `claude stop` was done, before the re-plan's lines went on record.
+		const lines = readFileSync(join(dir, "effort.jsonl"), "utf8").split("\n").filter(Boolean);
+		const replanned = lines.map((line) => JSON.parse(line).type).lastIndexOf("plan-written");
+		writeFileSync(join(dir, "effort.jsonl"), `${lines.slice(0, replanned).join("\n")}\n`);
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.equal(counted(dir, "teammate-crashed"), 1, "nothing on record claims the stop, and builder-1 is gone");
+		assert.equal(counted(dir, "task-dropped"), 0, "the drop never happened: the Lead re-plans again");
+		const [wake] = awayWakes(again.sent);
+		assert.match(wake?.content ?? "", /`builder-1`'s session ended \(other\) during round 1 of Task `rename-key`/);
 	});
 
 	it("abandons a launch that never got in, leaving the Task planned and saying so once", async () => {
