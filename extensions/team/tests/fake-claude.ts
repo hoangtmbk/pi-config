@@ -81,7 +81,8 @@
  *   session, `<session id>.json` ({@link Agent}), as Claude Code's own
  *   registry of background sessions. `agents --json` prints the live ones as
  *   a JSON array; `stop <short id>` ends one, keeping its record, as the real
- *   one keeps the conversation; `--bg --resume <session id> <message>` wakes one
+ *   one keeps the conversation, and plays `SessionEnd` with reason `other`
+ *   first, as the real one fires it; `--bg --resume <session id> <message>` wakes one
  *   with a new socket, plays `SessionStart` with `source:
  *   "resume"`, then plays `FAKE_CLAUDE_REPLIES` with the message as its
  *   pointer. A session idle-stops when its record says `live: false` and its
@@ -166,6 +167,7 @@ async function main(): Promise<void> {
 			process.stderr.write(`fake claude: no running session ${argv[1]}\n`);
 			process.exit(1);
 		}
+		playSteps([{ event: "SessionEnd", payload: { reason: "other" } }], { ...agent, id: agent.sessionId ?? agent.id }, "");
 		end(agent);
 		process.exit(0);
 	}

@@ -2793,12 +2793,13 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 
 /**
  * A `SessionEnd`. A clear or a resume goes on in a new session, and a
- * Teammate the extension stopped is already over; anything else is a crash,
- * which ends the Teammate and wakes the Lead once, through the cursor.
+ * Teammate the extension stopped, its Task dropped or merged or to make room
+ * under the cap, is already over; anything else is a crash, which ends the
+ * Teammate and wakes the Lead once, through the cursor.
  */
 function sessionEnded(state: EffortState, teammate: Teammate, input: Extract<EffortInput, { kind: "journal" }>): Step {
 	const reason = text(input.line.payload?.reason) ?? "other";
-	if (reason === "clear" || reason === "resume" || teammate.ended !== undefined) return took(state, [], []);
+	if (reason === "clear" || reason === "resume" || !isLive(teammate)) return took(state, [], []);
 	// The old session of a Teammate started afresh ends as the new one starts: that is no crash.
 	const ended = text(input.line.payload?.session_id);
 	if (teammate.relaunching || (ended !== undefined && teammate.sessionId !== undefined && ended !== teammate.sessionId)) return took(state, [], []);
