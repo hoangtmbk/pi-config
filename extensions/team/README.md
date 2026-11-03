@@ -130,8 +130,9 @@ A new Teammate starts as `claude --bg` in the Workspace, named
 
 - `settings.json`, which adds to your own settings: the Teammate's hooks, `crossSessionInbound:
   "accept"`, the Playbook's allow and deny rules for the Role and for `*`, every `escalate` rule
-  as `ask`, and a deny on editing `brief.md`, `clarifications.md`, `approvals.jsonl`,
-  `playbook.md`, `team/**` and `effort.jsonl`;
+  as `ask`, a deny on editing `brief.md`, `clarifications.md`, `approvals.jsonl`,
+  `playbook.md`, `team/**` and `effort.jsonl`, and the mod's `TEAM_HOOK` and `TEAM_LAUNCH` (the
+  launch prompt, which Claude Code hands the mod as if you had typed it, so it is not a Takeover);
 - `prompt.md`, appended to the system prompt: a preamble naming the Teammate, its Role, the Lead
   as its only contact, `AskUserQuestion` for questions, the Task-folder convention, the paths of
   `brief.md` and `clarifications.md`, and that installing dependencies in the fresh Workspace is

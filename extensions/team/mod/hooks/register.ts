@@ -15,7 +15,10 @@
  * command (its argv in the `TEAM_HOOK` variable the Teammate's settings set),
  * which writes the mod line and rings the Lead's doorbell. Only the human's own
  * input counts: the Lead's inbox messages and plugins' runs don't come from
- * the composer. Journalling is best effort and never stands in the human's way.
+ * the composer. The launch prompt does (Claude Code raises the `claude --bg`
+ * prompt with origin `composer`, and `PromptOrigin` has no kind or marker for
+ * it), so it is known by its text, which the launch puts in `TEAM_LAUNCH`.
+ * Journalling is best effort and never stands in the human's way.
  *
  * The types are written out here rather than imported from `claude-code`,
  * which only Claude Code resolves.
@@ -58,7 +61,7 @@ interface Session {
 		run(input: { command: string }): Promise<unknown>;
 		register(command: { name: string; description: string; argumentHint?: string }): Promise<unknown>;
 	};
-	env: { get(name: "TEAM_HOOK"): Promise<string | undefined> };
+	env: { get(name: "TEAM_HOOK" | "TEAM_LAUNCH"): Promise<string | undefined> };
 	process: { run(argv: readonly string[], init?: { stdin?: string }): Promise<unknown> };
 }
 
@@ -83,6 +86,16 @@ async function journal($: Session, event: string, payload: Record<string, unknow
 	}
 }
 
+/** Whether `text` is the prompt the Teammate was launched with, which the Lead wrote, not the human. */
+async function isLaunchPrompt($: Session, text: string): Promise<boolean> {
+	try {
+		const launch = await $.env.get("TEAM_LAUNCH");
+		return launch !== undefined && launch.trim() === text.trim();
+	} catch {
+		return false;
+	}
+}
+
 export const register = (on: On): void => {
 	on("session.receive", ($, event, next) => {
 		if (event.text.includes(CLEAR_MARKER)) {
@@ -100,7 +113,7 @@ export const register = (on: On): void => {
 
 	// A slash command raises `command.run` as well, so the prompt is journalled only when it is one.
 	on("prompt.submit", async ($, event, next) => {
-		if (event.origin.kind === "composer" && event.command === undefined && event.isMeta !== true) await journal($, "prompt.submit", { text: event.text });
+		if (event.origin.kind === "composer" && event.command === undefined && event.isMeta !== true && !(await isLaunchPrompt($, event.text))) await journal($, "prompt.submit", { text: event.text });
 		return next(event);
 	});
 

@@ -131,7 +131,8 @@ export interface FakeClaudeOptions {
  * edit a file in its working directory, committing it when a message is given,
  * or update its status line, which runs the `statusLine.command` of its
  * `--settings` with the payload (the session id and folder filled in), or
- * raise the human's input at its terminal through its mods (`mod`).
+ * raise the human's input at its terminal through its mods (`mod`), `{pointer}`
+ * in its `text` standing for the session's pointer.
  */
 export type FakeHookStep = ({ event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string } | { statusLine: Record<string, unknown> } | { mod: string; input: Record<string, unknown> }) & {
 	/** Play the step only for a pointer that includes this text. */

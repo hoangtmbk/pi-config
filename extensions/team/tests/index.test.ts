@@ -1658,14 +1658,14 @@ describe("handing off: team_handoff", () => {
 			crossSessionInbound: "accept",
 			hooks: hooks("builder-1", builderCwd),
 			statusLine: statusLine("builder-1"),
-			env: { TEAM_HOOK: JSON.stringify([process.execPath, HOOK_SCRIPT, dir, "builder-1"]) },
+			env: { TEAM_HOOK: JSON.stringify([process.execPath, HOOK_SCRIPT, dir, "builder-1"]), TEAM_LAUNCH: pi.claude.launches()[0].argv.at(-1) },
 		});
 		assert.deepEqual(scout, {
 			permissions: { allow: ["Bash(git status)"], deny: ["Bash(curl:*)", ...records], ask },
 			crossSessionInbound: "accept",
 			hooks: hooks("scout-1", scoutCwd),
 			statusLine: statusLine("scout-1"),
-			env: { TEAM_HOOK: JSON.stringify([process.execPath, HOOK_SCRIPT, dir, "scout-1"]) },
+			env: { TEAM_HOOK: JSON.stringify([process.execPath, HOOK_SCRIPT, dir, "scout-1"]), TEAM_LAUNCH: pi.claude.launches()[1].argv.at(-1) },
 		});
 	});
 
