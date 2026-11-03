@@ -127,14 +127,33 @@ function questions(input: Record<string, unknown>): Question[] {
 	});
 }
 
-/** The part of a tool call's input a person reads it by: the command, the file, the URL. */
-function gist(input: Record<string, unknown>): string {
+/** The command, file, path, URL, pattern or query a tool call's input names, in full; undefined when it names none. */
+function named(input: Record<string, unknown>): string | undefined {
 	for (const key of ["command", "file_path", "path", "url", "pattern", "query"]) {
 		const value = input[key];
 		if (typeof value === "string" && value !== "") return value;
 	}
-	const json = JSON.stringify(input);
-	return json.length > 80 ? `${json.slice(0, 79)}…` : json;
+	return undefined;
+}
+
+/** `text` in at most `max` characters, ending in one `…` when it was cut. */
+function shorten(text: string, max: number): string {
+	if (text.length <= max) return text;
+	return `${text.slice(0, max - 1).replace(/…$/, "")}…`;
+}
+
+/**
+ * The part of a tool call's input a person reads it by, in a line: a command's
+ * first line, cut to 100 characters; a file, a URL or the input's JSON, cut to 80.
+ * The Lead is prompted with the full input (`askText`), not this.
+ */
+function gist(input: Record<string, unknown>): string {
+	const command = input.command;
+	if (typeof command === "string" && command !== "") {
+		const [first = "", ...rest] = command.trim().split("\n");
+		return shorten(rest.length > 0 ? `${first}…` : first, 100);
+	}
+	return named(input) ?? shorten(JSON.stringify(input), 80);
 }
 
 function backticked(items: readonly string[]): string {
@@ -343,7 +362,7 @@ export function matchesRule(rule: string, tool: string, input: Record<string, un
 		const command = typeof input.command === "string" ? input.command : "";
 		return fits(command.trim()) || simpleCommands(command).some((words) => fits(words.join(" ")));
 	}
-	const read = gist(input);
+	const read = named(input) ?? JSON.stringify(input);
 	if (prefix !== undefined) return read.startsWith(prefix);
 	return read === content || read.endsWith(`/${content}`);
 }
