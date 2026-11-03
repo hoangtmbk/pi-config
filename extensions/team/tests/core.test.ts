@@ -216,6 +216,12 @@ describe("planning", () => {
 		assert.equal(text.match(/dependency cycle/g)?.length, 1);
 	});
 
+	it("reports a cycle once when a Task names the same dependency twice", () => {
+		const text = refusal(approved, plan([{ ...DESIGN, dependsOn: ["rename"] }, { ...RENAME, dependsOn: ["design", "design"] }]));
+
+		assert.equal(text.match(/dependency cycle/g)?.length, 1, text);
+	});
+
 	it("takes a plan covering every criterion with known Roles, as the whole Task list", () => {
 		const result = run(approved, plan([DESIGN, RENAME]));
 

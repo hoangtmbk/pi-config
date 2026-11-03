@@ -2105,9 +2105,13 @@ function quoted(items: readonly string[]): string {
 	return items.map((item) => `\`${item}\``).join(", ");
 }
 
-/** Each dependency cycle in the plan once, as the slugs around it with the first repeated at the end. Unknown slugs are skipped. */
+/**
+ * The dependency cycles a walk of the plan finds, each once, as the slugs
+ * around it with the first repeated at the end: a plan with a cycle has at
+ * least one listed. Unknown slugs and self-dependencies are skipped.
+ */
 function dependencyCycles(tasks: readonly PlannedTask[]): string[][] {
-	const edges = new Map(tasks.map((task) => [task.slug, task.dependsOn.filter((slug) => slug !== task.slug)]));
+	const edges = new Map(tasks.map((task) => [task.slug, [...new Set(task.dependsOn)].filter((slug) => slug !== task.slug)]));
 	const done = new Set<string>();
 	const path: string[] = [];
 	const cycles: string[][] = [];
