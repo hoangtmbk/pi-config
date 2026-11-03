@@ -2105,6 +2105,28 @@ function quoted(items: readonly string[]): string {
 	return items.map((item) => `\`${item}\``).join(", ");
 }
 
+/** Each dependency cycle in the plan once, as the slugs around it with the first repeated at the end. Unknown slugs are skipped. */
+function dependencyCycles(tasks: readonly PlannedTask[]): string[][] {
+	const edges = new Map(tasks.map((task) => [task.slug, task.dependsOn.filter((slug) => slug !== task.slug)]));
+	const done = new Set<string>();
+	const path: string[] = [];
+	const cycles: string[][] = [];
+	const visit = (slug: string): void => {
+		const at = path.indexOf(slug);
+		if (at >= 0) {
+			cycles.push([...path.slice(at), slug]);
+			return;
+		}
+		if (done.has(slug) || !edges.has(slug)) return;
+		path.push(slug);
+		for (const next of edges.get(slug) ?? []) visit(next);
+		path.pop();
+		done.add(slug);
+	};
+	for (const task of tasks) visit(task.slug);
+	return cycles;
+}
+
 /**
  * The Lead's whole Task list. Every criterion of the Brief must be covered,
  * since dropping one is a Brief change, and only the snapshot's Roles staff
@@ -2139,6 +2161,9 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 			if (slug === task.slug) problems.push(`Task \`${task.slug}\` depends on itself`);
 			else if (!slugs.includes(slug)) problems.push(`Task \`${task.slug}\` depends on \`${slug}\`, which isn't in the plan`);
 		}
+	}
+	for (const cycle of dependencyCycles(tasks)) {
+		problems.push(`dependency cycle: ${cycle.map((slug) => `\`${slug}\``).join(" -> ")}; no Task in it could ever have a result to work from`);
 	}
 	const uncovered = input.criteria.filter((id) => !tasks.some((task) => task.criteria.includes(id)));
 	if (uncovered.length > 0) {

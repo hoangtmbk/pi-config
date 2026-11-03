@@ -204,6 +204,18 @@ describe("planning", () => {
 		assert.match(text, /`Big Task`/);
 	});
 
+	it("refuses a dependency cycle, naming the Tasks around it", () => {
+		const text = refusal(approved, plan([{ ...DESIGN, dependsOn: ["review"] }, RENAME, { slug: "review", role: "qa", goal: "Review.", dependsOn: ["rename"] }]));
+
+		assert.match(text, /dependency cycle: `design` -> `review` -> `rename` -> `design`/);
+	});
+
+	it("reports a cycle once, however many Tasks lead into it", () => {
+		const text = refusal(approved, plan([{ ...DESIGN, dependsOn: ["rename"] }, RENAME, { slug: "qa", role: "qa", goal: "QA.", dependsOn: ["rename", "design"] }]));
+
+		assert.equal(text.match(/dependency cycle/g)?.length, 1);
+	});
+
 	it("takes a plan covering every criterion with known Roles, as the whole Task list", () => {
 		const result = run(approved, plan([DESIGN, RENAME]));
 
