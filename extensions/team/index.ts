@@ -158,7 +158,7 @@ const PlanParams = Type.Object({
 			slug: Type.String({ description: "The Task's kebab-case slug, unique in the Effort." }),
 			role: Type.String({ description: "The Role that does it." }),
 			goal: Type.String({ description: "What the Task is for, in a sentence." }),
-			dependsOn: Type.Optional(Type.Array(Type.String(), { description: "Slugs of the Tasks it waits for." })),
+			dependsOn: Type.Optional(Type.Array(Type.String(), { description: "Slugs of the Tasks it needs a result from: each must be done, in review or accepted, not necessarily accepted." })),
 			criteria: Type.Optional(Type.Array(Type.String(), { description: "Ids of the Brief's acceptance criteria it covers, such as `AC1`." })),
 		}),
 		{ description: "The whole Task list." },
@@ -2005,6 +2005,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		label: "Plan",
 		description: [
 			"Write the Effort's whole Task list: each Task's slug, Role, goal, the Tasks it depends on and the acceptance-criterion ids it covers.",
+			"A Task depends on another when it needs that Task's result to work from, so the other must be done, in review or accepted; accepted is not required, since the architect reviews a diff before the Lead accepts it. Leave a dependency out only when the Task doesn't need that result, since plan.md is what the human reads.",
 			"Refused when a Brief criterion is left uncovered or a Task names a Role the Team doesn't have. Planning again replaces the list; a Task already handed off keeps its Role.",
 			"Writes `plan.md` in the Effort directory as a view. Refused until the human approves the Brief.",
 		].join(" "),
