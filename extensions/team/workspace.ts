@@ -11,9 +11,9 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
-import type { MergeEvidence, Workspace } from "./core.ts";
+import type { MergeEvidence, RunningProcess, Workspace } from "./core.ts";
 import type { WorkspaceKind } from "./definitions.ts";
 
 /** The folder the worktrees go in, relative to the repo root, as a gitignore pattern for that folder. */
@@ -234,33 +234,166 @@ export function mergeEvidence(into: string, branch: string): MergeEvidence | und
 
 /**
  * Remove an isolated Task's worktree and its branch: once merged, or with
- * `force` to undo one whose Teammate never launched. Undefined when both are
- * gone, else what git said.
+ * `force` to undo one whose Teammate never launched. `error` is what git said
+ * when either is left, and `running` the processes still running in the
+ * worktree it removed, which are never stopped, the sessions in `spare` and
+ * their descendants aside (see {@link runningIn}).
  */
-export function removeTaskWorkspace(repo: string, task: { path: string; branch: string }, force = false): string | undefined {
+export function removeTaskWorkspace(repo: string, task: { path: string; branch: string }, force = false, spare: readonly number[] = []): { error?: string; running: RunningProcess[] } {
+	let running: RunningProcess[] = [];
 	try {
-		if (existsSync(task.path)) git(repo, ["worktree", "remove", ...(force ? ["--force"] : []), task.path]);
+		if (existsSync(task.path)) {
+			const found = runningIn(task.path, { spare });
+			git(repo, ["worktree", "remove", ...(force ? ["--force"] : []), task.path]);
+			running = found;
+		}
 		if (hasBranch(repo, task.branch)) git(repo, ["branch", force ? "-D" : "-d", task.branch]);
-		return undefined;
+		return { running };
 	} catch (error) {
-		if (error instanceof GitError) return error.message;
+		if (error instanceof GitError) return { error: error.message, running };
 		throw error;
 	}
 }
 
-/** One of an Effort's worktrees: its Workspace or an isolated Task's, with whether it has uncommitted changes. */
+/**
+ * The processes whose working directory is `dir` or a folder inside it, such
+ * as a server a Teammate started with `&`: `claude stop` never reaches them,
+ * and removing the worktree leaves them running in a folder that is gone.
+ * `dir` is matched in its own spelling and its real path, since `lsof` gives
+ * real paths (`/private/tmp`, not `/tmp`), and only on a folder boundary, so
+ * `/a/wt` doesn't match `/a/wt2`. pi's own process is never one of them, nor
+ * is a process in `spare`, a Teammate's session that sign-off stops, or one
+ * descended from it, such as its Bash tool's shell. lsof's escapes in a name
+ * are undone before it is matched (see {@link unescaped}). None when `lsof` is
+ * missing, fails or hangs past {@link LIST_TIMEOUT_MS}: what removes a
+ * worktree goes ahead all the same.
+ */
+export function runningIn(dir: string, options: { spare?: readonly number[]; lsof?: string } = {}): RunningProcess[] {
+	const roots = new Set([caretted(dir.replace(/(.)\/+$/, "$1"))]);
+	try {
+		roots.add(caretted(realpathSync(dir)));
+	} catch {
+		// Gone already: only its own spelling can match.
+	}
+	const inside = (path: string) => [...roots].some((root) => path === root || path.startsWith(`${root}/`));
+	const found = new Map<number, string>();
+	let pid: number | undefined;
+	let name = "";
+	// `-b` keeps lsof off the kernel calls that can block, as on a stale network mount; a UTF-8 locale keeps it from escaping non-ASCII names.
+	for (const line of output(options.lsof ?? "lsof", ["-b", "-a", "-d", "cwd", "-Fpcn", "-w"], { LC_ALL: "en_US.UTF-8" }).split("\n")) {
+		if (line.startsWith("p")) [pid, name] = [Number(line.slice(1)), ""];
+		else if (line.startsWith("c")) name = line.slice(1);
+		else if (line.startsWith("n") && pid !== undefined && pid !== process.pid && inside(unescaped(line.slice(1)))) found.set(pid, name);
+	}
+	if (found.size > 0 && options.spare !== undefined && options.spare.length > 0) {
+		for (const each of descendants(options.spare)) found.delete(each);
+	}
+	if (found.size === 0) return [];
+	const commands = new Map<number, string>();
+	for (const line of output("ps", ["-o", "pid=,command=", "-p", [...found.keys()].join(",")]).split("\n")) {
+		const match = /^\s*(\d+)\s+(.+)$/.exec(line);
+		if (match) commands.set(Number(match[1]), match[2].trim());
+	}
+	return [...found].map(([each, named]) => ({ pid: each, command: commands.get(each) ?? named }));
+}
+
+/** The C escapes `lsof` writes a name's control characters with. */
+const LSOF_ESCAPES: Record<string, number> = { b: 0x08, f: 0x0c, n: 0x0a, r: 0x0d, t: 0x09, "\\": 0x5c };
+
+/**
+ * A name as `lsof` prints it, its escapes undone: `\xNN` is a byte, so a
+ * name is read as UTF-8 once they are, and `\t`, `\n`, `\r`, `\b`, `\f` and
+ * `\\` are what C means by them. A control character it prints as `^X` stays
+ * so, since a literal `^` is printed as itself: {@link caretted} spells a
+ * worktree's path the same way to match it.
+ */
+function unescaped(name: string): string {
+	const bytes: number[] = [];
+	for (let at = 0; at < name.length; at++) {
+		const hex = name[at] === "\\" && name[at + 1] === "x" ? /^[0-9a-fA-F]{2}/.exec(name.slice(at + 2)) : null;
+		const escape = name[at] === "\\" ? LSOF_ESCAPES[name[at + 1] ?? ""] : undefined;
+		if (hex) {
+			bytes.push(Number.parseInt(hex[0], 16));
+			at += 3;
+		} else if (escape !== undefined) {
+			bytes.push(escape);
+			at += 1;
+		} else {
+			const point = name.codePointAt(at) ?? 0;
+			bytes.push(...Buffer.from(String.fromCodePoint(point), "utf8"));
+			if (point > 0xffff) at += 1;
+		}
+	}
+	return Buffer.from(bytes).toString("utf8");
+}
+
+/** `path` with each control character `lsof` prints as `^X` (all but those it escapes in C's way) spelled so, to match {@link unescaped} names. */
+function caretted(path: string): string {
+	return path.replace(/[\x00-\x07\x0b\x0e-\x1f\x7f]/g, (char) => (char === "\x7f" ? "^?" : `^${String.fromCharCode(char.charCodeAt(0) + 0x40)}`));
+}
+
+/** The processes in `roots` and every process descended from them, by the parent pids `ps` lists. */
+function descendants(roots: readonly number[]): Set<number> {
+	const children = new Map<number, number[]>();
+	for (const line of output("ps", ["-A", "-o", "pid=,ppid="]).split("\n")) {
+		const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+		if (match) children.set(Number(match[2]), [...(children.get(Number(match[2])) ?? []), Number(match[1])]);
+	}
+	const found = new Set<number>(roots);
+	const queue = [...roots];
+	for (let next = queue.pop(); next !== undefined; next = queue.pop()) {
+		for (const child of children.get(next) ?? []) {
+			if (found.has(child)) continue;
+			found.add(child);
+			queue.push(child);
+		}
+	}
+	return found;
+}
+
+/** How long `lsof` or `ps` may take before the check gives up on it and finds nothing. */
+export const LIST_TIMEOUT_MS = 3000;
+
+/**
+ * What `file` prints to stdout, even when it exits non-zero (`lsof` and `ps`
+ * do when a process is gone or unreadable); empty when it can't run, or is
+ * killed for taking longer than {@link LIST_TIMEOUT_MS}: with SIGKILL, since
+ * one that hangs may ignore SIGTERM. `env` is set over pi's own environment.
+ */
+function output(file: string, args: string[], env: Record<string, string> = {}): string {
+	try {
+		return execFileSync(file, args, {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+			maxBuffer: 64 * 1024 * 1024,
+			timeout: LIST_TIMEOUT_MS,
+			killSignal: "SIGKILL",
+			env: { ...process.env, ...env },
+		});
+	} catch (error) {
+		const { stdout, signal } = error as { stdout?: unknown; signal?: unknown };
+		return typeof stdout === "string" && !signal ? stdout : "";
+	}
+}
+
+/**
+ * One of an Effort's worktrees: its Workspace or an isolated Task's, with
+ * whether it has uncommitted changes and the processes still running in it.
+ */
 export interface EffortWorktree {
 	path: string;
 	branch: string;
 	dirty: boolean;
+	running: RunningProcess[];
 }
 
 /**
  * The worktrees Effort `effortId` has in `repo` now, as `git worktree list`
  * knows them: the one on its branch `team/<effort-id>` and each on a Task
- * branch `team/<effort-id>-task-<nnn>`.
+ * branch `team/<effort-id>-task-<nnn>`. What runs in each leaves out the
+ * sessions in `spare` and their descendants (see {@link runningIn}).
  */
-export function effortWorktrees(repo: string, effortId: string): EffortWorktree[] {
+export function effortWorktrees(repo: string, effortId: string, spare: readonly number[] = []): EffortWorktree[] {
 	const { branch: own } = workspaceFor(repo, effortId);
 	const found: EffortWorktree[] = [];
 	for (const entry of git(repo, ["worktree", "list", "--porcelain", "-z"]).split("\0\0")) {
@@ -268,7 +401,7 @@ export function effortWorktrees(repo: string, effortId: string): EffortWorktree[
 		const path = fields.find((field) => field.startsWith("worktree "))?.slice("worktree ".length);
 		const branch = fields.find((field) => field.startsWith("branch refs/heads/"))?.slice("branch refs/heads/".length);
 		if (path === undefined || branch === undefined || (branch !== own && !branch.startsWith(`${own}-task-`))) continue;
-		found.push({ path, branch, dirty: existsSync(path) && changed(path).length > 0 });
+		found.push({ path, branch, dirty: existsSync(path) && changed(path).length > 0, running: existsSync(path) ? runningIn(path, { spare }) : [] });
 	}
 	return found;
 }
@@ -277,12 +410,15 @@ export function effortWorktrees(repo: string, effortId: string): EffortWorktree[
  * Remove Effort `effortId`'s clean worktrees at its end, sign-off or cancel,
  * and keep every branch: the work stays in git for the human to merge or
  * delete. A worktree with uncommitted changes is kept, never forced, and so is
- * one git refuses to remove, with git's reason.
+ * one git refuses to remove, with git's reason. Each one's `running` is
+ * what still runs in it as it goes, found then rather than at the final
+ * Report, since a process can start in between, the sessions in `spare`
+ * aside; none of it is stopped.
  */
-export function endWorktrees(repo: string, effortId: string): { removed: EffortWorktree[]; kept: (EffortWorktree & { why: string })[] } {
+export function endWorktrees(repo: string, effortId: string, spare: readonly number[] = []): { removed: EffortWorktree[]; kept: (EffortWorktree & { why: string })[] } {
 	const removed: EffortWorktree[] = [];
 	const kept: (EffortWorktree & { why: string })[] = [];
-	for (const worktree of effortWorktrees(repo, effortId)) {
+	for (const worktree of effortWorktrees(repo, effortId, spare)) {
 		if (worktree.dirty) {
 			kept.push({ ...worktree, why: `it has uncommitted changes (${listed(changed(worktree.path))})` });
 			continue;

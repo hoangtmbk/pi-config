@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { awayText, currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openEscalations, openMerges, type Step, step, taskStatus, type UsageItem, type UsageReading, usageText, waitingInTerminal, workdir } from "../core.ts";
+import { awayText, currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openEscalations, openMerges, runningClause, type Step, step, taskStatus, type UsageItem, type UsageReading, usageText, waitingInTerminal, workdir } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -2221,6 +2221,31 @@ describe("the final Report and sign-off", () => {
 	it("names no model for a Task that never launched", () => {
 		const report = written(run(plannedReport, finalReport("2026-11-02T12:00:00.000Z")));
 		assert.deepEqual(report.sections.find((each) => each.title === "Tasks")?.lines, ["`design` (architect): planned", "`rename` (dev): planned"]);
+	});
+
+	it("names each process still running in a worktree, by pid and command, and says the Team doesn't stop it", () => {
+		const worktrees = [
+			{ ...WORKTREES[0], running: [{ pid: 4242, command: "python3 -m http.server 8125" }] },
+			{
+				...WORKTREES[1],
+				running: [
+					{ pid: 4300, command: "chrome --headless" },
+					{ pid: 4301, command: "npm run dev" },
+				],
+			},
+		];
+		const report = written(run(running, finalReport("2026-11-02T12:00:00.000Z", { final: { checkpoints: [], changes: [], worktrees } })));
+
+		assert.deepEqual(report.sections.find((each) => each.title === "Worktrees")?.lines, [
+			"/work/app/.claude/worktrees/team-software-2026-11-02 (`team/software-2026-11-02`): clean, removed at sign-off; the branch is kept; pid 4242 (`python3 -m http.server 8125`) is still running in it, and the Team doesn't stop it: `kill 4242` does (found as this Report was written; sign-off checks again)",
+			"/work/app/.claude/worktrees/team-software-2026-11-02-task-002 (`team/software-2026-11-02-task-002`): has uncommitted changes, so it is kept; the branch is kept; pids 4300 (`chrome --headless`) and 4301 (`npm run dev`) are still running in it, and the Team doesn't stop them: `kill 4300 4301` does (found as this Report was written; sign-off checks again)",
+		]);
+	});
+
+	it("names a process with no command by its pid alone, cuts a long command by code point, and keeps a command holding a backtick in one code span", () => {
+		assert.equal(runningClause([{ pid: 7, command: "" }]), "pid 7 is still running in it, and the Team doesn't stop it: `kill 7` does");
+		assert.equal(runningClause([{ pid: 9, command: "\u{1F600}".repeat(130) }]), `pid 9 (\`${"\u{1F600}".repeat(119)}…\`) is still running in it, and the Team doesn't stop it: \`kill 9\` does`);
+		assert.equal(runningClause([{ pid: 8, command: "sh -c `date`" }]), "pid 8 (`` sh -c `date` ``) is still running in it, and the Team doesn't stop it: `kill 8` does");
 	});
 
 	it("orders the final Report's sections as the spec lists them, found work before usage, the sign-off's own after the logged ones", () => {

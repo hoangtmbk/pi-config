@@ -194,7 +194,36 @@ export function stillListed(agents: Map<string, AgentStatus> | { error: string }
  * leniently, as a list of sessions or an object holding one, since Claude
  * Code doesn't document it; a session without a name is left out.
  */
-export function agentsList(claudePath: string): Promise<Map<string, AgentStatus> | { error: string }> {
+export async function agentsList(claudePath: string): Promise<Map<string, AgentStatus> | { error: string }> {
+	const listed = await listedAgents(claudePath);
+	if (!(listed instanceof Map)) return listed;
+	const agents = new Map<string, AgentStatus>();
+	for (const [name, entry] of listed) {
+		const status: AgentStatus = {};
+		for (const key of ["status", "state", "waitingFor"] as const) {
+			const value = entry[key];
+			if (typeof value === "string") status[key] = value;
+		}
+		agents.set(name, status);
+	}
+	return agents;
+}
+
+/**
+ * The pid of each live background session's own process, by `--name`, from
+ * `claude agents --json`: empty when it can't be read, and a session the list
+ * gives no pid for is left out.
+ */
+export async function agentPids(claudePath: string): Promise<Map<string, number>> {
+	const listed = await listedAgents(claudePath);
+	const pids = new Map<string, number>();
+	if (!(listed instanceof Map)) return pids;
+	for (const [name, entry] of listed) if (typeof entry.pid === "number" && Number.isInteger(entry.pid) && entry.pid > 0) pids.set(name, entry.pid);
+	return pids;
+}
+
+/** Each named entry `claude agents --json` prints, read leniently (see {@link agentsList}). */
+function listedAgents(claudePath: string): Promise<Map<string, Record<string, unknown>> | { error: string }> {
 	return new Promise((resolve) => {
 		execFile(claudePath, ["agents", "--json"], { timeout: AGENTS_TIMEOUT_MS, encoding: "utf8" }, (error, stdout, stderr) => {
 			if (error) return resolve({ error: (stderr.trim() || error.message).split("\n")[0] });
@@ -206,15 +235,9 @@ export function agentsList(claudePath: string): Promise<Map<string, AgentStatus>
 			}
 			const holder = isObject(parsed) ? parsed : {};
 			const list = Array.isArray(parsed) ? parsed : [holder.agents, holder.sessions].find(Array.isArray);
-			const agents = new Map<string, AgentStatus>();
+			const agents = new Map<string, Record<string, unknown>>();
 			for (const entry of (list ?? []) as unknown[]) {
-				if (!isObject(entry) || typeof entry.name !== "string") continue;
-				const status: AgentStatus = {};
-				for (const key of ["status", "state", "waitingFor"] as const) {
-					const value = entry[key];
-					if (typeof value === "string") status[key] = value;
-				}
-				agents.set(entry.name, status);
+				if (isObject(entry) && typeof entry.name === "string") agents.set(entry.name, entry);
 			}
 			resolve(agents);
 		});

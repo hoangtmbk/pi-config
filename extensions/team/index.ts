@@ -23,7 +23,7 @@ import { attachTarget, chooseAttach, pickerLabel } from "./attach.ts";
 import { renderTeamBlock, teamStatus } from "./block.ts";
 import { leadCost } from "./cost.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
-import { agentsList, CLEAR_MARKER, getUsage, humanStatusLine, installMod, launchBackground, sendToInbox, statusLineReading, stillListed, stopBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
+import { agentPids, agentsList, CLEAR_MARKER, getUsage, humanStatusLine, installMod, launchBackground, sendToInbox, statusLineReading, stillListed, stopBackground, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
 import {
 	awayText,
 	BRIEF,
@@ -49,6 +49,8 @@ import {
 	type PendingApproval,
 	type PlaybookChange,
 	refuseRequest,
+	type RunningProcess,
+	runningClause,
 	SIGN_OFF,
 	type Step,
 	step,
@@ -371,6 +373,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * a new session's lines go to its new Task.
 	 */
 	const stopping = new Set<string>();
+	/** The pid of each Teammate session `claude stop` ended here, with when, until a worktree check uses it (see {@link sparedSessions}). */
+	const stoppedSessions = new Map<number, number>();
 	// Whether the Lead's model is working on a prompt, and what wakes about Teammates wait for it to settle.
 	let busy = false;
 	let waiting: string[] = [];
@@ -644,8 +648,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				// A merged Task's worktree goes as an accept removes it; an abandoned launch's had nothing worked in it.
 				const accepted = result.state.tasks[action.slug]?.accepted !== undefined;
 				if (accepted && (!stopped || !result.state.workspace)) continue;
-				const left = removeTaskWorkspace(accepted && result.state.workspace ? result.state.workspace.path : result.state.repo, action, !accepted);
-				if (left) texts.push(`Task \`${action.slug}\`'s worktree or branch is left in place: ${left}`);
+				const removed = removeTaskWorkspace(accepted && result.state.workspace ? result.state.workspace.path : result.state.repo, action, !accepted, await sparedSessions(result.state));
+				if (removed.error) texts.push(`Task \`${action.slug}\`'s worktree or branch is left in place: ${removed.error}`);
+				const running = removedRunning(action.path, removed.running);
+				if (running) texts.push(`${running} Tell the human.`);
 			} else if (action.kind === "merge") {
 				try {
 					texts.push(await acceptMerged(held, { ok: true, state: effortState(held), append: [], actions: [] }, action));
@@ -1215,8 +1221,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 					notes.push(`\`${action.teammate}\` didn't stop (${failed.error}), so its worktree is left in place; tell the human.`);
 				}
 			} else if (action.kind === "remove-task-workspace" && stopped && result.state.workspace) {
-				const left = removeTaskWorkspace(result.state.workspace.path, action);
-				if (left) notes.push(`Its worktree or branch is left in place: ${left}`);
+				const removed = removeTaskWorkspace(result.state.workspace.path, action, false, await sparedSessions(outcome.state));
+				if (removed.error) notes.push(`Its worktree or branch is left in place: ${removed.error}`);
+				const running = removedRunning(action.path, removed.running);
+				if (running) notes.push(`${running} Tell the human.`);
 			} else if (action.kind === "write-plan") writePlan(held.paths, outcome.state);
 		}
 		return [outcome.reply ?? "", ...notes].join(" ");
@@ -1266,8 +1274,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 					if (stopped) throw new Error(`Teammate \`${action.teammate}\` couldn't be stopped with \`claude stop ${action.shortId}\` (${stopped.error}), so nothing was re-planned. Stop and tell the human.`);
 				} else if (action.kind === "remove-task-workspace" && result.state.workspace) {
 					// Not forced, and from the Workspace so `branch -d` weighs the Effort branch: uncommitted or unmerged work stays.
-					const left = removeTaskWorkspace(result.state.workspace.path, action);
-					if (left) notes.push(`Task \`${action.slug}\`'s worktree \`${action.path}\` or branch \`${action.branch}\` is left in place, since git refused to remove it: ${left} Tell the human, who can merge or delete it.`);
+					const removed = removeTaskWorkspace(result.state.workspace.path, action, false, await sparedSessions(result.state));
+					if (removed.error) notes.push(`Task \`${action.slug}\`'s worktree \`${action.path}\` or branch \`${action.branch}\` is left in place, since git refused to remove it: ${removed.error} Tell the human, who can merge or delete it.`);
+					const running = removedRunning(action.path, removed.running);
+					if (running) notes.push(`${running} Tell the human.`);
 				}
 			}
 			appendLines(held.paths, result.append);
@@ -1295,14 +1305,40 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * human to read. One already idle-stopped needs none: a failed stop counts
 	 * only while `claude agents --json` still lists it, or can't be read. Its
 	 * `SessionEnd` reads as a crash unless the line that ends it is on record
-	 * by then: append that line first, or stop it {@link whileStopping}.
+	 * by then: append that line first, or stop it {@link whileStopping}. Its
+	 * session's pid is kept in {@link stoppedSessions} first, for a worktree
+	 * check to wait on.
 	 */
 	async function stopTeammate(state: EffortState, action: Extract<EffortAction, { kind: "stop-teammate" }>): Promise<{ error: string } | undefined> {
-		const stopped = await stopBackground(paths.claudePath, action.shortId);
-		if (!stopped) return undefined;
-		const agents = await agentsList(paths.claudePath);
 		const name = state.teammates.find((teammate) => teammate.id === action.teammate)?.name;
+		const pid = name === undefined ? undefined : (await agentPids(paths.claudePath)).get(name);
+		const stopped = await stopBackground(paths.claudePath, action.shortId);
+		if (!stopped) {
+			if (pid !== undefined) stoppedSessions.set(pid, now().getTime());
+			return undefined;
+		}
+		const agents = await agentsList(paths.claudePath);
 		return stillListed(agents, name) ? stopped : undefined;
+	}
+
+	/**
+	 * The sessions a worktree check leaves out, with all they started that is
+	 * still attached to them, since stopping the Teammates stops those: each of
+	 * the Effort's Teammates `claude agents --json` lists as live, and each
+	 * session stopped here that is still exiting, `claude stop` having
+	 * returned first. Those get up to {@link STOP_SETTLE_MS} to exit before
+	 * the check; only one still there after that is left out. Only a session
+	 * stopped within {@link STOPPED_RECENTLY_MS} counts, and each counts for
+	 * one check, since a pid an exited session had can go to another process.
+	 */
+	async function sparedSessions(state: EffortState): Promise<number[]> {
+		const recent = [...stoppedSessions].flatMap(([pid, at]) => (now().getTime() - at <= STOPPED_RECENTLY_MS ? [pid] : []));
+		stoppedSessions.clear();
+		const deadline = Date.now() + STOP_SETTLE_MS;
+		while (recent.some(processAlive) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+		const names = new Set(state.teammates.map((teammate) => teammate.name));
+		const live = [...(await agentPids(paths.claudePath))].flatMap(([name, pid]) => (names.has(name) ? [pid] : []));
+		return [...new Set([...live, ...recent.filter(processAlive)])];
 	}
 
 	/**
@@ -1742,9 +1778,13 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			notes.push(`These didn't stop, so every worktree is left in place: ${unstopped.join(", ")}. Stop them with \`claude stop\`.`);
 		} else {
 			try {
-				const { removed, kept } = endWorktrees(state.repo, held.effortId);
+				const { removed, kept } = endWorktrees(state.repo, held.effortId, await sparedSessions(state));
 				if (removed.length > 0) notes.push(`Removed the clean worktrees ${removed.map((each) => each.path).join(", ")}.`);
-				for (const each of kept) notes.push(`Kept ${each.path} (\`${each.branch}\`): ${each.why}.`);
+				notes.push(...removed.flatMap((each) => removedRunning(each.path, each.running) ?? []));
+				for (const each of kept) {
+					const running = runningClause(each.running);
+					notes.push(`Kept ${each.path} (\`${each.branch}\`): ${each.why}${running ? `; ${running}` : ""}.`);
+				}
 			} catch (error) {
 				notes.push(`Its worktrees are left in place: ${error instanceof Error ? error.message : String(error)}.`);
 			}
@@ -1801,16 +1841,17 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	/**
 	 * What the shell gathers for the final Report: the checkpoints the Effort's
 	 * Playbook snapshot names, the proposed changes, each checked to apply to
-	 * that Playbook, and the Effort's worktrees as git has them now.
+	 * that Playbook, and the Effort's worktrees as git has them now, with what
+	 * runs in each apart from the Teammates' sessions, which sign-off stops.
 	 */
-	function finalFacts(held: HeldEffort, state: EffortState, changes: readonly PlaybookChange[]): FinalFacts {
+	async function finalFacts(held: HeldEffort, state: EffortState, changes: readonly PlaybookChange[]): Promise<FinalFacts> {
 		const { roles, playbook } = approved(held);
 		const problems = changes.flatMap((change) => {
 			const made = changedPlaybook(playbook, change, roles.map((role) => role.name));
 			return "error" in made ? [`Playbook change \`${change.id}\`: ${made.error}`] : [];
 		});
 		if (problems.length > 0) throw new Error(`The final Report wasn't written:\n${bullets(problems)}`);
-		return { checkpoints: playbook.checkpoints.map((checkpoint) => checkpoint.id), changes, worktrees: effortWorktrees(state.repo, held.effortId) };
+		return { checkpoints: playbook.checkpoints.map((checkpoint) => checkpoint.id), changes, worktrees: effortWorktrees(state.repo, held.effortId, await sparedSessions(state)) };
 	}
 
 	// Each subcommand is one row, so later ones are added without touching the rest.
@@ -2271,7 +2312,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			const modes = snapshot ? snapshot.roles.map((role) => ({ role: role.name, mode: modeInForce(snapshot.playbook, role) })) : [];
 			// So are the Playbook entries the Brief skips, read from it rather than left to the Lead to mention.
 			const skips = snapshot ? briefSkips(snapshot.brief) : [];
-			const final = params.final && state.brief ? finalFacts(held, state, params.changes ?? []) : undefined;
+			const final = params.final && state.brief ? await finalFacts(held, state, params.changes ?? []) : undefined;
 			const leadCostUsd = leadCost(ctx.sessionManager.getEntries());
 			const at = now().toISOString();
 			const result = step(state, { kind: "report", headline: params.headline, coverage: params.coverage, found: params.found, criteria, modes, skips, final, leadCostUsd, at });
@@ -2491,6 +2532,28 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 function bullets(lines: readonly string[]): string {
 	return lines.map((line) => `- ${line}`).join("\n");
+}
+
+/** How long a worktree check waits for the sessions `claude stop` ended to exit, since it can return first. */
+const STOP_SETTLE_MS = 3000;
+
+/** How long after `claude stop` a worktree check still counts that session as exiting, rather than its pid as another process's. */
+const STOPPED_RECENTLY_MS = 30_000;
+
+/** Whether process `pid` is still there, even one pi may not signal. */
+function processAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as { code?: string }).code === "EPERM";
+	}
+}
+
+/** What is said of the worktree at `path` once it is removed with processes still running in it: undefined when none are. */
+function removedRunning(path: string, running: readonly RunningProcess[]): string | undefined {
+	const clause = runningClause(running);
+	return clause === undefined ? undefined : `${path} is removed, but ${clause}.`;
 }
 
 export default function (pi: ExtensionAPI): void {

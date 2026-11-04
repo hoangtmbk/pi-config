@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
@@ -117,6 +117,8 @@ function fakePi(
 		sessionEntries?: Record<string, unknown>[];
 		/** How long a Teammate's held hook holds before giving the prompt back to its terminal; the hook's own when unset. */
 		holdMs?: number;
+		/** A command each Teammate's session keeps running as an attached child in its folder, as its Bash tool's shell. */
+		sessionChild?: string[];
 		/** The fake `claude` an earlier pi ran, whose background sessions outlive it; a new one unless set. */
 		claude?: FakeClaude;
 	} = {},
@@ -175,6 +177,7 @@ function fakePi(
 			attachExit: options.attachExit,
 			holdMs: options.holdMs,
 			usage: options.usage,
+			sessionChild: options.sessionChild,
 		});
 	const tmux = fakeTmux(roots);
 	registerTeam(pi as unknown as ExtensionAPI, {
@@ -1459,7 +1462,7 @@ function crewBrief(repo: string, playbook = CREW_PLAYBOOK, overrides: string[] =
 async function crewApproved(
 	options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown>; playbook?: string; overrides?: string[] } & Pick<
 		NonNullable<Parameters<typeof fakePi>[1]>,
-		"mode" | "env" | "attachExit" | "holdMs" | "usage" | "sessionEntries"
+		"mode" | "env" | "attachExit" | "holdMs" | "usage" | "sessionEntries" | "sessionChild"
 	> = {},
 ) {
 	const roots = tempRoots();
@@ -1497,6 +1500,7 @@ async function crewApproved(
 		usage: options.usage,
 		sessionEntries: options.sessionEntries,
 		holdMs: options.holdMs,
+		sessionChild: options.sessionChild,
 	});
 	await pi.team("start crew");
 	const dir = effortDir(roots, CREW_EFFORT_ID);
@@ -1724,6 +1728,9 @@ describe("handing off: team_handoff", () => {
 			"`result-<n>.md`",
 			"The Workspace is fresh",
 			"installing dependencies is yours to do",
+			"Stop every process you start in the background",
+			"before you write your result",
+			"name each one you leave running, with its pid and command",
 			join(dir, "brief.md"),
 			join(dir, "clarifications.md"),
 		];
@@ -4009,6 +4016,33 @@ describe("an isolated Task in a worktree of its own", () => {
 		assert.match(reply, /Dropped Task `rename-key`, and stopped `builder-1`/);
 		assert.equal(existsSync(task.path), false);
 		assert.equal(git(repo, "branch", "--list", task.branch), "");
+		assert.doesNotMatch(reply, /still running/);
+	});
+
+	it("tells the Lead, by pid and command, of a process its Teammate left running in an accepted Task's worktree, removing the worktree without stopping it", async (t) => {
+		const { pi, task } = await isolatedReported([...COMMITS.slice(0, 3), { background: ["sleep", "300"] }, ...COMMITS.slice(3)]);
+		t.after(() => pi.claude.killBackground());
+		const [pid] = pi.claude.background();
+
+		const reply = await pi.call("team_review", { slug: "rename-key", verdict: "accept" });
+
+		assert.ok(reply.includes(`${task.path} is removed, but pid ${pid} (\`sleep 300\`) is still running in it, and the Team doesn't stop it: \`kill ${pid}\` does.`), reply);
+		assert.equal(existsSync(task.path), false);
+		assert.doesNotThrow(() => process.kill(pid, 0), "accepting doesn't stop it");
+	});
+
+	it("tells the Lead of a process left running in a dropped Task's worktree as it removes it", async (t) => {
+		const { pi, repo } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }, { background: ["sleep", "300"] }] });
+		t.after(() => pi.claude.killBackground());
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true });
+		const task = crewTask(repo, "001");
+		const [pid] = pi.claude.background();
+
+		const reply = await pi.call("team_plan", { tasks: [{ ...CREW_PLAN[0], slug: "rename-key-everywhere" }, { ...CREW_PLAN[1], dependsOn: ["rename-key-everywhere"] }, CREW_PLAN[2]] });
+
+		assert.ok(reply.includes(`${task.path} is removed, but pid ${pid} (\`sleep 300\`) is still running in it`), reply);
+		assert.equal(existsSync(task.path), false);
 	});
 
 	it("keeps a dropped isolated Task's branch when it has commits the Effort branch lacks, telling the Lead", async () => {
@@ -4182,11 +4216,82 @@ describe("ending an Effort: the final Report and sign-off", () => {
 		const said = pi.notifications.at(-1)?.message ?? "";
 		assert.match(said, /[Ss]igned off/);
 		assert.ok(said.includes(dirty.path), said);
+		assert.doesNotMatch(said, /still running/, "nothing was left running in a worktree");
+		assert.doesNotMatch(readFileSync(report, "utf8"), /still running/);
 		assert.deepEqual(
 			pi.activeTools().filter((name) => EFFORT_TOOL_NAMES.includes(name)),
 			[],
 		);
 		assert.equal(teamBlock(pi), undefined);
+	});
+
+	it("names a process a Teammate left running in its worktree, by pid and command, in the final Report and as sign-off removes the worktree, and leaves it running", async (t) => {
+		// Each live session sits in its worktree with a child still attached to it, as a Bash tool's shell: sign-off stops those.
+		const { pi, dir, repo, workspace } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }, { background: ["sleep", "300"] }], sessionChild: ["sleep", "301"] });
+		t.after(() => pi.claude.killBackground());
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true });
+		await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
+		const [inTask, inWorkspace] = pi.claude.background();
+		const task = crewTask(repo, "001");
+		const sessions = [...pi.claude.agents().map((agent) => agent.pid), ...pi.claude.sessionChildren()];
+		assert.equal(sessions.filter((pid) => pid !== undefined).length, 4, "two sessions, each with its child");
+		await pi.call("team_report", { headline: "Both criteria are met.", coverage: FINAL_COVERAGE, final: true });
+
+		const written = readFileSync(join(dir, "reports", "001.md"), "utf8");
+		for (const [path, branch, pid] of [
+			[task.path, task.branch, inTask],
+			[workspace, `team/${CREW_EFFORT_ID}`, inWorkspace],
+		] as const) {
+			assert.ok(
+				written.includes(
+					`- ${path} (\`${branch}\`): clean, removed at sign-off; the branch is kept; pid ${pid} (\`sleep 300\`) is still running in it, and the Team doesn't stop it: \`kill ${pid}\` does (found as this Report was written; sign-off checks again)\n`,
+				),
+				written,
+			);
+		}
+		for (const pid of sessions) assert.doesNotMatch(written, new RegExp(`(?<!\\d)${pid} \\(`), `the live session process ${pid} isn't named:\n${written}`);
+
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		const said = pi.notifications.at(-1)?.message ?? "";
+		for (const pid of sessions) assert.doesNotMatch(said, new RegExp(`(?<!\\d)${pid} \\(`), `the stopped session process ${pid} isn't named: ${said}`);
+		for (const [path, pid] of [
+			[task.path, inTask],
+			[workspace, inWorkspace],
+		] as const) {
+			assert.ok(said.includes(`${path} is removed, but pid ${pid} (\`sleep 300\`) is still running in it, and the Team doesn't stop it: \`kill ${pid}\` does.`), said);
+			assert.equal(existsSync(path), false);
+			assert.doesNotThrow(() => process.kill(pid, 0), "sign-off doesn't stop it");
+		}
+	});
+
+	it("doesn't spare a process by the pid of a session stopped long before, which the system may have handed on", async (t) => {
+		const { pi, dir, workspace } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		const orphan = spawn("sleep", ["300"], { cwd: workspace, detached: true, stdio: "ignore" });
+		orphan.unref();
+		const pid = orphan.pid ?? 0;
+		t.after(() => {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				// Gone already.
+			}
+		});
+		// The session builder-1 had goes by the pid the orphan has now.
+		const [session] = pi.claude.agents();
+		pi.claude.setAgent(session?.name ?? "", { pid });
+		// A re-plan drops its Task and stops it, and no worktree check follows.
+		await pi.call("team_plan", { tasks: [{ ...CREW_PLAN[0], slug: "rename-key-everywhere" }, { ...CREW_PLAN[1], dependsOn: ["rename-key-everywhere"] }, CREW_PLAN[2]] });
+		pi.advance(60 * 60_000);
+
+		await pi.call("team_report", { headline: "Both criteria are met.", coverage: FINAL_COVERAGE, final: true });
+
+		const written = readFileSync(join(dir, "reports", "001.md"), "utf8");
+		assert.ok(written.includes(`pid ${pid} (\`sleep 300\`) is still running in it`), written);
 	});
 
 	it("leaves nothing waiting once signed off, and adopts nothing ended with `/team resume`", async () => {

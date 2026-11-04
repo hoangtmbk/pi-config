@@ -617,7 +617,37 @@ export interface Report {
 export interface FinalFacts {
 	checkpoints: readonly string[];
 	changes: readonly PlaybookChange[];
-	worktrees: readonly { path: string; branch: string; dirty: boolean }[];
+	worktrees: readonly { path: string; branch: string; dirty: boolean; running?: readonly RunningProcess[] }[];
+}
+
+/** A process running with its working directory in a worktree, which no `claude stop` reaches. */
+export interface RunningProcess {
+	pid: number;
+	/** Its command line, or its name alone when `ps` can't tell. */
+	command: string;
+}
+
+/**
+ * What the human is told of the processes still running in a worktree, as a
+ * clause about "it", the worktree: each pid and command, that the Team never
+ * stops them, and the `kill` that does. Undefined when there are none.
+ */
+export function runningClause(running: readonly RunningProcess[]): string | undefined {
+	if (running.length === 0) return undefined;
+	const shown = running.map((each) => {
+		// Cut by code point, so no surrogate pair is split.
+		const points = [...each.command.trim()];
+		return points.length === 0 ? String(each.pid) : `${each.pid} (${codeSpan(points.length > 120 ? `${points.slice(0, 119).join("")}…` : points.join(""))})`;
+	});
+	const which = running.length === 1 ? `pid ${shown[0]} is` : `pids ${shown.slice(0, -1).join(", ")} and ${shown.at(-1)} are`;
+	return `${which} still running in it, and the Team doesn't stop ${running.length === 1 ? "it" : "them"}: \`kill ${running.map((each) => each.pid).join(" ")}\` does`;
+}
+
+/** `text` as one Markdown code span: fenced with one backtick more than its longest run of them, and padded when it holds any. */
+function codeSpan(text: string): string {
+	const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
+	const fence = "`".repeat(longest + 1);
+	return longest === 0 ? `${fence}${text}${fence}` : `${fence} ${text} ${fence}`;
 }
 
 /** What an Effort's lines fold to. */
@@ -3742,7 +3772,10 @@ function finalSections(state: EffortState, final: FinalFacts): ReportSection[] {
 				final.worktrees.length === 0
 					? ["none"]
 					: final.worktrees.map(
-							(each) => `${each.path} (\`${each.branch}\`): ${each.dirty ? "has uncommitted changes, so it is kept" : "clean, removed at sign-off"}; the branch is kept`,
+							(each) => {
+								const running = runningClause(each.running ?? []);
+								return `${each.path} (\`${each.branch}\`): ${each.dirty ? "has uncommitted changes, so it is kept" : "clean, removed at sign-off"}; the branch is kept${running ? `; ${running} (found as this Report was written; sign-off checks again)` : ""}`;
+							},
 						),
 		},
 	];
