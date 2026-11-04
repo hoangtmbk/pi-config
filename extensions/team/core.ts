@@ -100,6 +100,12 @@ export interface HandedTask {
 	folder: string;
 	role: string;
 	teammate: string;
+	/**
+	 * The `--model` its Teammate was launched with, as the Role had it then:
+	 * `null` for a launch with none, on Claude Code's default; absent when no
+	 * model was recorded, as on a line from before models were.
+	 */
+	model?: string | null;
 	at: string;
 	/** The round in progress: its result is `result-<round>.md` in the folder. */
 	round: number;
@@ -167,6 +173,8 @@ export interface Teammate {
 	cursor?: number;
 	/** The permission mode it was launched in. */
 	mode?: string;
+	/** The `--model` its current session was launched with: `null` for none, on Claude Code's default; absent when none was recorded. */
+	model?: string | null;
 	/** The permission mode its hooks last reported, once one differs from {@link mode}: drift is logged, not a Takeover. */
 	observedMode?: string;
 	/** Absent until a prompt first lands: then `busy`, and `idle` once it stops. */
@@ -378,14 +386,15 @@ export type EffortLine =
 	/**
 	 * An idle Teammate whose Role's launch options an approved Brief change
 	 * altered was stopped and launched afresh, under the same id and name, for
-	 * Task `task`, in permission mode `mode`. Its next `SessionStart` gives it
-	 * a new short id.
+	 * Task `task`, in permission mode `mode`, on `model` (`null` for Claude
+	 * Code's default, absent when not recorded). Its next `SessionStart` gives
+	 * it a new short id.
 	 */
-	| { type: "teammate-relaunched"; teammate: string; task: string; mode?: string; at: string }
+	| { type: "teammate-relaunched"; teammate: string; task: string; mode?: string; model?: string | null; at: string }
 	/** The human used the `/team` menu on a Teammate: the short id they were given, which clears its `(new)` mark. Reads no journal line. */
 	| { type: "teammate-attached"; teammate: string; shortId: string; at: string }
-	/** A send-back gave the Task to a new Teammate, since its own had ended. */
-	| { type: "task-reassigned"; slug: string; teammate: string; at: string }
+	/** A send-back gave the Task to a new Teammate, since its own had ended, running on `model`. */
+	| { type: "task-reassigned"; slug: string; teammate: string; model?: string | null; at: string }
 	/** A re-plan left out a handed-off Task, or gave it another Role: this handoff of it is over. */
 	| { type: "task-dropped"; slug: string; at: string }
 	/** The extension stopped a Teammate with `claude stop`, since its Task was dropped, or its isolated Task merged and its worktree goes. Reads no journal line. */
@@ -708,6 +717,8 @@ export type EffortInput =
 			found?: string[];
 			criteria: readonly string[];
 			modes: readonly { role: string; mode: string }[];
+			/** The Playbook ids the approved Brief's overrides skip, each with its reason, for the plan Report. */
+			skips?: readonly { rule: string; reason: string }[];
 			/** For the final Report, which maps every criterion to evidence: what the shell gathered. */
 			final?: FinalFacts;
 			/** The Lead's own cost so far, in USD, as pi reports it, which the shell reads. */
@@ -726,9 +737,10 @@ export type EffortInput =
 	 * `team_handoff` of a planned Task, with the permission mode a Teammate
 	 * started for it launches in and the cap of live Teammates (pi's
 	 * `maxTeammates` setting, {@link DEFAULT_MAX_TEAMMATES} by default), and
-	 * the `--name`s `claude agents --json` lists (undefined when it couldn't be read).
+	 * the `--name`s `claude agents --json` lists (undefined when it couldn't be read),
+	 * and each Role's model, which a Teammate launched for it gets.
 	 */
-	| { kind: "handoff"; slug: string; at: string; mode?: string; maxTeammates?: number; isolated?: boolean; agents?: readonly string[] }
+	| { kind: "handoff"; slug: string; at: string; mode?: string; maxTeammates?: number; isolated?: boolean; agents?: readonly string[]; models?: Readonly<Record<string, string>> }
 	/** What the merge an accept intended came to: merge commit `commit` (absent when there was nothing to merge), or why git refused it, nothing half-done. */
 	| { kind: "merge-result"; slug: string; commit?: string; error?: string; at: string }
 	/**
@@ -763,6 +775,8 @@ export type EffortInput =
 			mode?: string;
 			/** The cap of live Teammates, for a send-back whose Teammate has ended and goes through the staffing ladder. */
 			maxTeammates?: number;
+			/** Each Role's model, as for a handoff, for a send-back that launches a Teammate. */
+			models?: Readonly<Record<string, string>>;
 			at: string;
 	  }
 	/**
@@ -770,9 +784,9 @@ export type EffortInput =
 	 * cap of live Teammates. The shell asks after each acceptance, once the
 	 * acceptance is on record, and again while one starts: each start is its
 	 * own step, so a launch that fails leaves only its own Task queued. With
-	 * `agents` as for a handoff.
+	 * `agents` and `models` as for a handoff.
 	 */
-	| { kind: "drain"; at: string; maxTeammates?: number; agents?: readonly string[] }
+	| { kind: "drain"; at: string; maxTeammates?: number; agents?: readonly string[]; models?: Readonly<Record<string, string>> }
 	/** The human used the `/team` menu on a Teammate: attached here, in a tmux window, or took the command. */
 	| { kind: "attach"; teammate: string; at: string }
 	/** `/team pause` from the human, or `team_pause` from the Lead, which must give a reason. */
@@ -1024,8 +1038,8 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 					if (teammate.id !== line.teammate) return teammate;
 					// What the old session knew goes with it: the new one starts from its launch, with no session rules.
 					// A card its old session's terminal killed the hook of goes too: the new session going on says nothing of it.
-					const { freshDue: _fresh, inbox: _inbox, activity: _activity, doing: _doing, limit: _limit, rules: _rules, clearing: _clearing, observedMode: _observed, mode: _mode, denied: _denied, ...rest } = teammate;
-					return { ...rest, task: line.task, startedAt: line.at, relaunching: true, ...(line.mode === undefined ? {} : { mode: line.mode }) };
+					const { freshDue: _fresh, inbox: _inbox, activity: _activity, doing: _doing, limit: _limit, rules: _rules, clearing: _clearing, observedMode: _observed, mode: _mode, model: _model, denied: _denied, ...rest } = teammate;
+					return { ...rest, task: line.task, startedAt: line.at, relaunching: true, ...(line.mode === undefined ? {} : { mode: line.mode }), ...(line.model === undefined ? {} : { model: line.model }) };
 				}),
 			}, line.teammate);
 		case "teammate-session": {
@@ -1086,9 +1100,16 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			return withTeammate(state, line, { observedMode: line.mode });
 		case "task-dropped":
 			return { ...withTask(state, line.slug, { dropped: line.at }), queue: state.queue.filter((queued) => queued.slug !== line.slug) };
-		case "task-reassigned":
-			// Its new Teammate's launch carries the pointer. A sent-back Task queued for one leaves the queue.
-			return { ...owe(withTask(state, line.slug, { teammate: line.teammate }), line.slug, undefined), queue: state.queue.filter((queued) => queued.slug !== line.slug) };
+		case "task-reassigned": {
+			// Its new Teammate's launch carries the pointer, and its model is the Task's from now on. A sent-back Task queued for one leaves the queue.
+			const handed = state.tasks[line.slug];
+			let next = state;
+			if (handed) {
+				const { model: _model, ...rest } = handed;
+				next = { ...state, tasks: { ...state.tasks, [line.slug]: { ...rest, teammate: line.teammate, ...(line.model === undefined ? {} : { model: line.model }) } } };
+			}
+			return { ...owe(next, line.slug, undefined), queue: state.queue.filter((queued) => queued.slug !== line.slug) };
+		}
 		case "teammate-ended":
 			return endRequests({ ...state, teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, ended: { how: line.how, at: line.at } } : teammate)) }, line.teammate);
 		case "teammate-crashed":
@@ -2324,7 +2345,7 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 			`queued ${pointer}: Role \`${task.role}\` is held by ${holdText(hold)}, while other Roles go on. It starts by itself once the hold lifts.`,
 		);
 	}
-	const staffed = staff(state, wanted, max, input.agents);
+	const staffed = staff(state, wanted, max, input.agents, input.models);
 	if (staffed) {
 		return took(
 			state,
@@ -2377,17 +2398,29 @@ function free(state: EffortState, teammate: Teammate): boolean {
  * A sent-back Task whose Teammate ended goes up the same ladder, in its own
  * folder (and worktree): a Teammate reused for it starts afresh, since its
  * launch is what carries the pointer to the rounds so far.
+ *
+ * `models` is each Role's model as a Teammate launched now gets it, a Role
+ * missing from it launching with no `--model`; the Task records the model its
+ * Teammate runs on: a reused one's own launch model, or the one it is launched
+ * on now. Without `models` nothing is recorded.
  */
-function staff(state: EffortState, task: QueuedTask, max: number, agents?: readonly string[]): { append: EffortLine[]; actions: EffortAction[]; who: string; note?: string } | undefined {
+function staff(
+	state: EffortState,
+	task: QueuedTask,
+	max: number,
+	agents?: readonly string[],
+	models?: Readonly<Record<string, string>>,
+): { append: EffortLine[]; actions: EffortAction[]; who: string; note?: string } | undefined {
+	const model = models === undefined ? undefined : (models[task.role] ?? null);
 	// An isolated Task needs a Teammate launched in its own worktree, so it never reuses one.
 	const reused = task.isolated ? undefined : live(state).find((teammate) => teammate.role === task.role && teammate.inbox !== undefined && free(state, teammate));
-	if (reused?.freshDue && reused.shortId) return relaunch(state, reused, task, freshForBrief(reused.role));
-	if (reused && agents !== undefined && !agents.includes(reused.name)) return relaunch(state, reused, task, FRESH_FOR_IDLE);
-	if (reused && sentBack(state, task.slug)) return relaunch(state, reused, task, FRESH_FOR_SENT_BACK);
+	if (reused?.freshDue && reused.shortId) return relaunch(state, reused, task, freshForBrief(reused.role), model);
+	if (reused && agents !== undefined && !agents.includes(reused.name)) return relaunch(state, reused, task, FRESH_FOR_IDLE, model);
+	if (reused && sentBack(state, task.slug)) return relaunch(state, reused, task, FRESH_FOR_SENT_BACK, model);
 	if (reused?.inbox) {
 		return {
 			append: [
-				takenBy(state, task, reused.id),
+				takenBy(state, task, reused.id, undefined, reused.model),
 				{ type: "clear-requested", teammate: reused.id, slug: task.slug, at: task.at },
 			],
 			actions: [{ kind: "clear-then-send", teammate: reused.id, inbox: reused.inbox, slug: task.slug, folder: task.folder }],
@@ -2395,12 +2428,12 @@ function staff(state: EffortState, task: QueuedTask, max: number, agents?: reado
 			note: "Its context is cleared first, then it gets the Task's pointer.",
 		};
 	}
-	if (live(state).length < max) return start(state, task);
+	if (live(state).length < max) return start(state, task, model);
 	const roles = new Set(state.queue.filter((queued) => queued.slug !== task.slug).map((queued) => queued.role));
 	const idle = live(state).find((teammate) => teammate.shortId !== undefined && free(state, teammate) && !roles.has(teammate.role));
 	if (!idle?.shortId) return undefined;
 	const retired: EffortLine = { type: "teammate-retired", teammate: idle.id, at: task.at };
-	const started = start(apply(state, retired), task);
+	const started = start(apply(state, retired), task, model);
 	return {
 		append: [retired, ...started.append],
 		actions: [{ kind: "stop-teammate", teammate: idle.id, shortId: idle.shortId }, ...started.actions],
@@ -2420,10 +2453,11 @@ function sentBack(state: EffortState, slug: string): boolean {
 	return task !== undefined && task.dropped === undefined;
 }
 
-/** The line that gives `task` to `teammate`: its handoff, or for a sent-back Task, its reassignment. */
-function takenBy(state: EffortState, task: QueuedTask, teammate: string, worktree?: TaskWorktree): EffortLine {
-	if (sentBack(state, task.slug)) return { type: "task-reassigned", slug: task.slug, teammate, at: task.at };
-	return { type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate, at: task.at, round: 1, ...(worktree ? { worktree } : {}) };
+/** The line that gives `task` to `teammate`, which runs on `model`: its handoff, or for a sent-back Task, its reassignment. */
+function takenBy(state: EffortState, task: QueuedTask, teammate: string, worktree?: TaskWorktree, model?: string | null): EffortLine {
+	const on = model === undefined ? {} : { model };
+	if (sentBack(state, task.slug)) return { type: "task-reassigned", slug: task.slug, teammate, ...on, at: task.at };
+	return { type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate, ...on, at: task.at, round: 1, ...(worktree ? { worktree } : {}) };
 }
 
 /** Why an idle Teammate given a sent-back Task starts afresh rather than being cleared. */
@@ -2436,15 +2470,15 @@ const FRESH_FOR_IDLE =
 /**
  * Start a free Teammate afresh on the Task, for `note`'s reason: its old
  * session is stopped (its conversation kept), and a new one launched under
- * the same id and name, at a Task boundary, never mid-Task.
+ * the same id and name, at a Task boundary, never mid-Task, on `model`.
  */
-function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask, note: string): { append: EffortLine[]; actions: EffortAction[]; who: string; note: string } {
+function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask, note: string, model?: string | null): { append: EffortLine[]; actions: EffortAction[]; who: string; note: string } {
 	const last = Math.max(...state.teammates.map((each) => Date.parse(each.startedAt)));
 	const at = new Date(Math.max(Date.parse(task.at), last + STAGGER_MS)).toISOString();
 	return {
 		append: [
-			takenBy(state, task, teammate.id),
-			{ type: "teammate-relaunched", teammate: teammate.id, task: task.slug, ...(task.mode === undefined ? {} : { mode: task.mode }), at },
+			takenBy(state, task, teammate.id, undefined, model),
+			{ type: "teammate-relaunched", teammate: teammate.id, task: task.slug, ...(task.mode === undefined ? {} : { mode: task.mode }), ...(model === undefined ? {} : { model }), at },
 		],
 		actions: [
 			{ kind: "stop-teammate", teammate: teammate.id, shortId: teammate.shortId ?? teammate.name },
@@ -2455,8 +2489,8 @@ function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask, note
 	};
 }
 
-/** Start the next Teammate of the Task's Role on it, no sooner than {@link STAGGER_MS} after the last start. */
-function start(state: EffortState, task: QueuedTask): { append: EffortLine[]; actions: EffortAction[]; who: string } {
+/** Start the next Teammate of the Task's Role on it, on `model`, no sooner than {@link STAGGER_MS} after the last start. */
+function start(state: EffortState, task: QueuedTask, model?: string | null): { append: EffortLine[]; actions: EffortAction[]; who: string } {
 	const id = `${task.role}-${state.teammates.filter((teammate) => teammate.role === task.role).length + 1}`;
 	const name = `team-${state.effortId}-${id}`;
 	const last = Math.max(...state.teammates.map((teammate) => Date.parse(teammate.startedAt)));
@@ -2465,8 +2499,8 @@ function start(state: EffortState, task: QueuedTask): { append: EffortLine[]; ac
 	const launch: EffortAction = { kind: "launch-teammate", teammate: { id, role: task.role, name }, task: { slug: task.slug, folder: task.folder }, at };
 	return {
 		append: [
-			{ type: "teammate-started", id, role: task.role, name, task: task.slug, startedAt: at, ...(task.mode === undefined ? {} : { mode: task.mode }) },
-			takenBy(state, task, id, worktree),
+			{ type: "teammate-started", id, role: task.role, name, task: task.slug, startedAt: at, ...(task.mode === undefined ? {} : { mode: task.mode }), ...(model === undefined ? {} : { model }) },
+			takenBy(state, task, id, worktree, model),
 		],
 		actions: worktree && state.workspace ? [{ kind: "add-task-workspace", slug: task.slug, from: state.workspace.branch, ...worktree }, launch] : [launch],
 		who: worktree
@@ -2497,7 +2531,7 @@ function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }
 	for (const queued of state.queue) {
 		if (holdOn(state, queued.role) || briefHeld(state, queued.slug)) continue;
 		// It starts now, whenever it was queued.
-		const staffed = staff(state, { ...queued, at: input.at }, max, input.agents);
+		const staffed = staff(state, { ...queued, at: input.at }, max, input.agents, input.models);
 		if (!staffed) continue;
 		return took(
 			state,
@@ -3243,7 +3277,7 @@ function restaff(state: EffortState, input: Extract<EffortInput, { kind: "review
 	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
 	const pauses = heldPauses(after);
 	const hold = holdOn(after, task.role);
-	const staffed = pauses.length > 0 || hold ? undefined : staff(after, wanted, max);
+	const staffed = pauses.length > 0 || hold ? undefined : staff(after, wanted, max, undefined, input.models);
 	if (staffed) {
 		const id = staffed.append.flatMap((line) => (line.type === "task-reassigned" ? [line.teammate] : []))[0] ?? "";
 		return took(
@@ -3600,9 +3634,9 @@ function report(state: EffortState, input: Extract<EffortInput, { kind: "report"
 	const now = found.reduce(apply, state);
 	const n = state.reports + 1;
 	const usage = { title: "Usage", lines: usageLines(now, input.leadCostUsd) };
-	// The final Report tells all found work, not only what is new, so its own section replaces the logged one; usage stays last, as in every Report.
-	const kept = reportSections(now, n === 1 ? input.modes : undefined);
-	const logged = input.final ? [...kept.filter((each) => each.title !== "Found work"), ...finalSections(now, input.final)] : kept;
+	// The final Report tells every Task and all found work, not only what moved, so its own sections replace the logged ones; usage stays last, as in every Report.
+	const kept = reportSections(now, n === 1 ? input.modes : undefined, n === 1 ? input.skips : undefined);
+	const logged = input.final ? [...kept.filter((each) => each.title !== "Plan" && each.title !== "Found work"), ...finalSections(now, input.final)] : kept;
 	const sections = [...logged, usage].filter((each) => each.lines.length > 0);
 	const written: Report = { n, at: input.at, headline, coverage, sections, ...(input.final ? { final: true as const } : {}) };
 	const file = `reports/${String(n).padStart(3, "0")}.md`;
@@ -3657,15 +3691,32 @@ function outcomeText(asked: Asked): string {
 }
 
 /**
- * The final Report's own sections, always present so a gap shows: every
- * checkpoint with its approval (a Playbook checkpoint never asked says so),
- * all found work, each proposed Playbook change, and what happens to each
- * worktree at sign-off.
+ * A planned Task as the final Report lists it: its Role, the model its
+ * Teammate was launched on (none for a Task never launched, and saying so for
+ * one whose launch recorded none), and its status.
+ */
+function taskLine(state: EffortState, task: PlannedTask): string {
+	const handed = state.tasks[task.slug];
+	const model = handed?.model;
+	const on =
+		handed === undefined || handed.dropped !== undefined ? "" : model === undefined ? ", model not recorded" : `, on ${model === null ? "Claude Code's default model" : `\`${model}\``}`;
+	return `\`${task.slug}\` (${task.role}${on}): ${taskStatus(state, task.slug)}`;
+}
+
+/**
+ * The final Report's own sections, always present so a gap shows: every Task
+ * with its Role and the model it ran on, every checkpoint with its approval (a
+ * Playbook checkpoint never asked says so), all found work, each proposed
+ * Playbook change, and what happens to each worktree at sign-off.
  */
 function finalSections(state: EffortState, final: FinalFacts): ReportSection[] {
 	const asked = (state.asked ?? []).filter((each) => each.checkpoint !== PLAYBOOK_CHANGE);
 	const askedAt = new Set<string>(asked.map((each) => each.checkpoint));
 	return [
+		{
+			title: "Tasks",
+			lines: (state.plan ?? []).length === 0 ? ["none"] : [...(state.plan ?? []).map((task) => taskLine(state, task)), ...replanReasons(state)],
+		},
 		{
 			title: "Checkpoints",
 			lines: [
@@ -3764,18 +3815,24 @@ function usageLines(state: EffortState, leadCostUsd: number | undefined): string
 	return lines;
 }
 
-/** The logged sections, from `since` the last Report; the plan Report passes each Role's mode. */
-function reportSections(state: EffortState, modes: readonly { role: string; mode: string }[] | undefined): ReportSection[] {
+/** Why the Lead re-planned since the last Report, one line for each re-plan that gave a reason. */
+function replanReasons(state: EffortState): string[] {
+	return state.sinceReport.flatMap((line) => (line.type === "plan-written" && line.reason !== undefined ? [`re-planned at ${clock(line.at)}: ${line.reason}`] : []));
+}
+
+/** The logged sections, from `since` the last Report; the plan Report passes each Role's mode and the Playbook entries the Brief skips. */
+function reportSections(state: EffortState, modes: readonly { role: string; mode: string }[] | undefined, skips?: readonly { rule: string; reason: string }[]): ReportSection[] {
 	const since = state.sinceReport;
 	const of = <T extends EffortLine["type"]>(type: T) => since.filter((line): line is Extract<EffortLine, { type: T }> => line.type === type);
 	const planChanged = modes !== undefined || since.some((line) => ["plan-written", "task-handed-off", "task-done", "task-sent-back", "task-accepted"].includes(line.type));
 	const plan = state.plan && planChanged ? state.plan.map((task) => `\`${task.slug}\` (${task.role}): ${taskStatus(state, task.slug)}`) : [];
-	const reasons = of("plan-written").flatMap((line) => (line.reason === undefined ? [] : [`re-planned at ${clock(line.at)}: ${line.reason}`]));
+	const reasons = replanReasons(state);
 	const newFound = of("found-work");
 	const launched = (id: string) => state.teammates.find((each) => each.id === id)?.mode;
 	return [
 		{ title: "Since the last Report", lines: since.flatMap((line) => { const text = told(line, state); return text === undefined || !("at" in line) ? [] : [`${clock(line.at)} ${text}`]; }) },
 		{ title: "Plan", lines: [...plan, ...reasons] },
+		{ title: "Playbook entries the Brief skips", lines: (skips ?? []).map(({ rule, reason }) => `\`${rule}\`: ${reason}`) },
 		{
 			title: "Waiting on you",
 			lines: [
