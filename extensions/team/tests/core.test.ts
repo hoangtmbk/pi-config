@@ -2121,6 +2121,8 @@ describe("the final Report and sign-off", () => {
 		{ path: "/work/app/.claude/worktrees/team-software-2026-11-02", branch: "team/software-2026-11-02", dirty: false },
 		{ path: "/work/app/.claude/worktrees/team-software-2026-11-02-task-002", branch: "team/software-2026-11-02-task-002", dirty: true },
 	];
+	// The architect's Role names its model; the dev's names none, so it runs on Claude Code's default.
+	const MODELS = { architect: "opus" };
 	const EVIDENCE = [
 		{ criterion: "AC1", note: "renamed in `config.ts`, tests in `config.test.ts` pass" },
 		{ criterion: "AC2", note: "design accepted in `001-architect-design/result-1.md`" },
@@ -2133,7 +2135,7 @@ describe("the final Report and sign-off", () => {
 			coverage: EVIDENCE,
 			criteria: ["AC1", "AC2"],
 			modes: [],
-			final: { checkpoints: ["design-review"], changes: [CHANGE], worktrees: WORKTREES },
+			final: { checkpoints: ["design-review"], changes: [CHANGE], worktrees: WORKTREES, models: MODELS },
 			at,
 			...extra,
 		};
@@ -2156,9 +2158,9 @@ describe("the final Report and sign-off", () => {
 	it("refuses a final Report that leaves a criterion without evidence, or proposes a change twice", () => {
 		assert.match(refusal(running, finalReport("2026-11-02T12:00:00.000Z", { coverage: [EVIDENCE[0]] })), /`AC2`/);
 		assert.match(refusal(running, finalReport("2026-11-02T12:00:00.000Z", { coverage: [EVIDENCE[0], { criterion: "AC2", note: " " }] })), /`AC2`/);
-		const twice = finalReport("2026-11-02T12:00:00.000Z", { final: { checkpoints: [], changes: [CHANGE, CHANGE], worktrees: [] } });
+		const twice = finalReport("2026-11-02T12:00:00.000Z", { final: { checkpoints: [], changes: [CHANGE, CHANGE], worktrees: [], models: {} } });
 		assert.match(refusal(running, twice), /`qa-first`.*once/);
-		const unkebab = finalReport("2026-11-02T12:00:00.000Z", { final: { checkpoints: [], changes: [{ ...CHANGE, id: "QA First" }], worktrees: [] } });
+		const unkebab = finalReport("2026-11-02T12:00:00.000Z", { final: { checkpoints: [], changes: [{ ...CHANGE, id: "QA First" }], worktrees: [], models: {} } });
 		assert.match(refusal(running, unkebab), /kebab-case/);
 	});
 
@@ -2183,10 +2185,17 @@ describe("the final Report and sign-off", () => {
 		]);
 	});
 
+	it("lists every Task with its Role, the model the Role ran it on and its status, in place of the logged Plan", () => {
+		const report = written(run(running, finalReport("2026-11-02T12:00:00.000Z")));
+		const section = (title: string) => report.sections.find((each) => each.title === title)?.lines;
+		assert.deepEqual(section("Tasks"), ["`design` (architect, on `opus`): running", "`rename` (dev, on Claude Code's default model): running"]);
+		assert.equal(section("Plan"), undefined);
+	});
+
 	it("orders the final Report's sections as the spec lists them, found work before usage, the sign-off's own after the logged ones", () => {
 		const report = written(run(running, finalReport("2026-11-02T12:00:00.000Z", { leadCostUsd: 1.5 })));
 		const titles = report.sections.map((each) => each.title);
-		assert.deepEqual(titles.slice(titles.indexOf("Checkpoints")), ["Checkpoints", "Found work", "Proposed Playbook changes", "Worktrees", "Usage"]);
+		assert.deepEqual(titles.slice(titles.indexOf("Tasks")), ["Tasks", "Checkpoints", "Found work", "Proposed Playbook changes", "Worktrees", "Usage"]);
 	});
 
 	it("asks for sign-off and for each proposed Playbook change separately", () => {

@@ -38,6 +38,12 @@ How the Lead runs this Team. **Rules** are the bullets that start with a bold id
 follow them, and departing from one is a per-Effort override on the Brief, named by that id.
 Everything else is guidance, and the Lead uses its judgment there.
 
+A Rule must ask for something the Lead's tools can do. Before it writes the Brief, the Lead checks
+each Rule against them. A Rule it can't carry out goes in the Brief as a `skip` override naming
+the Rule's id, in the plan Report, and in the final Report as a proposed Playbook change. It is
+never skipped silently. Choosing a Task's model is one such: each Teammate runs on its Role's
+`model`, so a cheaper model for simpler Tasks means a separate Role (a `dev-lite` on Haiku, say).
+
 ## Brief sections
 
 Besides the sections every Brief has, a Brief for this Team has:

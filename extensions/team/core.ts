@@ -604,11 +604,13 @@ export interface Report {
 	final?: true;
 }
 
-/** What the shell gathers for the final Report: the Playbook snapshot's checkpoint ids, the proposed changes and the Effort's worktrees now. */
+/** What the shell gathers for the final Report: the Playbook snapshot's checkpoint ids, the proposed changes, the Effort's worktrees now and each Role's model. */
 export interface FinalFacts {
 	checkpoints: readonly string[];
 	changes: readonly PlaybookChange[];
 	worktrees: readonly { path: string; branch: string; dirty: boolean }[];
+	/** Each Role's model in the Team snapshot, which its Teammates were launched on; a Role without one ran on Claude Code's default. */
+	models: Readonly<Record<string, string>>;
 }
 
 /** What an Effort's lines fold to. */
@@ -3600,9 +3602,9 @@ function report(state: EffortState, input: Extract<EffortInput, { kind: "report"
 	const now = found.reduce(apply, state);
 	const n = state.reports + 1;
 	const usage = { title: "Usage", lines: usageLines(now, input.leadCostUsd) };
-	// The final Report tells all found work, not only what is new, so its own section replaces the logged one; usage stays last, as in every Report.
+	// The final Report tells every Task and all found work, not only what moved, so its own sections replace the logged ones; usage stays last, as in every Report.
 	const kept = reportSections(now, n === 1 ? input.modes : undefined);
-	const logged = input.final ? [...kept.filter((each) => each.title !== "Found work"), ...finalSections(now, input.final)] : kept;
+	const logged = input.final ? [...kept.filter((each) => each.title !== "Plan" && each.title !== "Found work"), ...finalSections(now, input.final)] : kept;
 	const sections = [...logged, usage].filter((each) => each.lines.length > 0);
 	const written: Report = { n, at: input.at, headline, coverage, sections, ...(input.final ? { final: true as const } : {}) };
 	const file = `reports/${String(n).padStart(3, "0")}.md`;
@@ -3657,15 +3659,23 @@ function outcomeText(asked: Asked): string {
 }
 
 /**
- * The final Report's own sections, always present so a gap shows: every
- * checkpoint with its approval (a Playbook checkpoint never asked says so),
- * all found work, each proposed Playbook change, and what happens to each
- * worktree at sign-off.
+ * The final Report's own sections, always present so a gap shows: every Task
+ * with its Role and the model it ran on, every checkpoint with its approval (a
+ * Playbook checkpoint never asked says so), all found work, each proposed
+ * Playbook change, and what happens to each worktree at sign-off.
  */
 function finalSections(state: EffortState, final: FinalFacts): ReportSection[] {
 	const asked = (state.asked ?? []).filter((each) => each.checkpoint !== PLAYBOOK_CHANGE);
 	const askedAt = new Set<string>(asked.map((each) => each.checkpoint));
+	const model = (role: string) => (final.models[role] === undefined ? "Claude Code's default model" : `\`${final.models[role]}\``);
 	return [
+		{
+			title: "Tasks",
+			lines:
+				(state.plan ?? []).length === 0
+					? ["none"]
+					: [...(state.plan ?? []).map((task) => `\`${task.slug}\` (${task.role}, on ${model(task.role)}): ${taskStatus(state, task.slug)}`), ...replanReasons(state)],
+		},
 		{
 			title: "Checkpoints",
 			lines: [
@@ -3764,13 +3774,18 @@ function usageLines(state: EffortState, leadCostUsd: number | undefined): string
 	return lines;
 }
 
+/** Why the Lead re-planned since the last Report, one line for each re-plan that gave a reason. */
+function replanReasons(state: EffortState): string[] {
+	return state.sinceReport.flatMap((line) => (line.type === "plan-written" && line.reason !== undefined ? [`re-planned at ${clock(line.at)}: ${line.reason}`] : []));
+}
+
 /** The logged sections, from `since` the last Report; the plan Report passes each Role's mode. */
 function reportSections(state: EffortState, modes: readonly { role: string; mode: string }[] | undefined): ReportSection[] {
 	const since = state.sinceReport;
 	const of = <T extends EffortLine["type"]>(type: T) => since.filter((line): line is Extract<EffortLine, { type: T }> => line.type === type);
 	const planChanged = modes !== undefined || since.some((line) => ["plan-written", "task-handed-off", "task-done", "task-sent-back", "task-accepted"].includes(line.type));
 	const plan = state.plan && planChanged ? state.plan.map((task) => `\`${task.slug}\` (${task.role}): ${taskStatus(state, task.slug)}`) : [];
-	const reasons = of("plan-written").flatMap((line) => (line.reason === undefined ? [] : [`re-planned at ${clock(line.at)}: ${line.reason}`]));
+	const reasons = replanReasons(state);
 	const newFound = of("found-work");
 	const launched = (id: string) => state.teammates.find((each) => each.id === id)?.mode;
 	return [

@@ -193,7 +193,10 @@ const ReportParams = Type.Object({
 				oldText: Type.String({ description: "The passage of the Effort's playbook.md to replace, quoted exactly; it must be there once." }),
 				newText: Type.String({ description: "What replaces it." }),
 			}),
-			{ description: "With `final`: Playbook changes the Effort taught, each adopted or declined by the human on its own, for the Team's next Effort." },
+			{
+				description:
+					"With `final`: Playbook changes the Effort taught, each adopted or declined by the human on its own, for the Team's next Effort. Include one for each rule the Brief skips because your tools can't carry it out.",
+			},
 		),
 	),
 });
@@ -1785,7 +1788,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	/**
 	 * What the shell gathers for the final Report: the checkpoints the Effort's
 	 * Playbook snapshot names, the proposed changes, each checked to apply to
-	 * that Playbook, and the Effort's worktrees as git has them now.
+	 * that Playbook, the Effort's worktrees as git has them now, and each
+	 * Role's model in the Team snapshot, which its Tasks ran on.
 	 */
 	function finalFacts(held: HeldEffort, state: EffortState, changes: readonly PlaybookChange[]): FinalFacts {
 		const { roles, playbook } = approved(held);
@@ -1794,7 +1798,12 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			return "error" in made ? [`Playbook change \`${change.id}\`: ${made.error}`] : [];
 		});
 		if (problems.length > 0) throw new Error(`The final Report wasn't written:\n${bullets(problems)}`);
-		return { checkpoints: playbook.checkpoints.map((checkpoint) => checkpoint.id), changes, worktrees: effortWorktrees(state.repo, held.effortId) };
+		return {
+			checkpoints: playbook.checkpoints.map((checkpoint) => checkpoint.id),
+			changes,
+			worktrees: effortWorktrees(state.repo, held.effortId),
+			models: Object.fromEntries(roles.flatMap((role) => (role.model === undefined ? [] : [[role.name, role.model]]))),
+		};
 	}
 
 	// Each subcommand is one row, so later ones are added without touching the rest.
@@ -2232,6 +2241,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		description: [
 			"Write the next Report to the human: your headline and Brief coverage, with the sections the extension adds from the Effort's log (what happened since the last Report, the plan, what waits on the human, what was decided for them, Teammate modes, work found outside the Brief).",
 			"Write the plan Report once you have planned, and another whenever the human asks with `/team report` or the Effort reaches a milestone.",
+			"The plan Report names each Playbook rule the Brief skips because your tools can't carry it out.",
 			"Saved as `reports/<nnn>.md` and shown to the human in chat; you get back only where it went. Refused until the human approves the Brief.",
 		].join(" "),
 		promptSnippet: "Write a Report to the human: where the Effort stands and Brief coverage",

@@ -79,6 +79,8 @@ export function intakePrompt(context: IntakeContext): string {
 		"```",
 		"",
 		`The Playbook in force is ${playbook.filePath} (sha256 ${playbook.sha256}); read it for its rules. When the human wants this Effort to depart from one, add an override to \`overrides\`: \`{ rule: <id>, change: skip, reason: <why> }\` drops one of the Playbook's ids (${ids.length > 0 ? quoted(ids) : "it has none"}), and \`{ rule: <new id>, change: "add grant: <what it allows>", reason: <why> }\` adds a grant.`,
+		"",
+		"Before you write the Brief, check each of the Playbook's rules against what your tools can do. A rule that asks for something none of them does can't be carried out: choosing a Task's model is one, since each Teammate runs on its Role's `model` and models are chosen in the Role files, so a cheaper model for simpler Tasks means a separate Role, such as a `dev-lite` on Haiku. Tell the human which rule and why while you grill them, add `{ rule: <its id>, change: skip, reason: <what your tools can't do> }` to `overrides`, name it in the plan Report, and propose the Playbook change that fixes the rule in the final Report's `changes`. Never skip a rule silently: the human reads the Playbook as what happens.",
 	].join("\n");
 }
 

@@ -908,6 +908,17 @@ describe("intake: `/team start` on a Team with an adopted Playbook", () => {
 		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer", "team_escalate", "team_send"]);
 	});
 
+	it("tells the Lead to check each Rule against what its tools can do, and to flag one it can't carry out as a `skip` override, never skipping it silently", async () => {
+		const { pi } = intakeSession();
+
+		await pi.team("start software");
+
+		const woken = pi.sent.at(-1)?.content ?? "";
+		for (const needed of ["Before you write the Brief, check each of the Playbook's rules against what your tools can do", "`{ rule: <its id>, change: skip", "Never skip a rule silently", "the Role files"]) {
+			assert.ok(woken.includes(needed), `the intake prompt doesn't say ${needed}:\n${woken}`);
+		}
+	});
+
 	it("gives each Effort its own id, so a second one the same day is numbered", async () => {
 		const { roots, repo, pi } = intakeSession();
 		await pi.team("start software");
@@ -4082,6 +4093,9 @@ describe("ending an Effort: the final Report and sign-off", () => {
 		for (const needed of [
 			"# Final Report 1 · Effort `crew-2026-11-02`",
 			"- AC1: `rename-key` accepted: no file mentions `colour`.",
+			"## Tasks",
+			"- `rename-key` (builder, on `opus`): running",
+			"- `check-old-configs` (reviewer, on Claude Code's default model): planned",
 			"## Checkpoints",
 			"- Brief: `r1` approved at 10:00 UTC",
 			"## Found work",
