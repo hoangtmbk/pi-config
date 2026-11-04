@@ -19,8 +19,10 @@
  * prints `permissionDecision: "ask"`, so Claude Code prompts even in `auto`
  * and the prompt arrives as a held `PermissionRequest`. The Workspace it
  * judges deletes against is the hook command's third argument, given only to
- * this hook, and the session's `cwd` when it is missing. It is a guardrail,
- * not a security boundary.
+ * this hook, and the session's `cwd` when it is missing. A delete in the
+ * Teammate's own temp folders (`$CLAUDE_JOB_DIR/tmp`, and the payload's
+ * `scratchpad_dir` when it has one) is inside too. It is a guardrail, not a
+ * security boundary.
  *
  * A `PermissionRequest` (an AskUserQuestion included) is held instead: the
  * journal line carries a request id, and the hook keeps a socket open to the
@@ -177,13 +179,24 @@ function hold(journal, request) {
 	setInterval(offer, WATCH_MS);
 }
 
+/**
+ * The Teammate's own temp folders, where a delete isn't on the floor: its
+ * Claude Code job temp folder, `$CLAUDE_JOB_DIR/tmp`, which Claude Code sets
+ * for a background session and tells it to keep scratch files in, and the
+ * session's scratchpad when the payload names one.
+ */
+function ownTempFolders(payload) {
+	const job = process.env.CLAUDE_JOB_DIR;
+	return [...(job ? [join(job, "tmp")] : []), ...(typeof payload.scratchpad_dir === "string" && payload.scratchpad_dir !== "" ? [payload.scratchpad_dir] : [])];
+}
+
 /** The floor hook's `ask` for a `PreToolUse` of a floor command, or undefined to let it through. */
 function floorAsk(payload) {
 	if (payload?.hook_event_name !== "PreToolUse" || payload.tool_name !== "Bash") return undefined;
 	const command = payload.tool_input?.command;
 	const root = workspace || payload.cwd;
 	if (typeof command !== "string" || typeof root !== "string") return undefined;
-	const floor = floorAction(command, { workspace: root, cwd: typeof payload.cwd === "string" ? payload.cwd : undefined });
+	const floor = floorAction(command, { workspace: root, cwd: typeof payload.cwd === "string" ? payload.cwd : undefined, roots: ownTempFolders(payload) });
 	if (floor === undefined) return undefined;
 	return {
 		hookSpecificOutput: {

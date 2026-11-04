@@ -22,18 +22,26 @@
  * hide what it does will get past it.
  */
 
+import { homedir } from "node:os";
 import { posix } from "node:path";
 
 /**
  * The floor action a Bash command takes, or undefined when it takes none.
  *
+ * A delete is inside when it reaches only what is under the Workspace or
+ * under one of `roots`: other folders that are the Teammate's own, such as
+ * its Claude Code job temp folder. A path that starts `~/` or `$HOME/` is
+ * read under `home`; any other variable leaves the path unknown, so outside.
+ *
  * @param {string} command the Bash command as the Teammate wrote it
- * @param {{ workspace: string, cwd?: string }} where the Workspace, and the directory the command runs in (the Workspace when not given)
+ * @param {{ workspace: string, cwd?: string, roots?: string[], home?: string }} where the Workspace, the directory the command runs in (the Workspace when not given), the other folders a delete under counts as inside, and the home folder (this user's when not given)
  * @returns {{ kind: "push" | "publish" | "deploy" | "delete" | "send", command: string } | undefined}
  */
 export function floorAction(command, where) {
 	const workspace = posix.resolve(where.workspace);
-	return scan(command, { workspace, cwd: where.cwd === undefined ? workspace : posix.resolve(where.cwd) }, 0);
+	const roots = [workspace, ...(where.roots ?? []).map((root) => posix.resolve(root))];
+	const home = posix.resolve(where.home ?? homedir());
+	return scan(command, { roots, home, cwd: where.cwd === undefined ? workspace : posix.resolve(where.cwd) }, 0);
 }
 
 /**
@@ -70,19 +78,19 @@ function scan(text, context, depth) {
 		if (words.length === 0) continue;
 		const script = depth < MAX_DEPTH ? innerScript(words) : undefined;
 		if (script !== undefined) {
-			const inner = scan(script, { workspace: context.workspace, cwd }, depth + 1);
+			const inner = scan(script, { ...context, cwd }, depth + 1);
 			if (inner) return inner;
 			continue;
 		}
 		if (words[0] === "cd" || words[0] === "pushd") {
-			cwd = changeDir(cwd, words[1]);
+			cwd = changeDir(cwd, words[1] === undefined ? undefined : homeExpanded(words[1], context.home));
 			continue;
 		}
 		if (words[0] === "popd") {
 			cwd = undefined;
 			continue;
 		}
-		const kind = classify(words, { workspace: context.workspace, cwd, xargs });
+		const kind = classify(words, { ...context, cwd, xargs });
 		if (kind) return { kind, command: segment.text };
 	}
 	return undefined;
@@ -91,6 +99,14 @@ function scan(text, context, depth) {
 function changeDir(cwd, target) {
 	if (target === undefined || target === "-" || target.startsWith("~") || target.includes("$") || cwd === undefined && !target.startsWith("/")) return undefined;
 	return posix.resolve(cwd ?? "/", target);
+}
+
+/** The spellings of the home folder a path may start with, as a shell expands them. */
+const HOME_PREFIX = /^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/;
+
+/** A path with a leading `~`, `$HOME` or `${HOME}` read as `home`; any other path as it is. */
+function homeExpanded(target, home) {
+	return target.replace(HOME_PREFIX, () => home);
 }
 
 // ---------------------------------------------------------------------------
@@ -648,16 +664,18 @@ const MAILERS = new Set(["mail", "mailx", "sendmail", "msmtp", "mutt"]);
 const DELETERS = new Set(["rm", "rmdir", "unlink", "shred", "srm", "trash", "trash-put"]);
 
 /**
- * Is a path, as the command names it, outside the Workspace? The Workspace
- * itself counts as outside unless `within` says a deletion there only reaches
- * what is under it (as `find`'s starting point does). Anything unknown counts
+ * Is a path, as the command names it, outside the Workspace and the other
+ * roots? A root itself counts as outside unless `within` says a deletion
+ * there only reaches what is under it (as `find`'s starting point does).
+ * A leading `~` or `$HOME` is the home folder; anything else unknown counts
  * as outside.
  */
-function outside(target, context, within = false) {
+function outside(written, context, within = false) {
+	const target = homeExpanded(written, context.home);
 	if (target === "" || target.startsWith("~") || target.includes("$") || target.includes("`")) return true;
 	if (!target.startsWith("/") && context.cwd === undefined) return true;
 	const resolved = posix.resolve(context.cwd ?? "/", target);
-	return !(resolved.startsWith(`${context.workspace}/`) || (within && resolved === context.workspace));
+	return !context.roots.some((root) => resolved.startsWith(`${root}/`) || (within && resolved === root));
 }
 
 function remove(name, args, context) {

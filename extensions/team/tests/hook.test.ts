@@ -208,6 +208,26 @@ describe("the hook script as the PreToolUse floor hook", () => {
 		assert.deepEqual(inside, { code: 0, output: "" });
 		assert.match(fallback.output, /floor: delete/);
 	});
+
+	it("lets through a delete in the Teammate's own job temp folder, `$CLAUDE_JOB_DIR/tmp`, or the payload's scratchpad_dir", async () => {
+		const dir = effortDir();
+		const job = { HOME: "/home/qa", CLAUDE_JOB_DIR: "/home/qa/.claude/jobs/bad941c8" };
+		const scratch = { ...bash("rm -rf /tmp/claude-501/p/s-1/scratchpad/clone"), scratchpad_dir: "/tmp/claude-501/p/s-1/scratchpad" };
+
+		const results = [
+			await runHook(dir, "builder-1", bash("rm -f ~/.claude/jobs/bad941c8/tmp/x"), job, [WORKSPACE]),
+			await runHook(dir, "builder-1", bash("rm -rf /home/qa/.claude/jobs/bad941c8/tmp/clone"), job, [WORKSPACE]),
+			await runHook(dir, "builder-1", scratch, { CLAUDE_JOB_DIR: "" }, [WORKSPACE]),
+		];
+		const escape = await runHook(dir, "builder-1", bash("rm -rf ~/.claude/jobs/bad941c8/tmp/../state.json"), job, [WORKSPACE]);
+		const variable = await runHook(dir, "builder-1", bash("J=~/.claude/jobs/bad941c8/tmp; rm -rf $J/clone"), job, [WORKSPACE]);
+		const noJob = await runHook(dir, "builder-1", bash("rm -f /home/qa/.claude/jobs/bad941c8/tmp/x"), { HOME: "/home/qa", CLAUDE_JOB_DIR: "" }, [WORKSPACE]);
+
+		assert.deepEqual(results, Array(3).fill({ code: 0, output: "" }));
+		assert.match(escape.output, /floor: delete/);
+		assert.match(variable.output, /floor: delete/);
+		assert.match(noJob.output, /floor: delete/);
+	});
 });
 
 /**

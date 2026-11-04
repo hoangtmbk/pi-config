@@ -74,6 +74,7 @@ export function teammatePrompt(preamble: PreambleFor, rolePrompt: string): strin
 		"- When you need a decision you can't make yourself, ask through `AskUserQuestion`; the Lead answers it, or brings it to the human.",
 		`- The Brief is ${preamble.brief}, and answers given since it was approved are in ${preamble.clarifications}. Read both before you start and whenever you are unsure; they are the source of truth, and you may not edit them.`,
 		`- Every Task has its own folder under ${preamble.tasks}: \`task.md\` says what to do, and you write your result for round <n> to \`result-<n>.md\` beside it, with anything else you produce. Feedback on a round arrives as \`feedback-<n>.md\`.`,
+		"- Your own scratch folder is your Claude Code job temp folder, `$CLAUDE_JOB_DIR/tmp` (`~/.claude/jobs/<short id>/tmp`; `echo $CLAUDE_JOB_DIR` prints it). To delete something there, write its path out in full, starting `/` or `~/`, with no shell variable such as `$CLAUDE_JOB_DIR` or `$J`: a delete whose path holds one counts as outside the Workspace and waits on the Lead.",
 		"- The Workspace is fresh: installing dependencies is yours to do before you build or test.",
 		"",
 		"# Your Role",

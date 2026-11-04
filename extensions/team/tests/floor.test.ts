@@ -149,6 +149,33 @@ describe("the floor classifier", () => {
 		assert.equal(floorAction("rm -rf build", { workspace: WORKSPACE, cwd: "/elsewhere" })?.kind, "delete");
 	});
 
+	it("counts a delete under the Teammate's own temp folder as inside, but not the folder itself or a `../` out of it", () => {
+		const where = { workspace: WORKSPACE, roots: ["/home/qa/.claude/jobs/bad941c8/tmp"] };
+		assert.equal(floorAction("rm -f /home/qa/.claude/jobs/bad941c8/tmp/x", where)?.kind, undefined);
+		assert.equal(floorAction("rm -rf /home/qa/.claude/jobs/bad941c8/tmp/clone build", where)?.kind, undefined);
+		assert.equal(floorAction("find /home/qa/.claude/jobs/bad941c8/tmp -name '*.log' -delete", where)?.kind, undefined);
+		assert.equal(floorAction("rm -rf /home/qa/.claude/jobs/bad941c8/tmp", where)?.kind, "delete");
+		assert.equal(floorAction("rm -rf /home/qa/.claude/jobs/bad941c8/tmp/../state.json", where)?.kind, "delete");
+		assert.equal(floorAction("rm -rf /home/qa/.claude/jobs/bad941c8/tmp-other", where)?.kind, "delete");
+		assert.equal(floorAction("rm -f /home/qa/.claude/jobs/bad941c8/tmp/x", { workspace: WORKSPACE })?.kind, "delete");
+	});
+
+	it("reads `~/` and `$HOME/` as the home folder, and any other variable as unknown, so outside", () => {
+		const where = { workspace: WORKSPACE, home: "/home/qa", roots: ["/home/qa/.claude/jobs/bad941c8/tmp"] };
+		assert.equal(floorAction("rm -f ~/.claude/jobs/bad941c8/tmp/x", where)?.kind, undefined);
+		assert.equal(floorAction("rm -rf $HOME/.claude/jobs/bad941c8/tmp/clone", where)?.kind, undefined);
+		assert.equal(floorAction('rm -rf "${HOME}/.claude/jobs/bad941c8/tmp/clone"', where)?.kind, undefined);
+		assert.equal(floorAction("cd ~/.claude/jobs/bad941c8/tmp && rm -rf clone", where)?.kind, undefined);
+		assert.equal(floorAction("rm -rf ~/.claude/jobs/bad941c8/tmp/../../other", where)?.kind, "delete");
+		assert.equal(floorAction("rm -rf ~/projects", where)?.kind, "delete");
+		assert.equal(floorAction("rm -rf ~", where)?.kind, "delete");
+		assert.equal(floorAction("rm -rf ~qa/.claude/jobs/bad941c8/tmp/x", where)?.kind, "delete");
+		assert.equal(floorAction("J=~/.claude/jobs/bad941c8/tmp; rm -rf $J/clone", where)?.kind, "delete");
+		assert.equal(floorAction("rm -rf $HOME$SUB/x", where)?.kind, "delete");
+		assert.equal(floorAction("rm -rf ~/.claude/jobs/bad941c8/tmp/`whoami`", where)?.kind, "delete");
+		assert.equal(floorAction("rm -f /work/effort/~/x", where)?.kind, undefined);
+	});
+
 	it("names the command it caught", () => {
 		assert.equal(floorAction("npm test && git -C . push origin main", { workspace: WORKSPACE })?.command, "git -C . push origin main");
 	});
