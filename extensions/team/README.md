@@ -88,10 +88,13 @@ Acceptance criteria (`- **AC1** …`, unique ids), Scope, Decide for me / Ask me
 sections the Playbook adds under `## Brief sections`. It then calls `team_request_approval` with
 checkpoint `brief`, which refuses the draft naming each problem: a missing section, a repeated or
 missing criterion id, an override naming a rule the Playbook doesn't have, a wrong repo or sha.
-Before writing the Brief the Lead checks each Playbook rule against what its tools can do. A rule
-it can't carry out (choosing a Task's model, say: that is the Role's `model`) it tells you about,
-skips with an override naming the rule, names in the plan Report and proposes changing in the
-final Report.
+Before writing the Brief the Lead checks each Playbook rule against what its tools can do. A Role's
+model is set by its Role file, or for the whole Effort by the Brief's `roles:`, so a rule asking
+for a model per Role is carried out there. There is no per-Task choice: a cheaper model for simpler
+Tasks means a separate Role (a `dev-lite` on Haiku), which you add, since a Playbook change can't
+create a Role file. A rule the Lead can't carry out it tells you about, skips with an override
+naming the rule, and proposes changing in the final Report. The approval dialog lists each rule the
+Brief skips, with its reason, and so does the plan Report.
 
 In `/team pending` you see the draft's path and sha, the repo, and every Role with the mode it
 would run in. Approving writes the snapshot asked about as `brief.md`, copies the Playbook to
@@ -255,6 +258,8 @@ adds the logged sections from `effort.jsonl`, leaving out any with nothing in th
   accepted or denied, with the time (UTC);
 - **Plan**: each Task's status, when the plan or a Task moved, and why the Lead re-planned
   (`team_plan`'s `reason`);
+- **Playbook rules the Brief skips**: in the plan Report only, each `skip` override with its
+  reason;
 - **Waiting on you**: what `/team pending` holds;
 - **Decided for you**: what the extension answered on your behalf;
 - **Teammate modes**: every Role's mode in the plan Report, then a Teammate's mode only when it
@@ -271,8 +276,9 @@ chat collapsed to its headline; the Lead gets back only where it went. The Team 
 The Lead ends the work with a final Report: `team_report` with `final: true`. It must map every
 Brief criterion id to evidence, and may propose Playbook `changes`, each an `oldText` to replace
 with `newText` in the Playbook the Effort runs on; a change that doesn't apply is refused. The
-final Report adds every Task with its Role and the model that Role ran it on, the checkpoints
-with their approvals and the found work, and puts sign-off in
+final Report replaces the Plan section with every Task, its Role and the model its Teammate was
+launched on (none for a Task never launched), adds the checkpoints with their approvals and the
+found work, and puts sign-off in
 `/team pending`. There each Playbook change is asked first, one by one: adopted, it becomes the
 Team's Playbook for the next Effort (this Effort keeps its snapshot); declined, it is dropped.
 Approving sign-off records the Report's sha256 in `approvals.jsonl`, stops every Teammate and ends

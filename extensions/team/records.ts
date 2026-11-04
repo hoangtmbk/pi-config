@@ -587,6 +587,18 @@ export function briefCriteria(text: string): string[] {
 }
 
 /**
+ * The Playbook ids a Brief's overrides skip, each with its reason, in the
+ * order the Brief gives them: what the human is shown before work starts.
+ */
+export function briefSkips(text: string): { rule: string; reason: string }[] {
+	const { frontmatter } = parseFrontmatter(text);
+	const overrides = isMapping(frontmatter) && Array.isArray(frontmatter.overrides) ? frontmatter.overrides.filter(isMapping) : [];
+	return overrides.flatMap((each) =>
+		typeof each.rule === "string" && typeof each.change === "string" && each.change.trim() === SKIP ? [{ rule: each.rule, reason: typeof each.reason === "string" ? each.reason.trim() : "" }] : [],
+	);
+}
+
+/**
  * What an approved Brief and its Playbook let the Lead allow, for
  * `team_answer`'s guard: the Playbook's grants and those the Brief's overrides
  * add, less those it skips; its Delivery text; and the `escalate` entries it

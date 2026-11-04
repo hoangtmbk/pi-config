@@ -40,9 +40,11 @@ Everything else is guidance, and the Lead uses its judgment there.
 
 A Rule must ask for something the Lead's tools can do. Before it writes the Brief, the Lead checks
 each Rule against them. A Rule it can't carry out goes in the Brief as a `skip` override naming
-the Rule's id, in the plan Report, and in the final Report as a proposed Playbook change. It is
-never skipped silently. Choosing a Task's model is one such: each Teammate runs on its Role's
-`model`, so a cheaper model for simpler Tasks means a separate Role (a `dev-lite` on Haiku, say).
+the Rule's id, which the Brief's approval and the plan Report show, and in the final Report as a
+proposed Playbook change. It is never skipped silently. A Role's model is set by its Role file,
+or for the whole Effort by the Brief's `roles:`. There is no per-Task choice, so a cheaper model
+for simpler Tasks means a separate Role (a `dev-lite` on Haiku, say), which the human adds: a
+Playbook change can't create a Role file.
 
 ## Brief sections
 

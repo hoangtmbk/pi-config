@@ -82,6 +82,7 @@ import {
 	resultFile,
 	takeoverMarked,
 	unchangedSince,
+	briefSkips,
 	type EffortPaths,
 	effortPaths,
 	promoteBrief,
@@ -195,7 +196,7 @@ const ReportParams = Type.Object({
 			}),
 			{
 				description:
-					"With `final`: Playbook changes the Effort taught, each adopted or declined by the human on its own, for the Team's next Effort. Include one for each rule the Brief skips because your tools can't carry it out.",
+					"Only in the final Report (`final: true`); any other Report with changes is refused. Playbook changes the Effort taught, each adopted or declined by the human on its own, for the Team's next Effort. In the final Report, include one for each rule the Brief skips because your tools can't carry it out.",
 			},
 		),
 	),
@@ -731,10 +732,15 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	/** Each Role's model in the Effort's Team snapshot, which a model-family limit holds Roles by; none before its Brief is approved. */
 	function roleModels(held: HeldEffort): Record<string, string> | undefined {
 		try {
-			return Object.fromEntries(readApproved(held.paths, held.effortId).roles.flatMap((role) => (role.model === undefined ? [] : [[role.name, role.model]])));
+			return modelsOf(readApproved(held.paths, held.effortId).roles);
 		} catch {
 			return undefined;
 		}
+	}
+
+	/** Each Role's `--model`, as a Teammate launched now gets it; a Role without one is left out. */
+	function modelsOf(roles: readonly Role[]): Record<string, string> {
+		return Object.fromEntries(roles.flatMap((role) => (role.model === undefined ? [] : [[role.name, role.model]])));
 	}
 
 	/**
@@ -1373,7 +1379,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const said: string[] = [];
 		for (;;) {
 			const agents = await listedNames();
-			const drained = step(state, { kind: "drain", at: now().toISOString(), maxTeammates: maxTeammates(), ...(agents ? { agents } : {}) });
+			const models = roleModels(held);
+			const drained = step(state, { kind: "drain", at: now().toISOString(), maxTeammates: maxTeammates(), ...(agents ? { agents } : {}), ...(models ? { models } : {}) });
 			if (!drained.ok) break;
 			if (drained.reply === undefined) {
 				// Nothing starts; the lines left say why each queued Task still waits, now that a pause no longer does.
@@ -1788,8 +1795,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	/**
 	 * What the shell gathers for the final Report: the checkpoints the Effort's
 	 * Playbook snapshot names, the proposed changes, each checked to apply to
-	 * that Playbook, the Effort's worktrees as git has them now, and each
-	 * Role's model in the Team snapshot, which its Tasks ran on.
+	 * that Playbook, and the Effort's worktrees as git has them now.
 	 */
 	function finalFacts(held: HeldEffort, state: EffortState, changes: readonly PlaybookChange[]): FinalFacts {
 		const { roles, playbook } = approved(held);
@@ -1798,12 +1804,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			return "error" in made ? [`Playbook change \`${change.id}\`: ${made.error}`] : [];
 		});
 		if (problems.length > 0) throw new Error(`The final Report wasn't written:\n${bullets(problems)}`);
-		return {
-			checkpoints: playbook.checkpoints.map((checkpoint) => checkpoint.id),
-			changes,
-			worktrees: effortWorktrees(state.repo, held.effortId),
-			models: Object.fromEntries(roles.flatMap((role) => (role.model === undefined ? [] : [[role.name, role.model]]))),
-		};
+		return { checkpoints: playbook.checkpoints.map((checkpoint) => checkpoint.id), changes, worktrees: effortWorktrees(state.repo, held.effortId) };
 	}
 
 	// Each subcommand is one row, so later ones are added without touching the rest.
@@ -2086,6 +2087,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				maxTeammates: maxTeammates(),
 				...(params.isolated ? { isolated: true } : {}),
 				...(agents ? { agents } : {}),
+				models: modelsOf(roles),
 			});
 			if (!result.ok) throw new Error(result.refusal);
 			if (!state.workspace) throw new Error(`Effort \`${held.effortId}\` has no Workspace, so no Teammate starts; stop and tell the human.`);
@@ -2128,6 +2130,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				at: now().toISOString(),
 				mode: plannedMode(state.plan, params.slug, roles, playbook),
 				maxTeammates: maxTeammates(),
+				models: modelsOf(roles),
 			});
 			if (!result.ok) throw new Error(result.refusal);
 			const merge = result.actions.find((action) => action.kind === "merge");
@@ -2241,7 +2244,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		description: [
 			"Write the next Report to the human: your headline and Brief coverage, with the sections the extension adds from the Effort's log (what happened since the last Report, the plan, what waits on the human, what was decided for them, Teammate modes, work found outside the Brief).",
 			"Write the plan Report once you have planned, and another whenever the human asks with `/team report` or the Effort reaches a milestone.",
-			"The plan Report names each Playbook rule the Brief skips because your tools can't carry it out.",
+			"The plan Report lists each Playbook rule the Brief skips, with its reason, read from the Brief; say in the headline which of them your tools can't carry out.",
 			"Saved as `reports/<nnn>.md` and shown to the human in chat; you get back only where it went. Refused until the human approves the Brief.",
 		].join(" "),
 		promptSnippet: "Write a Report to the human: where the Effort stands and Brief coverage",
@@ -2249,6 +2252,9 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		defaultActive: false,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!effort) throw new Error("No Effort is open in this session, so there is nothing to report on; the human opens one with `/team start <team>`.");
+			if (!params.final && (params.changes?.length ?? 0) > 0) {
+				throw new Error("Nothing was written: Playbook changes go in the final Report (`final: true`), where the human adopts or declines each. Write this Report without `changes`, and propose them in the final one.");
+			}
 			const held = effort;
 			// The Report's usage is as of now: each live Teammate's status line is read first.
 			const state = readStatusLines(held);
@@ -2257,10 +2263,12 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			// The Role modes go only into the plan Report.
 			const snapshot = state.reports === 0 ? records : undefined;
 			const modes = snapshot ? snapshot.roles.map((role) => ({ role: role.name, mode: modeInForce(snapshot.playbook, role) })) : [];
+			// So are the Playbook rules the Brief skips, read from it rather than left to the Lead to mention.
+			const skips = snapshot ? briefSkips(snapshot.brief) : [];
 			const final = params.final && state.brief ? finalFacts(held, state, params.changes ?? []) : undefined;
 			const leadCostUsd = leadCost(ctx.sessionManager.getEntries());
 			const at = now().toISOString();
-			const result = step(state, { kind: "report", headline: params.headline, coverage: params.coverage, found: params.found, criteria, modes, final, leadCostUsd, at });
+			const result = step(state, { kind: "report", headline: params.headline, coverage: params.coverage, found: params.found, criteria, modes, skips, final, leadCostUsd, at });
 			if (!result.ok) throw new Error(result.refusal);
 			let details: ReportDetails | undefined;
 			const replies = [result.reply ?? ""];

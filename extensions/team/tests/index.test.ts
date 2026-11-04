@@ -908,13 +908,20 @@ describe("intake: `/team start` on a Team with an adopted Playbook", () => {
 		assert.deepEqual(pi.activeTools(), [...PI_TOOLS, "team_request_approval", "team_plan", "team_handoff", "team_review", "team_status", "team_report", "team_pause", "team_resume", "team_answer", "team_escalate", "team_send"]);
 	});
 
-	it("tells the Lead to check each Rule against what its tools can do, and to flag one it can't carry out as a `skip` override, never skipping it silently", async () => {
+	it("tells the Lead to check each Rule against what its tools can do, a Role's model for the Effort among them, and to flag one it can't carry out as a `skip` override, never skipping it silently", async () => {
 		const { pi } = intakeSession();
 
 		await pi.team("start software");
 
 		const woken = pi.sent.at(-1)?.content ?? "";
-		for (const needed of ["Before you write the Brief, check each of the Playbook's rules against what your tools can do", "`{ rule: <its id>, change: skip", "Never skip a rule silently", "the Role files"]) {
+		for (const needed of [
+			"Before you write the Brief, check each of the Playbook's rules against what your tools can do",
+			"unless the Brief's `roles:` frontmatter sets another",
+			"there is no per-Task choice",
+			"a Playbook change can't create a Role file",
+			"`{ rule: <its id>, change: skip",
+			"Never skip a rule silently",
+		]) {
 			assert.ok(woken.includes(needed), `the intake prompt doesn't say ${needed}:\n${woken}`);
 		}
 	});
@@ -1068,6 +1075,15 @@ describe("intake: asking the human to approve the Brief", () => {
 		assert.deepEqual(dialog.options, ANSWERS);
 		assert.ok(dialog.title.includes(draft) && dialog.title.includes(sha(asked)), dialog.title);
 		assert.match(dialog.title, /- `architect`: auto\n- `dev`: acceptEdits\n- `qa`: auto/);
+	});
+
+	it("shows in the dialog each Playbook rule the Brief skips, with its reason, so the human sees it before work starts", async () => {
+		const { pi } = await briefAsked();
+
+		pi.answer("Later");
+		await pi.team("pending");
+
+		assert.match(pi.dialogs[0].title, /Playbook rules this Brief skips:\n- `small-diffs`: The rename touches every file\./);
 	});
 
 	it("keeps Teammates from starting until the Brief is approved: `team_plan` and `team_handoff` refuse", async () => {
@@ -3236,6 +3252,20 @@ describe("reporting: team_report", () => {
 			assert.ok(written.includes(needed), `reports/001.md doesn't say ${needed}:\n${written}`);
 		}
 		assert.equal(written.includes("## Waiting on you"), false, `an empty section is left out:\n${written}`);
+		assert.equal(written.includes("## Playbook rules the Brief skips"), false, `a Brief that skips none leaves it out:\n${written}`);
+	});
+
+	it("lists in the plan Report each Playbook rule the Brief skips, with its reason, and in no later Report", async () => {
+		const { pi, dir } = await crewApproved({ overrides: ["overrides:", "  - rule: small-diffs", "    change: skip", "    reason: The rename touches every file."] });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_report", { headline: "Planned three Tasks." });
+		await pi.call("team_report", { headline: "Nothing has moved." });
+
+		const first = readFileSync(join(dir, "reports", "001.md"), "utf8");
+		assert.ok(first.includes("## Playbook rules the Brief skips\n\n- `small-diffs`: The rename touches every file."), first);
+		const second = readFileSync(join(dir, "reports", "002.md"), "utf8");
+		assert.equal(second.includes("Playbook rules the Brief skips"), false, second);
 	});
 
 	it("writes the next Report as reports/002.md, covering only what happened since the first", async () => {
@@ -4095,7 +4125,8 @@ describe("ending an Effort: the final Report and sign-off", () => {
 			"- AC1: `rename-key` accepted: no file mentions `colour`.",
 			"## Tasks",
 			"- `rename-key` (builder, on `opus`): running",
-			"- `check-old-configs` (reviewer, on Claude Code's default model): planned",
+			"- `check-old-configs` (reviewer): planned",
+			"- `survey` (scout, on Claude Code's default model): running",
 			"## Checkpoints",
 			"- Brief: `r1` approved at 10:00 UTC",
 			"## Found work",
@@ -4113,6 +4144,15 @@ describe("ending an Effort: the final Report and sign-off", () => {
 		await pi.call("team_plan", { tasks: CREW_PLAN });
 
 		await assert.rejects(pi.call("team_report", { headline: "Done.", coverage: [FINAL_COVERAGE[0]], final: true }), /AC2/);
+		assert.equal(existsSync(join(dir, "reports")), false);
+	});
+
+	it("refuses Playbook changes in a Report that isn't final, writing nothing, rather than dropping them", async () => {
+		const { pi, dir } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		const changes = [{ id: "qa-first", summary: "QA first.", oldText: "a", newText: "b" }];
+
+		await assert.rejects(pi.call("team_report", { headline: "Planned.", changes }), /Playbook changes go in the final Report/);
 		assert.equal(existsSync(join(dir, "reports")), false);
 	});
 
@@ -4752,6 +4792,28 @@ describe("Brief changes: fresh sessions", () => {
 			JSON.stringify(teamBlock(pi)),
 		);
 		assert.equal(effortLines(dir).some((line) => line.type === "teammate-crashed"), false);
+	});
+
+	it("the final Report names the model each Task's Teammate was launched on, not the Role's model after a Brief change", async () => {
+		const { pi, dir, repo } = await crewPlanned();
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		const first = pi.claude.launches()[0]?.argv ?? [];
+		assert.equal(first[first.indexOf("--model") + 1], "opus");
+		writeFileSync(join(dir, "brief.draft.md"), changedBrief(repo, BUILDER_ON_SONNET));
+		await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: [] });
+		pi.answer("Approve");
+		await pi.team("pending");
+		await until(() => teammateWakes(pi.sent).length === 1, "rename-key has a result");
+		await pi.call("team_review", { slug: "rename-key", verdict: "accept" });
+		// builder-1 starts afresh on the new model for its next Task.
+		await pi.call("team_handoff", { slug: "update-docs", body: "# Docs\n" });
+
+		await pi.call("team_report", { headline: "Both criteria are met.", coverage: FINAL_COVERAGE, final: true });
+
+		const written = readFileSync(join(dir, "reports", "001.md"), "utf8");
+		for (const needed of ["- `rename-key` (builder, on `opus`): accepted", "- `update-docs` (builder, on `sonnet`): in review", "- `survey` (scout): planned"]) {
+			assert.ok(written.includes(needed), `reports/001.md doesn't say ${needed}:\n${written}`);
+		}
 	});
 
 	it("a Brief change that leaves the launch options alone reuses the Teammate with a clear", async () => {
