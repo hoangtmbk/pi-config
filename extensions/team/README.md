@@ -273,11 +273,14 @@ Team's Playbook for the next Effort (this Effort keeps its snapshot); declined, 
 Approving sign-off records the Report's sha256 in `approvals.jsonl`, stops every Teammate and ends
 the Effort; sending it back wakes the Lead with your note and drops the proposed changes. At the
 end clean worktrees are removed and every branch is kept; a dirty worktree is kept and named.
+`/team cancel` ends the Effort the same way without a Report. An ended Effort can't be adopted.
+
 A process still running in a worktree (a server a Teammate started with `&`, which `claude stop`
 doesn't reach) is named by pid and command in the final Report's Worktrees section and in the
 notice as the worktree goes, and is never stopped; so is one left in an isolated Task's worktree
 when an accept or a drop removes it. A Teammate's own session, and what is still attached to it,
-isn't named, since stopping the Teammate stops those. `/team cancel` ends the Effort the same way without a Report. An ended Effort can't be adopted.
+isn't named, since stopping the Teammate stops those. The session is known by the pid `claude
+agents --json` gives it: if that list gives no pids, a live session may be named too.
 
 ### Pausing
 

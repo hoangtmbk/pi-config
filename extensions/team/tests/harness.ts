@@ -212,7 +212,7 @@ export interface FakeClaude {
 	/** Forget the session named `name` altogether, as if Claude Code had cleaned it up: no record, no socket, nothing to resume. */
 	forget(name: string): void;
 	/** Set what `agents --json` says of the session named `name`. */
-	setAgent(name: string, change: Partial<Pick<FakeAgent, "status" | "state" | "waitingFor">>): void;
+	setAgent(name: string, change: Partial<Pick<FakeAgent, "status" | "state" | "waitingFor" | "pid">>): void;
 	/** Set what `get_usage` answers from now on; undefined makes it answer with an error. */
 	setUsage(usage: Record<string, unknown> | undefined): void;
 	/** How many times `get_usage` was asked for: each is one `claude -p`. */

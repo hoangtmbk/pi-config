@@ -161,6 +161,39 @@ describe("which processes count as running in a worktree", () => {
 		assert.ok(Date.now() - started < 8000, `it took ${Date.now() - started}ms`);
 	});
 
+	it("is none, within a few seconds, when a hanging `lsof` ignores SIGTERM", (t) => {
+		const { workspace } = effortWithTask();
+		leaveRunning(t, workspace.path);
+		const stubborn = join(tempRoots().scratch, "lsof");
+		writeFileSync(stubborn, "#!/bin/sh\ntrap '' TERM\nexec sleep 60\n", { mode: 0o755 });
+
+		const started = Date.now();
+		assert.deepEqual(runningIn(workspace.path, { lsof: stubborn }), []);
+		assert.ok(Date.now() - started < 8000, `it took ${Date.now() - started}ms`);
+	});
+
+	it("finds a process in a folder whose name `lsof` escapes (non-ASCII, a tab, a backslash, a control character), with pi in no UTF-8 locale", (t) => {
+		const roots = tempRoots();
+		const dir = join(roots.scratch, "josé a\tb\\c\u0001d");
+		mkdirSync(dir);
+		const pid = leaveRunning(t, dir);
+		const locale = Object.fromEntries(["LANG", "LC_ALL", "LC_CTYPE"].map((name) => [name, process.env[name]]));
+		t.after(() => {
+			for (const [name, value] of Object.entries(locale)) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		});
+		for (const name of Object.keys(locale)) delete process.env[name];
+		// lsof as it runs in no locale at all, printing every non-ASCII byte as `\xNN`.
+		const bare = join(roots.scratch, "lsof");
+		writeFileSync(bare, '#!/bin/sh\nexec env -u LANG -u LC_ALL -u LC_CTYPE lsof "$@"\n', { mode: 0o755 });
+
+		assert.deepEqual(runningIn(dir), [{ pid, command: "sleep 300" }]);
+		assert.deepEqual(runningIn(dir, { lsof: bare }), [{ pid, command: "sleep 300" }]);
+		assert.deepEqual(runningIn(join(roots.scratch, "josé a\tb\\c")), [], "a folder whose name starts the same is another folder");
+	});
+
 	it("leaves out a spared process, a live Teammate's session, and everything descended from it, but not a process outside it", async (t) => {
 		const { workspace } = effortWithTask();
 		// The session, with a child of its own still attached to it, as a Bash-tool shell is.

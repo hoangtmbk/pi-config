@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
@@ -4196,13 +4196,13 @@ describe("ending an Effort: the final Report and sign-off", () => {
 				written,
 			);
 		}
-		for (const pid of sessions) assert.ok(!written.includes(`${pid} (`), `the live session process ${pid} isn't named:\n${written}`);
+		for (const pid of sessions) assert.doesNotMatch(written, new RegExp(`(?<!\\d)${pid} \\(`), `the live session process ${pid} isn't named:\n${written}`);
 
 		pi.answer("Approve");
 		await pi.team("pending");
 
 		const said = pi.notifications.at(-1)?.message ?? "";
-		for (const pid of sessions) assert.ok(!said.includes(`${pid} (`), `the stopped session process ${pid} isn't named: ${said}`);
+		for (const pid of sessions) assert.doesNotMatch(said, new RegExp(`(?<!\\d)${pid} \\(`), `the stopped session process ${pid} isn't named: ${said}`);
 		for (const [path, pid] of [
 			[task.path, inTask],
 			[workspace, inWorkspace],
@@ -4211,6 +4211,33 @@ describe("ending an Effort: the final Report and sign-off", () => {
 			assert.equal(existsSync(path), false);
 			assert.doesNotThrow(() => process.kill(pid, 0), "sign-off doesn't stop it");
 		}
+	});
+
+	it("doesn't spare a process by the pid of a session stopped long before, which the system may have handed on", async (t) => {
+		const { pi, dir, workspace } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		const orphan = spawn("sleep", ["300"], { cwd: workspace, detached: true, stdio: "ignore" });
+		orphan.unref();
+		const pid = orphan.pid ?? 0;
+		t.after(() => {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				// Gone already.
+			}
+		});
+		// The session builder-1 had goes by the pid the orphan has now.
+		const [session] = pi.claude.agents();
+		pi.claude.setAgent(session?.name ?? "", { pid });
+		// A re-plan drops its Task and stops it, and no worktree check follows.
+		await pi.call("team_plan", { tasks: [{ ...CREW_PLAN[0], slug: "rename-key-everywhere" }, { ...CREW_PLAN[1], dependsOn: ["rename-key-everywhere"] }, CREW_PLAN[2]] });
+		pi.advance(60 * 60_000);
+
+		await pi.call("team_report", { headline: "Both criteria are met.", coverage: FINAL_COVERAGE, final: true });
+
+		const written = readFileSync(join(dir, "reports", "001.md"), "utf8");
+		assert.ok(written.includes(`pid ${pid} (\`sleep 300\`) is still running in it`), written);
 	});
 
 	it("leaves nothing waiting once signed off, and adopts nothing ended with `/team resume`", async () => {

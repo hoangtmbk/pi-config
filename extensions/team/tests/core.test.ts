@@ -2202,8 +2202,9 @@ describe("the final Report and sign-off", () => {
 		]);
 	});
 
-	it("names a process with no command by its pid alone, and keeps a command holding a backtick in one code span", () => {
+	it("names a process with no command by its pid alone, cuts a long command by code point, and keeps a command holding a backtick in one code span", () => {
 		assert.equal(runningClause([{ pid: 7, command: "" }]), "pid 7 is still running in it, and the Team doesn't stop it: `kill 7` does");
+		assert.equal(runningClause([{ pid: 9, command: "\u{1F600}".repeat(130) }]), `pid 9 (\`${"\u{1F600}".repeat(119)}…\`) is still running in it, and the Team doesn't stop it: \`kill 9\` does`);
 		assert.equal(runningClause([{ pid: 8, command: "sh -c `date`" }]), "pid 8 (`` sh -c `date` ``) is still running in it, and the Team doesn't stop it: `kill 8` does");
 	});
 

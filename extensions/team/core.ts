@@ -626,8 +626,9 @@ export interface RunningProcess {
 export function runningClause(running: readonly RunningProcess[]): string | undefined {
 	if (running.length === 0) return undefined;
 	const shown = running.map((each) => {
-		const command = each.command.trim();
-		return command === "" ? String(each.pid) : `${each.pid} (${codeSpan(command.length > 120 ? `${command.slice(0, 119)}…` : command)})`;
+		// Cut by code point, so no surrogate pair is split.
+		const points = [...each.command.trim()];
+		return points.length === 0 ? String(each.pid) : `${each.pid} (${codeSpan(points.length > 120 ? `${points.slice(0, 119).join("")}…` : points.join(""))})`;
 	});
 	const which = running.length === 1 ? `pid ${shown[0]} is` : `pids ${shown.slice(0, -1).join(", ")} and ${shown.at(-1)} are`;
 	return `${which} still running in it, and the Team doesn't stop ${running.length === 1 ? "it" : "them"}: \`kill ${running.map((each) => each.pid).join(" ")}\` does`;

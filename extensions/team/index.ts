@@ -369,8 +369,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * a new session's lines go to its new Task.
 	 */
 	const stopping = new Set<string>();
-	/** The pid of each Teammate session `claude stop` ended here, until it is seen to have exited (see {@link sparedSessions}). */
-	const stoppedSessions = new Set<number>();
+	/** The pid of each Teammate session `claude stop` ended here, with when, until a worktree check uses it (see {@link sparedSessions}). */
+	const stoppedSessions = new Map<number, number>();
 	// Whether the Lead's model is working on a prompt, and what wakes about Teammates wait for it to settle.
 	let busy = false;
 	let waiting: string[] = [];
@@ -1305,7 +1305,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const pid = name === undefined ? undefined : (await agentPids(paths.claudePath)).get(name);
 		const stopped = await stopBackground(paths.claudePath, action.shortId);
 		if (!stopped) {
-			if (pid !== undefined) stoppedSessions.add(pid);
+			if (pid !== undefined) stoppedSessions.set(pid, now().getTime());
 			return undefined;
 		}
 		const agents = await agentsList(paths.claudePath);
@@ -1318,15 +1318,18 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * the Effort's Teammates `claude agents --json` lists as live, and each
 	 * session stopped here that is still exiting, `claude stop` having
 	 * returned first. Those get up to {@link STOP_SETTLE_MS} to exit before
-	 * the check; only one still there after that is left out.
+	 * the check; only one still there after that is left out. Only a session
+	 * stopped within {@link STOPPED_RECENTLY_MS} counts, and each counts for
+	 * one check, since a pid an exited session had can go to another process.
 	 */
 	async function sparedSessions(state: EffortState): Promise<number[]> {
+		const recent = [...stoppedSessions].flatMap(([pid, at]) => (now().getTime() - at <= STOPPED_RECENTLY_MS ? [pid] : []));
+		stoppedSessions.clear();
 		const deadline = Date.now() + STOP_SETTLE_MS;
-		while ([...stoppedSessions].some(processAlive) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
-		for (const pid of stoppedSessions) if (!processAlive(pid)) stoppedSessions.delete(pid);
+		while (recent.some(processAlive) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
 		const names = new Set(state.teammates.map((teammate) => teammate.name));
 		const live = [...(await agentPids(paths.claudePath))].flatMap(([name, pid]) => (names.has(name) ? [pid] : []));
-		return [...new Set([...live, ...stoppedSessions])];
+		return [...new Set([...live, ...recent.filter(processAlive)])];
 	}
 
 	/**
@@ -2509,6 +2512,9 @@ function bullets(lines: readonly string[]): string {
 
 /** How long a worktree check waits for the sessions `claude stop` ended to exit, since it can return first. */
 const STOP_SETTLE_MS = 3000;
+
+/** How long after `claude stop` a worktree check still counts that session as exiting, rather than its pid as another process's. */
+const STOPPED_RECENTLY_MS = 30_000;
 
 /** Whether process `pid` is still there, even one pi may not signal. */
 function processAlive(pid: number): boolean {
