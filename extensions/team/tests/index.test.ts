@@ -117,6 +117,8 @@ function fakePi(
 		sessionEntries?: Record<string, unknown>[];
 		/** How long a Teammate's held hook holds before giving the prompt back to its terminal; the hook's own when unset. */
 		holdMs?: number;
+		/** A command each Teammate's session keeps running as an attached child in its folder, as its Bash tool's shell. */
+		sessionChild?: string[];
 		/** The fake `claude` an earlier pi ran, whose background sessions outlive it; a new one unless set. */
 		claude?: FakeClaude;
 	} = {},
@@ -175,6 +177,7 @@ function fakePi(
 			attachExit: options.attachExit,
 			holdMs: options.holdMs,
 			usage: options.usage,
+			sessionChild: options.sessionChild,
 		});
 	const tmux = fakeTmux(roots);
 	registerTeam(pi as unknown as ExtensionAPI, {
@@ -1432,7 +1435,7 @@ function crewBrief(repo: string, playbook = CREW_PLAYBOOK, overrides: string[] =
 async function crewApproved(
 	options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown>; playbook?: string; overrides?: string[] } & Pick<
 		NonNullable<Parameters<typeof fakePi>[1]>,
-		"mode" | "env" | "attachExit" | "holdMs" | "usage" | "sessionEntries"
+		"mode" | "env" | "attachExit" | "holdMs" | "usage" | "sessionEntries" | "sessionChild"
 	> = {},
 ) {
 	const roots = tempRoots();
@@ -1470,6 +1473,7 @@ async function crewApproved(
 		usage: options.usage,
 		sessionEntries: options.sessionEntries,
 		holdMs: options.holdMs,
+		sessionChild: options.sessionChild,
 	});
 	await pi.team("start crew");
 	const dir = effortDir(roots, CREW_EFFORT_ID);
@@ -4168,13 +4172,16 @@ describe("ending an Effort: the final Report and sign-off", () => {
 	});
 
 	it("names a process a Teammate left running in its worktree, by pid and command, in the final Report and as sign-off removes the worktree, and leaves it running", async (t) => {
-		const { pi, dir, repo, workspace } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }, { background: ["sleep", "300"] }] });
+		// Each live session sits in its worktree with a child still attached to it, as a Bash tool's shell: sign-off stops those.
+		const { pi, dir, repo, workspace } = await crewApproved({ hooks: [{ event: "SessionStart", payload: { source: "startup" } }, { background: ["sleep", "300"] }], sessionChild: ["sleep", "301"] });
 		t.after(() => pi.claude.killBackground());
 		await pi.call("team_plan", { tasks: CREW_PLAN });
 		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n", isolated: true });
 		await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
 		const [inTask, inWorkspace] = pi.claude.background();
 		const task = crewTask(repo, "001");
+		const sessions = [...pi.claude.agents().map((agent) => agent.pid), ...pi.claude.sessionChildren()];
+		assert.equal(sessions.filter((pid) => pid !== undefined).length, 4, "two sessions, each with its child");
 		await pi.call("team_report", { headline: "Both criteria are met.", coverage: FINAL_COVERAGE, final: true });
 
 		const written = readFileSync(join(dir, "reports", "001.md"), "utf8");
@@ -4182,13 +4189,20 @@ describe("ending an Effort: the final Report and sign-off", () => {
 			[task.path, task.branch, inTask],
 			[workspace, `team/${CREW_EFFORT_ID}`, inWorkspace],
 		] as const) {
-			assert.ok(written.includes(`- ${path} (\`${branch}\`): clean, removed at sign-off; the branch is kept; pid ${pid} (\`sleep 300\`) is still running in it`), written);
+			assert.ok(
+				written.includes(
+					`- ${path} (\`${branch}\`): clean, removed at sign-off; the branch is kept; pid ${pid} (\`sleep 300\`) is still running in it, and the Team doesn't stop it: \`kill ${pid}\` does (found as this Report was written; sign-off checks again)\n`,
+				),
+				written,
+			);
 		}
+		for (const pid of sessions) assert.ok(!written.includes(`${pid} (`), `the live session process ${pid} isn't named:\n${written}`);
 
 		pi.answer("Approve");
 		await pi.team("pending");
 
 		const said = pi.notifications.at(-1)?.message ?? "";
+		for (const pid of sessions) assert.ok(!said.includes(`${pid} (`), `the stopped session process ${pid} isn't named: ${said}`);
 		for (const [path, pid] of [
 			[task.path, inTask],
 			[workspace, inWorkspace],

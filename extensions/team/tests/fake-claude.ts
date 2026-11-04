@@ -41,6 +41,10 @@
  *   Code does when the human answers the prompt in the terminal.
  * - `FAKE_CLAUDE_BACKGROUND_OUT`: a file each `background` step appends the
  *   pid of the process it started to, one per line, so the test can kill it.
+ * - `FAKE_CLAUDE_SESSION_CHILD`: a JSON argv each session's inbox server, which
+ *   stands for the session's own process, runs as a child of its own in the
+ *   session's folder, as a Bash tool's shell, and kills as the session ends;
+ *   each one's pid goes to the file `FAKE_CLAUDE_CHILDREN_OUT` names.
  * - `FAKE_CLAUDE_SOCKETS`: a short folder a session with hooks opens its inbox
  *   socket in. The socket is real: a small server process outlives the
  *   launch, as the real session does, and stops once the test process
@@ -84,9 +88,11 @@
  * - `FAKE_CLAUDE_AGENTS`: a folder that holds one JSON file per started
  *   session, `<session id>.json` ({@link Agent}), as Claude Code's own
  *   registry of background sessions. `agents --json` prints the live ones as
- *   a JSON array; `stop <short id>` ends one, keeping its record, as the real
- *   one keeps the conversation, and plays `SessionEnd` with reason `other`
- *   first, as the real one fires it; `--bg --resume <session id> <message>` wakes one
+ *   a JSON array, with the pid of a session's inbox server as its `pid`;
+ *   `stop <short id>` ends one, keeping its record, as the real one keeps the
+ *   conversation, and plays `SessionEnd` with reason `other` first, as the
+ *   real one fires it, returning before the inbox server has exited, as the
+ *   real one can; `--bg --resume <session id> <message>` wakes one
  *   with a new socket, plays `SessionStart` with `source:
  *   "resume"`, then plays `FAKE_CLAUDE_REPLIES` with the message as its
  *   pointer. A session idle-stops when its record says `live: false` and its
@@ -134,6 +140,8 @@ interface Agent extends Session {
 	status: string;
 	state: string;
 	waitingFor?: string;
+	/** The session's own process, its inbox server, which `agents --json` lists. */
+	pid?: number;
 }
 
 if (argv[0] === "--fake-inbox") {
@@ -161,7 +169,9 @@ async function main(): Promise<void> {
 
 	if (argv[0] === "agents" && argv[1] === "--json") {
 		const agents = registry().filter((agent) => agent.live);
-		process.stdout.write(`${JSON.stringify(agents.map((agent) => ({ id: agent.id.slice(0, 8), sessionId: agent.sessionId ?? agent.id, name: agent.name, status: agent.status, state: agent.state, ...(agent.waitingFor === undefined ? {} : { waitingFor: agent.waitingFor }) })))}\n`);
+		process.stdout.write(
+			`${JSON.stringify(agents.map((agent) => ({ ...(agent.pid === undefined ? {} : { pid: agent.pid }), id: agent.id.slice(0, 8), sessionId: agent.sessionId ?? agent.id, name: agent.name, status: agent.status, state: agent.state, ...(agent.waitingFor === undefined ? {} : { waitingFor: agent.waitingFor }) })))}\n`,
+		);
 		process.exit(0);
 	}
 
@@ -185,8 +195,9 @@ async function main(): Promise<void> {
 		rmSync(agent.socket, { force: true });
 		const sockets = process.env.FAKE_CLAUDE_SOCKETS;
 		const session: Session = { ...agent, id: agent.sessionId ?? agent.id, socket: sockets ? join(sockets, `${randomBytes(4).toString("hex")}.sock`) : agent.socket, token: `inbox-${randomBytes(4).toString("hex")}` };
-		record({ ...agent, socket: session.socket, token: session.token, live: true, status: "running", state: "idle" });
-		if (sockets) await openInbox(session);
+		const resumed: Agent = { ...agent, socket: session.socket, token: session.token, live: true, status: "running", state: "idle" };
+		record(resumed);
+		if (sockets) record({ ...resumed, pid: await openInbox(session) });
 		playSteps([{ event: "SessionStart", payload: { source: "resume" } }], session, "");
 		play(process.env.FAKE_CLAUDE_REPLIES, session, argv[3] ?? "");
 		process.stdout.write("fake claude: background session resumed\n");
@@ -219,7 +230,7 @@ async function main(): Promise<void> {
 			};
 			const name = argv.indexOf("--name") === -1 ? undefined : argv[argv.indexOf("--name") + 1];
 			record({ ...session, name, live: true, status: "running", state: "idle" });
-			if (process.env.FAKE_CLAUDE_HOOKS && sockets) await openInbox(session);
+			if (process.env.FAKE_CLAUDE_HOOKS && sockets) record({ ...session, name, live: true, status: "running", state: "idle", pid: await openInbox(session) });
 			play(process.env.FAKE_CLAUDE_HOOKS, session, argv.at(-1) ?? "");
 			process.stdout.write("fake claude: background session started\n");
 		}
@@ -305,13 +316,13 @@ type HookStep = (
 
 /**
  * Start the session's inbox server, detached so it outlives this launch, and
- * wait until it listens. It runs in the sockets folder, not the session's: it
- * stands for the session itself, which `claude stop` has ended by the time a
- * worktree is removed, so it is never a process left running there.
+ * wait until it listens: its pid. It stands for the session's own process,
+ * so it runs in the session's folder, as the real one does, and `agents
+ * --json` gives its pid.
  */
-async function openInbox(session: Session): Promise<void> {
+async function openInbox(session: Session): Promise<number | undefined> {
 	const server = spawn(process.execPath, [process.argv[1] ?? "", "--fake-inbox", JSON.stringify(session)], {
-		cwd: dirname(session.socket),
+		cwd: session.cwd,
 		detached: true,
 		stdio: ["ignore", "pipe", "ignore"],
 	});
@@ -321,6 +332,7 @@ async function openInbox(session: Session): Promise<void> {
 	});
 	server.stdout.destroy();
 	server.unref();
+	return server.pid;
 }
 
 /**
@@ -351,10 +363,17 @@ function serveInbox(session: Session): void {
 			}
 		});
 	});
+	// A child the session keeps attached, as its Bash tool's shell: it ends with the session.
+	const shell = process.env.FAKE_CLAUDE_SESSION_CHILD;
+	const child = shell ? spawn((JSON.parse(shell) as string[])[0] ?? "", (JSON.parse(shell) as string[]).slice(1), { cwd: session.cwd, stdio: "ignore" }) : undefined;
+	const childrenOut = process.env.FAKE_CLAUDE_CHILDREN_OUT;
+	if (child?.pid !== undefined && childrenOut) appendFileSync(childrenOut, `${child.pid}\n`);
 	server.listen(session.socket, () => process.stdout.write("listening\n"));
 	const owner = Number(process.env.FAKE_CLAUDE_OWNER);
 	setInterval(() => {
-		if (!existsSync(session.socket) || !alive(owner)) process.exit(0);
+		if (existsSync(session.socket) && alive(owner)) return;
+		child?.kill("SIGKILL");
+		process.exit(0);
 	}, 200);
 }
 

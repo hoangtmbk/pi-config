@@ -625,9 +625,19 @@ export interface RunningProcess {
  */
 export function runningClause(running: readonly RunningProcess[]): string | undefined {
 	if (running.length === 0) return undefined;
-	const shown = running.map((each) => `${each.pid} (\`${each.command.length > 120 ? `${each.command.slice(0, 119)}…` : each.command}\`)`);
+	const shown = running.map((each) => {
+		const command = each.command.trim();
+		return command === "" ? String(each.pid) : `${each.pid} (${codeSpan(command.length > 120 ? `${command.slice(0, 119)}…` : command)})`;
+	});
 	const which = running.length === 1 ? `pid ${shown[0]} is` : `pids ${shown.slice(0, -1).join(", ")} and ${shown.at(-1)} are`;
 	return `${which} still running in it, and the Team doesn't stop ${running.length === 1 ? "it" : "them"}: \`kill ${running.map((each) => each.pid).join(" ")}\` does`;
+}
+
+/** `text` as one Markdown code span: fenced with one backtick more than its longest run of them, and padded when it holds any. */
+function codeSpan(text: string): string {
+	const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
+	const fence = "`".repeat(longest + 1);
+	return longest === 0 ? `${fence}${text}${fence}` : `${fence} ${text} ${fence}`;
 }
 
 /** What an Effort's lines fold to. */
@@ -3712,7 +3722,7 @@ function finalSections(state: EffortState, final: FinalFacts): ReportSection[] {
 					: final.worktrees.map(
 							(each) => {
 								const running = runningClause(each.running ?? []);
-								return `${each.path} (\`${each.branch}\`): ${each.dirty ? "has uncommitted changes, so it is kept" : "clean, removed at sign-off"}; the branch is kept${running ? `; ${running}` : ""}`;
+								return `${each.path} (\`${each.branch}\`): ${each.dirty ? "has uncommitted changes, so it is kept" : "clean, removed at sign-off"}; the branch is kept${running ? `; ${running} (found as this Report was written; sign-off checks again)` : ""}`;
 							},
 						),
 		},

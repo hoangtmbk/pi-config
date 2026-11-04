@@ -122,6 +122,8 @@ export interface FakeClaudeOptions {
 	usage?: Record<string, unknown>;
 	/** How long a held hook holds before giving the prompt back to the terminal, `TEAM_HOOK_HOLD_MS`; the hook's own when unset. */
 	holdMs?: number;
+	/** A command each session runs as a child it keeps attached, in its folder, as its Bash tool's shell; it ends with the session. */
+	sessionChild?: string[];
 }
 
 /**
@@ -197,6 +199,8 @@ export interface FakeClaude {
 	background(): number[];
 	/** SIGKILL every process a `background` step started, so none outlives the test. */
 	killBackground(): void;
+	/** The pid of each session's {@link FakeClaudeOptions.sessionChild}, oldest first. */
+	sessionChildren(): number[];
 	/** Every session it started, live or not, as its registry holds it. */
 	agents(): FakeAgent[];
 	/** Play `steps` on the session named `name` now, as the human at its terminal does, resolving once they have played. */
@@ -224,6 +228,8 @@ export interface FakeAgent {
 	status: string;
 	state: string;
 	waitingFor?: string;
+	/** The session's own process, its inbox server. */
+	pid?: number;
 }
 
 /** One connection to a fake session's inbox socket. */
@@ -268,6 +274,7 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 	const attachOut = join(dir, "attaches.jsonl");
 	const heldOut = join(dir, "held.jsonl");
 	const backgroundOut = join(dir, "background.jsonl");
+	const childrenOut = join(dir, "children.jsonl");
 	const hooks = join(dir, "hooks.json");
 	const replies = join(dir, "replies.json");
 	if (options.hooks) writeFileSync(hooks, JSON.stringify(options.hooks));
@@ -304,6 +311,8 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 		FAKE_CLAUDE_USAGE: usage,
 		FAKE_CLAUDE_HELD_OUT: heldOut,
 		FAKE_CLAUDE_BACKGROUND_OUT: backgroundOut,
+		FAKE_CLAUDE_SESSION_CHILD: options.sessionChild ? JSON.stringify(options.sessionChild) : undefined,
+		FAKE_CLAUDE_CHILDREN_OUT: childrenOut,
 		TEAM_HOOK_HOLD_MS: options.holdMs === undefined ? undefined : String(options.holdMs),
 	};
 	const exports = Object.entries(env)
@@ -322,6 +331,7 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 			for (const { pid, exit } of jsonLines<{ pid: number; exit: string }>(heldOut)) if (!existsSync(exit)) kill(pid);
 		},
 		background: () => jsonLines<number>(backgroundOut),
+		sessionChildren: () => jsonLines<number>(childrenOut),
 		killBackground() {
 			for (const pid of jsonLines<number>(backgroundOut)) {
 				try {

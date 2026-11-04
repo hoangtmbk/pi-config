@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { existsSync, lstatSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { agentsList, BUNDLED_MOD, CLEAR_MARKER, getUsage, humanStatusLine, installMod, launchBackground, MIN_CLAUDE_VERSION, statusLineReading, stopBackground, trustFolder, versionWarning } from "../claude.ts";
+import { agentPids, agentsList, BUNDLED_MOD, CLEAR_MARKER, getUsage, humanStatusLine, installMod, launchBackground, MIN_CLAUDE_VERSION, statusLineReading, stopBackground, trustFolder, versionWarning } from "../claude.ts";
 import { fakeClaude, tempRoots, writeFiles } from "./harness.ts";
 
 describe("the claude version check", () => {
@@ -90,6 +90,19 @@ describe("background sessions in `claude agents --json`", () => {
 		const after = await agentsList(claude.path);
 		assert.ok(!("error" in after));
 		assert.equal(after.get("team-e-dev-1"), undefined, "an idle-stopped session is missing");
+	});
+
+	it("gives the pid of each live session's own process by its `--name`, and none once it is gone or the list can't be read", async () => {
+		const roots = tempRoots();
+		const claude = fakeClaude(roots, { hooks: [] });
+		assert.equal(await launchBackground(claude.path, roots.scratch, ["--bg", "--name", "team-e-dev-1", "go"]), undefined);
+		const [agent] = claude.agents();
+
+		assert.ok(agent.pid !== undefined);
+		assert.deepEqual(await agentPids(claude.path), new Map([["team-e-dev-1", agent.pid]]));
+		claude.idleStop("team-e-dev-1");
+		assert.deepEqual(await agentPids(claude.path), new Map());
+		assert.deepEqual(await agentPids(join(roots.scratch, "no-such-claude")), new Map());
 	});
 
 	it("stops a session by its short id with `claude stop`", async () => {

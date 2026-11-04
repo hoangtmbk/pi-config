@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it, type TestContext } from "node:test";
 import { addTaskWorkspace, addWorkspace, endWorktrees, mergeEvidence, mergeTaskWorkspace, removeTaskWorkspace, runningIn } from "../workspace.ts";
@@ -147,6 +147,43 @@ describe("which processes count as running in a worktree", () => {
 		const { workspace } = effortWithTask();
 		leaveRunning(t, workspace.path);
 
-		assert.deepEqual(runningIn(workspace.path, join(workspace.path, "no-such-lsof")), []);
+		assert.deepEqual(runningIn(workspace.path, { lsof: join(workspace.path, "no-such-lsof") }), []);
+	});
+
+	it("is none, within a few seconds, when `lsof` hangs, as on a stale network mount", (t) => {
+		const { workspace } = effortWithTask();
+		leaveRunning(t, workspace.path);
+		const hanging = join(tempRoots().scratch, "lsof");
+		writeFileSync(hanging, "#!/bin/sh\nexec sleep 60\n", { mode: 0o755 });
+
+		const started = Date.now();
+		assert.deepEqual(runningIn(workspace.path, { lsof: hanging }), []);
+		assert.ok(Date.now() - started < 8000, `it took ${Date.now() - started}ms`);
+	});
+
+	it("leaves out a spared process, a live Teammate's session, and everything descended from it, but not a process outside it", async (t) => {
+		const { workspace } = effortWithTask();
+		// The session, with a child of its own still attached to it, as a Bash-tool shell is.
+		const session = spawn("sh", ["-c", "sleep 300 & echo $!; wait"], { cwd: workspace.path, detached: true, stdio: ["ignore", "pipe", "ignore"] });
+		const pid = session.pid;
+		assert.ok(pid !== undefined);
+		t.after(() => {
+			try {
+				process.kill(-pid, "SIGKILL");
+			} catch {
+				// Gone already.
+			}
+		});
+		const child = Number(await new Promise<string>((resolve) => session.stdout.once("data", (chunk: Buffer) => resolve(chunk.toString()))));
+		session.stdout.destroy();
+		const orphan = leaveRunning(t, workspace.path);
+
+		assert.deepEqual(
+			runningIn(workspace.path)
+				.map((each) => each.pid)
+				.sort(),
+			[pid, child, orphan].sort(),
+		);
+		assert.deepEqual(runningIn(workspace.path, { spare: [pid] }), [{ pid: orphan, command: "sleep 300" }]);
 	});
 });
