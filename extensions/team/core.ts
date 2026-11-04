@@ -100,8 +100,12 @@ export interface HandedTask {
 	folder: string;
 	role: string;
 	teammate: string;
-	/** The `--model` its Teammate was launched with, as the Role had it then; absent for Claude Code's default. */
-	model?: string;
+	/**
+	 * The `--model` its Teammate was launched with, as the Role had it then:
+	 * `null` for a launch with none, on Claude Code's default; absent when no
+	 * model was recorded, as on a line from before models were.
+	 */
+	model?: string | null;
 	at: string;
 	/** The round in progress: its result is `result-<round>.md` in the folder. */
 	round: number;
@@ -169,8 +173,8 @@ export interface Teammate {
 	cursor?: number;
 	/** The permission mode it was launched in. */
 	mode?: string;
-	/** The `--model` its current session was launched with; absent for Claude Code's default. */
-	model?: string;
+	/** The `--model` its current session was launched with: `null` for none, on Claude Code's default; absent when none was recorded. */
+	model?: string | null;
 	/** The permission mode its hooks last reported, once one differs from {@link mode}: drift is logged, not a Takeover. */
 	observedMode?: string;
 	/** Absent until a prompt first lands: then `busy`, and `idle` once it stops. */
@@ -382,14 +386,15 @@ export type EffortLine =
 	/**
 	 * An idle Teammate whose Role's launch options an approved Brief change
 	 * altered was stopped and launched afresh, under the same id and name, for
-	 * Task `task`, in permission mode `mode`, on `model` (absent for Claude
-	 * Code's default). Its next `SessionStart` gives it a new short id.
+	 * Task `task`, in permission mode `mode`, on `model` (`null` for Claude
+	 * Code's default, absent when not recorded). Its next `SessionStart` gives
+	 * it a new short id.
 	 */
-	| { type: "teammate-relaunched"; teammate: string; task: string; mode?: string; model?: string; at: string }
+	| { type: "teammate-relaunched"; teammate: string; task: string; mode?: string; model?: string | null; at: string }
 	/** The human used the `/team` menu on a Teammate: the short id they were given, which clears its `(new)` mark. Reads no journal line. */
 	| { type: "teammate-attached"; teammate: string; shortId: string; at: string }
 	/** A send-back gave the Task to a new Teammate, since its own had ended, running on `model`. */
-	| { type: "task-reassigned"; slug: string; teammate: string; model?: string; at: string }
+	| { type: "task-reassigned"; slug: string; teammate: string; model?: string | null; at: string }
 	/** A re-plan left out a handed-off Task, or gave it another Role: this handoff of it is over. */
 	| { type: "task-dropped"; slug: string; at: string }
 	/** The extension stopped a Teammate with `claude stop`, since its Task was dropped, or its isolated Task merged and its worktree goes. Reads no journal line. */
@@ -2394,9 +2399,10 @@ function free(state: EffortState, teammate: Teammate): boolean {
  * folder (and worktree): a Teammate reused for it starts afresh, since its
  * launch is what carries the pointer to the rounds so far.
  *
- * `models` is each Role's model as a Teammate launched now gets it; the Task
- * records the model its Teammate runs on: a reused one's own launch model, or
- * the one it is launched on now.
+ * `models` is each Role's model as a Teammate launched now gets it, a Role
+ * missing from it launching with no `--model`; the Task records the model its
+ * Teammate runs on: a reused one's own launch model, or the one it is launched
+ * on now. Without `models` nothing is recorded.
  */
 function staff(
 	state: EffortState,
@@ -2405,7 +2411,7 @@ function staff(
 	agents?: readonly string[],
 	models?: Readonly<Record<string, string>>,
 ): { append: EffortLine[]; actions: EffortAction[]; who: string; note?: string } | undefined {
-	const model = models?.[task.role];
+	const model = models === undefined ? undefined : (models[task.role] ?? null);
 	// An isolated Task needs a Teammate launched in its own worktree, so it never reuses one.
 	const reused = task.isolated ? undefined : live(state).find((teammate) => teammate.role === task.role && teammate.inbox !== undefined && free(state, teammate));
 	if (reused?.freshDue && reused.shortId) return relaunch(state, reused, task, freshForBrief(reused.role), model);
@@ -2448,7 +2454,7 @@ function sentBack(state: EffortState, slug: string): boolean {
 }
 
 /** The line that gives `task` to `teammate`, which runs on `model`: its handoff, or for a sent-back Task, its reassignment. */
-function takenBy(state: EffortState, task: QueuedTask, teammate: string, worktree?: TaskWorktree, model?: string): EffortLine {
+function takenBy(state: EffortState, task: QueuedTask, teammate: string, worktree?: TaskWorktree, model?: string | null): EffortLine {
 	const on = model === undefined ? {} : { model };
 	if (sentBack(state, task.slug)) return { type: "task-reassigned", slug: task.slug, teammate, ...on, at: task.at };
 	return { type: "task-handed-off", slug: task.slug, folder: task.folder, role: task.role, teammate, ...on, at: task.at, round: 1, ...(worktree ? { worktree } : {}) };
@@ -2466,7 +2472,7 @@ const FRESH_FOR_IDLE =
  * session is stopped (its conversation kept), and a new one launched under
  * the same id and name, at a Task boundary, never mid-Task, on `model`.
  */
-function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask, note: string, model?: string): { append: EffortLine[]; actions: EffortAction[]; who: string; note: string } {
+function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask, note: string, model?: string | null): { append: EffortLine[]; actions: EffortAction[]; who: string; note: string } {
 	const last = Math.max(...state.teammates.map((each) => Date.parse(each.startedAt)));
 	const at = new Date(Math.max(Date.parse(task.at), last + STAGGER_MS)).toISOString();
 	return {
@@ -2484,7 +2490,7 @@ function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask, note
 }
 
 /** Start the next Teammate of the Task's Role on it, on `model`, no sooner than {@link STAGGER_MS} after the last start. */
-function start(state: EffortState, task: QueuedTask, model?: string): { append: EffortLine[]; actions: EffortAction[]; who: string } {
+function start(state: EffortState, task: QueuedTask, model?: string | null): { append: EffortLine[]; actions: EffortAction[]; who: string } {
 	const id = `${task.role}-${state.teammates.filter((teammate) => teammate.role === task.role).length + 1}`;
 	const name = `team-${state.effortId}-${id}`;
 	const last = Math.max(...state.teammates.map((teammate) => Date.parse(teammate.startedAt)));
@@ -3684,10 +3690,16 @@ function outcomeText(asked: Asked): string {
 	return `${how} at ${clock(outcome.at)} UTC${outcome.note === undefined ? "" : `: ${outcome.note}`}`;
 }
 
-/** A planned Task as the final Report lists it: its Role, the model its Teammate was launched on (none for a Task never launched), and its status. */
+/**
+ * A planned Task as the final Report lists it: its Role, the model its
+ * Teammate was launched on (none for a Task never launched, and saying so for
+ * one whose launch recorded none), and its status.
+ */
 function taskLine(state: EffortState, task: PlannedTask): string {
 	const handed = state.tasks[task.slug];
-	const on = handed === undefined || handed.dropped !== undefined ? "" : `, on ${handed.model === undefined ? "Claude Code's default model" : `\`${handed.model}\``}`;
+	const model = handed?.model;
+	const on =
+		handed === undefined || handed.dropped !== undefined ? "" : model === undefined ? ", model not recorded" : `, on ${model === null ? "Claude Code's default model" : `\`${model}\``}`;
 	return `\`${task.slug}\` (${task.role}${on}): ${taskStatus(state, task.slug)}`;
 }
 
@@ -3808,7 +3820,7 @@ function replanReasons(state: EffortState): string[] {
 	return state.sinceReport.flatMap((line) => (line.type === "plan-written" && line.reason !== undefined ? [`re-planned at ${clock(line.at)}: ${line.reason}`] : []));
 }
 
-/** The logged sections, from `since` the last Report; the plan Report passes each Role's mode and the Playbook rules the Brief skips. */
+/** The logged sections, from `since` the last Report; the plan Report passes each Role's mode and the Playbook entries the Brief skips. */
 function reportSections(state: EffortState, modes: readonly { role: string; mode: string }[] | undefined, skips?: readonly { rule: string; reason: string }[]): ReportSection[] {
 	const since = state.sinceReport;
 	const of = <T extends EffortLine["type"]>(type: T) => since.filter((line): line is Extract<EffortLine, { type: T }> => line.type === type);
@@ -3820,7 +3832,7 @@ function reportSections(state: EffortState, modes: readonly { role: string; mode
 	return [
 		{ title: "Since the last Report", lines: since.flatMap((line) => { const text = told(line, state); return text === undefined || !("at" in line) ? [] : [`${clock(line.at)} ${text}`]; }) },
 		{ title: "Plan", lines: [...plan, ...reasons] },
-		{ title: "Playbook rules the Brief skips", lines: (skips ?? []).map(({ rule, reason }) => `\`${rule}\`: ${reason}`) },
+		{ title: "Playbook entries the Brief skips", lines: (skips ?? []).map(({ rule, reason }) => `\`${rule}\`: ${reason}`) },
 		{
 			title: "Waiting on you",
 			lines: [

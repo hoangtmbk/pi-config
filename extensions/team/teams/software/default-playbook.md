@@ -42,7 +42,8 @@ A Rule must ask for something the Lead's tools can do. Before it writes the Brie
 each Rule against them. A Rule it can't carry out goes in the Brief as a `skip` override naming
 the Rule's id, which the Brief's approval and the plan Report show, and in the final Report as a
 proposed Playbook change. It is never skipped silently. A Role's model is set by its Role file,
-or for the whole Effort by the Brief's `roles:`. There is no per-Task choice, so a cheaper model
+or for this Effort by the Brief's `roles:` (a Brief change applies from the Role's next launch).
+There is no per-Task choice, so a cheaper model
 for simpler Tasks means a separate Role (a `dev-lite` on Haiku, say), which the human adds: a
 Playbook change can't create a Role file.
 

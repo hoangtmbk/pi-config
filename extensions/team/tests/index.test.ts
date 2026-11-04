@@ -1077,13 +1077,13 @@ describe("intake: asking the human to approve the Brief", () => {
 		assert.match(dialog.title, /- `architect`: auto\n- `dev`: acceptEdits\n- `qa`: auto/);
 	});
 
-	it("shows in the dialog each Playbook rule the Brief skips, with its reason, so the human sees it before work starts", async () => {
+	it("shows in the dialog each Playbook entry the Brief skips, with its reason, so the human sees it before work starts", async () => {
 		const { pi } = await briefAsked();
 
 		pi.answer("Later");
 		await pi.team("pending");
 
-		assert.match(pi.dialogs[0].title, /Playbook rules this Brief skips:\n- `small-diffs`: The rename touches every file\./);
+		assert.match(pi.dialogs[0].title, /Playbook entries this Brief skips:\n- `small-diffs`: The rename touches every file\./);
 	});
 
 	it("keeps Teammates from starting until the Brief is approved: `team_plan` and `team_handoff` refuse", async () => {
@@ -3252,10 +3252,10 @@ describe("reporting: team_report", () => {
 			assert.ok(written.includes(needed), `reports/001.md doesn't say ${needed}:\n${written}`);
 		}
 		assert.equal(written.includes("## Waiting on you"), false, `an empty section is left out:\n${written}`);
-		assert.equal(written.includes("## Playbook rules the Brief skips"), false, `a Brief that skips none leaves it out:\n${written}`);
+		assert.equal(written.includes("## Playbook entries the Brief skips"), false, `a Brief that skips none leaves it out:\n${written}`);
 	});
 
-	it("lists in the plan Report each Playbook rule the Brief skips, with its reason, and in no later Report", async () => {
+	it("lists in the plan Report each Playbook entry the Brief skips, with its reason, and in no later Report", async () => {
 		const { pi, dir } = await crewApproved({ overrides: ["overrides:", "  - rule: small-diffs", "    change: skip", "    reason: The rename touches every file."] });
 		await pi.call("team_plan", { tasks: CREW_PLAN });
 
@@ -3263,9 +3263,9 @@ describe("reporting: team_report", () => {
 		await pi.call("team_report", { headline: "Nothing has moved." });
 
 		const first = readFileSync(join(dir, "reports", "001.md"), "utf8");
-		assert.ok(first.includes("## Playbook rules the Brief skips\n\n- `small-diffs`: The rename touches every file."), first);
+		assert.ok(first.includes("## Playbook entries the Brief skips\n\n- `small-diffs`: The rename touches every file."), first);
 		const second = readFileSync(join(dir, "reports", "002.md"), "utf8");
-		assert.equal(second.includes("Playbook rules the Brief skips"), false, second);
+		assert.equal(second.includes("Playbook entries the Brief skips"), false, second);
 	});
 
 	it("writes the next Report as reports/002.md, covering only what happened since the first", async () => {
@@ -4610,6 +4610,21 @@ describe("Brief changes: team_request_approval at `brief-change`", () => {
 		assert.match(started, /^started builder-1 on Task `rename-key`/);
 		assert.equal(pi.claude.launches().length, 1);
 		await until(() => teammateWakes(pi.sent).length === 1, "the unaffected Task runs to its result");
+	});
+
+	it("shows in the dialog each Playbook entry the change newly skips, with its reason on one line, and not those the approved Brief already skips", async () => {
+		const lockfile = ["  - rule: lockfile", "    change: skip", "    reason: The lockfile is regenerated."];
+		const { pi, dir, repo } = await crewPlanned({ overrides: ["overrides:", ...lockfile] });
+		const added = ["  - rule: small-diffs", "    change: skip", "    reason: |", "      The rename", "      touches every file."];
+		writeFileSync(join(dir, "brief.draft.md"), changedBrief(repo, ["overrides:", ...lockfile, ...added]));
+		await pi.call("team_request_approval", { checkpoint: "brief-change", path: join(dir, "brief.draft.md"), affects: [] });
+
+		pi.answer("Later");
+		await pi.team("pending");
+
+		const title = pi.dialogs.at(-1)?.title ?? "";
+		assert.match(title, /Playbook entries this change newly skips:\n- `small-diffs`: The rename touches every file\.\n/);
+		assert.equal(title.includes("`lockfile`"), false, title);
 	});
 
 	it("approval promotes the draft to brief.md, records it with its sha and releases the held Tasks", async () => {

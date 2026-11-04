@@ -696,6 +696,20 @@ describe("staffing a handoff", () => {
 		return [...lines, ...result.append];
 	}
 
+	it("gives a reused Teammate's Task the model it was launched with: its own, `null` for no `--model`, or nothing for a launch that recorded none", () => {
+		const reusedOn = (models?: Record<string, string>) => {
+			const renamed = accepted(stops(applied(planned, { ...handoff("rename"), ...(models ? { models } : {}) }), "dev-1"), "dev-1");
+			const result = run(renamed, { ...handoff("docs", { at: "2026-11-02T14:00:00.000Z" }), models: { dev: "haiku" } });
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			const line = result.append.find((each) => each.type === "task-handed-off");
+			return line && "model" in line ? line.model : "absent";
+		};
+		assert.equal(reusedOn({ dev: "sonnet" }), "sonnet");
+		assert.equal(reusedOn({}), null);
+		// A Teammate launched before models were recorded passes on none, not Claude Code's default.
+		assert.equal(reusedOn(), "absent");
+	});
+
 	it("reuses an idle Teammate of the Role whose Task is accepted, clearing it before the pointer goes, and launches nothing", () => {
 		const renamed = accepted(stops(applied(planned, handoff("rename")), "dev-1"), "dev-1");
 
@@ -2191,6 +2205,17 @@ describe("the final Report and sign-off", () => {
 		const section = (title: string) => report.sections.find((each) => each.title === title)?.lines;
 		assert.deepEqual(section("Tasks"), ["`design` (architect, on `opus`): running", "`rename` (dev, on Claude Code's default model): running"]);
 		assert.equal(section("Plan"), undefined);
+	});
+
+	it("tells a launch with no `--model` from one whose model wasn't recorded, as a line from before models were has none", () => {
+		const withDefault = applied(plannedReport, { kind: "handoff", slug: "design", models: {}, at: "2026-11-02T11:20:00.000Z" });
+		const legacy: EffortLine = { type: "task-handed-off", slug: "rename", folder: "002-dev-rename", role: "dev", teammate: "dev-1", at: "2026-11-02T11:21:00.000Z", round: 1 };
+		const lines: EffortLine[] = [...withDefault, { type: "teammate-started", id: "dev-1", role: "dev", name: "team-software-2026-11-02-dev-1", task: "rename", startedAt: "2026-11-02T11:21:00.000Z" }, legacy];
+		const report = written(run(lines, finalReport("2026-11-02T12:00:00.000Z")));
+		assert.deepEqual(report.sections.find((each) => each.title === "Tasks")?.lines, [
+			"`design` (architect, on Claude Code's default model): running",
+			"`rename` (dev, model not recorded): running",
+		]);
 	});
 
 	it("names no model for a Task that never launched", () => {

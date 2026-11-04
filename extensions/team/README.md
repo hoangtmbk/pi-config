@@ -89,12 +89,14 @@ sections the Playbook adds under `## Brief sections`. It then calls `team_reques
 checkpoint `brief`, which refuses the draft naming each problem: a missing section, a repeated or
 missing criterion id, an override naming a rule the Playbook doesn't have, a wrong repo or sha.
 Before writing the Brief the Lead checks each Playbook rule against what its tools can do. A Role's
-model is set by its Role file, or for the whole Effort by the Brief's `roles:`, so a rule asking
-for a model per Role is carried out there. There is no per-Task choice: a cheaper model for simpler
-Tasks means a separate Role (a `dev-lite` on Haiku), which you add, since a Playbook change can't
-create a Role file. A rule the Lead can't carry out it tells you about, skips with an override
-naming the rule, and proposes changing in the final Report. The approval dialog lists each rule the
-Brief skips, with its reason, and so does the plan Report.
+model is set by its Role file, or for this Effort by the Brief's `roles:`, which an approved Brief
+change can change again from the Role's next launch on; so a rule asking for a model per Role is
+carried out there. There is no per-Task choice: a cheaper model for simpler Tasks means a separate
+Role (a `dev-lite` on Haiku), which you add, since a Playbook change can't create a Role file. A
+rule the Lead can't carry out it tells you about, skips with an override naming the rule, and
+proposes changing in the final Report. The approval dialog lists each Playbook entry the Brief
+skips, with its reason, and so does the plan Report; a Brief change's dialog lists those it newly
+skips.
 
 In `/team pending` you see the draft's path and sha, the repo, and every Role with the mode it
 would run in. Approving writes the snapshot asked about as `brief.md`, copies the Playbook to
@@ -258,7 +260,7 @@ adds the logged sections from `effort.jsonl`, leaving out any with nothing in th
   accepted or denied, with the time (UTC);
 - **Plan**: each Task's status, when the plan or a Task moved, and why the Lead re-planned
   (`team_plan`'s `reason`);
-- **Playbook rules the Brief skips**: in the plan Report only, each `skip` override with its
+- **Playbook entries the Brief skips**: in the plan Report only, each `skip` override with its
   reason;
 - **Waiting on you**: what `/team pending` holds;
 - **Decided for you**: what the extension answered on your behalf;

@@ -64,7 +64,7 @@ import {
 	workdir,
 } from "./core.ts";
 import { EVERY_ROLE, listTeams, loadTeam, type Playbook, type Role, sha256, type Team, type TeamRoots, teamInForce } from "./definitions.ts";
-import { briefApprovalTitle, intakePrompt, openedText } from "./intake.ts";
+import { briefApprovalTitle, intakePrompt, openedText, skipsText } from "./intake.ts";
 import { adoptable, hasEnded, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
 import {
 	answerTerms,
@@ -1617,9 +1617,15 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const state = effortState(held);
 		const current = approved(held, ctx);
 		const holds = item.affects ?? [];
+		// The skips the approved Brief already has were shown at its approval; only the ones this change adds are new to the human.
+		const skipped = new Set(briefSkips(current.brief).map((each) => each.rule));
 		const title = [
 			`Approve a Brief change of Effort \`${state.effortId}\` (request \`${item.id}\`)? ${item.path} (sha256 ${item.sha256})`,
 			holds.length > 0 ? `It holds Task${holds.length === 1 ? "" : "s"} ${holds.map((slug) => `\`${slug}\``).join(", ")} until you answer; every other Task goes on.` : "It holds no Task.",
+			...skipsText(
+				briefSkips(item.snapshot).filter((each) => !skipped.has(each.rule)),
+				"Playbook entries this change newly skips:",
+			),
 			"Approving makes exactly this snapshot brief.md; the Team and Playbook snapshots stay as they are.",
 		].join("\n");
 		const picked = await approveOrSendBack(title, ctx);
@@ -2263,7 +2269,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			// The Role modes go only into the plan Report.
 			const snapshot = state.reports === 0 ? records : undefined;
 			const modes = snapshot ? snapshot.roles.map((role) => ({ role: role.name, mode: modeInForce(snapshot.playbook, role) })) : [];
-			// So are the Playbook rules the Brief skips, read from it rather than left to the Lead to mention.
+			// So are the Playbook entries the Brief skips, read from it rather than left to the Lead to mention.
 			const skips = snapshot ? briefSkips(snapshot.brief) : [];
 			const final = params.final && state.brief ? finalFacts(held, state, params.changes ?? []) : undefined;
 			const leadCostUsd = leadCost(ctx.sessionManager.getEntries());
