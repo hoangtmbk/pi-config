@@ -1460,12 +1460,12 @@ function crewBrief(repo: string, playbook = CREW_PLAYBOOK, overrides: string[] =
  * Roles set every launch flag between them, on {@link CREW_PLAYBOOK}.
  */
 async function crewApproved(
-	options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown>; playbook?: string; overrides?: string[] } & Pick<
+	options: { bgExit?: number; hooks?: FakeHookStep[]; replies?: FakeHookStep[]; settings?: Record<string, unknown>; playbook?: string; overrides?: string[]; roots?: TempRoots } & Pick<
 		NonNullable<Parameters<typeof fakePi>[1]>,
 		"mode" | "env" | "attachExit" | "holdMs" | "usage" | "sessionEntries" | "sessionChild"
 	> = {},
 ) {
-	const roots = tempRoots();
+	const roots = options.roots ?? tempRoots();
 	const plugin = join(roots.scratch, "plugins", "lint");
 	writeUserTeam(roots, "crew", {
 		"team.md": teamMd("crew"),
@@ -1737,6 +1737,18 @@ describe("handing off: team_handoff", () => {
 		for (const fact of facts) assert.ok(prompt.includes(fact), `the preamble should say: ${fact}\n\n${prompt}`);
 		assert.ok(prompt.trimEnd().endsWith("You are the builder."), prompt);
 		assert.ok(!prompt.includes("Old configs still load"), "the preamble must not copy the Brief");
+	});
+
+	it("names the Teammate's job temp folder in the preamble, and asks for delete paths written out in full, with no shell variable", async () => {
+		const { pi } = await crewApproved();
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+
+		const prompt = pi.claude.launches()[0].prompt ?? "";
+		for (const fact of ["`$CLAUDE_JOB_DIR/tmp`", "`~/.claude/jobs/<short id>/tmp`", "write its path out in full", "no shell variable"]) {
+			assert.ok(prompt.includes(fact), `the preamble should say: ${fact}\n\n${prompt}`);
+		}
 	});
 
 	it("launches with `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` unset, even when pi has it set", async () => {
@@ -2396,14 +2408,16 @@ const FLOOR_PLAYBOOK = CREW_PLAYBOOK.replace("permissions:\n", "permissions:\n  
  * grant `open-pr`, and whose `builder-1` runs each of `commands` in Bash: the
  * floor hook makes each floor one a prompt, and the fake plays the held
  * `PermissionRequest` that follows, as Claude Code does. Waits until `floors`
- * requests are held.
+ * requests are held. `roots` are the temp folders to use, when a command names one,
+ * and `sessionId` the session's id, whose first eight characters are its short id.
  */
-async function floorAsking(commands: string[], floors = commands.length) {
+async function floorAsking(commands: string[], floors = commands.length, roots?: TempRoots, sessionId = "c0ffee12-0000-4000-8000-000000000001") {
 	const crew = await crewApproved({
+		roots,
 		playbook: FLOOR_PLAYBOOK,
 		overrides: ["overrides:", "  - rule: open-pr", '    change: "add grant: open the pull request the Delivery asks for"', "    reason: The human reviews every change as a PR."],
 		hooks: [
-			{ event: "SessionStart", payload: { source: "startup", session_id: "c0ffee12-0000-4000-8000-000000000001" } },
+			{ event: "SessionStart", payload: { source: "startup", session_id: sessionId } },
 			{ event: "UserPromptSubmit", payload: { prompt: "New Task `rename-key`" } },
 			...commands.map((command): FakeHookStep => ({ event: "PreToolUse", payload: { tool_name: "Bash", tool_input: { command } } })),
 		],
@@ -2464,6 +2478,25 @@ describe("the floor: irreversible outward actions reach the human", () => {
 			/`escalate` entry `history-rewrite`.*`team_escalate`/s,
 		);
 		await pi.call("team_answer", { request: force, decision: "deny", reason: "Rewriting history is the human's call." });
+	});
+
+	it("takes an uncited allow of a delete in the Teammate's own job temp folder, by its short id, but not in another session's", async () => {
+		const roots = tempRoots();
+		const own = `rm -f ${join(roots.claudeDir, "jobs", "c0ffee12", "tmp", "x")}`;
+		const other = `rm -f ${join(roots.claudeDir, "jobs", "deadbeef", "tmp", "x")}`;
+		const { pi, request } = await floorAsking([own, other], 2, roots);
+
+		await pi.call("team_answer", { request: request(own), decision: "allow", reason: "Its own scratch file." });
+		await assert.rejects(pi.call("team_answer", { request: request(other), decision: "allow", reason: "A scratch file." }), /floor delete/);
+	});
+
+	it("adds no job temp folder for a short id that isn't one plain path segment", async () => {
+		const roots = tempRoots();
+		// The short id `../../xy` would name `<claude dir>/../xy/tmp`.
+		const escaped = `rm -f ${join(roots.claudeDir, "..", "xy", "tmp", "x")}`;
+		const { pi, request } = await floorAsking([escaped], 1, roots, "../../xy-0000-4000-8000-000000000001");
+
+		await assert.rejects(pi.call("team_answer", { request: request(escaped), decision: "allow", reason: "A scratch file." }), /floor delete/);
 	});
 
 	it("takes no grant from a Brief changed since approval: team_answer and team_report refuse, and the human is told", async () => {

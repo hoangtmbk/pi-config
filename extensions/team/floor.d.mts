@@ -13,6 +13,10 @@ export interface FloorAction {
 export interface FloorWhere {
 	workspace: string;
 	cwd?: string;
+	/** Other folders that are the Teammate's own, such as its Claude Code job temp folder: a delete under one is inside, as under the Workspace. */
+	roots?: string[];
+	/** The folder a leading `~` or `$HOME` names; this user's home when not given. */
+	home?: string;
 }
 
 /** The floor action a Bash command takes, or undefined when it takes none. */
