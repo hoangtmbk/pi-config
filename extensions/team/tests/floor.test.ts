@@ -5,8 +5,9 @@
  */
 
 import assert from "node:assert/strict";
+import { posix } from "node:path";
 import { describe, it } from "node:test";
-import { floorAction } from "../floor.mjs";
+import { floorAction, simpleCommands } from "../floor.mjs";
 
 const WORKSPACE = "/work/effort";
 
@@ -160,6 +161,21 @@ describe("the floor classifier", () => {
 		assert.equal(floorAction("rm -f /home/qa/.claude/jobs/bad941c8/tmp/x", { workspace: WORKSPACE })?.kind, "delete");
 	});
 
+	it("ignores a root that is `/`, relative or the home folder itself, so it never widens what is inside", () => {
+		const home = "/home/qa";
+		for (const [root, command] of [
+			["/", "rm -rf /tmp/important"],
+			["/", "find / -delete"],
+			["//", "find / -delete"],
+			[".", `rm -rf ${posix.resolve("x")}`],
+			["tmp", `rm -rf ${posix.resolve("tmp", "x")}`],
+			[home, "rm -rf ~/projects"],
+			[`${home}/`, "rm -rf /home/qa/projects"],
+		]) {
+			assert.equal(floorAction(command, { workspace: WORKSPACE, home, roots: [root] })?.kind, "delete", `root ${JSON.stringify(root)}, \`${command}\``);
+		}
+	});
+
 	it("reads `~/` and `$HOME/` as the home folder, and any other variable as unknown, so outside", () => {
 		const where = { workspace: WORKSPACE, home: "/home/qa", roots: ["/home/qa/.claude/jobs/bad941c8/tmp"] };
 		assert.equal(floorAction("rm -f ~/.claude/jobs/bad941c8/tmp/x", where)?.kind, undefined);
@@ -174,6 +190,32 @@ describe("the floor classifier", () => {
 		assert.equal(floorAction("rm -rf $HOME$SUB/x", where)?.kind, "delete");
 		assert.equal(floorAction("rm -rf ~/.claude/jobs/bad941c8/tmp/`whoami`", where)?.kind, "delete");
 		assert.equal(floorAction("rm -f /work/effort/~/x", where)?.kind, undefined);
+	});
+
+	it("reads a quoted or escaped `~`, or a single-quoted or escaped `$HOME`, as the literal it is to the shell, not the home folder", () => {
+		const where = { workspace: WORKSPACE, home: "/home/qa", roots: ["/home/qa/.claude/jobs/bad941c8/tmp"] };
+		for (const command of [
+			"cd / && rm -rf '~/.claude/jobs/bad941c8/tmp/x'",
+			'cd / && rm -rf "~/.claude/jobs/bad941c8/tmp/x"',
+			"cd / && rm -rf \\~/.claude/jobs/bad941c8/tmp/x",
+			"cd / && rm -rf ''~/.claude/jobs/bad941c8/tmp/x",
+			"cd / && rm -rf '$HOME'/.claude/jobs/bad941c8/tmp/x",
+			"cd / && rm -rf \\$HOME/.claude/jobs/bad941c8/tmp/x",
+			"cd '~/.claude/jobs/bad941c8/tmp' && rm -rf x",
+		]) {
+			assert.equal(floorAction(command, where)?.kind, "delete", command);
+		}
+		for (const command of ['rm -rf "$HOME"/.claude/jobs/bad941c8/tmp/x', 'rm -rf ""$HOME/.claude/jobs/bad941c8/tmp/x', "rm -rf ~/'.claude/jobs/bad941c8/tmp/x'"]) {
+			assert.equal(floorAction(command, where)?.kind, undefined, command);
+		}
+	});
+
+	it("lists a quoted `~` or `$HOME` word for permission rules as it is written, unmarked", () => {
+		assert.deepEqual(simpleCommands("rm -rf '~/x' \\$HOME/y && eval rm \\~/z && sh -c '$HOME'"), [
+			["rm", "-rf", "~/x", "$HOME/y"],
+			["rm", "~/z"],
+			["$HOME"],
+		]);
 	});
 
 	it("names the command it caught", () => {

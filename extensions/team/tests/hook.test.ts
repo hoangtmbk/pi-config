@@ -211,7 +211,7 @@ describe("the hook script as the PreToolUse floor hook", () => {
 
 	it("lets through a delete in the Teammate's own job temp folder, `$CLAUDE_JOB_DIR/tmp`, or the payload's scratchpad_dir", async () => {
 		const dir = effortDir();
-		const job = { HOME: "/home/qa", CLAUDE_JOB_DIR: "/home/qa/.claude/jobs/bad941c8" };
+		const job = { HOME: "/home/qa", CLAUDE_CONFIG_DIR: "", CLAUDE_JOB_DIR: "/home/qa/.claude/jobs/bad941c8" };
 		const scratch = { ...bash("rm -rf /tmp/claude-501/p/s-1/scratchpad/clone"), scratchpad_dir: "/tmp/claude-501/p/s-1/scratchpad" };
 
 		const results = [
@@ -227,6 +227,29 @@ describe("the hook script as the PreToolUse floor hook", () => {
 		assert.match(escape.output, /floor: delete/);
 		assert.match(variable.output, /floor: delete/);
 		assert.match(noJob.output, /floor: delete/);
+	});
+
+	it("trusts `$CLAUDE_JOB_DIR` only directly under the Claude Code config folder's `jobs`, and no scratchpad_dir that is `/` or relative", async () => {
+		const dir = effortDir();
+		const home = { HOME: "/home/qa", CLAUDE_CONFIG_DIR: "" };
+		const cases: [Record<string, string>, unknown][] = [
+			[{ ...home, CLAUDE_JOB_DIR: "/" }, bash("rm -rf /tmp/important")],
+			[{ ...home, CLAUDE_JOB_DIR: "." }, bash(`rm -rf ${join(process.cwd(), "tmp", "x")}`)],
+			[{ ...home, CLAUDE_JOB_DIR: "/elsewhere/jobs/bad941c8" }, bash("rm -f /elsewhere/jobs/bad941c8/tmp/x")],
+			[{ ...home, CLAUDE_JOB_DIR: "/home/qa/.claude/jobs/bad941c8/deeper" }, bash("rm -f /home/qa/.claude/jobs/bad941c8/deeper/tmp/x")],
+			[{ ...home, CLAUDE_JOB_DIR: "/home/qa/.claude/jobs" }, bash("rm -f /home/qa/.claude/jobs/tmp/x")],
+			[{ ...home, CLAUDE_JOB_DIR: "/home/qa/.claude/jobs/../x" }, bash("rm -f /home/qa/.claude/x/tmp/y")],
+			[{ HOME: "/home/qa", CLAUDE_CONFIG_DIR: "/cfg", CLAUDE_JOB_DIR: "/home/qa/.claude/jobs/bad941c8" }, bash("rm -f /home/qa/.claude/jobs/bad941c8/tmp/x")],
+			[{ ...home, CLAUDE_JOB_DIR: "" }, { ...bash("find / -delete"), scratchpad_dir: "/" }],
+			[{ ...home, CLAUDE_JOB_DIR: "" }, { ...bash(`rm -rf ${join(process.cwd(), "x")}`), scratchpad_dir: "." }],
+		];
+
+		for (const [env, payload] of cases) {
+			const ran = await runHook(dir, "builder-1", payload, env, [WORKSPACE]);
+			assert.match(ran.output, /floor: delete/, JSON.stringify({ env, payload }));
+		}
+		const configured = await runHook(dir, "builder-1", bash("rm -f /cfg/jobs/bad941c8/tmp/x"), { HOME: "/home/qa", CLAUDE_CONFIG_DIR: "/cfg", CLAUDE_JOB_DIR: "/cfg/jobs/bad941c8" }, [WORKSPACE]);
+		assert.deepEqual(configured, { code: 0, output: "" });
 	});
 });
 

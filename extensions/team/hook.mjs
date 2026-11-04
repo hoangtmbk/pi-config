@@ -51,7 +51,8 @@
 import { randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { connect } from "node:net";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { floorAction } from "./floor.mjs";
 
 /** How long the doorbell may take before the hook gives up on it; the journal line is already written. */
@@ -183,11 +184,16 @@ function hold(journal, request) {
  * The Teammate's own temp folders, where a delete isn't on the floor: its
  * Claude Code job temp folder, `$CLAUDE_JOB_DIR/tmp`, which Claude Code sets
  * for a background session and tells it to keep scratch files in, and the
- * session's scratchpad when the payload names one.
+ * session's scratchpad when the payload names one. `$CLAUDE_JOB_DIR` is
+ * trusted only when it is a folder directly under `jobs` in Claude Code's
+ * config folder (`$CLAUDE_CONFIG_DIR`, else `~/.claude`), as Claude Code
+ * itself checks; `floorAction` drops a root that is relative or `/`.
  */
 function ownTempFolders(payload) {
 	const job = process.env.CLAUDE_JOB_DIR;
-	return [...(job ? [join(job, "tmp")] : []), ...(typeof payload.scratchpad_dir === "string" && payload.scratchpad_dir !== "" ? [payload.scratchpad_dir] : [])];
+	const config = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+	const trusted = job && isAbsolute(job) && isAbsolute(config) && dirname(resolve(job)) === resolve(config, "jobs");
+	return [...(trusted ? [join(resolve(job), "tmp")] : []), ...(typeof payload.scratchpad_dir === "string" ? [payload.scratchpad_dir] : [])];
 }
 
 /** The floor hook's `ask` for a `PreToolUse` of a floor command, or undefined to let it through. */
