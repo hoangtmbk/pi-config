@@ -192,22 +192,68 @@ describe("the floor classifier", () => {
 		assert.equal(floorAction("rm -f /work/effort/~/x", where)?.kind, undefined);
 	});
 
-	it("reads a quoted or escaped `~`, or a single-quoted or escaped `$HOME`, as the literal it is to the shell, not the home folder", () => {
+	describe("reads the home folder only from an unquoted `~/`, `$HOME/` or `${HOME}/`, or a double-quoted `$HOME` token, and only while nothing reassigns HOME", () => {
 		const where = { workspace: WORKSPACE, home: "/home/qa", roots: ["/home/qa/.claude/jobs/bad941c8/tmp"] };
+		const path = ".claude/jobs/bad941c8/tmp/x";
+		/** `[target as written, inside]`: each is run as `cd /etc && rm -rf <target>`. */
+		const targets: [string, boolean][] = [
+			[`~/${path}`, true],
+			[`$HOME/${path}`, true],
+			[`\${HOME}/${path}`, true],
+			[`"$HOME"/${path}`, true],
+			[`"\${HOME}"/${path}`, true],
+			[`"$HOME/${path}"`, true],
+			[`"\${HOME}/${path}"`, true],
+			[`'~/${path}'`, false],
+			[`"~/${path}"`, false],
+			[`\\~/${path}`, false],
+			[`''~/${path}`, false],
+			[`'$HOME'/${path}`, false],
+			[`\\$HOME/${path}`, false],
+			[`"\\$HOME/${path}"`, false],
+			[`"\\$HOME"/${path}`, false],
+			[`$'HOME'/${path}`, false],
+			[`"$"HOME/${path}`, false],
+			[`$\\HOME/${path}`, false],
+			[`$HOM\\E/${path}`, false],
+			[`$H""OME/${path}`, false],
+			[`$"HOME"/${path}`, false],
+			[`""$HOME/${path}`, false],
+			[`~"/${path}"`, false],
+			[`~'/${path}'`, false],
+			[`~\\/${path}`, false],
+			[`~""/${path}`, false],
+		];
+		for (const [target, inside] of targets) {
+			const command = `cd /etc && rm -rf ${target}`;
+			it(`${JSON.stringify(command)} is ${inside ? "inside" : "outside"}`, () => {
+				assert.equal(floorAction(command, where)?.kind, inside ? undefined : "delete");
+			});
+		}
+
 		for (const command of [
-			"cd / && rm -rf '~/.claude/jobs/bad941c8/tmp/x'",
-			'cd / && rm -rf "~/.claude/jobs/bad941c8/tmp/x"',
-			"cd / && rm -rf \\~/.claude/jobs/bad941c8/tmp/x",
-			"cd / && rm -rf ''~/.claude/jobs/bad941c8/tmp/x",
-			"cd / && rm -rf '$HOME'/.claude/jobs/bad941c8/tmp/x",
-			"cd / && rm -rf \\$HOME/.claude/jobs/bad941c8/tmp/x",
 			"cd '~/.claude/jobs/bad941c8/tmp' && rm -rf x",
+			'cd ~"/.claude/jobs/bad941c8/tmp" && rm -rf x',
+			"HOME=/etc; rm -rf ~/.claude/jobs/bad941c8/tmp/x",
+			"export HOME=/etc; rm -rf $HOME/.claude/jobs/bad941c8/tmp/x",
+			"declare -x HOME=/etc; rm -rf ~/.claude/jobs/bad941c8/tmp/x",
+			"typeset HOME=/etc; rm -rf ~/.claude/jobs/bad941c8/tmp/x",
+			"f() { local HOME=/etc; rm -rf ~/.claude/jobs/bad941c8/tmp/x; }; f",
+			"unset HOME; rm -rf ~/.claude/jobs/bad941c8/tmp/x",
+			"read HOME < f; rm -rf ~/.claude/jobs/bad941c8/tmp/x",
+			"HOME=/etc rm -rf ~/.claude/jobs/bad941c8/tmp/x",
+			"env HOME=/etc rm -rf ~/.claude/jobs/bad941c8/tmp/x",
+			"rm -rf ~/.claude/jobs/bad941c8/tmp/x; sh -c 'HOME=/etc'",
 		]) {
-			assert.equal(floorAction(command, where)?.kind, "delete", command);
+			it(`${JSON.stringify(command)} is outside`, () => {
+				assert.equal(floorAction(command, where)?.kind, "delete");
+			});
 		}
-		for (const command of ['rm -rf "$HOME"/.claude/jobs/bad941c8/tmp/x', 'rm -rf ""$HOME/.claude/jobs/bad941c8/tmp/x', "rm -rf ~/'.claude/jobs/bad941c8/tmp/x'"]) {
-			assert.equal(floorAction(command, where)?.kind, undefined, command);
-		}
+
+		it("still reads a variable merely named like HOME, or `$HOME` used again, as no reassignment", () => {
+			assert.equal(floorAction("MY_HOME=/etc HOME_DIR=/etc; rm -rf ~/.claude/jobs/bad941c8/tmp/x", where)?.kind, undefined);
+			assert.equal(floorAction('echo "$HOME" && rm -rf ${HOME}/.claude/jobs/bad941c8/tmp/x', where)?.kind, undefined);
+		});
 	});
 
 	it("lists a quoted `~` or `$HOME` word for permission rules as it is written, unmarked", () => {

@@ -2314,7 +2314,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			const asker = state.teammateRequests[params.request]?.teammate;
 			const records = state.brief && state.workspace ? approved(held, ctx) : undefined;
 			const shortId = state.teammates.find((teammate) => teammate.id === asker)?.shortId;
-			const roots = shortId === undefined ? {} : { roots: [join(claudeDir, "jobs", shortId, "tmp")] };
+			// A short id is a job folder's name only when it is one plain path segment.
+			const roots = shortId !== undefined && /^[A-Za-z0-9_-]+$/.test(shortId) ? { roots: [join(claudeDir, "jobs", shortId, "tmp")] } : {};
 			const terms = records && state.workspace ? { ...answerTerms(records.playbook, records.brief, (asker && workdir(state, asker)) ?? state.workspace.path), ...roots } : undefined;
 			const answer = {
 				kind: "answer-request" as const,

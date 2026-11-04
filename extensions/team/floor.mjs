@@ -31,9 +31,12 @@ import { posix } from "node:path";
  * A delete is inside when it reaches only what is under the Workspace or
  * under one of `roots`: other folders that are the Teammate's own, such as
  * its Claude Code job temp folder. A root that is relative, `/` or the home
- * folder itself is ignored, so a bad value never widens what is inside. A
- * path that starts with an unquoted `~/`, or `$HOME/`, is read under `home`;
- * any other variable leaves the path unknown, so outside.
+ * folder itself is ignored, so a bad value never widens what is inside.
+ *
+ * A path is read under `home` only when it starts with a home prefix the
+ * shell is sure to expand ({@link HOME_START}) and nothing in the command
+ * line names HOME otherwise ({@link namesHome}). Any other spelling of `~`
+ * or a variable leaves the path unknown, so outside.
  *
  * @param {string} command the Bash command as the Teammate wrote it
  * @param {{ workspace: string, cwd?: string, roots?: string[], home?: string }} where the Workspace, the directory the command runs in (the Workspace when not given), the other folders a delete under counts as inside, and the home folder (this user's when not given)
@@ -44,7 +47,16 @@ export function floorAction(command, where) {
 	const home = posix.resolve(where.home ?? homedir());
 	const own = (where.roots ?? []).filter((root) => posix.isAbsolute(root)).map((root) => posix.resolve(root));
 	const roots = [workspace, ...own.filter((root) => root !== "/" && root !== home)];
-	return scan(command, { roots, home, cwd: where.cwd === undefined ? workspace : posix.resolve(where.cwd) }, 0);
+	return scan(command, { roots, home: namesHome(command) ? undefined : home, cwd: where.cwd === undefined ? workspace : posix.resolve(where.cwd) }, 0);
+}
+
+/**
+ * Whether a command line names HOME other than as `$HOME` or `${HOME}`: an
+ * assignment, `export`, `declare`, `local`, `unset`, `read` or anything else
+ * that may change it. Then no `~` or `$HOME` in it is read as the home folder.
+ */
+function namesHome(command) {
+	return /\bHOME\b/.test(command.replace(/\$\{HOME\}|\$HOME\b/g, ""));
 }
 
 /**
@@ -86,7 +98,7 @@ function scan(text, context, depth) {
 			continue;
 		}
 		if (words[0] === "cd" || words[0] === "pushd") {
-			cwd = changeDir(cwd, words[1] === undefined ? undefined : plain(homeExpanded(words[1], context.home)));
+			cwd = changeDir(cwd, words[1] === undefined ? undefined : homeExpanded(words[1], context.home));
 			continue;
 		}
 		if (words[0] === "popd") {
@@ -104,24 +116,34 @@ function changeDir(cwd, target) {
 	return posix.resolve(cwd ?? "/", target);
 }
 
-/** The spellings of the home folder a path may start with, as a shell expands them. */
-const HOME_PREFIX = /^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/;
+/**
+ * The home prefixes the shell is sure to expand, as written at a word's start
+ * with their quotes: `~/`, `$HOME/` and `${HOME}/` unquoted, or `$HOME` and
+ * `${HOME}` as a whole double-quoted token, the `/` after it inside the quotes
+ * or not. Any other spelling, quoted or escaped in part, isn't one.
+ */
+const HOME_START = /~\/|\$HOME\/|\$\{HOME\}\/|"\$HOME"?\/|"\$\{HOME\}"?\//y;
 
-/** A path with a leading `~`, `$HOME` or `${HOME}` read as `home`; any other path, a {@link LITERAL} one included, as it is. */
-function homeExpanded(target, home) {
-	return target.replace(HOME_PREFIX, () => home);
-}
+/** A home prefix once its quotes are gone, as it starts a {@link HOME} word. */
+const HOME_PREFIX = /^(?:~|\$HOME|\$\{HOME\})(?=\/)/;
 
 /**
- * The mark {@link segments} puts before a word whose leading `~` or `$` the
- * shell leaves as it is: a quoted or escaped `~`, a single-quoted or escaped
- * `$`. No shell word can hold it, and {@link plain} takes it off.
+ * The mark {@link segments} puts before a word that starts with a
+ * {@link HOME_START} prefix. No shell word can hold it, and {@link plain}
+ * takes it off.
  */
-const LITERAL = "\u0000";
+const HOME = "\u0000";
 
-/** A word without its {@link LITERAL} mark. */
+/** A word without its {@link HOME} mark. */
 function plain(word) {
-	return word.startsWith(LITERAL) ? word.slice(LITERAL.length) : word;
+	return word.startsWith(HOME) ? word.slice(HOME.length) : word;
+}
+
+/** A word with its home prefix read as `home` when it carries the {@link HOME} mark and `home` is known; any other word as it is written. */
+function homeExpanded(word, home) {
+	if (!word.startsWith(HOME)) return word;
+	const bare = plain(word);
+	return home === undefined ? bare : bare.replace(HOME_PREFIX, () => home);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,8 +153,8 @@ function plain(word) {
  * The simple commands in a shell text, each with its words (quotes removed)
  * and the text it was written as. A `$(…)` or backtick substitution is a
  * command of its own, listed before the command it sits in; its place in that
- * command's word reads as `$(…)`, an unknown value. A word whose leading
- * `~` or `$` the shell doesn't expand carries the {@link LITERAL} mark.
+ * command's word reads as `$(…)`, an unknown value. A word that starts, as
+ * written, with a {@link HOME_START} prefix carries the {@link HOME} mark.
  */
 function segments(text) {
 	const out = [];
@@ -143,19 +165,15 @@ function segments(text) {
 	let end = 0;
 	let redirect = false;
 	let atCommandStart = true;
-	// Whether the word opened with a quote or an escape, so a leading `~` in it is no home folder.
-	let quotedStart = false;
-	// Whether the word's first character is a `$` from single quotes or an escape, so no variable.
-	let literalDollar = false;
+	// Whether the word, as written, starts with a home prefix the shell is sure to expand.
+	let homeStart = false;
 	const endWord = () => {
 		if (!inWord) return;
-		const literal = (quotedStart && word.startsWith("~")) || (literalDollar && word.startsWith("$"));
 		if (redirect) redirect = false;
-		else words.push(literal ? `${LITERAL}${word}` : word);
+		else words.push(homeStart ? `${HOME}${word}` : word);
 		word = "";
 		inWord = false;
-		quotedStart = false;
-		literalDollar = false;
+		homeStart = false;
 	};
 	const endSegment = () => {
 		endWord();
@@ -164,9 +182,12 @@ function segments(text) {
 		start = -1;
 		atCommandStart = true;
 	};
-	const begin = (i, quoted = false) => {
+	const begin = (i) => {
 		if (start < 0) start = i;
-		if (!inWord) quotedStart = quoted;
+		if (!inWord) {
+			HOME_START.lastIndex = i;
+			homeStart = HOME_START.test(text);
+		}
 		inWord = true;
 	};
 	const substitution = (inner) => {
@@ -177,10 +198,9 @@ function segments(text) {
 	while (i < text.length) {
 		const c = text[i];
 		if (c === "\\") {
-			begin(i, true);
+			begin(i);
 			if (text[i + 1] === "\n") i += 2;
 			else {
-				if (word === "" && text[i + 1] === "$") literalDollar = true;
 				word += text[i + 1] ?? "";
 				i += 2;
 			}
@@ -188,17 +208,16 @@ function segments(text) {
 			continue;
 		}
 		if (c === "'") {
-			begin(i, true);
+			begin(i);
 			const close = text.indexOf("'", i + 1);
 			const stop = close < 0 ? text.length : close;
-			if (word === "" && text[i + 1] === "$") literalDollar = true;
 			word += text.slice(i + 1, stop);
 			i = stop + 1;
 			end = i;
 			continue;
 		}
 		if (c === '"') {
-			begin(i, true);
+			begin(i);
 			i++;
 			while (i < text.length && text[i] !== '"') {
 				if (text[i] === "\\" && '"\\$`'.includes(text[i + 1] ?? "")) {
@@ -693,11 +712,11 @@ const DELETERS = new Set(["rm", "rmdir", "unlink", "shred", "srm", "trash", "tra
  * Is a path, as the command names it, outside the Workspace and the other
  * roots? A root itself counts as outside unless `within` says a deletion
  * there only reaches what is under it (as `find`'s starting point does).
- * A leading `~` or `$HOME` is the home folder, unless the shell leaves it
- * as it is (the {@link LITERAL} mark); anything else unknown counts as outside.
+ * A home prefix is the home folder only in a word with the {@link HOME}
+ * mark; anything else unknown counts as outside.
  */
 function outside(written, context, within = false) {
-	const target = plain(homeExpanded(written, context.home));
+	const target = homeExpanded(written, context.home);
 	if (target === "" || target.startsWith("~") || target.includes("$") || target.includes("`")) return true;
 	if (!target.startsWith("/") && context.cwd === undefined) return true;
 	const resolved = posix.resolve(context.cwd ?? "/", target);
@@ -734,7 +753,7 @@ function make(args) {
 	return undefined;
 }
 
-/** The floor kind of one simple command, past its wrappers, or undefined. Only deletes read the {@link LITERAL} mark. */
+/** The floor kind of one simple command, past its wrappers, or undefined. Only deletes read the {@link HOME} mark. */
 function classify(marked, context) {
 	const words = marked.map(plain);
 	const [head, ...args] = words;

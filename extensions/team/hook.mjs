@@ -187,7 +187,8 @@ function hold(journal, request) {
  * session's scratchpad when the payload names one. `$CLAUDE_JOB_DIR` is
  * trusted only when it is a folder directly under `jobs` in Claude Code's
  * config folder (`$CLAUDE_CONFIG_DIR`, else `~/.claude`), as Claude Code
- * itself checks; `floorAction` drops a root that is relative or `/`.
+ * itself checks; `floorAction` drops a root that is relative, `/` or the
+ * home folder itself.
  */
 function ownTempFolders(payload) {
 	const job = process.env.CLAUDE_JOB_DIR;
