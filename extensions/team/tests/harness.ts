@@ -129,12 +129,21 @@ export interface FakeClaudeOptions {
  * hook commands of its `--settings` (the payload gets the session id, folder
  * and event name filled in), write the result its handoff pointer asks for,
  * edit a file in its working directory, committing it when a message is given,
- * or update its status line, which runs the `statusLine.command` of its
- * `--settings` with the payload (the session id and folder filled in), or
- * raise the human's input at its terminal through its mods (`mod`), `{pointer}`
- * in its `text` standing for the session's pointer.
+ * start a command detached in its working directory and leave it running
+ * (`background`, as a Teammate's `cmd &` does), or update its status line,
+ * which runs the `statusLine.command` of its `--settings` with the payload
+ * (the session id and folder filled in), or raise the human's input at its
+ * terminal through its mods (`mod`), `{pointer}` in its `text` standing for
+ * the session's pointer.
  */
-export type FakeHookStep = ({ event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string } | { statusLine: Record<string, unknown> } | { mod: string; input: Record<string, unknown> }) & {
+export type FakeHookStep = (
+	| { event: string; payload?: Record<string, unknown>; hold?: boolean }
+	| { write: "result" }
+	| { edit: string; commit?: string }
+	| { background: string[] }
+	| { statusLine: Record<string, unknown> }
+	| { mod: string; input: Record<string, unknown> }
+) & {
 	/** Play the step only for a pointer that includes this text. */
 	when?: string;
 };
@@ -184,6 +193,10 @@ export interface FakeClaude {
 	held(): FakeHeldHook[];
 	/** SIGTERM every held hook still running, so none outlives the test. */
 	release(): void;
+	/** The pid of every process a `background` step started, oldest first. */
+	background(): number[];
+	/** SIGKILL every process a `background` step started, so none outlives the test. */
+	killBackground(): void;
 	/** Every session it started, live or not, as its registry holds it. */
 	agents(): FakeAgent[];
 	/** Play `steps` on the session named `name` now, as the human at its terminal does, resolving once they have played. */
@@ -254,6 +267,7 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 	const inboxOut = join(dir, "inbox.jsonl");
 	const attachOut = join(dir, "attaches.jsonl");
 	const heldOut = join(dir, "held.jsonl");
+	const backgroundOut = join(dir, "background.jsonl");
 	const hooks = join(dir, "hooks.json");
 	const replies = join(dir, "replies.json");
 	if (options.hooks) writeFileSync(hooks, JSON.stringify(options.hooks));
@@ -289,6 +303,7 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 		FAKE_CLAUDE_ATTACH_EXIT: options.attachExit === undefined ? undefined : String(options.attachExit),
 		FAKE_CLAUDE_USAGE: usage,
 		FAKE_CLAUDE_HELD_OUT: heldOut,
+		FAKE_CLAUDE_BACKGROUND_OUT: backgroundOut,
 		TEAM_HOOK_HOLD_MS: options.holdMs === undefined ? undefined : String(options.holdMs),
 	};
 	const exports = Object.entries(env)
@@ -305,6 +320,16 @@ export function fakeClaude(roots: TempRoots, options: FakeClaudeOptions = {}): F
 		held: () => jsonLines<{ pid: number; event: string; out: string; exit: string }>(heldOut).map(heldHook),
 		release() {
 			for (const { pid, exit } of jsonLines<{ pid: number; exit: string }>(heldOut)) if (!existsSync(exit)) kill(pid);
+		},
+		background: () => jsonLines<number>(backgroundOut),
+		killBackground() {
+			for (const pid of jsonLines<number>(backgroundOut)) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {
+					// Gone already.
+				}
+			}
 		},
 		agents: () => readdirSync(agents).map((file) => JSON.parse(readFileSync(join(agents, file), "utf8")) as FakeAgent),
 		// Not synchronous: a hook rings the Lead's doorbell in this very process, which must be free to answer it.

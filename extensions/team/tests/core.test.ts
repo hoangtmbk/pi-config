@@ -2183,6 +2183,25 @@ describe("the final Report and sign-off", () => {
 		]);
 	});
 
+	it("names each process still running in a worktree, by pid and command, and says the Team doesn't stop it", () => {
+		const worktrees = [
+			{ ...WORKTREES[0], running: [{ pid: 4242, command: "python3 -m http.server 8125" }] },
+			{
+				...WORKTREES[1],
+				running: [
+					{ pid: 4300, command: "chrome --headless" },
+					{ pid: 4301, command: "npm run dev" },
+				],
+			},
+		];
+		const report = written(run(running, finalReport("2026-11-02T12:00:00.000Z", { final: { checkpoints: [], changes: [], worktrees } })));
+
+		assert.deepEqual(report.sections.find((each) => each.title === "Worktrees")?.lines, [
+			"/work/app/.claude/worktrees/team-software-2026-11-02 (`team/software-2026-11-02`): clean, removed at sign-off; the branch is kept; pid 4242 (`python3 -m http.server 8125`) is still running in it, and the Team doesn't stop it: `kill 4242` does",
+			"/work/app/.claude/worktrees/team-software-2026-11-02-task-002 (`team/software-2026-11-02-task-002`): has uncommitted changes, so it is kept; the branch is kept; pids 4300 (`chrome --headless`) and 4301 (`npm run dev`) are still running in it, and the Team doesn't stop them: `kill 4300 4301` does",
+		]);
+	});
+
 	it("orders the final Report's sections as the spec lists them, found work before usage, the sign-off's own after the logged ones", () => {
 		const report = written(run(running, finalReport("2026-11-02T12:00:00.000Z", { leadCostUsd: 1.5 })));
 		const titles = report.sections.map((each) => each.title);

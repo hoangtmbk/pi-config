@@ -11,9 +11,9 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
-import type { MergeEvidence, Workspace } from "./core.ts";
+import type { MergeEvidence, RunningProcess, Workspace } from "./core.ts";
 import type { WorkspaceKind } from "./definitions.ts";
 
 /** The folder the worktrees go in, relative to the repo root, as a gitignore pattern for that folder. */
@@ -234,25 +234,80 @@ export function mergeEvidence(into: string, branch: string): MergeEvidence | und
 
 /**
  * Remove an isolated Task's worktree and its branch: once merged, or with
- * `force` to undo one whose Teammate never launched. Undefined when both are
- * gone, else what git said.
+ * `force` to undo one whose Teammate never launched. `error` is what git said
+ * when either is left, and `running` the processes still running in the
+ * worktree it removed, which are never stopped.
  */
-export function removeTaskWorkspace(repo: string, task: { path: string; branch: string }, force = false): string | undefined {
+export function removeTaskWorkspace(repo: string, task: { path: string; branch: string }, force = false): { error?: string; running: RunningProcess[] } {
+	let running: RunningProcess[] = [];
 	try {
-		if (existsSync(task.path)) git(repo, ["worktree", "remove", ...(force ? ["--force"] : []), task.path]);
+		if (existsSync(task.path)) {
+			const found = runningIn(task.path);
+			git(repo, ["worktree", "remove", ...(force ? ["--force"] : []), task.path]);
+			running = found;
+		}
 		if (hasBranch(repo, task.branch)) git(repo, ["branch", force ? "-D" : "-d", task.branch]);
-		return undefined;
+		return { running };
 	} catch (error) {
-		if (error instanceof GitError) return error.message;
+		if (error instanceof GitError) return { error: error.message, running };
 		throw error;
 	}
 }
 
-/** One of an Effort's worktrees: its Workspace or an isolated Task's, with whether it has uncommitted changes. */
+/**
+ * The processes whose working directory is `dir` or a folder inside it, such
+ * as a server a Teammate started with `&`: `claude stop` never reaches them,
+ * and removing the worktree leaves them running in a folder that is gone.
+ * `dir` is matched in its own spelling and its real path, since `lsof` gives
+ * real paths (`/private/tmp`, not `/tmp`), and only on a folder boundary, so
+ * `/a/wt` doesn't match `/a/wt2`. pi's own process is never one of them. None
+ * when `lsof` is missing or fails: what removes a worktree goes ahead all the
+ * same.
+ */
+export function runningIn(dir: string, lsof = "lsof"): RunningProcess[] {
+	const roots = new Set([dir.replace(/(.)\/+$/, "$1")]);
+	try {
+		roots.add(realpathSync(dir));
+	} catch {
+		// Gone already: only its own spelling can match.
+	}
+	const inside = (path: string) => [...roots].some((root) => path === root || path.startsWith(`${root}/`));
+	const found = new Map<number, string>();
+	let pid: number | undefined;
+	let name = "";
+	for (const line of output(lsof, ["-a", "-d", "cwd", "-Fpcn", "-w"]).split("\n")) {
+		if (line.startsWith("p")) [pid, name] = [Number(line.slice(1)), ""];
+		else if (line.startsWith("c")) name = line.slice(1);
+		else if (line.startsWith("n") && pid !== undefined && pid !== process.pid && inside(line.slice(1))) found.set(pid, name);
+	}
+	if (found.size === 0) return [];
+	const commands = new Map<number, string>();
+	for (const line of output("ps", ["-o", "pid=,command=", "-p", [...found.keys()].join(",")]).split("\n")) {
+		const match = /^\s*(\d+)\s+(.+)$/.exec(line);
+		if (match) commands.set(Number(match[1]), match[2].trim());
+	}
+	return [...found].map(([each, named]) => ({ pid: each, command: commands.get(each) ?? named }));
+}
+
+/** What `file` prints to stdout, even when it exits non-zero (`lsof` and `ps` do when a process is gone or unreadable); empty when it can't run. */
+function output(file: string, args: string[]): string {
+	try {
+		return execFileSync(file, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 * 1024 });
+	} catch (error) {
+		const stdout = (error as { stdout?: unknown }).stdout;
+		return typeof stdout === "string" ? stdout : "";
+	}
+}
+
+/**
+ * One of an Effort's worktrees: its Workspace or an isolated Task's, with
+ * whether it has uncommitted changes and the processes still running in it.
+ */
 export interface EffortWorktree {
 	path: string;
 	branch: string;
 	dirty: boolean;
+	running: RunningProcess[];
 }
 
 /**
@@ -268,7 +323,7 @@ export function effortWorktrees(repo: string, effortId: string): EffortWorktree[
 		const path = fields.find((field) => field.startsWith("worktree "))?.slice("worktree ".length);
 		const branch = fields.find((field) => field.startsWith("branch refs/heads/"))?.slice("branch refs/heads/".length);
 		if (path === undefined || branch === undefined || (branch !== own && !branch.startsWith(`${own}-task-`))) continue;
-		found.push({ path, branch, dirty: existsSync(path) && changed(path).length > 0 });
+		found.push({ path, branch, dirty: existsSync(path) && changed(path).length > 0, running: existsSync(path) ? runningIn(path) : [] });
 	}
 	return found;
 }
@@ -277,7 +332,9 @@ export function effortWorktrees(repo: string, effortId: string): EffortWorktree[
  * Remove Effort `effortId`'s clean worktrees at its end, sign-off or cancel,
  * and keep every branch: the work stays in git for the human to merge or
  * delete. A worktree with uncommitted changes is kept, never forced, and so is
- * one git refuses to remove, with git's reason.
+ * one git refuses to remove, with git's reason. Each one's `running` is
+ * what still runs in it as it goes, found then rather than at the final
+ * Report, since a process can start in between; none of it is stopped.
  */
 export function endWorktrees(repo: string, effortId: string): { removed: EffortWorktree[]; kept: (EffortWorktree & { why: string })[] } {
 	const removed: EffortWorktree[] = [];

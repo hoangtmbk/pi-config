@@ -49,6 +49,8 @@ import {
 	type PendingApproval,
 	type PlaybookChange,
 	refuseRequest,
+	type RunningProcess,
+	runningClause,
 	SIGN_OFF,
 	type Step,
 	step,
@@ -640,8 +642,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 				// A merged Task's worktree goes as an accept removes it; an abandoned launch's had nothing worked in it.
 				const accepted = result.state.tasks[action.slug]?.accepted !== undefined;
 				if (accepted && (!stopped || !result.state.workspace)) continue;
-				const left = removeTaskWorkspace(accepted && result.state.workspace ? result.state.workspace.path : result.state.repo, action, !accepted);
-				if (left) texts.push(`Task \`${action.slug}\`'s worktree or branch is left in place: ${left}`);
+				const removed = removeTaskWorkspace(accepted && result.state.workspace ? result.state.workspace.path : result.state.repo, action, !accepted);
+				if (removed.error) texts.push(`Task \`${action.slug}\`'s worktree or branch is left in place: ${removed.error}`);
+				const running = removedRunning(action.path, removed.running);
+				if (running) texts.push(`${running} Tell the human.`);
 			} else if (action.kind === "merge") {
 				try {
 					texts.push(await acceptMerged(held, { ok: true, state: effortState(held), append: [], actions: [] }, action));
@@ -1206,8 +1210,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 					notes.push(`\`${action.teammate}\` didn't stop (${failed.error}), so its worktree is left in place; tell the human.`);
 				}
 			} else if (action.kind === "remove-task-workspace" && stopped && result.state.workspace) {
-				const left = removeTaskWorkspace(result.state.workspace.path, action);
-				if (left) notes.push(`Its worktree or branch is left in place: ${left}`);
+				const removed = removeTaskWorkspace(result.state.workspace.path, action);
+				if (removed.error) notes.push(`Its worktree or branch is left in place: ${removed.error}`);
+				const running = removedRunning(action.path, removed.running);
+				if (running) notes.push(`${running} Tell the human.`);
 			} else if (action.kind === "write-plan") writePlan(held.paths, outcome.state);
 		}
 		return [outcome.reply ?? "", ...notes].join(" ");
@@ -1257,8 +1263,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 					if (stopped) throw new Error(`Teammate \`${action.teammate}\` couldn't be stopped with \`claude stop ${action.shortId}\` (${stopped.error}), so nothing was re-planned. Stop and tell the human.`);
 				} else if (action.kind === "remove-task-workspace" && result.state.workspace) {
 					// Not forced, and from the Workspace so `branch -d` weighs the Effort branch: uncommitted or unmerged work stays.
-					const left = removeTaskWorkspace(result.state.workspace.path, action);
-					if (left) notes.push(`Task \`${action.slug}\`'s worktree \`${action.path}\` or branch \`${action.branch}\` is left in place, since git refused to remove it: ${left} Tell the human, who can merge or delete it.`);
+					const removed = removeTaskWorkspace(result.state.workspace.path, action);
+					if (removed.error) notes.push(`Task \`${action.slug}\`'s worktree \`${action.path}\` or branch \`${action.branch}\` is left in place, since git refused to remove it: ${removed.error} Tell the human, who can merge or delete it.`);
+					const running = removedRunning(action.path, removed.running);
+					if (running) notes.push(`${running} Tell the human.`);
 				}
 			}
 			appendLines(held.paths, result.append);
@@ -1728,7 +1736,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			try {
 				const { removed, kept } = endWorktrees(state.repo, held.effortId);
 				if (removed.length > 0) notes.push(`Removed the clean worktrees ${removed.map((each) => each.path).join(", ")}.`);
-				for (const each of kept) notes.push(`Kept ${each.path} (\`${each.branch}\`): ${each.why}.`);
+				notes.push(...removed.flatMap((each) => removedRunning(each.path, each.running) ?? []));
+				for (const each of kept) {
+					const running = runningClause(each.running);
+					notes.push(`Kept ${each.path} (\`${each.branch}\`): ${each.why}${running ? `; ${running}` : ""}.`);
+				}
 			} catch (error) {
 				notes.push(`Its worktrees are left in place: ${error instanceof Error ? error.message : String(error)}.`);
 			}
@@ -2467,6 +2479,12 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 function bullets(lines: readonly string[]): string {
 	return lines.map((line) => `- ${line}`).join("\n");
+}
+
+/** What is said of the worktree at `path` once it is removed with processes still running in it: undefined when none are. */
+function removedRunning(path: string, running: readonly RunningProcess[]): string | undefined {
+	const clause = runningClause(running);
+	return clause === undefined ? undefined : `${path} is removed, but ${clause}.`;
 }
 
 export default function (pi: ExtensionAPI): void {

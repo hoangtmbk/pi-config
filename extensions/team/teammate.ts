@@ -75,6 +75,7 @@ export function teammatePrompt(preamble: PreambleFor, rolePrompt: string): strin
 		`- The Brief is ${preamble.brief}, and answers given since it was approved are in ${preamble.clarifications}. Read both before you start and whenever you are unsure; they are the source of truth, and you may not edit them.`,
 		`- Every Task has its own folder under ${preamble.tasks}: \`task.md\` says what to do, and you write your result for round <n> to \`result-<n>.md\` beside it, with anything else you produce. Feedback on a round arrives as \`feedback-<n>.md\`.`,
 		"- The Workspace is fresh: installing dependencies is yours to do before you build or test.",
+		"- Stop every process you start in the background (a server, a browser, a watcher) before you write your result: stopping your session doesn't stop them. In your result, name each one you leave running, with its pid and command.",
 		"",
 		"# Your Role",
 		"",

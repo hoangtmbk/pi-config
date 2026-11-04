@@ -23,7 +23,9 @@
  *   asks for; `{ edit: <file>, commit?: <message> }` writes `<file>` in the
  *   session's working directory, `{task}` in its name standing for the Task
  *   folder the pointer names, and commits just that file when a message is
- *   given. Each session gets a session id of its own unless a payload names
+ *   given; `{ background: [file, ...args] }` starts that command detached in
+ *   the session's working directory and leaves it running once the session
+ *   ends, as a Teammate's `cmd &` does. Each session gets a session id of its own unless a payload names
  *   one. A step with `hold: true` starts each hook command without
  *   waiting for it, as Claude Code waits on a held `PermissionRequest` while
  *   its prompt stays live: the step after it plays at once, standing for
@@ -37,6 +39,8 @@
  *   line to: its process group, the event, and the files its stdout and exit
  *   code land in once it exits. Killing the group with SIGTERM is what Claude
  *   Code does when the human answers the prompt in the terminal.
+ * - `FAKE_CLAUDE_BACKGROUND_OUT`: a file each `background` step appends the
+ *   pid of the process it started to, one per line, so the test can kill it.
  * - `FAKE_CLAUDE_SOCKETS`: a short folder a session with hooks opens its inbox
  *   socket in. The socket is real: a small server process outlives the
  *   launch, as the real session does, and stops once the test process
@@ -290,11 +294,24 @@ function fileOf(flag: string): string | undefined {
 }
 
 /** One scripted step of a started session. */
-type HookStep = ({ event: string; payload?: Record<string, unknown>; hold?: boolean } | { write: "result" } | { edit: string; commit?: string } | { statusLine: Record<string, unknown> } | { mod: string; input: Record<string, unknown> }) & { when?: string };
+type HookStep = (
+	| { event: string; payload?: Record<string, unknown>; hold?: boolean }
+	| { write: "result" }
+	| { edit: string; commit?: string }
+	| { background: string[] }
+	| { statusLine: Record<string, unknown> }
+	| { mod: string; input: Record<string, unknown> }
+) & { when?: string };
 
-/** Start the session's inbox server, detached so it outlives this launch, and wait until it listens. */
+/**
+ * Start the session's inbox server, detached so it outlives this launch, and
+ * wait until it listens. It runs in the sockets folder, not the session's: it
+ * stands for the session itself, which `claude stop` has ended by the time a
+ * worktree is removed, so it is never a process left running there.
+ */
 async function openInbox(session: Session): Promise<void> {
 	const server = spawn(process.execPath, [process.argv[1] ?? "", "--fake-inbox", JSON.stringify(session)], {
+		cwd: dirname(session.socket),
 		detached: true,
 		stdio: ["ignore", "pipe", "ignore"],
 	});
@@ -463,6 +480,14 @@ function playSteps(steps: HookStep[], session: Session, pointer: string): void {
 				execFileSync("git", ["add", "--", file], { cwd: session.cwd, stdio: "ignore" });
 				execFileSync("git", ["commit", "-q", "--allow-empty", "-m", step.commit], { cwd: session.cwd, stdio: "ignore" });
 			}
+			continue;
+		}
+		if ("background" in step) {
+			const [file = "", ...args] = step.background;
+			const child = spawn(file, args, { cwd: session.cwd, detached: true, stdio: "ignore" });
+			child.unref();
+			const out = process.env.FAKE_CLAUDE_BACKGROUND_OUT;
+			if (out && child.pid !== undefined) appendFileSync(out, `${child.pid}\n`);
 			continue;
 		}
 		if ("write" in step) {
