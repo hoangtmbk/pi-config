@@ -194,9 +194,10 @@ describe("the human's own status line command", () => {
 describe("usage readings", () => {
 	const AT = "2026-11-02T10:00:00.000Z";
 
-	it("reads a status line's JSON: the account's windows, the session's tokens, estimate and context", () => {
+	it("reads a status line's JSON: the account's windows, the session's model, estimate and context, but not its tokens (#135, #137)", () => {
 		const json = JSON.stringify({
 			session_id: "sess-1",
+			model: { id: "claude-sonnet-5-5", display_name: "Sonnet 5.5" },
 			context_window: { total_input_tokens: 41_000, total_output_tokens: 900, used_percentage: 21 },
 			rate_limits: { five_hour: { used_percentage: 12.4, resets_at: 1_793_617_200 }, seven_day: { used_percentage: 73, resets_at: 1_793_955_600 } },
 			cost: { total_cost_usd: 0.42 },
@@ -210,16 +211,16 @@ describe("usage readings", () => {
 			rateLimits: true,
 			fiveHour: { percent: 12.4, resetsAt: "2026-11-02T11:00:00.000Z" },
 			sevenDay: { percent: 73, resetsAt: "2026-11-06T09:00:00.000Z" },
-			tokens: 41_900,
+			model: "claude-sonnet-5-5",
 			costUsd: 0.42,
 			ctx: 21,
 		});
 	});
 
 	it("reads a status line without rate_limits, as an API key's, and leaves out what it doesn't say", () => {
-		const json = JSON.stringify({ session_id: "sess-2", context_window: { total_input_tokens: 10, total_output_tokens: 5, used_percentage: null }, cost: { total_cost_usd: 1.5 } });
+		const json = JSON.stringify({ session_id: "sess-2", model: { display_name: "Sonnet" }, context_window: { total_input_tokens: 10, total_output_tokens: 5, used_percentage: null }, cost: { total_cost_usd: 1.5 } });
 
-		assert.deepEqual(statusLineReading(json, "dev-2", AT), { source: "status-line", at: AT, teammate: "dev-2", sessionId: "sess-2", rateLimits: false, tokens: 15, costUsd: 1.5 });
+		assert.deepEqual(statusLineReading(json, "dev-2", AT), { source: "status-line", at: AT, teammate: "dev-2", sessionId: "sess-2", rateLimits: false, costUsd: 1.5 });
 		assert.equal(statusLineReading("{ half", "dev-2", AT), undefined);
 		assert.equal(statusLineReading("[]", "dev-2", AT), undefined);
 	});

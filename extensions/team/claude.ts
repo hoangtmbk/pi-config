@@ -383,7 +383,9 @@ function given<T extends object>(value: T): T {
  * A Teammate's `statusline.json`, as Claude Code gave it to the status line,
  * read `at` its modification time; undefined when it isn't a JSON object.
  * `rate_limits` is absent with an API key (and before the first call), and
- * `resets_at` there is in epoch seconds.
+ * `resets_at` there is in epoch seconds. `model.id` is the model the session
+ * runs on, whatever it was launched with. `context_window`'s token totals are
+ * left out: they are the last request's context, not what the session used.
  */
 export function statusLineReading(text: string, teammate: string, at: string): UsageReading | undefined {
 	let json: Record<string, unknown> | undefined;
@@ -400,8 +402,7 @@ export function statusLineReading(text: string, teammate: string, at: string): U
 		return usageWindow(each?.used_percentage, resets === undefined ? undefined : new Date(resets * 1000).toISOString());
 	};
 	const context = objectOr(json.context_window);
-	const input = numberOr(context?.total_input_tokens);
-	const output = numberOr(context?.total_output_tokens);
+	const model = objectOr(json.model)?.id;
 	return given<UsageReading>({
 		source: "status-line",
 		at,
@@ -410,7 +411,7 @@ export function statusLineReading(text: string, teammate: string, at: string): U
 		rateLimits: limits !== undefined,
 		fiveHour: window("five_hour"),
 		sevenDay: window("seven_day"),
-		tokens: input === undefined && output === undefined ? undefined : (input ?? 0) + (output ?? 0),
+		model: typeof model === "string" && model !== "" ? model : undefined,
 		costUsd: numberOr(objectOr(json.cost)?.total_cost_usd),
 		ctx: numberOr(context?.used_percentage),
 	});

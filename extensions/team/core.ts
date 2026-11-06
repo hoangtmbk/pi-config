@@ -106,6 +106,11 @@ export interface HandedTask {
 	 * model was recorded, as on a line from before models were.
 	 */
 	model?: string | null;
+	/**
+	 * The models its sessions ran on, as their status lines gave them, in the
+	 * order first seen; absent until a reading of its session gives one.
+	 */
+	models?: string[];
 	at: string;
 	/** The round in progress: its result is `result-<round>.md` in the folder. */
 	round: number;
@@ -537,20 +542,24 @@ export interface UsageReading {
 	rateLimits: boolean;
 	fiveHour?: UsageWindow;
 	sevenDay?: UsageWindow;
-	/** The session's input and output tokens so far. */
-	tokens?: number;
-	/** The session's estimate so far, at API prices, in USD. */
+	/**
+	 * The model the session runs on, the status line's `model.id`: what it
+	 * actually ran on, which a `/model` in a Takeover can change from its launch.
+	 * There is no token count: the status line's token totals are the last
+	 * request's context, not what the session used, so only the estimate is kept.
+	 */
+	model?: string;
+	/** The session's estimate so far, at API prices, in USD: the status line's `cost.total_cost_usd`. */
 	costUsd?: number;
 	/** How full the session's context window is, 0 to 100. */
 	ctx?: number;
 }
 
-/** What one session has spent: its latest figures, and what earlier figures it reset from had reached. */
+/** What one session has spent: its latest estimate, and what earlier estimates it reset from had reached. */
 export interface SessionSpend {
-	tokens: number;
 	costUsd: number;
-	/** The sum of the figures a drop showed to be reset: they were spent too. */
-	banked: { tokens: number; costUsd: number };
+	/** The sum of the estimates a drop showed to be reset: they were spent too. */
+	banked: number;
 }
 
 /** What the usage readings fold to. */
@@ -561,8 +570,12 @@ export interface UsageState {
 	first: { fiveHour?: UsageWindow; sevenDay?: UsageWindow };
 	/** Whether any reading came with rate limits; never, with an API key. */
 	rateLimits: boolean;
-	/** Each Teammate's latest status line: when it was taken, and how full its context was. */
-	statusLines: Record<string, { at: string; ctx?: number }>;
+	/**
+	 * Each Teammate's latest status line reading logged: when it was taken, how
+	 * full its context was, and the figures a reading is compared with, since one
+	 * that changes none of them isn't logged.
+	 */
+	statusLines: Record<string, UsageReading>;
 	/** What each Teammate spent, by session id. */
 	spend: Record<string, Record<string, SessionSpend>>;
 }
@@ -1090,16 +1103,19 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 					return rest;
 				}),
 			};
-			if (line.source !== "clear") return changed;
+			if (line.source !== "clear") return withObservedModel(changed, line.teammate);
 			// The clear asked for has happened.
-			return {
-				...changed,
-				teammates: changed.teammates.map((teammate) => {
-					if (teammate.id !== line.teammate) return teammate;
-					const { clearing: _clearing, ...rest } = teammate;
-					return rest;
-				}),
-			};
+			return withObservedModel(
+				{
+					...changed,
+					teammates: changed.teammates.map((teammate) => {
+						if (teammate.id !== line.teammate) return teammate;
+						const { clearing: _clearing, ...rest } = teammate;
+						return rest;
+					}),
+				},
+				line.teammate,
+			);
 		}
 		case "teammate-attached":
 			return {
@@ -1163,7 +1179,8 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 			return state;
 		case "usage-read": {
 			const { type: _type, ...reading } = line;
-			return { ...state, usage: withReading(state.usage, reading) };
+			const read = { ...state, usage: withReading(state.usage, reading) };
+			return reading.source === "status-line" && reading.teammate !== undefined ? withObservedModel(read, reading.teammate) : read;
 		}
 		case "request-held": {
 			const { type: _type, cursor: _cursor, ...held } = line;
@@ -1330,36 +1347,77 @@ function withReading(usage: UsageState | undefined, reading: UsageReading): Usag
 	if (next.first.sevenDay === undefined) delete next.first.sevenDay;
 	const teammate = reading.teammate;
 	if (reading.source !== "status-line" || teammate === undefined) return next;
-	next.statusLines = { ...before.statusLines, [teammate]: { at: reading.at, ...(reading.ctx === undefined ? {} : { ctx: reading.ctx }) } };
-	if (reading.sessionId !== undefined && (reading.tokens !== undefined || reading.costUsd !== undefined)) {
+	next.statusLines = { ...before.statusLines, [teammate]: reading };
+	if (reading.sessionId !== undefined && reading.costUsd !== undefined) {
 		const sessions = before.spend[teammate] ?? {};
-		const was = sessions[reading.sessionId] ?? { tokens: 0, costUsd: 0, banked: { tokens: 0, costUsd: 0 } };
-		const tokens = reading.tokens ?? was.tokens;
-		const costUsd = reading.costUsd ?? was.costUsd;
-		// A figure that drops was reset, so what it had reached was spent too.
-		const banked = { tokens: was.banked.tokens + (tokens < was.tokens ? was.tokens : 0), costUsd: was.banked.costUsd + (costUsd < was.costUsd ? was.costUsd : 0) };
-		next.spend = { ...before.spend, [teammate]: { ...sessions, [reading.sessionId]: { tokens, costUsd, banked } } };
+		const was = sessions[reading.sessionId] ?? { costUsd: 0, banked: 0 };
+		// An estimate that drops was reset, so what it had reached was spent too.
+		const banked = was.banked + (reading.costUsd < was.costUsd ? was.costUsd : 0);
+		next.spend = { ...before.spend, [teammate]: { ...sessions, [reading.sessionId]: { costUsd: reading.costUsd, banked } } };
 	}
 	return next;
 }
 
-/** Whether a Teammate's status line was read under a minute before `now`, in ms: then `get_usage` isn't needed. */
-export function freshStatusLine(state: EffortState, now: number): boolean {
-	return Object.values(state.usage?.statusLines ?? {}).some((each) => now - Date.parse(each.at) < USAGE_FRESH_MS);
+/**
+ * The state with the model of Teammate `id`'s latest status line added to its
+ * Task's models, when that reading is of the session working the Task: not
+ * while a clear or a fresh start for another Task is under way, and not of a
+ * session other than its current one. A reading of its new session taken
+ * before that session's `SessionStart` is applied is added once it is.
+ */
+function withObservedModel(state: EffortState, id: string): EffortState {
+	const reading = state.usage?.statusLines[id];
+	const teammate = state.teammates.find((each) => each.id === id);
+	if (reading?.model === undefined || teammate === undefined || teammate.clearing !== undefined || teammate.relaunching) return state;
+	if (reading.sessionId !== undefined && teammate.sessionId !== undefined && reading.sessionId !== teammate.sessionId) return state;
+	const task = state.tasks[teammate.task];
+	if (task === undefined || task.dropped !== undefined || task.teammate !== id || task.models?.includes(reading.model)) return state;
+	return withTask(state, teammate.task, { models: [...(task.models ?? []), reading.model] });
+}
+
+/**
+ * Whether a Teammate's status line was read under a minute before `now`, in ms:
+ * then `get_usage` isn't needed. `seen` is when the shell last read each
+ * Teammate's, logged or not: one unchanged since it was logged isn't logged
+ * again, but is as fresh as when it was read.
+ */
+export function freshStatusLine(state: EffortState, now: number, seen: Readonly<Record<string, string>> = {}): boolean {
+	const times = [...Object.values(state.usage?.statusLines ?? {}).map((each) => each.at), ...Object.values(seen)];
+	return times.some((at) => now - Date.parse(at) < USAGE_FRESH_MS);
 }
 
 /** A status line younger than this is fresh; `get_usage` is asked at most this often. */
 export const USAGE_FRESH_MS = 60_000;
 
+function sameWindow(a: UsageWindow | undefined, b: UsageWindow | undefined): boolean {
+	return a?.percent === b?.percent && a?.resetsAt === b?.resetsAt;
+}
+
+/** Whether two status line readings give the same figures, whenever each was taken. */
+function sameFigures(a: UsageReading, b: UsageReading): boolean {
+	return (
+		a.sessionId === b.sessionId &&
+		a.rateLimits === b.rateLimits &&
+		sameWindow(a.fiveHour, b.fiveHour) &&
+		sameWindow(a.sevenDay, b.sevenDay) &&
+		a.model === b.model &&
+		a.costUsd === b.costUsd &&
+		a.ctx === b.ctx
+	);
+}
+
 /**
- * Take a usage reading. A status line no newer than the last one read of its
- * Teammate adds nothing, so the same file read twice is kept once.
+ * Take a usage reading. A status line adds nothing when it is no newer than
+ * the last one logged of its Teammate, or gives the same figures: Claude Code
+ * runs it again about once a minute, idle or not, and an idle Effort's log
+ * would fill with copies. The shell keeps when it last read each one, for
+ * {@link freshStatusLine}.
  */
 function usage(state: EffortState, input: Extract<EffortInput, { kind: "usage" }>): Step {
 	const { reading } = input;
 	if (reading.source === "status-line") {
 		const last = reading.teammate === undefined ? undefined : state.usage?.statusLines[reading.teammate];
-		if (reading.teammate === undefined || (last !== undefined && reading.at <= last.at)) return took(state, [], []);
+		if (reading.teammate === undefined || (last !== undefined && (reading.at <= last.at || sameFigures(last, reading)))) return took(state, [], []);
 	}
 	return took(state, [{ type: "usage-read", ...reading }], []);
 }
@@ -2182,11 +2240,49 @@ function dependencyCycles(tasks: readonly PlannedTask[]): string[][] {
 	return cycles;
 }
 
+/** Slugs or criterion ids as the plan's refusals quote them, or `none`. */
+function quotedOrNone(items: readonly string[]): string {
+	return items.length === 0 ? "none" : quoted(items);
+}
+
+function sameSet(a: readonly string[], b: readonly string[]): boolean {
+	const left = new Set(a);
+	const right = new Set(b);
+	return left.size === right.size && [...left].every((each) => right.has(each));
+}
+
+/**
+ * How `next` changes a Task recorded as `was`: its goal (spacing at either end
+ * aside), its criteria or its dependencies (order and repeats aside). Empty
+ * when it restates it.
+ */
+function planChanges(was: PlannedTask, next: PlannedTask): string[] {
+	const changes: string[] = [];
+	if (was.goal.trim() !== next.goal.trim()) changes.push(`its goal from ${JSON.stringify(was.goal)} to ${JSON.stringify(next.goal)}`);
+	if (!sameSet(was.criteria, next.criteria)) changes.push(`its criteria from ${quotedOrNone(was.criteria)} to ${quotedOrNone(next.criteria)}`);
+	if (!sameSet(was.dependsOn, next.dependsOn)) changes.push(`its dependencies from ${quotedOrNone(was.dependsOn)} to ${quotedOrNone(next.dependsOn)}`);
+	return changes;
+}
+
+/** Why a re-plan can't change a Task already handed off, and what the Lead can do instead. */
+function frozenText(state: EffortState, slug: string, handed: HandedTask, was: PlannedTask, changes: readonly string[]): string {
+	const asRecorded = `goal ${JSON.stringify(was.goal)}, criteria ${quotedOrNone(was.criteria)}, dependencies ${quotedOrNone(was.dependsOn)}`;
+	const changed = `this plan changes ${andList(changes)}`;
+	if (handed.accepted !== undefined) {
+		return `Task \`${slug}\` is accepted, so its goal, criteria and dependencies stay as recorded, and ${changed}. Restate it as recorded (${asRecorded}), and plan any further work as a new Task`;
+	}
+	return `Task \`${slug}\` is ${taskStatus(state, slug)} with \`${handed.teammate}\`, so its goal, criteria and dependencies stay as handed off, and ${changed}. Restate it as recorded (${asRecorded}); to change what it is for, leave it out of the plan, which drops it and stops \`${handed.teammate}\`, and plan the new work as a new Task`;
+}
+
 /**
  * The Lead's whole Task list. Every criterion of the Brief must be covered,
  * since dropping one is a Brief change, and only the snapshot's Roles staff
  * Tasks. A Task already handed off keeps its slug and Role: its folder is
- * named by both, and its Teammate fills that Role for life.
+ * named by both, and its Teammate fills that Role for life. It also keeps its
+ * goal, criteria and dependencies, which the plan's record says it was handed
+ * off for (and, accepted, done for): a plan sent whole again restates them,
+ * and one that changes them is refused. One not yet accepted can still be
+ * dropped, by leaving it out or giving it another Role.
  */
 function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>): Step {
 	const early = beforeBrief(state, "team_plan");
@@ -2225,14 +2321,24 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 		problems.push(`no Task covers ${quoted(uncovered)}; every acceptance criterion of the Brief must be covered, and dropping one is a Brief change for the human`);
 	}
 	// A handoff left out, or moved to another Role, is dropped; an accepted Task is done, and stays as it was.
+	// A Task handed off keeps what it was handed off for, and an accepted one what it was done for: restated, it is kept as recorded.
 	const dropping: string[] = [];
+	const recorded = new Map<string, PlannedTask>();
 	for (const [slug, handed] of Object.entries(state.tasks)) {
 		if (handed.dropped !== undefined) continue;
 		const kept = tasks.find((task) => task.slug === slug);
+		const was = state.plan?.find((task) => task.slug === slug);
 		if (handed.accepted !== undefined) {
 			if (!kept) problems.push(`Task \`${slug}\` is accepted, so it stays in the plan`);
 			else if (kept.role !== handed.role) problems.push(`Task \`${slug}\` is accepted in Role \`${handed.role}\`, so it keeps that Role`);
-		} else if (!kept || kept.role !== handed.role) dropping.push(slug);
+		} else if (!kept || kept.role !== handed.role) {
+			dropping.push(slug);
+			continue;
+		}
+		if (!kept || kept.role !== handed.role || was === undefined) continue;
+		const changes = planChanges(was, kept);
+		if (changes.length === 0) recorded.set(slug, was);
+		else problems.push(frozenText(state, slug, handed, was, changes));
 	}
 	// A queued Task has no Teammate yet: dropped, it just leaves the queue.
 	const unqueuing = state.queue.filter((queued) => {
@@ -2243,7 +2349,7 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 		return { ok: false, refusal: `The plan for Effort \`${state.effortId}\` can't be taken until these are fixed:\n${problems.map((problem) => `- ${problem}`).join("\n")}` };
 	}
 	const reason = input.reason?.trim();
-	const append: EffortLine[] = [{ type: "plan-written", tasks, ...(reason ? { reason } : {}), at: input.at }];
+	const append: EffortLine[] = [{ type: "plan-written", tasks: tasks.map((task) => recorded.get(task.slug) ?? task), ...(reason ? { reason } : {}), at: input.at }];
 	const actions: EffortAction[] = [];
 	const notes: string[] = [];
 	for (const slug of dropping) {
@@ -3720,22 +3826,35 @@ function outcomeText(asked: Asked): string {
 	return `${how} at ${clock(outcome.at)} UTC${outcome.note === undefined ? "" : `: ${outcome.note}`}`;
 }
 
+/** `a`, `a and b`, `a, b and c`. */
+function andList(items: readonly string[]): string {
+	return items.length <= 1 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
+}
+
 /**
- * A planned Task as the final Report lists it: its Role, the model its
- * Teammate was launched on (none for a Task never launched, and saying so for
- * one whose launch recorded none), and its status.
+ * A planned Task as the final Report lists it: its Role, the model it ran on
+ * as its sessions' status lines gave it (each one, when it changed), and its
+ * status. With no reading, the model its Teammate was launched on, saying it
+ * is only that, or that none was recorded; none for a Task never launched.
  */
 function taskLine(state: EffortState, task: PlannedTask): string {
 	const handed = state.tasks[task.slug];
-	const model = handed?.model;
+	const launched = handed?.model;
+	const ran = handed?.models ?? [];
 	const on =
-		handed === undefined || handed.dropped !== undefined ? "" : model === undefined ? ", model not recorded" : `, on ${model === null ? "Claude Code's default model" : `\`${model}\``}`;
+		handed === undefined || handed.dropped !== undefined
+			? ""
+			: ran.length > 0
+				? `, on ${andList(ran.map((model) => `\`${model}\``))}`
+				: launched === undefined
+					? ", model not recorded"
+					: `, launched on ${launched === null ? "Claude Code's default model" : `\`${launched}\``}; no status line showed the model it ran on`;
 	return `\`${task.slug}\` (${task.role}${on}): ${taskStatus(state, task.slug)}`;
 }
 
 /**
  * The final Report's own sections, always present so a gap shows: every Task
- * with its Role and the model it ran on, every checkpoint with its approval (a
+ * with its Role and the model it ran on (or was launched on), every checkpoint with its approval (a
  * Playbook checkpoint never asked says so), all found work, each proposed
  * Playbook change, and what happens to each worktree at sign-off.
  */
@@ -3781,13 +3900,6 @@ function finalSections(state: EffortState, final: FinalFacts): ReportSection[] {
 	];
 }
 
-/** `412k`, `1.2M`: a token count as a Report gives it. */
-function tokenCount(tokens: number): string {
-	if (tokens < 1000) return String(Math.round(tokens));
-	if (tokens < 1_000_000) return `${Math.round(tokens / 1000)}k`;
-	return `${(tokens / 1_000_000).toFixed(1)}M`;
-}
-
 function dollars(usd: number): string {
 	return `$${usd.toFixed(2)}`;
 }
@@ -3811,8 +3923,10 @@ function windowReset(firstResetsAt: string | undefined, nowResetsAt: string | un
 
 /**
  * The Report's usage: the freshest account reading with its change since the
- * Effort began, each Role's tokens and estimate summed across its Teammates'
- * sessions, and the Lead's own cost. Empty with no reading and no Lead cost.
+ * Effort began, each Role's estimate summed across its Teammates' sessions
+ * (a Role with none yet left out), and the Lead's own cost. Empty with no
+ * reading and no Lead cost. No token count: the status line gives none that
+ * adds up what a session used.
  */
 function usageLines(state: EffortState, leadCostUsd: number | undefined): string[] {
 	const lines: string[] = [];
@@ -3826,20 +3940,13 @@ function usageLines(state: EffortState, leadCostUsd: number | undefined): string
 		};
 		const { latest } = usage;
 		lines.push(`Account, from ${usageSource(latest)} at ${clock(latest.at)} UTC: ${window("5h", latest.fiveHour, usage.first.fiveHour)} · ${window("week", latest.sevenDay, usage.first.sevenDay)}. It includes your own use outside the Team.`);
-		const byRole = new Map<string, { tokens: number; costUsd: number }>();
+		const byRole = new Map<string, number>();
 		for (const teammate of state.teammates) {
-			const sessions = Object.values(usage.spend[teammate.id] ?? {});
-			if (sessions.length === 0) continue;
-			const sum = byRole.get(teammate.role) ?? { tokens: 0, costUsd: 0 };
-			for (const each of sessions) {
-				sum.tokens += each.tokens + each.banked.tokens;
-				sum.costUsd += each.costUsd + each.banked.costUsd;
-			}
-			if (sum.tokens === 0) continue;
-			byRole.set(teammate.role, sum);
+			const spent = Object.values(usage.spend[teammate.id] ?? {}).reduce((sum, each) => sum + each.costUsd + each.banked, 0);
+			if (spent > 0) byRole.set(teammate.role, (byRole.get(teammate.role) ?? 0) + spent);
 		}
 		if (byRole.size > 0) {
-			const roles = [...byRole].sort(([a], [b]) => a.localeCompare(b)).map(([role, sum]) => `${role} ${tokenCount(sum.tokens)} tokens ≈ ${dollars(sum.costUsd)}`);
+			const roles = [...byRole].sort(([a], [b]) => a.localeCompare(b)).map(([role, costUsd]) => `${role} ≈ ${dollars(costUsd)}`);
 			const label = usage.rateLimits ? "*API-price equivalent, not your bill.*" : "No reading has `rate_limits`, as with an API key, so the estimate is the nearest thing to a charge.";
 			lines.push(`By Role: ${roles.join(" · ")}. ${label}`);
 		}

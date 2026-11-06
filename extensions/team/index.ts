@@ -395,6 +395,12 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	let stopUsage: (() => void) | undefined;
 	let usageRun: Promise<void> | undefined;
 	let usageAsked: number | undefined;
+	// When each Teammate's status line was last read, logged or not, for the held Effort: one unchanged isn't logged again, but is as fresh.
+	let statusLinesSeen: { effortId: string; at: Record<string, string> } | undefined;
+
+	function seenStatusLines(held: HeldEffort): Record<string, string> {
+		return statusLinesSeen?.effortId === held.effortId ? statusLinesSeen.at : {};
+	}
 
 	function syncLeadTools(): void {
 		const others = pi.getActiveTools().filter((name) => !LEAD_TOOLS.includes(name));
@@ -414,7 +420,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const state = effort ? effortState(effort) : undefined;
 		syncClock(state);
 		if (!surface) return;
-		const lines = state ? renderTeamBlock(teamStatus(state, { adoptionsPending: pending.length, ...(confirmed ? { confirmed } : {}) }), now().getTime(), { maxTeammates: maxTeammates() }) : undefined;
+		const seen = effort ? seenStatusLines(effort) : {};
+		const lines = state ? renderTeamBlock(teamStatus(state, { adoptionsPending: pending.length, ...(confirmed ? { confirmed } : {}), statusLinesSeen: seen }), now().getTime(), { maxTeammates: maxTeammates() }) : undefined;
 		if (lines && !stopUsage) stopUsage = every(USAGE_FRESH_MS, readUsage);
 		if (!lines) endUsage();
 		if (lines === shown || (lines && shown && lines.length === shown.length && lines.every((line, index) => line === shown?.[index]))) return;
@@ -439,16 +446,21 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	/**
 	 * Each live Teammate's status line, read from its `statusline.json` on
 	 * demand (the wrapper never pushes it), recorded when newer than the last
-	 * one recorded. The file's modification time is when it was taken.
+	 * one recorded and something in it changed. The file's modification time is
+	 * when it was taken, and is kept in memory either way.
 	 */
 	function readStatusLines(held: HeldEffort): EffortState {
 		let state = effortState(held);
+		const seen = { ...seenStatusLines(held) };
 		for (const teammate of state.teammates) {
 			if (!isLive(teammate)) continue;
 			const line = readStatusLine(held.paths, teammate.id);
 			const reading = line && statusLineReading(line.text, teammate.id, line.at);
-			if (reading) state = recordUsage(held, state, reading);
+			if (!reading) continue;
+			state = recordUsage(held, state, reading);
+			if ((seen[teammate.id] ?? "") < reading.at) seen[teammate.id] = reading.at;
 		}
+		statusLinesSeen = { effortId: held.effortId, at: seen };
 		return state;
 	}
 
@@ -472,7 +484,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			if (!held || !shown) return;
 			const state = readStatusLines(held);
 			const at = now().getTime();
-			if (!freshStatusLine(state, at) && (usageAsked === undefined || at - usageAsked >= USAGE_FRESH_MS)) {
+			if (!freshStatusLine(state, at, seenStatusLines(held)) && (usageAsked === undefined || at - usageAsked >= USAGE_FRESH_MS)) {
 				usageAsked = at;
 				const reading = await getUsage(paths.claudePath, new Date(at).toISOString());
 				if (!("error" in reading) && effort === held) recordUsage(held, effortState(held), reading);
@@ -2087,7 +2099,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		description: [
 			"Write the Effort's whole Task list: each Task's slug, Role, goal, the Tasks it depends on and the acceptance-criterion ids it covers.",
 			"A Task depends on another when it needs that Task's result to work from, so the other must be in review or accepted; accepted is not required, since the architect reviews a diff before the Lead accepts it. Leave a dependency out only when the Task doesn't need that result, since plan.md is what the human reads.",
-			"Refused when a Brief criterion is left uncovered or a Task names a Role the Team doesn't have. Planning again replaces the list; a Task already handed off keeps its Role.",
+			"Refused when a Brief criterion is left uncovered or a Task names a Role the Team doesn't have. Planning again replaces the list; a Task already handed off keeps its Role, and restates its goal, criteria and dependencies as recorded: a re-plan that changes them is refused, naming each change. An accepted Task stays in the plan; one not yet accepted is dropped by leaving it out, which stops its Teammate. Put new or changed work in a new Task.",
 			"Writes `plan.md` in the Effort directory as a view. Refused until the human approves the Brief.",
 		].join(" "),
 		promptSnippet: "Write the Effort's Task list once its Brief is approved",
@@ -2230,7 +2242,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		async execute() {
 			if (!effort) throw new Error("No Effort is open in this session, so there is no status to give; the human opens one with `/team start <team>`.");
 			const state = effortState(effort);
-			const block = teamStatus(state, { adoptionsPending: pending.length });
+			const block = teamStatus(state, { adoptionsPending: pending.length, statusLinesSeen: seenStatusLines(effort) });
 			// One `claude agents --json` for every row: what Claude Code says of each session, or `missing` once it is gone (idle-stopped).
 			const agents = await agentsList(paths.claudePath);
 			const status = {

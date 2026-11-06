@@ -3192,6 +3192,34 @@ describe("usage readings", () => {
 		assert.equal(pi.claude.usageCalls(), 0, "a status line under a minute old means no get_usage");
 	});
 
+	it("logs a status line Claude Code ran again unchanged only once, while it still counts as fresh (#140)", async () => {
+		const { pi, dir, file } = await statusLineRan(12_000);
+		const usageReads = () => effortLines(dir).filter((line) => line.type === "usage-read");
+		await pi.tick();
+		assert.equal(usageReads().length, 1);
+
+		// An idle session: the same JSON, rewritten each minute.
+		for (let minute = 1; minute <= 3; minute++) {
+			pi.advance(60_000);
+			const taken = new Date(NOW.getTime() + minute * 60_000 - 2_000);
+			utimesSync(file, taken, taken);
+			await pi.tick();
+		}
+
+		assert.equal(usageReads().length, 1, "an unchanged status line adds no line");
+		assert.equal(pi.claude.usageCalls(), 0, "a status line under a minute old means no get_usage, logged or not");
+		assert.match(teamBlock(pi)?.[2] ?? "", /builder-1's status line, 2s ago +│$/);
+
+		// Its cost moved: that is logged.
+		writeFileSync(file, JSON.stringify({ ...STATUS_LINE, cost: { total_cost_usd: 3.4 } }));
+		pi.advance(60_000);
+		await pi.tick();
+		assert.deepEqual(
+			usageReads().map((line) => line.costUsd),
+			[3.1, 3.4],
+		);
+	});
+
 	it("asks get_usage when no status line is under a minute old, at most once a minute", async () => {
 		const { pi } = await statusLineRan(12_000);
 		await pi.tick();
@@ -3247,7 +3275,8 @@ describe("usage readings", () => {
 
 		assert.match(markdown, /## Usage\n\n/);
 		assert.match(markdown, /Account, from builder-1's status line at 09:59 UTC: 5h n\/a · week 73% \(\+0 since the Effort began\)/);
-		assert.match(markdown, /By Role: builder 412k tokens ≈ \$3\.10\. \*API-price equivalent, not your bill\.\*/);
+		assert.match(markdown, /By Role: builder ≈ \$3\.10\. \*API-price equivalent, not your bill\.\*/);
+		assert.doesNotMatch(markdown, /tokens/);
 		assert.match(markdown, /The Lead: \$0\.43, as pi reports it\./);
 		assert.equal(pi.claude.usageCalls(), 0, "the Report reads the status lines; it never asks get_usage");
 	});
@@ -4191,9 +4220,9 @@ describe("ending an Effort: the final Report and sign-off", () => {
 			"# Final Report 1 · Effort `crew-2026-11-02`",
 			"- AC1: `rename-key` accepted: no file mentions `colour`.",
 			"## Tasks",
-			"- `rename-key` (builder, on `opus`): running",
+			"- `rename-key` (builder, launched on `opus`; no status line showed the model it ran on): running",
 			"- `check-old-configs` (reviewer): planned",
-			"- `survey` (scout, on Claude Code's default model): running",
+			"- `survey` (scout, launched on Claude Code's default model; no status line showed the model it ran on): running",
 			"## Checkpoints",
 			"- Brief: `r1` approved at 10:00 UTC",
 			"## Found work",
@@ -4947,7 +4976,7 @@ describe("Brief changes: fresh sessions", () => {
 		assert.equal(effortLines(dir).some((line) => line.type === "teammate-crashed"), false);
 	});
 
-	it("the final Report names the model each Task's Teammate was launched on, not the Role's model after a Brief change", async () => {
+	it("with no status line, the final Report names the model each Task's Teammate was launched on, not the Role's model after a Brief change", async () => {
 		const { pi, dir, repo } = await crewPlanned();
 		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
 		const first = pi.claude.launches()[0]?.argv ?? [];
@@ -4964,7 +4993,7 @@ describe("Brief changes: fresh sessions", () => {
 		await pi.call("team_report", { headline: "Both criteria are met.", coverage: FINAL_COVERAGE, final: true });
 
 		const written = readFileSync(join(dir, "reports", "001.md"), "utf8");
-		for (const needed of ["- `rename-key` (builder, on `opus`): accepted", "- `update-docs` (builder, on `sonnet`): in review", "- `survey` (scout): planned"]) {
+		for (const needed of ["- `rename-key` (builder, launched on `opus`; no status line showed the model it ran on): accepted", "- `update-docs` (builder, launched on `sonnet`; no status line showed the model it ran on): in review", "- `survey` (scout): planned"]) {
 			assert.ok(written.includes(needed), `reports/001.md doesn't say ${needed}:\n${written}`);
 		}
 	});
