@@ -5,9 +5,10 @@
  */
 
 import assert from "node:assert/strict";
+import { homedir } from "node:os";
 import { posix } from "node:path";
 import { describe, it } from "node:test";
-import { floorAction, simpleCommands } from "../floor.mjs";
+import { claudeConfigDir, floorAction, ownFolders, simpleCommands } from "../floor.mjs";
 
 const WORKSPACE = "/work/effort";
 
@@ -253,6 +254,112 @@ describe("the floor classifier", () => {
 		it("still reads a variable merely named like HOME, or `$HOME` used again, as no reassignment", () => {
 			assert.equal(floorAction("MY_HOME=/etc HOME_DIR=/etc; rm -rf ~/.claude/jobs/bad941c8/tmp/x", where)?.kind, undefined);
 			assert.equal(floorAction('echo "$HOME" && rm -rf ${HOME}/.claude/jobs/bad941c8/tmp/x', where)?.kind, undefined);
+		});
+	});
+
+	describe("reads `$CLAUDE_JOB_DIR` as the trusted job folder, and only while nothing reassigns it", () => {
+		const job = "/home/qa/.claude/jobs/02878adf";
+		const where = { workspace: WORKSPACE, home: "/home/qa", jobDir: job, roots: [`${job}/tmp`] };
+		/** `[command, inside]`, each read with the Teammate's own job folder. */
+		const commands: [string, boolean][] = [
+			// The three deletes the dogfood run held (#130).
+			['cd $CLAUDE_JOB_DIR/tmp/qa-gg && grep -c "Victory!" fastwin.mjs; rm -f fastwin-done.flag', true],
+			["cd $CLAUDE_JOB_DIR/tmp/qa-gg && rm -rf mut && mkdir mut", true],
+			["rm -rf $CLAUDE_JOB_DIR/tmp/old", true],
+			// Every spelling the shell is sure to expand.
+			["rm -rf ${CLAUDE_JOB_DIR}/tmp/old", true],
+			['rm -rf "$CLAUDE_JOB_DIR/tmp/old"', true],
+			['rm -rf "$CLAUDE_JOB_DIR"/tmp/old', true],
+			['rm -rf "${CLAUDE_JOB_DIR}/tmp/old"', true],
+			['rm -rf "${CLAUDE_JOB_DIR}"/tmp/old', true],
+			['cd "$CLAUDE_JOB_DIR/tmp" && rm -rf old', true],
+			["find $CLAUDE_JOB_DIR/tmp/qa-gg -name '*.log' -delete", true],
+			['echo "$CLAUDE_JOB_DIR" && rm -rf $CLAUDE_JOB_DIR/tmp/old', true],
+			// The job folder and its temp root themselves, and a way out of them.
+			["rm -rf $CLAUDE_JOB_DIR", false],
+			['rm -rf "$CLAUDE_JOB_DIR"', false],
+			["rm -rf $CLAUDE_JOB_DIR/tmp", false],
+			["rm -rf $CLAUDE_JOB_DIR/tmp/", false],
+			["rm -rf $CLAUDE_JOB_DIR/tmp/../state.json", false],
+			["cd $CLAUDE_JOB_DIR/tmp && rm -rf ../state.json", false],
+			["cd $CLAUDE_JOB_DIR && rm -rf tmp", false],
+			// Spellings that aren't the variable, or not only it.
+			["rm -rf '$CLAUDE_JOB_DIR/tmp/old'", false],
+			["rm -rf \\$CLAUDE_JOB_DIR/tmp/old", false],
+			["rm -rf $CLAUDE_JOB_DIRX/tmp/old", false],
+			["rm -rf ${CLAUDE_JOB_DIR}x/tmp/old", false],
+			['rm -rf "$CLAUDE_JOB_DIR"x/tmp/old', false],
+			["rm -rf $CLAUDE_JOB_DIR$SUB/tmp/old", false],
+			["rm -rf $CLAUDE_JOB_\\DIR/tmp/old", false],
+			["J=$CLAUDE_JOB_DIR/tmp; rm -rf $J/old", false],
+			// A line that names CLAUDE_JOB_DIR otherwise, in any spelling, may change it.
+			["CLAUDE_JOB_DIR=/etc; rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
+			["CLAUDE_JOB_DIR=/etc rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
+			["export CLAUDE_JOB_DIR=/etc; rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
+			["export CLAUDE_JOB\\_DIR=/etc; rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
+			['export "CLAUDE_JOB"_DIR=/etc; rm -rf $CLAUDE_JOB_DIR/tmp/x', false],
+			["declare CLAUDE_JOB''_DIR=/etc; rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
+			["typeset -x CLAUDE_JOB_DIR=/etc; rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
+			["read -r CLAUDE_JOB_DIR <<< /etc; rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
+			["unset CLAUDE_JOB_DIR; rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
+			["printf -v CLAUDE_JOB_DIR /etc; rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
+			['eval "CLAUDE_JOB""_DIR=/etc"; rm -rf $CLAUDE_JOB_DIR/tmp/x', false],
+			["export $'CLAUDE_JOB_\\x44IR'=/etc; rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
+			[": ${CLAUDE_JOB_DIR:=/etc}; rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
+			["rm -rf $CLAUDE_JOB_DIR/tmp/x; sh -c 'CLAUDE_JOB_DIR=/etc'", false],
+			// A shell of its own may not have the variable at all (`sudo`, `env -i`).
+			["sudo sh -c 'rm -rf $CLAUDE_JOB_DIR/tmp/x'", false],
+			["env -i bash -c 'rm -rf \"$CLAUDE_JOB_DIR\"/tmp/x'", false],
+			// Unquoted, bash splits it on IFS.
+			["IFS=/; rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
+			["I\\FS=/; rm -rf ${CLAUDE_JOB_DIR}/tmp/x", false],
+			['IFS=/; rm -rf "$CLAUDE_JOB_DIR"/tmp/x', true],
+		];
+		for (const [command, inside] of commands) {
+			it(`${JSON.stringify(command)} is ${inside ? "inside" : "a floor delete"}`, () => {
+				assert.equal(floorAction(command, where)?.kind, inside ? undefined : "delete");
+			});
+		}
+
+		it("reads it as unknown, so outside, when no trusted job folder is given", () => {
+			assert.equal(floorAction("rm -rf $CLAUDE_JOB_DIR/tmp/old", { workspace: WORKSPACE, roots: [`${job}/tmp`] })?.kind, "delete");
+			assert.equal(floorAction('rm -rf "$CLAUDE_JOB_DIR/tmp/old"', { workspace: WORKSPACE, roots: [`${job}/tmp`] })?.kind, "delete");
+			assert.equal(floorAction("rm -rf $CLAUDE_JOB_DIR/tmp/old", { workspace: WORKSPACE, jobDir: "jobs/02878adf", roots: [`${job}/tmp`] })?.kind, "delete");
+		});
+
+		it("reads the unquoted form as unknown when the job folder's path holds whitespace or a glob character", () => {
+			for (const spaced of ["/home/John Smith/.claude/jobs/02878adf", "/home/qa/.claude*/jobs/02878adf"]) {
+				const at = { workspace: WORKSPACE, jobDir: spaced, roots: [`${spaced}/tmp`] };
+				assert.equal(floorAction("rm -rf $CLAUDE_JOB_DIR/tmp/x", at)?.kind, "delete", spaced);
+				assert.equal(floorAction("rm -rf ${CLAUDE_JOB_DIR}/tmp/x", at)?.kind, "delete", spaced);
+				assert.equal(floorAction('rm -rf "$CLAUDE_JOB_DIR/tmp/x"', at)?.kind, undefined, spaced);
+			}
+		});
+	});
+
+	describe("the Teammate's own folders, worked out once for the hook and team_answer", () => {
+		it("reads Claude Code's config folder from `CLAUDE_CONFIG_DIR`, else `~/.claude`", () => {
+			assert.equal(claudeConfigDir({ CLAUDE_CONFIG_DIR: "/x" }, "/home/qa/.claude"), "/x");
+			assert.equal(claudeConfigDir({ CLAUDE_CONFIG_DIR: "" }, "/home/qa/.claude"), "/home/qa/.claude");
+			assert.equal(claudeConfigDir({}, "/home/qa/.claude"), "/home/qa/.claude");
+			assert.equal(claudeConfigDir({}), posix.join(homedir(), ".claude"));
+		});
+
+		it("trusts a job folder only directly under the config folder's `jobs`, and adds the scratchpad", () => {
+			assert.deepEqual(ownFolders({ config: "/x", job: "/x/jobs/02878adf", scratchpad: "/tmp/s/scratchpad" }), { jobDir: "/x/jobs/02878adf", roots: ["/x/jobs/02878adf/tmp", "/tmp/s/scratchpad"] });
+			assert.deepEqual(ownFolders({ config: "/x", job: "/x/jobs/02878adf/" }), { jobDir: "/x/jobs/02878adf", roots: ["/x/jobs/02878adf/tmp"] });
+			for (const job of ["/home/qa/.claude/jobs/02878adf", "/x/jobs", "/x/jobs/a/b", "/x/jobs/../y", "/x/jobs/..", "/x/jobs/.", "jobs/02878adf", "", undefined]) {
+				assert.deepEqual(ownFolders({ config: "/x", job }), { roots: [] }, String(job));
+			}
+			assert.deepEqual(ownFolders({ config: "x", job: "x/jobs/02878adf" }), { roots: [] });
+			assert.deepEqual(ownFolders({ config: "/x", scratchpad: 42 }), { roots: [] });
+		});
+
+		it("with `CLAUDE_CONFIG_DIR=/x`, reads a delete under `/x/jobs/<id>/tmp` as inside and one under `~/.claude/jobs/<id>/tmp` as a floor delete", () => {
+			const where = { workspace: WORKSPACE, home: "/home/qa", ...ownFolders({ config: claudeConfigDir({ CLAUDE_CONFIG_DIR: "/x" }, "/home/qa/.claude"), job:"/x/jobs/02878adf" }) };
+			assert.equal(floorAction("rm -rf /x/jobs/02878adf/tmp/a", where)?.kind, undefined);
+			assert.equal(floorAction("rm -rf $CLAUDE_JOB_DIR/tmp/a", where)?.kind, undefined);
+			assert.equal(floorAction("rm -rf ~/.claude/jobs/02878adf/tmp/a", where)?.kind, "delete");
 		});
 	});
 

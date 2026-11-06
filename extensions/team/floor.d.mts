@@ -17,10 +17,18 @@ export interface FloorWhere {
 	roots?: string[];
 	/** The folder a leading `~` or `$HOME` names; this user's home when not given. */
 	home?: string;
+	/** The folder a leading `$CLAUDE_JOB_DIR` names, once the caller trusts it ({@link ownFolders}); unknown, so outside, when not given. */
+	jobDir?: string;
 }
 
 /** The floor action a Bash command takes, or undefined when it takes none. */
 export function floorAction(command: string, where: FloorWhere): FloorAction | undefined;
+
+/** Claude Code's config folder: `$CLAUDE_CONFIG_DIR`, else `fallback` (`~/.claude` when not given). */
+export function claudeConfigDir(env?: Record<string, string | undefined>, fallback?: string): string;
+
+/** A Teammate's own folders, worked out the same way for the floor hook and `team_answer`; it spreads into {@link FloorWhere}. */
+export function ownFolders(from: { config: string; job?: string; scratchpad?: unknown }): { jobDir?: string; roots: string[] };
 
 /** The simple commands in a Bash command, each as its words, past env assignments and wrappers, `sh -c` and `eval` read through. */
 export function simpleCommands(command: string): string[][];

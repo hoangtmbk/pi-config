@@ -66,6 +66,7 @@ import {
 	workdir,
 } from "./core.ts";
 import { EVERY_ROLE, listTeams, loadTeam, type Playbook, type Role, sha256, type Team, type TeamRoots, teamInForce } from "./definitions.ts";
+import { claudeConfigDir, ownFolders } from "./floor.mjs";
 import { briefApprovalTitle, intakePrompt, openedText, skipsText } from "./intake.ts";
 import { adoptable, hasEnded, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
 import {
@@ -282,7 +283,7 @@ export interface TeamDeps {
 	agentDir?: string;
 	/** Claude Code's config file, `~/.claude.json`. Injected by tests, and by nothing else. */
 	claudeConfigPath?: string;
-	/** Claude Code's folder, `~/.claude`, whose settings.json names the human's status line; only read. Injected by tests, and by nothing else. */
+	/** Claude Code's folder, `~/.claude`, whose settings.json names the human's status line and whose `jobs` holds each Teammate's job folder; only read, and `$CLAUDE_CONFIG_DIR` in `env` takes its place. Injected by tests, and by nothing else. */
 	claudeDir?: string;
 	/** The `claude` executable. Injected by tests, and by nothing else. */
 	claudePath?: string;
@@ -342,7 +343,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		claudeConfigPath: deps.claudeConfigPath ?? join(homedir(), ".claude.json"),
 		claudePath: deps.claudePath ?? "claude",
 	};
-	const claudeDir = deps.claudeDir ?? join(homedir(), ".claude");
+	// Claude Code's config folder, `$CLAUDE_CONFIG_DIR` as the floor hook reads it, else `~/.claude`.
+	const claudeDir = claudeConfigDir(deps.env ?? process.env, deps.claudeDir);
 	const now = deps.now ?? (() => new Date());
 	const every =
 		deps.every ??
@@ -2375,13 +2377,15 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			// What the terminal did meanwhile counts first: the first answer wins.
 			wakeAboutTeammates(applyJournals(held));
 			const state = effortState(held);
-			// What the approved Brief lets you allow on the floor, deletes judged against the Teammate's own folder and its Claude Code job temp folder.
-			const asker = state.teammateRequests[params.request]?.teammate;
+			// What the approved Brief lets you allow on the floor, deletes judged against the Teammate's own folder and
+			// its own temp folders, worked out as its floor hook works them out: the job folder its short id names, and
+			// the scratchpad its request's payload named.
+			const asking = state.teammateRequests[params.request];
+			const asker = asking?.teammate;
 			const records = state.brief && state.workspace ? approved(held, ctx) : undefined;
 			const shortId = state.teammates.find((teammate) => teammate.id === asker)?.shortId;
-			// A short id is a job folder's name only when it is one plain path segment.
-			const roots = shortId !== undefined && /^[A-Za-z0-9_-]+$/.test(shortId) ? { roots: [join(claudeDir, "jobs", shortId, "tmp")] } : {};
-			const terms = records && state.workspace ? { ...answerTerms(records.playbook, records.brief, (asker && workdir(state, asker)) ?? state.workspace.path), ...roots } : undefined;
+			const own = ownFolders({ config: claudeDir, ...(shortId === undefined ? {} : { job: join(claudeDir, "jobs", shortId) }), scratchpad: asking?.scratchpad });
+			const terms = records && state.workspace ? { ...answerTerms(records.playbook, records.brief, (asker && workdir(state, asker)) ?? state.workspace.path), ...own } : undefined;
 			const answer = {
 				kind: "answer-request" as const,
 				request: params.request,
