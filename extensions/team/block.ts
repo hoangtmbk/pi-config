@@ -146,6 +146,12 @@ export interface StatusExtras {
 	adoptionsPending: number;
 	/** After a restart, the Teammates heard from since: any other is unconfirmed. Absent when there was none. */
 	confirmed?: ReadonlySet<string>;
+	/**
+	 * When the shell last read each Teammate's status line, logged or not: a
+	 * reading unchanged since it was logged is as fresh as that. Absent, the
+	 * logged times stand.
+	 */
+	statusLinesSeen?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -170,17 +176,24 @@ export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockD
 		waitingOnYou: state.pending.length + waitingInTerminal(state).length + openEscalations(state).length + extras.adoptionsPending + (state.usageItems?.length ?? 0) + (waitingConfirm(state) ? 1 : 0),
 		reports: state.reports,
 		...pauseRows(state),
-		...usageRow(state, teammates.length),
+		...usageRow(state, teammates.length, extras.statusLinesSeen ?? {}),
 		...holdRows(state),
 	};
 }
 
-/** The freshest reading; one `get_usage` took while no Teammate is live says so. */
-function usageRow(state: EffortState, live: number): { usage?: UsageRow } {
+/**
+ * The freshest reading; one `get_usage` took while no Teammate is live says so.
+ * A status line read again since, unchanged, makes it as fresh as that read.
+ */
+function usageRow(state: EffortState, live: number, seen: Readonly<Record<string, string>>): { usage?: UsageRow } {
 	const reading = state.usage?.latest;
 	if (!reading) return {};
 	const source = reading.source === "get-usage" && live === 0 ? `${usageSource(reading)} (no Teammate live)` : usageSource(reading);
-	return { usage: { ...(reading.fiveHour ? { fiveHour: reading.fiveHour } : {}), ...(reading.sevenDay ? { sevenDay: reading.sevenDay } : {}), source, at: reading.at } };
+	// Only while the reading is still the last one logged of its Teammate: a later one that changed was logged.
+	const last = reading.source === "status-line" && reading.teammate !== undefined && state.usage?.statusLines[reading.teammate]?.at === reading.at;
+	const again = last && reading.teammate !== undefined ? seen[reading.teammate] : undefined;
+	const at = again !== undefined && again > reading.at ? again : reading.at;
+	return { usage: { ...(reading.fiveHour ? { fiveHour: reading.fiveHour } : {}), ...(reading.sevenDay ? { sevenDay: reading.sevenDay } : {}), source, at } };
 }
 
 function pauseRows(state: EffortState): { pauses?: PauseRow[] } {

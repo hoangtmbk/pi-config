@@ -115,6 +115,14 @@ the criterion ids it covers. It refuses a list that leaves one of the Brief's cr
 names a Role the Team doesn't have. Planning again replaces the list, and `plan.md` in the Effort
 is rewritten as a view of it; editing `plan.md` changes nothing.
 
+A Task handed off (running, in review or sent back) keeps the goal, criteria and dependencies it
+was handed off for, and an accepted one those it was done for. A re-plan must restate them: the
+same goal (spacing at its ends aside) and the same criteria and dependencies in any order, which
+`plan.md` and `effort.jsonl` keep as recorded. One that changes them is refused, naming each change
+and the recorded values. An accepted Task stays in the plan in its Role; one not yet accepted is
+dropped by leaving it out or giving it another Role, which stops its Teammate, and new work goes in
+a new Task.
+
 `team_handoff` writes the Task's folder, `tasks/<nnn>-<role>-<slug>/task.md`, and staffs the
 Task with no judgment from the Lead, down a ladder:
 
@@ -207,11 +215,15 @@ Every Teammate's status line runs `statusline.mjs`, which runs the human's own s
 command (local, then project, then user settings, as Claude Code picks it) and prints its output
 unchanged, then writes the JSON it got to `teammates/<id>/statusline.json`. While the Team block
 shows, the extension reads those files once a minute: the block's usage line shows the freshest
-reading, where it came from and how old it is, and each row's `ctx` comes from them. With no
-status line under a minute old it asks Claude Code's undocumented `get_usage` control request
-instead, at most once a minute. Each Report's Usage section has the freshest reading and its change
-since the Effort began, each Role's tokens and API-price estimate summed across its sessions, and
-the Lead's own cost as pi reports it.
+reading, where it came from and how old it is, and each row's `ctx` comes from them. A reading goes
+into `effort.jsonl` only when something in it changed (the windows, the session, its model, its
+estimate or its `ctx`): Claude Code runs the status line again about once a minute even while idle,
+and the extension keeps when it last read each file in memory. With no status line read under a
+minute ago it asks Claude Code's undocumented `get_usage` control request instead, at most once a
+minute. Each Report's Usage section has the freshest reading and its change since the Effort began,
+each Role's API-price estimate summed across its sessions (a Role with none yet is left out), and
+the Lead's own cost as pi reports it. It gives no token count: the status line's token totals are
+the last request's context, not what a session used.
 ### Held requests
 
 A Teammate's permission prompt, an `AskUserQuestion` included, is held by its `PermissionRequest`
@@ -284,9 +296,10 @@ chat collapsed to its headline; the Lead gets back only where it went. The Team 
 The Lead ends the work with a final Report: `team_report` with `final: true`. It must map every
 Brief criterion id to evidence, and may propose Playbook `changes`, each an `oldText` to replace
 with `newText` in the Playbook the Effort runs on; a change that doesn't apply is refused. The
-final Report replaces the Plan section with every Task, its Role and the model its Teammate was
-launched on (none for a Task never launched), adds the checkpoints with their approvals and the
-found work, and puts sign-off in
+final Report replaces the Plan section with every Task, its Role and the model it ran on, as its
+sessions' status lines gave it (every one, when it changed, as a `/model` in a Takeover does). With
+no reading it gives the model its Teammate was launched on and says so; none for a Task never
+launched. It adds the checkpoints with their approvals and the found work, and puts sign-off in
 `/team pending`. There each Playbook change is asked first, one by one: adopted, it becomes the
 Team's Playbook for the next Effort (this Effort keeps its snapshot); declined, it is dropped.
 Approving sign-off records the Report's sha256 in `approvals.jsonl`, stops every Teammate and ends

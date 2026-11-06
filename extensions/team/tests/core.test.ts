@@ -528,6 +528,49 @@ describe("reviewing a Task", () => {
 		assert.match(refusal(applied(done, review("accept")), handoff), /`rename` is accepted.*never handed off again/);
 	});
 
+	describe("planning again (#136)", () => {
+		const accepted = applied(done, review("accept"));
+		function replan(tasks: Extract<EffortInput, { kind: "plan" }>["tasks"], criteria = ["AC1"]): Extract<EffortInput, { kind: "plan" }> {
+			return { kind: "plan", tasks, criteria, roles: ["dev"], at: "2026-11-02T14:00:00.000Z" };
+		}
+		const RENAME = { slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1"] };
+		const DOCS = { slug: "docs", role: "dev", goal: "Document it.", criteria: ["AC1"] };
+
+		it("refuses to change an accepted Task's goal, criteria or dependencies, naming each change and what was recorded", () => {
+			const text = refusal(accepted, replan([{ ...RENAME, goal: "Rename.", criteria: ["AC1", "AC2"], dependsOn: ["docs"] }, DOCS], ["AC1", "AC2"]));
+
+			assert.match(text, /Task `rename` is accepted, so its goal, criteria and dependencies stay as recorded/);
+			assert.match(text, /goal from "Rename the key\." to "Rename\."/);
+			assert.match(text, /criteria from `AC1` to `AC1`, `AC2`/);
+			assert.match(text, /dependencies from none to `docs`/);
+			assert.match(text, /Restate it as recorded.*new Task/);
+		});
+
+		it("refuses to change a Task in progress, saying leaving it out drops it", () => {
+			for (const lines of [running, done]) {
+				const text = refusal(lines, replan([{ ...RENAME, goal: "Rename the key everywhere." }, DOCS]));
+
+				assert.match(text, new RegExp(`Task \`rename\` is ${taskStatus(fold(lines), "rename")} with \`dev-1\`, so its goal, criteria and dependencies stay as handed off`));
+				assert.match(text, /goal from "Rename the key\." to "Rename the key everywhere\."/);
+				assert.match(text, /leave it out of the plan, which drops it and stops `dev-1`/);
+			}
+		});
+
+		it("takes a whole plan sent again that restates an accepted or running Task as recorded, keeping the record's order", () => {
+			const twoCriteria = applied(approved, replan([{ ...RENAME, criteria: ["AC1", "AC2"], dependsOn: ["docs"] }, DOCS], ["AC1", "AC2"]));
+			const handed = applied(twoCriteria, { kind: "handoff", slug: "rename", at: "2026-11-02T11:30:00.000Z" });
+
+			const result = run(handed, replan([{ ...RENAME, goal: " Rename the key. ", criteria: ["AC2", "AC1"], dependsOn: ["docs"] }, { ...DOCS, goal: "Document the new key." }], ["AC1", "AC2"]));
+
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			assert.deepEqual(result.state.plan, [
+				{ slug: "rename", role: "dev", goal: "Rename the key.", dependsOn: ["docs"], criteria: ["AC1", "AC2"] },
+				{ slug: "docs", role: "dev", goal: "Document the new key.", dependsOn: [], criteria: ["AC1"] },
+			]);
+			assert.ok(run(accepted, replan([RENAME, DOCS])).ok);
+		});
+	});
+
 	it("sends a Task back to the Teammate that did it, over its inbox and with no clear, starting the next round", () => {
 		const result = run(done, review("send_back"));
 
@@ -2197,14 +2240,68 @@ describe("the final Report and sign-off", () => {
 		]);
 	});
 
-	it("lists every Task with its Role, the model its Teammate was launched on and its status, in place of the logged Plan", () => {
+	it("lists every Task with its Role and status, in place of the logged Plan, falling back to the model its Teammate was launched on when no status line gave one", () => {
 		// The architect launches on `opus`; by the dev's launch the Roles' models have moved on, which the design keeps out of.
 		const onOpus = applied(plannedReport, { kind: "handoff", slug: "design", models: { architect: "opus" }, at: "2026-11-02T11:20:00.000Z" });
 		const lines = applied(onOpus, { kind: "handoff", slug: "rename", models: { architect: "sonnet" }, at: "2026-11-02T11:21:00.000Z" });
 		const report = written(run(lines, finalReport("2026-11-02T12:00:00.000Z")));
 		const section = (title: string) => report.sections.find((each) => each.title === title)?.lines;
-		assert.deepEqual(section("Tasks"), ["`design` (architect, on `opus`): running", "`rename` (dev, on Claude Code's default model): running"]);
+		assert.deepEqual(section("Tasks"), [
+			"`design` (architect, launched on `opus`; no status line showed the model it ran on): running",
+			"`rename` (dev, launched on Claude Code's default model; no status line showed the model it ran on): running",
+		]);
 		assert.equal(section("Plan"), undefined);
+	});
+
+	it("names the model each Task ran on from its session's status lines, every one when it changed, whatever it was launched on (#135)", () => {
+		const onOpus = applied(plannedReport, { kind: "handoff", slug: "design", models: { architect: "opus" }, at: "2026-11-02T11:20:00.000Z" });
+		const handed = applied(onOpus, { kind: "handoff", slug: "rename", models: { dev: "haiku" }, at: "2026-11-02T11:21:00.000Z" });
+		const started: EffortLine[] = [...handed, { type: "teammate-session", teammate: "architect-1", cursor: 1, source: "startup", sessionId: "s-1", shortId: "abc123", at: "2026-11-02T11:22:00.000Z" }];
+		const read = (at: string, model: string, sessionId = "s-1"): EffortInput => ({ kind: "usage", reading: { source: "status-line", at: `2026-11-02T${at}:00.000Z`, teammate: "architect-1", sessionId, rateLimits: true, model } });
+		const lines = [
+			// A session other than its current one is not the Task's.
+			read("11:25", "claude-haiku-5-5", "s-0"),
+			read("11:30", "claude-sonnet-5-5"),
+			// `/model opus` typed in a Takeover, then back.
+			read("11:40", "claude-opus-5-5"),
+			read("11:50", "claude-sonnet-5-5"),
+		].reduce(applied, started);
+
+		const report = written(run(lines, finalReport("2026-11-02T12:00:00.000Z")));
+
+		assert.deepEqual(report.sections.find((each) => each.title === "Tasks")?.lines, [
+			"`design` (architect, on `claude-sonnet-5-5` and `claude-opus-5-5`): running",
+			"`rename` (dev, launched on `haiku`; no status line showed the model it ran on): running",
+		]);
+	});
+
+	it("gives a reused Teammate's new Task only the models its new session showed", () => {
+		const withDocs = applied(plannedReport, {
+			kind: "plan",
+			tasks: [
+				{ slug: "rename", role: "dev", goal: "Rename the key.", criteria: ["AC1", "AC2"] },
+				{ slug: "docs", role: "dev", goal: "Document the key.", criteria: ["AC1"] },
+			],
+			criteria: ["AC1", "AC2"],
+			roles: ["architect", "dev"],
+			at: "2026-11-02T11:16:00.000Z",
+		});
+		const handed = applied(withDocs, { kind: "handoff", slug: "rename", models: { dev: "haiku" }, at: "2026-11-02T11:20:00.000Z" });
+		const inbox = { socket: "/tmp/cc-socks/dev-1.sock", token: "token-dev-1" };
+		const session = (cursor: number, sessionId: string, source: string): EffortLine => ({ type: "teammate-session", teammate: "dev-1", cursor, source, sessionId, shortId: "abc123", inbox, at: "2026-11-02T11:21:00.000Z" });
+		const read = (at: string, model: string, sessionId: string): EffortInput => ({ kind: "usage", reading: { source: "status-line", at: `2026-11-02T${at}:00.000Z`, teammate: "dev-1", sessionId, rateLimits: true, model } });
+		const ran = applied([...handed, session(1, "s-1", "startup")], read("11:30", "claude-haiku-5-5", "s-1"));
+		const accepted: EffortLine[] = [...ran, { type: "task-done", slug: "rename", teammate: "dev-1", round: 1, cursor: 2, at: "2026-11-02T11:40:00.000Z" }, { type: "task-accepted", slug: "rename", round: 1, at: "2026-11-02T11:41:00.000Z" }];
+		const reused = applied(accepted, { kind: "handoff", slug: "docs", models: { dev: "haiku" }, at: "2026-11-02T11:42:00.000Z" });
+		assert.equal(fold(reused).tasks.docs?.teammate, "dev-1", "the Task went to dev-1, reused");
+
+		// While the clear is under way the old session still shows; its new one shows before its SessionStart is applied.
+		const clearing = [read("11:43", "claude-opus-5-5", "s-1"), read("11:44", "claude-sonnet-5-5", "s-2")].reduce(applied, reused);
+		const cleared: EffortLine[] = [...clearing, session(3, "s-2", "clear")];
+
+		const tasks = written(run(cleared, finalReport("2026-11-02T12:00:00.000Z"))).sections.find((each) => each.title === "Tasks")?.lines;
+
+		assert.deepEqual(tasks, ["`rename` (dev, on `claude-haiku-5-5`): accepted", "`docs` (dev, on `claude-sonnet-5-5`): running"]);
 	});
 
 	it("tells a launch with no `--model` from one whose model wasn't recorded, as a line from before models were has none", () => {
@@ -2213,7 +2310,7 @@ describe("the final Report and sign-off", () => {
 		const lines: EffortLine[] = [...withDefault, { type: "teammate-started", id: "dev-1", role: "dev", name: "team-software-2026-11-02-dev-1", task: "rename", startedAt: "2026-11-02T11:21:00.000Z" }, legacy];
 		const report = written(run(lines, finalReport("2026-11-02T12:00:00.000Z")));
 		assert.deepEqual(report.sections.find((each) => each.title === "Tasks")?.lines, [
-			"`design` (architect, on Claude Code's default model): running",
+			"`design` (architect, launched on Claude Code's default model; no status line showed the model it ran on): running",
 			"`rename` (dev, model not recorded): running",
 		]);
 	});
@@ -2407,6 +2504,26 @@ describe("usage readings", () => {
 		assert.deepEqual(older.append, []);
 	});
 
+	it("logs a status line only when something in it changes, not each time Claude Code runs it again (#140)", () => {
+		const figures: Partial<UsageReading> = { sevenDay: { percent: 73, resetsAt: "2026-11-06T09:00:00.000Z" }, costUsd: 0.5, ctx: 21, model: "claude-haiku-5-5" };
+		const read = applied(staffed, statusLine("dev-1", "2026-11-02T11:30:00.000Z", figures));
+
+		const minutes = ["11:31", "11:32", "11:33"].map((at) => statusLine("dev-1", `2026-11-02T${at}:00.000Z`, figures));
+		const idle = minutes.reduce(applied, read);
+
+		assert.equal(idle.length, read.length, "the same figures at a later time add nothing");
+		// Freshness comes from when the shell last saw the file, not from the log.
+		assert.equal(freshStatusLine(fold(idle), Date.parse("2026-11-02T11:33:30.000Z")), false);
+		assert.equal(freshStatusLine(fold(idle), Date.parse("2026-11-02T11:33:30.000Z"), { "dev-1": "2026-11-02T11:33:00.000Z" }), true);
+		for (const change of [{ costUsd: 0.6 }, { ctx: 22 }, { model: "claude-sonnet-5-5" }, { sevenDay: { percent: 74, resetsAt: "2026-11-06T09:00:00.000Z" } }, { fiveHour: { percent: 3 } }, { sessionId: "dev-1-b" }, { rateLimits: false }]) {
+			const moved = run(idle, statusLine("dev-1", "2026-11-02T11:34:00.000Z", { ...figures, ...change }));
+			assert.ok(moved.ok);
+			assert.equal(moved.append.length, 1, JSON.stringify(change));
+		}
+		// Another Teammate's own figures are its own.
+		assert.equal(applied(idle, statusLine("dev-2", "2026-11-02T11:34:00.000Z", figures)).length, idle.length + 1);
+	});
+
 	it("leaves usage out of the Report until there is a reading, and out of what happened since the last Report", () => {
 		assert.equal(report(staffed, "2026-11-02T11:40:00.000Z"), undefined);
 		const read = applied(staffed, statusLine("dev-1", "2026-11-02T11:30:00.000Z", { sevenDay: { percent: 70 } }));
@@ -2455,34 +2572,52 @@ describe("usage readings", () => {
 
 	it("leaves a Role with no spend yet out of the usage", () => {
 		const lines = [
-			statusLine("dev-1", "2026-11-02T11:30:00.000Z", { tokens: 40_000, costUsd: 0.5 }),
-			statusLine("architect-1", "2026-11-02T11:30:00.000Z", { tokens: 0, costUsd: 0 }),
+			statusLine("dev-1", "2026-11-02T11:30:00.000Z", { costUsd: 0.5 }),
+			statusLine("architect-1", "2026-11-02T11:30:00.000Z", { costUsd: 0 }),
+			// No estimate at all yet.
+			statusLine("dev-2", "2026-11-02T11:30:00.000Z", { ctx: 2 }),
 		].reduce(applied, staffed);
 
-		assert.deepEqual(report(lines, "2026-11-02T12:05:00.000Z")?.slice(1), ["By Role: dev 40k tokens ≈ $0.50. *API-price equivalent, not your bill.*"]);
+		assert.deepEqual(report(lines, "2026-11-02T12:05:00.000Z")?.slice(1), ["By Role: dev ≈ $0.50. *API-price equivalent, not your bill.*"]);
 	});
 
-	it("sums each Role's tokens and estimate across session ids, a value that drops counting as a reset, labelled as not the bill", () => {
+	it("sums each Role's estimate across session ids, a value that drops counting as a reset, labelled as not the bill", () => {
 		const lines = [
-			statusLine("dev-1", "2026-11-02T11:30:00.000Z", { tokens: 40_000, costUsd: 0.5 }),
-			statusLine("dev-1", "2026-11-02T11:40:00.000Z", { tokens: 60_000, costUsd: 0.7 }),
+			statusLine("dev-1", "2026-11-02T11:30:00.000Z", { costUsd: 0.5 }),
+			statusLine("dev-1", "2026-11-02T11:40:00.000Z", { costUsd: 0.7 }),
 			// A clear: a new session id, counted from its own start.
-			statusLine("dev-1", "2026-11-02T11:50:00.000Z", { sessionId: "dev-1-b", tokens: 10_000, costUsd: 0.1 }),
+			statusLine("dev-1", "2026-11-02T11:50:00.000Z", { sessionId: "dev-1-b", costUsd: 0.1 }),
 			// The first session's figure dropped: it reset, so what it had counts too.
-			statusLine("dev-1", "2026-11-02T12:00:00.000Z", { tokens: 5_000, costUsd: 0.05 }),
-			statusLine("dev-2", "2026-11-02T12:00:00.000Z", { tokens: 21_000, costUsd: 0.25 }),
-			statusLine("architect-1", "2026-11-02T12:00:00.000Z", { tokens: 412_000, costUsd: 3.1 }),
+			statusLine("dev-1", "2026-11-02T12:00:00.000Z", { costUsd: 0.05 }),
+			statusLine("dev-2", "2026-11-02T12:00:00.000Z", { costUsd: 0.25 }),
+			statusLine("architect-1", "2026-11-02T12:00:00.000Z", { costUsd: 3.1 }),
 		].reduce(applied, staffed);
 
-		assert.deepEqual(report(lines, "2026-11-02T12:05:00.000Z")?.slice(1), ["By Role: architect 412k tokens ≈ $3.10 · dev 96k tokens ≈ $1.10. *API-price equivalent, not your bill.*"]);
+		assert.deepEqual(report(lines, "2026-11-02T12:05:00.000Z")?.slice(1), ["By Role: architect ≈ $3.10 · dev ≈ $1.10. *API-price equivalent, not your bill.*"]);
+	});
+
+	it("gives no token count, as the status line's tokens are the last request's context, which grows and shrinks (#137)", () => {
+		// One session: its context grows, then a compaction shrinks it, while its estimate only grows.
+		const lines = [
+			statusLine("dev-1", "2026-11-02T11:30:00.000Z", { ctx: 20, costUsd: 0.2 }),
+			statusLine("dev-1", "2026-11-02T11:40:00.000Z", { ctx: 60, costUsd: 0.6 }),
+			statusLine("dev-1", "2026-11-02T11:50:00.000Z", { ctx: 15, costUsd: 0.7 }),
+		].reduce(applied, staffed);
+		// A line logged before the fix still carries the old `tokens`, which is read no more.
+		const legacy = { type: "usage-read", source: "status-line", at: "2026-11-02T11:55:00.000Z", teammate: "dev-2", sessionId: "dev-2-a", rateLimits: true, tokens: 412_000, costUsd: 0.3 } as EffortLine;
+
+		const usage = report([...lines, legacy], "2026-11-02T12:05:00.000Z");
+
+		assert.deepEqual(usage?.slice(1), ["By Role: dev ≈ $1.00. *API-price equivalent, not your bill.*"]);
+		assert.ok(!usage?.some((line) => /tokens|412k/.test(line)), usage?.join("\n"));
 	});
 
 	it("says the estimate is the nearest thing to a charge when no reading has rate_limits, as with an API key", () => {
-		const lines = [statusLine("dev-1", "2026-11-02T11:30:00.000Z", { rateLimits: false, tokens: 96_000, costUsd: 1.1 })].reduce(applied, staffed);
+		const lines = [statusLine("dev-1", "2026-11-02T11:30:00.000Z", { rateLimits: false, costUsd: 1.1 })].reduce(applied, staffed);
 
 		assert.deepEqual(report(lines, "2026-11-02T11:35:00.000Z"), [
 			"Account, from dev-1's status line at 11:30 UTC: 5h n/a · week n/a. It includes your own use outside the Team.",
-			"By Role: dev 96k tokens ≈ $1.10. No reading has `rate_limits`, as with an API key, so the estimate is the nearest thing to a charge.",
+			"By Role: dev ≈ $1.10. No reading has `rate_limits`, as with an API key, so the estimate is the nearest thing to a charge.",
 		]);
 	});
 
