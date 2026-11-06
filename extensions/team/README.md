@@ -326,7 +326,10 @@ end clean worktrees are removed and every branch is kept; a dirty worktree is ke
 What the end did goes on record after `effort-ended` as a `worktrees-ended` line, each worktree
 `removed` or `kept` with its `why` and the processes found `running` in it, and to the Lead in the
 message that ends the Effort, which tells it not to use a removed worktree and to leave any process
-named there to the human.
+named there to the human. With the Lead idle, that message goes into the session at once and
+starts no turn, so it is there after pi exits, `/new` or `/resume` before your next prompt. While
+the Lead is running it waits for your next prompt instead, since sending it then would start one
+more model turn.
 
 A process still running in a worktree (a server a Teammate started with `&`, which `claude stop`
 doesn't reach) is named by pid and command in the final Report's Worktrees section, and as the

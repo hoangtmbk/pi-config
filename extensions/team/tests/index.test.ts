@@ -126,6 +126,9 @@ function fakePi(
 	const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
 	const tools = new Map<string, RegisteredTool>();
 	const sent: SentMessage[] = [];
+	// What pi has written to the session file. A `nextTurn` message waits in memory for the next prompt (`agent-session.js:1853-1855`), and none comes here.
+	const stored: SentMessage[] = [];
+	let streaming = options.streaming ?? false;
 	const notifications: Notification[] = [];
 	const dialogs: Dialog[] = [];
 	const answers: (string | boolean | undefined)[] = [];
@@ -160,7 +163,9 @@ function fakePi(
 			activations.push([...names]);
 		},
 		sendMessage(message: { customType: string; content: string; display?: boolean }, sendOptions?: { triggerTurn?: boolean; deliverAs?: string }) {
-			sent.push({ ...message, triggerTurn: sendOptions?.triggerTurn, deliverAs: sendOptions?.deliverAs });
+			const one = { ...message, triggerTurn: sendOptions?.triggerTurn, deliverAs: sendOptions?.deliverAs };
+			sent.push(one);
+			if (one.deliverAs !== "nextTurn") stored.push(one);
 		},
 		appendEntry(customType: string, data: unknown) {
 			entries.push({ customType, data });
@@ -224,7 +229,7 @@ function fakePi(
 		hasUI: options.hasUI ?? true,
 		mode: options.mode ?? "tui",
 		cwd: options.cwd ?? roots.scratch,
-		isIdle: () => !options.streaming,
+		isIdle: () => !streaming,
 		sessionManager: {
 			getSessionFile: () => sessionFile,
 			getEntries: () => [...(options.sessionEntries ?? []), ...[...carried, ...entries].map((entry, index) => ({ type: "custom", id: `e${index}`, ...entry }))],
@@ -275,6 +280,12 @@ function fakePi(
 		commands,
 		tools,
 		sent,
+		/** The messages pi has written to the session file by now, oldest first: all but the `nextTurn` ones, which wait in memory for a prompt and go if pi exits first. */
+		stored,
+		/** Start or stop the Lead's run, as `ctx.isIdle()` sees it. */
+		stream(on: boolean) {
+			streaming = on;
+		},
 		notifications,
 		dialogs,
 		activations,
@@ -4663,6 +4674,39 @@ describe("ending an Effort: the final Report and sign-off", () => {
 		assert.equal(teamBlock(pi), undefined);
 		await pi.team("cancel");
 		assert.match(pi.notifications.at(-1)?.message ?? "", /holds no Effort, so there is nothing to cancel/);
+	});
+
+	for (const [how, end] of [
+		["sign-off", ["Approve", "pending"]],
+		["`/team cancel`", [true, "cancel"]],
+	] as const) {
+		it(`with the Lead idle, ${how} stores the Lead's end-of-Effort message in the session at once, starting no turn, so it is there when pi exits before another prompt`, async () => {
+			const { pi, workspace } = await finalReported();
+
+			pi.answer(end[0]);
+			await pi.team(end[1]);
+			// pi exits, or the human runs `/new`, with no prompt in between.
+			await pi.emit("session_shutdown");
+
+			const ended = pi.stored.filter((message) => message.customType === "team-ended");
+			assert.equal(ended.length, 1, "the message is in the session file");
+			assert.notEqual(ended[0].triggerTurn, true, "it starts no turn");
+			assert.ok(ended[0].content.includes(workspace), ended[0].content);
+			assert.match(ended[0].content, /A removed worktree is gone: don't `cd` into it/);
+		});
+	}
+
+	it("while the Lead streams, the end-of-Effort message waits for its next prompt, so it starts no extra turn", async () => {
+		const { pi } = await finalReported();
+
+		pi.stream(true);
+		pi.answer("Approve");
+		await pi.team("pending");
+
+		const ended = pi.sent.filter((message) => message.customType === "team-ended");
+		assert.equal(ended.length, 1);
+		assert.equal(ended[0].deliverAs, "nextTurn");
+		assert.notEqual(ended[0].triggerTurn, true);
 	});
 });
 

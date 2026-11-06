@@ -1834,9 +1834,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		syncLeadTools();
 		paintBlock();
 		ctx.ui.notify(notes.join(" "), unstopped.length > 0 ? "warning" : "info");
+		// An idle session stores the message at once and starts no turn, so it is in the session file even if pi exits before another prompt.
+		// While the Lead streams, anything sent now starts one more model turn, so it waits in memory for the next prompt.
 		pi.sendMessage(
 			{ customType: "team-ended", content: `${lead.join(" ")} This session holds no Effort now, so the Team tools are off.`, display: true },
-			{ deliverAs: "nextTurn" },
+			{ deliverAs: ctx.isIdle() ? "followUp" : "nextTurn" },
 		);
 	}
 
