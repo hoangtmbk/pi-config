@@ -1750,7 +1750,17 @@ describe("handing off: team_handoff", () => {
 		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
 
 		const prompt = pi.claude.launches()[0].prompt ?? "";
-		for (const fact of ["`$CLAUDE_JOB_DIR/tmp`", '`rm -rf "$CLAUDE_JOB_DIR"/tmp/old`', '`cd "$CLAUDE_JOB_DIR"/tmp/<folder>`', "through any other variable", "waits on the Lead"]) {
+		for (const fact of [
+			"`$CLAUDE_JOB_DIR/tmp`",
+			'`rm -rf "$CLAUDE_JOB_DIR"/tmp/old`',
+			'`cd "$CLAUDE_JOB_DIR"/tmp/<folder>`',
+			"Don't put the folder in a variable",
+			"`T=$CLAUDE_JOB_DIR/tmp/x; rm -rf $T`",
+			"waits on the Lead",
+			// A local server's URL, written out (#142).
+			'`curl -X PUT -d v "http://127.0.0.1:$PORT/keys/a"`',
+			'`"$URL/keys/a"`',
+		]) {
 			assert.ok(prompt.includes(fact), `the preamble should say: ${fact}\n\n${prompt}`);
 		}
 		// Claude Code places the job folder under `$CLAUDE_CONFIG_DIR` when it is set, so no `~/.claude` path is promised.
@@ -2561,7 +2571,7 @@ describe("the floor: irreversible outward actions reach the human", () => {
 		});
 		await pi.call("team_answer", { request: push, decision: "allow", reason: "The Effort's branch, no force.", grant: "push-effort-branch" });
 		await pi.call("team_answer", { request: request("gh pr create --fill"), decision: "allow", reason: "The PR the human reviews.", grant: "open-pr" });
-		await pi.call("team_answer", { request: request("git -C . push origin HEAD:refs/heads/review"), decision: "allow", reason: "One branch, ready to merge.", grant: "delivery" });
+		await pi.call("team_answer", { request: request("git -C . push origin HEAD:refs/heads/review"), decision: "allow", reason: 'The Delivery asks for "one branch, ready to merge".', grant: "delivery" });
 
 		for (const hook of pi.claude.held()) {
 			await until(() => hook.exitCode() !== undefined, "each held hook exits");
@@ -2572,7 +2582,7 @@ describe("the floor: irreversible outward actions reach the human", () => {
 		for (const needed of [
 			"used grant `push-effort-branch` (Playbook: Push the Effort's branch to origin, never with force.) for builder-1's floor push `git push origin HEAD` (Task `rename-key`)",
 			"used grant `open-pr` (Brief override: open the pull request the Delivery asks for) for builder-1's floor send `gh pr create --fill` (Task `rename-key`)",
-			"used the Brief's Delivery (One branch, ready to merge.) for builder-1's floor push `git -C . push origin HEAD:refs/heads/review` (Task `rename-key`)",
+			'used the Brief\'s Delivery ("one branch, ready to merge") for builder-1\'s floor push `git -C . push origin HEAD:refs/heads/review` (Task `rename-key`)',
 		]) {
 			assert.ok(report.includes(needed), `reports/001.md doesn't say ${needed}:\n${report}`);
 		}

@@ -224,7 +224,8 @@ const AnswerParams = Type.Object({
 	),
 	grant: Type.Optional(
 		Type.String({
-			description: "With `allow`: the grant id in the Playbook or Brief the allow relies on, or `delivery` for the Brief's Delivery, logged for the human. Required to allow a floor action.",
+			description:
+				"With `allow`: the grant id in the Playbook or Brief the allow relies on, or `delivery` for the Brief's Delivery, logged for the human. Required to allow a floor action. Citing `delivery`, quote in `reason`, in double quotes, the words of the Delivery that cover the action.",
 		}),
 	),
 	answers: Type.Optional(
@@ -2141,7 +2142,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		label: "Hand off",
 		description: [
 			"Hand a planned Task to a Teammate of its Role, which the extension staffs: it reuses an idle Teammate of the Role (clearing its context first), else starts one as a Claude Code background session in the Effort's Workspace while under the human's `maxTeammates`, else stops an idle Teammate no queued Task needs and starts one, else queues the Task until a Teammate frees up.",
-			"`body` becomes the Task's `task.md`: make it self-contained, listing the Effort's `brief.md` and `clarifications.md` among its inputs, since the Teammate has no earlier conversation.",
+			"`body` becomes the Task's `task.md`: make it self-contained, listing the Effort's `brief.md` and `clarifications.md` among its inputs, since the Teammate has no earlier conversation. It restates the acceptance criteria as the Brief has them: never move where a criterion keeps scratch (into the Workspace, say) to keep deletes off the floor.",
 			"While the Effort is paused, by the human, by you or by a usage limit, the Task queues with `paused` and starts by itself once every pause is lifted.",
 			"Returns which Teammate was started or reused, or that the Task is queued and why. Refused until the human approves the Brief, and for a Task already handed off or queued (running, in review, sent back or accepted).",
 			"`isolated: true` gives the Task a worktree and branch of its own, cut from the Effort branch's tip beside the Workspace, for work that would clash with other Tasks' uncommitted files; its Teammate always starts fresh there. Say in `body` that only what it commits merges: accepting it merges its branch into the Effort branch.",
@@ -2388,7 +2389,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		description: [
 			"Answer a Teammate's held request: a permission prompt or an AskUserQuestion its hook holds open while the prompt stays live in its terminal.",
 			"For a permission, `decision` is `allow` or `deny` with a `reason`; an allow may add a session `rule` for the same tool and name the `grant` it relies on.",
-			"A floor action (push, publish, deploy, send, delete outside the Workspace) is allowed only citing as `grant` a Playbook grant, a Brief override grant, or `delivery` (the Brief's Delivery), and takes no `rule`; one the Playbook's `escalate` entries ask about goes to the human with `team_escalate`.",
+			"A floor action (push, publish, deploy, send, delete outside the Workspace) is allowed only citing as `grant` a Playbook grant, a Brief override grant, or `delivery` (the Brief's Delivery, with `reason` quoting in double quotes the words of it that cover the action; a Delivery that doesn't mention the action doesn't cover it), and takes no `rule`; one the Playbook's `escalate` entries ask about goes to the human with `team_escalate`.",
+			"Never answer a held delete by moving scratch into the Workspace, in a deny reason or a Task, when an acceptance criterion puts it elsewhere: that changes the criterion, which only the human does.",
 			"For an AskUserQuestion, `answers` maps each question's exact text to a label, or a list of labels for a multiSelect question.",
 			"The first answer wins: refused once the human answered in the terminal, or the hook gave up holding it. Nothing is allowed by default, and the next Report logs what you decided.",
 		].join(" "),

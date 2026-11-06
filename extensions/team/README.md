@@ -266,6 +266,26 @@ session's scratchpad. The floor hook and `team_answer` work these out with one f
 `floor.mjs`, so they agree on every command. Once trusted, `$CLAUDE_JOB_DIR` in a command reads as
 the job folder, unless the command sets it; unquoted, only where bash can't split it.
 
+A name the command sets itself reads as the path it holds, only in its double-quoted form (`"$T"`,
+`"$T"/x`, `"${T}/x"`), and only when there's no doubt: a plain `T=value` of its own, set nowhere
+else in the line and never exported, read or unset, in a text with no group, subshell, function,
+loop, `if`, `case`, `eval` or `source`; outside a `$(…)`, a pipeline or a backgrounded list; sure
+to have run before the delete (earlier in its `&&` chain, or leading an earlier list); and a value
+that is a literal absolute path or starts with `$PWD` (the directory known), the trusted
+`$CLAUDE_JOB_DIR` or such a name. So `T="$CLAUDE_JOB_DIR/tmp/smoke" && rm -rf "$T"` is inside;
+`T=$(pwd) && rm -rf "$T"`, `rm -rf $T` unquoted, and any name set twice are not.
+
+A request to a local host (`localhost`, `127.x`, `::1`, `0.0.0.0`) is no send, and the floor reads
+the host when it's written out, even with the port or path in a variable
+(`"http://127.0.0.1:$PORT/keys/$KEY"`). A URL held in a variable (`"$URL/keys"`) has no host the
+floor can read, so a write to it is a send; the preamble tells Teammates to write local URLs out.
+
+A `delivery` citation counts only when `reason` quotes, in double quotes, the words of the
+Delivery that cover the action, and the Report logs that passage. A Delivery that says nothing of a
+send or a delete doesn't cover one. Nor does the floor justify moving a criterion's scratch into
+the Workspace: `team_answer`'s and `team_handoff`'s text tell the Lead that changes a criterion,
+which is the human's.
+
 ### Reviewing
 
 Once woken about a result, the Lead decides on it with `team_review`, which refuses while the
