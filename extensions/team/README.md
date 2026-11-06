@@ -263,7 +263,20 @@ The next Report logs every answer, rule and grant under Decided for you, with th
 A delete is a floor action only outside the Teammate's own folders: its Workspace, its Claude Code
 job temp folder (`$CLAUDE_JOB_DIR/tmp`, under `$CLAUDE_CONFIG_DIR` or else `~/.claude`) and its
 session's scratchpad. The floor hook and `team_answer` work these out with one function in
-`floor.mjs`, so they agree on every command. Once trusted, `$CLAUDE_JOB_DIR` in a command reads as
+`floor.mjs`, so they agree on every command. `team_answer`'s description says so: a floor action is
+"a push, publish, deploy, send, or delete outside the Teammate's own folders (its Workspace, job
+temp folder and scratchpad)".
+
+The wake about a held `Bash` request says what the floor read of it, as `team_answer`'s guard reads
+it: the kind and the command that takes it. For a delete it says whether the floor read the target
+outside the Teammate's own folders, or couldn't read it (a name, `~`, a `cd` or `xargs` it can't
+follow), and names the folders by path. Whether it could read the target is asked of the floor
+itself: the command is read again with every top-level folder a path in it starts in counted as
+the Teammate's own, and a delete still found goes through something the floor can't follow. A
+delete the floor can't read stays a floor action even when the Lead sees it lands in the
+Teammate's folders; the wake tells the Lead to escalate it for that reason, not because the folder
+is outside, or to deny it asking the Teammate to write the path out. A refused uncited allow says
+the same. Once trusted, `$CLAUDE_JOB_DIR` in a command reads as
 the job folder, unless the command sets it; unquoted, only where bash can't split it.
 
 A name the command sets itself reads as the path it holds, only in its double-quoted form (`"$T"`,
@@ -325,6 +338,10 @@ adds the logged sections from `effort.jsonl`, leaving out any with nothing in th
   changes;
 - **Found work**: the running count, in every Report once anything is found, and the items new
   since the last Report.
+
+`team_report`'s description tells the Lead to call an action unauthorized, not allowed or denied
+only from the record, such as a request it or the human denied, never from its own reading: a
+delete the floor let through in a Teammate's own folders needed no grant.
 
 The first Report, written once the plan is, is the plan Report. Each is saved as
 `reports/<nnn>.md` in the Effort directory, numbered from 001 and never overwritten, and shows in

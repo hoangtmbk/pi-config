@@ -11,8 +11,9 @@
  * is one appended line and the state is only ever what the lines fold to.
  */
 
+import { ownFolders } from "./floor.mjs";
 import { CONSENT_FAMILY, classify, type Family, familyOf, LIMIT_FAMILY, type LimitKind, type TransientWhy } from "./limits.ts";
-import { answersText, askedText, askText, closedText, type HeldRequest, type HookDecision, isCallOf, isQuestion, type RequestAnswer, requestKind, settledText, type TakenAnswer, takeAnswer, terminalText } from "./requests.ts";
+import { answersText, askedText, askText, closedText, type HeldRequest, type HookDecision, isCallOf, isQuestion, type RequestAnswer, requestKind, settledText, type TakenAnswer, type TeammateFolders, takeAnswer, terminalText } from "./requests.ts";
 
 /** The one checkpoint an Effort has before its Brief is approved. */
 export const BRIEF = "brief";
@@ -850,6 +851,8 @@ export type EffortInput =
 			models?: Record<string, string>;
 			/** The prompts the Effort itself sent the Teammate (its pointers, `continue`): a prompt matching one is not the human's. */
 			sent?: readonly string[];
+			/** Claude Code's config folder, whose `jobs` hold the Teammate's job folder: a held request's wake names its job temp folder from it. */
+			claudeDir?: string;
 	  }
 	/**
 	 * `team_review` of a handed-off Task, with whether its current round's
@@ -3035,7 +3038,7 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 				state: "held",
 			};
 			const { state: _state, ...fields } = held;
-			return took(state, [{ type: "request-held", cursor, ...fields }], [{ kind: "wake-lead", text: askText(held) }]);
+			return took(state, [{ type: "request-held", cursor, ...fields }], [{ kind: "wake-lead", text: askText(held, teammateFolders(state, teammate.id, input.claudeDir, held.scratchpad)) }]);
 		}
 		case "PostToolUse":
 		case "PostToolUseFailure": {
@@ -3633,6 +3636,21 @@ export function workdir(state: EffortState, teammate: string): string | undefine
 	const slug = state.teammates.find((each) => each.id === teammate)?.task;
 	const worktree = slug === undefined ? undefined : state.tasks[slug]?.worktree;
 	return worktree?.path ?? state.workspace?.path;
+}
+
+/**
+ * A Teammate's own folders, as its floor hook works them out and as the floor
+ * judges its deletes against them: where it works ({@link workdir}), the job
+ * folder its short id names under `claudeDir`'s `jobs`, and the scratchpad its
+ * request named. The held request's wake and `team_answer` both read them
+ * here. Undefined while the Effort has no Workspace.
+ */
+export function teammateFolders(state: EffortState, teammate: string | undefined, claudeDir: string | undefined, scratchpad: string | undefined): TeammateFolders | undefined {
+	const workspace = (teammate === undefined ? undefined : workdir(state, teammate)) ?? state.workspace?.path;
+	if (workspace === undefined) return undefined;
+	const shortId = state.teammates.find((each) => each.id === teammate)?.shortId;
+	const job = claudeDir === undefined || shortId === undefined ? {} : { job: `${claudeDir}/jobs/${shortId}` };
+	return { workspace, ...ownFolders({ config: claudeDir ?? "", ...job, scratchpad }) };
 }
 
 /** Merges of isolated Tasks written ahead and not yet resolved, for recovery to finish or undo. */
