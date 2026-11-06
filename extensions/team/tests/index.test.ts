@@ -1731,6 +1731,8 @@ describe("handing off: team_handoff", () => {
 			"Stop every process you start in the background",
 			"before you write your result",
 			"name each one you leave running, with its pid and command",
+			"Record each one's pid when you start it (`$!`) and stop it by that pid",
+			"never by name or pattern (`pkill`, `killall`, `kill $(pgrep …)`)",
 			join(dir, "brief.md"),
 			join(dir, "clarifications.md"),
 		];
