@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { awayText, currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openEscalations, openMerges, runningClause, type Step, step, taskStatus, type UsageItem, type UsageReading, usageText, waitingInTerminal, workdir } from "../core.ts";
+import { awayText, currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, needsClock, openEffort, openEscalations, openMerges, runningClause, type Step, step, taskStatus, type UsageItem, type UsageReading, usageText, WAITING_QUIET_MS, waitingInTerminal, workdir } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -413,25 +413,154 @@ describe("a Teammate's journal", () => {
 		assert.ok(wake.kind === "wake-lead" && wake.text.includes(RESULT));
 	});
 
-	it("counts a Stop without the round's result as stopped short, giving the Lead the last assistant message", () => {
-		const result = run(started, event(3, "Stop", { last_assistant_message: "I couldn't find the config loader." }));
+	it("counts a Stop without the round's result as a turn ended without one, giving the Lead the last assistant message and telling it not to nudge", () => {
+		const result = run(started, event(3, "Stop", { last_assistant_message: "I couldn't find the config loader.", background_tasks: [], session_crons: [] }));
 
 		assert.ok(result.ok, result.ok ? "" : result.refusal);
 		assert.deepEqual(result.append.map((line) => line.type), ["teammate-stopped"]);
 		const [wake] = result.actions;
 		const text = wake?.kind === "wake-lead" ? wake.text : "";
-		assert.match(text, /stopped short/);
+		assert.match(text, /`dev-1` ended its turn on Task `rename` without writing a new/);
+		assert.doesNotMatch(text, /stopped short/);
+		assert.match(text, /A Stop doesn't end its session/);
+		assert.match(text, /background task or Monitor is re-prompted when (it|that) ends/);
+		assert.match(text, /[Dd]on't nudge it/);
 		assert.match(text, /I couldn't find the config loader\./);
 		assert.ok(text.includes(RESULT));
+		assert.equal(result.state.teammates[0].doing, "ended its turn without a result");
 	});
 
-	it("doesn't count a result already reported as new", () => {
-		const done = applied(started, event(3, "Stop", {}, {}, true));
+	it("tells a turn ended without a result in the next Report neutrally, not as a failure", () => {
+		const ended = applied(started, event(3, "Stop", { last_assistant_message: "Waiting on the run." }));
 
-		const result = run(done, event(4, "Stop", { last_assistant_message: "Anything else?" }, {}, true));
+		const result = run(ended, { kind: "report", headline: "On track.", criteria: ["AC1"], modes: [], at: "2026-11-02T12:00:00.000Z" });
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const action = result.actions.find((each) => each.kind === "write-report");
+		const since = action?.kind === "write-report" ? action.report.sections.find((each) => each.title === "Since the last Report")?.lines : undefined;
+		assert.ok(since?.some((line) => line.endsWith("dev-1 ended its turn on Task `rename` without a result")), JSON.stringify(since));
+		assert.ok(!since?.some((line) => /stopped short/.test(line)), JSON.stringify(since));
+	});
+
+	it("doesn't wake the Lead for a Stop while the Teammate's own background task or Monitor runs, logging a line no Report tells", () => {
+		const background_tasks = [
+			{ id: "bjzc7brur", type: "shell", status: "running", description: "Signal when the timed playthrough exits", command: "while kill -0 63058; do sleep 5; done" },
+			{ id: "bdt4xjp7i", type: "shell", status: "running", description: "Run the timed playthrough", command: "node timed.mjs" },
+		];
+
+		const result = run(started, event(3, "Stop", { last_assistant_message: "I'm waiting on the monitor's exit notice.", background_tasks, session_crons: [] }));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append.map((line) => [line.type, (line as { cursor: number }).cursor]), [["teammate-waiting", 3]]);
+		assert.deepEqual(result.actions, []);
+		assert.equal(result.state.teammates[0].activity, "idle");
+		assert.equal(result.state.teammates[0].doing, "waiting on its background work");
+		assert.deepEqual(result.state.sinceReport, fold(started).sinceReport, "no Report tells of it");
+	});
+
+	describe("a Teammate waiting on its background work that goes quiet", () => {
+		const background_tasks = [{ id: "b1", type: "shell", status: "running", description: "npm start" }];
+		// The Stop lands at 11:33.
+		const waiting = applied(started, event(3, "Stop", { last_assistant_message: "Which port should the server use?", background_tasks }));
+		const tick = (at: string): EffortInput => ({ kind: "tick", at });
+		const quietUntil = new Date(Date.parse("2026-11-02T11:33:00.000Z") + WAITING_QUIET_MS).toISOString();
+
+		it("wakes the Lead once, as a turn ended without a result, when nothing comes from it for WAITING_QUIET_MS", () => {
+			assert.equal(WAITING_QUIET_MS, 10 * 60_000);
+			const early = run(waiting, tick(new Date(Date.parse(quietUntil) - 1).toISOString()));
+			assert.ok(early.ok);
+			assert.deepEqual([early.append, early.actions], [[], []]);
+
+			const due = run(waiting, tick(quietUntil));
+
+			assert.ok(due.ok, due.ok ? "" : due.refusal);
+			assert.deepEqual(due.append.map((line) => [line.type, (line as { cursor: number }).cursor]), [["teammate-stopped", 3]]);
+			const [wake] = due.actions;
+			const text = wake?.kind === "wake-lead" ? wake.text : "";
+			assert.match(text, /`dev-1` ended its turn on Task `rename` without a result/);
+			assert.match(text, /nothing has come from it for 10 minutes/);
+			assert.match(text, /npm start/);
+			assert.match(text, /A Stop doesn't end its session/);
+			assert.match(text, /Which port should the server use\?/);
+			assert.equal(due.state.teammates[0].doing, "ended its turn without a result", "its prose question can be escalated");
+
+			const again = run([...waiting, ...due.append], tick(new Date(Date.parse(quietUntil) + 60_000).toISOString()));
+			assert.ok(again.ok);
+			assert.deepEqual([again.append, again.actions], [[], []], "once only");
+		});
+
+		it("cancels the wait on any further hook activity from the Teammate, a tool call included", () => {
+			const used = run(waiting, event(4, "PreToolUse", { tool_name: "Bash", tool_input: { command: "curl localhost:3000" } }));
+			assert.ok(used.ok, used.ok ? "" : used.refusal);
+			assert.deepEqual(used.append.map((line) => [line.type, (line as { cursor: number }).cursor]), [["teammate-active", 4]]);
+			assert.deepEqual(used.actions, []);
+			assert.deepEqual(used.state.sinceReport, fold(waiting).sinceReport, "no Report tells of it");
+
+			const after = run([...waiting, ...used.append], tick(quietUntil));
+			assert.ok(after.ok);
+			assert.deepEqual([after.append, after.actions], [[], []]);
+
+			const prompted = run(waiting, event(4, "UserPromptSubmit", { prompt: "<task-notification>b1 completed</task-notification>" }));
+			assert.ok(prompted.ok);
+			const afterPrompt = run([...waiting, ...prompted.append], tick(quietUntil));
+			assert.ok(afterPrompt.ok);
+			assert.deepEqual(afterPrompt.append, []);
+		});
+
+		it("restarts the wait on a later Stop that is waiting again", () => {
+			const again = applied(waiting, event(5, "Stop", { background_tasks }));
+			// That Stop lands at 11:35, two minutes on.
+			const result = run(again, tick(quietUntil));
+			assert.ok(result.ok);
+			assert.deepEqual(result.append, []);
+			const later = run(again, tick(new Date(Date.parse(quietUntil) + 2 * 60_000).toISOString()));
+			assert.ok(later.ok);
+			assert.deepEqual(later.append.map((line) => line.type), ["teammate-stopped"]);
+		});
+
+		it("keeps the clock running while a Teammate waits, so a restart's replay of effort.jsonl picks the wait up", () => {
+			assert.equal(needsClock(fold(started)), false);
+			assert.equal(needsClock(fold(waiting)), true);
+			assert.deepEqual(fold(waiting).teammates[0].waiting, { since: "2026-11-02T11:33:00.000Z", slug: "rename", on: ["npm start"], message: "Which port should the server use?" });
+		});
+	});
+
+	it("wakes the Lead as usual once the Teammate ends a turn with nothing in flight, after its background work woke it", () => {
+		const waiting = applied(started, event(3, "Stop", { background_tasks: [{ id: "b1", type: "monitor", status: "running", description: "Wait for the run" }] }));
+		const woken = applied(waiting, event(4, "UserPromptSubmit", { prompt: "<task-notification>b1 completed</task-notification>" }));
+
+		const result = run(woken, event(5, "Stop", { last_assistant_message: "The run failed; what next?", background_tasks: [], session_crons: [] }));
 
 		assert.ok(result.ok, result.ok ? "" : result.refusal);
 		assert.deepEqual(result.append.map((line) => line.type), ["teammate-stopped"]);
+		assert.equal(result.actions.length, 1);
+	});
+
+	it("doesn't count a Stop after the round's result is reported as anything: no turn-ended line, no Report line, no second wake", () => {
+		const first = run(started, event(3, "Stop", { last_assistant_message: "Renamed it." }, {}, true));
+		assert.ok(first.ok, first.ok ? "" : first.refusal);
+		const done = [...started, ...first.append];
+
+		const result = run(done, event(4, "Stop", { last_assistant_message: "That notice is a repeat; the result is already written." }, {}, true));
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const lines = [...first.append, ...result.append];
+		assert.deepEqual(lines.filter((line) => line.type === "task-done").length, 1);
+		assert.deepEqual(lines.filter((line) => line.type === "teammate-stopped"), []);
+		assert.deepEqual([...first.actions, ...result.actions].filter((action) => action.kind === "wake-lead").length, 1);
+		assert.deepEqual(result.append.map((line) => [line.type, (line as { cursor: number }).cursor]), [["teammate-idle", 4]], "the cursor moves past the Stop");
+		assert.deepEqual(result.state.sinceReport, first.state.sinceReport, "no Report tells of it");
+		assert.equal(result.state.teammates[0].doing, "round 1 done");
+	});
+
+	it("doesn't read a Stop that came after the round was reported again, as a re-read after a send-back would", () => {
+		const done = applied(applied(started, event(3, "Stop", {}, {}, true)), event(4, "Stop", {}, {}, true));
+
+		assert.equal(fold(done).teammates[0].cursor, 4);
+		// Read again with round 2's result not written, as after a send-back.
+		const again = run(done, event(4, "Stop", {}, {}, false));
+		assert.ok(again.ok);
+		assert.deepEqual([again.append, again.actions], [[], []]);
 	});
 
 	it("applies each journal line once: a line at or before the Teammate's cursor changes nothing", () => {
@@ -1490,7 +1619,7 @@ describe("a Teammate's held requests", () => {
 
 		it("refuses a prose question from a Teammate it doesn't know or that hasn't stopped short, and a second one while the first is open", () => {
 			assert.match(refusal(stoppedShort, escalate({ teammate: "qa-1", question: "?" })), /no Teammate `qa-1`/);
-			assert.match(refusal(session, escalate({ teammate: "dev-1", question: "Keep the old key?" })), /stopped short/);
+			assert.match(refusal(session, escalate({ teammate: "dev-1", question: "Keep the old key?" })), /ended its turn without a result/);
 			assert.match(refusal(stoppedShort, escalate({ teammate: "dev-1" })), /question/);
 			const escalated = applied(stoppedShort, escalate({ teammate: "dev-1", question: "Keep the old key?" }));
 			assert.match(refusal(escalated, escalate({ teammate: "dev-1", question: "And the docs?" })), /`q1`/);

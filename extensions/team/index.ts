@@ -33,7 +33,9 @@ import {
 
 	type EffortAction,
 	type EffortInput,
+	type EffortLine,
 	type EffortState,
+	type EndedWorktree,
 	type Escalation,
 	escalationText,
 	type FinalFacts,
@@ -52,9 +54,11 @@ import {
 	type RunningProcess,
 	runningClause,
 	SIGN_OFF,
+	worktreesEndedNotes,
 	type Step,
 	step,
 	USAGE_CHOICES,
+	needsClock,
 	usageHolds,
 	type UsageItem,
 	usageText,
@@ -110,7 +114,7 @@ import {
 import { repoRoot } from "./repo.ts";
 import { askedInFull, askedQuestions, terminalText } from "./requests.ts";
 import { REPORT_OVERLAY, type ReportChrome, ReportView, type ReportTui } from "./reports-view.ts";
-import { addTaskWorkspace, addWorkspace, effortWorktrees, endWorktrees, mergeEvidence, mergeTaskWorkspace, removeTaskWorkspace } from "./workspace.ts";
+import { addTaskWorkspace, addWorkspace, type EffortWorktree, effortWorktrees, endWorktrees, mergeEvidence, mergeTaskWorkspace, removeTaskWorkspace } from "./workspace.ts";
 import {
 	ADOPT_PLAYBOOK,
 	APPROVE,
@@ -233,7 +237,7 @@ const AnswerParams = Type.Object({
 
 const EscalateParams = Type.Object({
 	request: Type.Optional(Type.String({ description: "The held request to escalate, `req-<8 hex>`. Leave it out to escalate a prose question with `teammate` and `question`." })),
-	teammate: Type.Optional(Type.String({ description: "For a prose question: the Teammate that stopped short asking it, such as `dev-1`." })),
+	teammate: Type.Optional(Type.String({ description: "For a prose question: the Teammate whose turn ended without a result asking it, such as `dev-1`." })),
 	question: Type.Optional(Type.String({ description: "For a prose question: the question, as the Teammate's last message asked it." })),
 	summary: Type.String({ description: "For the human: what is asked, and why the Brief doesn't settle it, in a sentence or two." }),
 	brief: Type.Optional(Type.String({ description: "What the Brief says on it, if anything; it goes into clarifications.md with the human's answer." })),
@@ -433,7 +437,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 	/** Run the Lead's clock while a usage limit holds anything back in the held Effort, and only then. */
 	function syncClock(state: EffortState | undefined): void {
-		if (state && usageHolds(state)) stopClock ??= every(TICK_MS, tickEffort);
+		if (state && needsClock(state)) stopClock ??= every(TICK_MS, tickEffort);
 		else {
 			stopClock?.();
 			stopClock = undefined;
@@ -1784,26 +1788,37 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * Let go of an Effort that has ended: its clean worktrees go and every
 	 * branch stays, then the bridge closes, `lead.json` marks no live Lead and
 	 * the session holds no Effort, so its tools are off and the block is gone.
-	 * While a Teammate didn't stop, its worktrees are all left in place.
+	 * While a Teammate didn't stop, its worktrees are all left in place. What
+	 * became of each worktree, and what still runs in it, goes on record as a
+	 * `worktrees-ended` line and to the Lead, so it never uses one that's gone.
 	 */
 	async function endEffort(held: HeldEffort, state: EffortState, said: string, unstopped: readonly string[], ctx: ExtensionContext): Promise<void> {
 		const notes = [said];
-		if (unstopped.length > 0) {
-			notes.push(`These didn't stop, so every worktree is left in place: ${unstopped.join(", ")}. Stop them with \`claude stop\`.`);
-		} else {
-			try {
+		const ended: Extract<EffortLine, { type: "worktrees-ended" }> = { type: "worktrees-ended", removed: [], kept: [], at: now().toISOString() };
+		const shown = (each: EffortWorktree): EndedWorktree => ({ path: each.path, branch: each.branch, running: each.running });
+		try {
+			if (unstopped.length > 0) {
+				notes.push(`These didn't stop, so every worktree is left in place: ${unstopped.join(", ")}. Stop them with \`claude stop\`.`);
+				const why = `${unstopped.length === 1 ? "a Teammate" : "Teammates"} didn't stop, so every worktree is left in place`;
+				ended.kept = effortWorktrees(state.repo, held.effortId, await sparedSessions(state)).map((each) => ({ ...shown(each), why }));
+			} else {
 				const { removed, kept } = endWorktrees(state.repo, held.effortId, await sparedSessions(state));
-				if (removed.length > 0) notes.push(`Removed the clean worktrees ${removed.map((each) => each.path).join(", ")}.`);
-				notes.push(...removed.flatMap((each) => removedRunning(each.path, each.running) ?? []));
-				for (const each of kept) {
-					const running = runningClause(each.running);
-					notes.push(`Kept ${each.path} (\`${each.branch}\`): ${each.why}${running ? `; ${running}` : ""}.`);
-				}
-			} catch (error) {
-				notes.push(`Its worktrees are left in place: ${error instanceof Error ? error.message : String(error)}.`);
+				ended.removed = removed.map(shown);
+				ended.kept = kept.map((each) => ({ ...shown(each), why: each.why }));
 			}
+		} catch (error) {
+			ended.error = error instanceof Error ? error.message : String(error);
 		}
-		notes.push("Every branch is kept.");
+		const told = worktreesEndedNotes(ended);
+		notes.push(...told);
+		try {
+			appendLines(held.paths, [ended]);
+		} catch (error) {
+			notes.push(`What became of the worktrees isn't on record in effort.jsonl: ${error instanceof Error ? error.message : String(error)}.`);
+		}
+		const lead = [said, ...told];
+		if (ended.removed.length > 0) lead.push("A removed worktree is gone: don't `cd` into it or run anything there; its branch keeps the work.");
+		if ([...ended.removed, ...ended.kept].some((each) => each.running.length > 0)) lead.push("Never stop a process named here yourself: tell the human, who decides.");
 		const open = bridge;
 		bridge = undefined;
 		await open?.then(
@@ -1820,7 +1835,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		paintBlock();
 		ctx.ui.notify(notes.join(" "), unstopped.length > 0 ? "warning" : "info");
 		pi.sendMessage(
-			{ customType: "team-ended", content: `${said} This session holds no Effort now, so the Team tools are off.`, display: true },
+			{ customType: "team-ended", content: `${lead.join(" ")} This session holds no Effort now, so the Team tools are off.`, display: true },
 			{ deliverAs: "nextTurn" },
 		);
 	}

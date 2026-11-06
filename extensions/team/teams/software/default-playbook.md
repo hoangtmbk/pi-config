@@ -43,9 +43,8 @@ each Rule against them. A Rule it can't carry out goes in the Brief as a `skip` 
 the Rule's id, which the Brief's approval and the plan Report show, and in the final Report as a
 proposed Playbook change. It is never skipped silently. A Role's model is set by its Role file,
 or for this Effort by the Brief's `roles:` (a Brief change applies from the Role's next launch).
-There is no per-Task choice, so a cheaper model
-for simpler Tasks means a separate Role (a `dev-lite` on Haiku, say), which the human adds: a
-Playbook change can't create a Role file.
+There is no per-Task choice, so a cheaper model for simpler Tasks means a separate Role (a
+`dev-lite` on Haiku, say), which the human adds: a Playbook change can't create a Role file.
 
 ## Brief sections
 
@@ -67,8 +66,9 @@ Besides the sections every Brief has, a Brief for this Team has:
 - **parallel-devs-disjoint**: two devs run at once only on slices the design says share no files,
   and each of those Tasks is an `isolated` handoff: its own worktree and branch, merged into the
   Effort's branch when the Lead accepts it. Otherwise dev Tasks run one after another.
-- The Lead staffs QA only once there's an integrated change to verify, and stops the architect
-  once the last review is done, to free a slot under `maxTeammates`.
+- The Lead staffs QA only once there's an integrated change to verify. The Lead doesn't stop
+  Teammates: once the architect's last Task is accepted, the extension stops it when another
+  Role's Task needs its slot under `maxTeammates`.
 
 ## Order of work
 

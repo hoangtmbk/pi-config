@@ -1733,6 +1733,8 @@ describe("handing off: team_handoff", () => {
 			"name each one you leave running, with its pid and command",
 			"Record each one's pid when you start it (`$!`) and stop it by that pid",
 			"never by name or pattern (`pkill`, `killall`, `kill $(pgrep …)`)",
+			"To wait on a long run, end your turn with a `Monitor` or background task watching it",
+			"Ending your turn doesn't end your session",
 			join(dir, "brief.md"),
 			join(dir, "clarifications.md"),
 		];
@@ -1792,6 +1794,14 @@ describe("handing off: team_handoff", () => {
 });
 
 /** The `effort.jsonl` lines of an Effort, parsed. */
+/** A `worktrees-ended` line as effort.jsonl holds it. */
+interface WorktreesEnded {
+	type: string;
+	removed: { path: string; branch: string; running: { pid: number; command: string }[] }[];
+	kept: { path: string; branch: string; running: { pid: number; command: string }[]; why: string }[];
+	error?: string;
+}
+
 function effortLines(dir: string): Record<string, unknown>[] {
 	return readFileSync(join(dir, "effort.jsonl"), "utf8")
 		.split("\n")
@@ -1867,7 +1877,7 @@ describe("a Teammate's events reach the Lead", () => {
 		]);
 	});
 
-	it("wakes the Lead with \"stopped short\" and the last assistant message when a Stop comes without a new result", async () => {
+	it("wakes the Lead that the turn ended without a result, with the last assistant message, when a Stop comes without a new result", async () => {
 		const { pi, dir } = await crewApproved({
 			hooks: [
 				{ event: "SessionStart", payload: { source: "startup" } },
@@ -1880,9 +1890,88 @@ describe("a Teammate's events reach the Lead", () => {
 
 		const wakes = teammateWakes(pi.sent);
 		assert.equal(wakes.length, 1);
-		assert.match(wakes[0].content, /`builder-1` stopped short on Task `rename-key`/);
+		assert.match(wakes[0].content, /`builder-1` ended its turn on Task `rename-key` without writing a new/);
 		assert.ok(wakes[0].content.includes("I need the old config format before I can start."), wakes[0].content);
 		assert.ok(wakes[0].content.includes(join(dir, RENAME_RESULT)), wakes[0].content);
+		assert.equal(effortLines(dir).filter((line) => line.type === "teammate-stopped").length, 1);
+	});
+
+	it("wakes nobody when a Teammate ends its turn to wait on its own Monitor, which the Stop hook lists as running", async () => {
+		const { pi, dir } = await crewApproved({
+			hooks: [
+				{ event: "SessionStart", payload: { source: "startup" } },
+				{
+					event: "Stop",
+					payload: {
+						last_assistant_message: "I'm waiting on the monitor's exit notice rather than polling.",
+						background_tasks: [{ id: "bjzc7brur", type: "shell", status: "running", description: "Signal when the playthrough exits", command: "while kill -0 63058; do sleep 5; done" }],
+						session_crons: [],
+					},
+				},
+			],
+		});
+		await pi.call("team_plan", { tasks: CREW_PLAN });
+
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+
+		await until(() => effortLines(dir).some((line) => line.type === "teammate-waiting"), "builder-1 waits");
+		assert.deepEqual(teammateWakes(pi.sent), []);
+		assert.equal(effortLines(dir).filter((line) => line.type === "teammate-stopped").length, 0);
+		assert.deepEqual(effortLines(dir).find((line) => line.type === "teammate-waiting")?.waitingOn, ["Signal when the playthrough exits"]);
+	});
+
+	/** builder-1 ends its turn on `rename-key` with a server left running in the background, then goes quiet. */
+	async function quietWait() {
+		const crew = await crewApproved({
+			hooks: [
+				{ event: "SessionStart", payload: { source: "startup" } },
+				{
+					event: "Stop",
+					payload: {
+						last_assistant_message: "Which port should the server use?",
+						background_tasks: [{ id: "b1", type: "shell", status: "running", description: "npm start", command: "npm start" }],
+						session_crons: [],
+					},
+				},
+			],
+		});
+		await crew.pi.call("team_plan", { tasks: CREW_PLAN });
+		await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await until(() => effortLines(crew.dir).some((line) => line.type === "teammate-waiting"), "builder-1 waits");
+		// The hook stamps the Stop with the real clock; the wait counts from it.
+		const since = Date.parse(String(effortLines(crew.dir).find((line) => line.type === "teammate-waiting")?.at));
+		return { ...crew, since };
+	}
+
+	it("wakes the Lead, once, when a Teammate waiting on its background work stays quiet for 10 minutes", async () => {
+		const { pi, dir, since } = await quietWait();
+
+		pi.travel(new Date(since + 10 * 60_000 - 1000).toISOString());
+		await pi.tick();
+		assert.equal(pi.sent.filter((message) => /nothing has come from it/.test(message.content)).length, 0);
+
+		pi.advance(1000);
+		await pi.tick();
+		const wakes = pi.sent.filter((message) => /nothing has come from it for 10 minutes/.test(message.content));
+		assert.equal(wakes.length, 1);
+		assert.match(wakes[0].content, /`builder-1` ended its turn on Task `rename-key` without a result/);
+		assert.match(wakes[0].content, /Which port should the server use\?/);
+		assert.equal(effortLines(dir).filter((line) => line.type === "teammate-stopped").length, 1);
+
+		pi.advance(60_000);
+		await pi.tick();
+		assert.equal(pi.sent.filter((message) => /nothing has come from it/.test(message.content)).length, 1, "once only");
+	});
+
+	it("picks a quiet wait up after pi restarts, from effort.jsonl alone", async () => {
+		const { pi, roots, repo, dir, since } = await quietWait();
+		await pi.emit("session_shutdown", { reason: "quit" });
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		again.travel(new Date(since + 10 * 60_000).toISOString());
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.ok(again.sent.some((message) => /`builder-1` ended its turn on Task `rename-key` without a result, and nothing has come from it for 10 minutes/.test(message.content)), JSON.stringify(again.sent.map((message) => message.content)));
 		assert.equal(effortLines(dir).filter((line) => line.type === "teammate-stopped").length, 1);
 	});
 
@@ -4320,7 +4409,28 @@ describe("ending an Effort: the final Report and sign-off", () => {
 		assert.equal(signed?.report, sha(readFileSync(report)));
 		const stops = pi.claude.calls().filter((argv) => argv[0] === "stop").map((argv) => argv[1]);
 		assert.deepEqual(stops.sort(), [...shortIds].sort());
-		assert.deepEqual(effortLines(dir).at(-1), { type: "effort-ended", how: "signed-off", at: NOW.toISOString() });
+		assert.deepEqual(effortLines(dir).at(-2), { type: "effort-ended", how: "signed-off", at: NOW.toISOString() });
+		const worktrees = effortLines(dir).at(-1) as WorktreesEnded | undefined;
+		assert.equal(worktrees?.type, "worktrees-ended");
+		assert.deepEqual(
+			worktrees?.removed.map((each) => [each.path, each.branch, each.running]).sort(),
+			[
+				[workspace, `team/${CREW_EFFORT_ID}`, []],
+				[clean.path, clean.branch, []],
+			].sort(),
+		);
+		assert.deepEqual(
+			worktrees?.kept.map((each) => [each.path, each.branch, each.running, each.why]),
+			[[dirty.path, dirty.branch, [], "it has uncommitted changes (`notes.txt`)"]],
+		);
+		const ended = pi.sent.filter((message) => message.customType === "team-ended").map((message) => message.content);
+		assert.equal(ended.length, 1);
+		assert.ok(ended[0].includes(`Removed the clean worktrees `), ended[0]);
+		assert.ok(ended[0].includes(`${workspace}`), ended[0]);
+		assert.ok(ended[0].includes(`Kept ${dirty.path} (\`${dirty.branch}\`): it has uncommitted changes`), ended[0]);
+		assert.match(ended[0], /Every branch is kept\./);
+		assert.match(ended[0], /A removed worktree is gone: don't `cd` into it/);
+		assert.doesNotMatch(ended[0], /Never stop a process/, "nothing was left running");
 		assert.deepEqual(effortLines(dir).filter((line) => line.type === "teammate-crashed"), [], "the SessionEnds of the sign-off's own stops are no crash");
 		assert.ok(!teammateWakes(pi.sent).some((wake) => /session ended/.test(wake.content)), "nobody is woken about the stops");
 		assert.equal(existsSync(workspace), false);
@@ -4379,6 +4489,29 @@ describe("ending an Effort: the final Report and sign-off", () => {
 			assert.equal(existsSync(path), false);
 			assert.doesNotThrow(() => process.kill(pid, 0), "sign-off doesn't stop it");
 		}
+
+		// What sign-off did is on record, not only in a toast.
+		const worktrees = effortLines(dir).at(-1) as WorktreesEnded | undefined;
+		assert.equal(worktrees?.type, "worktrees-ended");
+		assert.deepEqual(worktrees?.kept, []);
+		assert.deepEqual(
+			worktrees?.removed.map((each) => [each.path, each.branch, each.running]).sort(),
+			[
+				[task.path, task.branch, [{ pid: inTask, command: "sleep 300" }]],
+				[workspace, `team/${CREW_EFFORT_ID}`, [{ pid: inWorkspace, command: "sleep 300" }]],
+			].sort(),
+		);
+		// And the Lead hears it, so it never uses a removed Workspace, nor stops what runs there.
+		const ended = pi.sent.find((message) => message.customType === "team-ended")?.content ?? "";
+		for (const [path, pid] of [
+			[task.path, inTask],
+			[workspace, inWorkspace],
+		] as const) {
+			assert.ok(ended.includes(`${path} is removed, but pid ${pid} (\`sleep 300\`) is still running in it`), ended);
+		}
+		assert.match(ended, /A removed worktree is gone: don't `cd` into it or run anything there; its branch keeps the work\./);
+		assert.match(ended, /Every branch is kept\./);
+		assert.match(ended, /Never stop a process named here yourself: tell the human/);
 	});
 
 	it("doesn't spare a process by the pid of a session stopped long before, which the system may have handed on", async (t) => {
@@ -4478,7 +4611,7 @@ describe("ending an Effort: the final Report and sign-off", () => {
 		assert.deepEqual(record && { request: record.request, change: record.change, playbook: record.playbook }, { request: "r3", change: "tiny-diffs", playbook: sha(Buffer.from(now)) });
 		const json = JSON.parse(readFileSync(join(playbooksDir(roots), "crew.adopted.json"), "utf8")) as { sha256: string };
 		assert.equal(json.sha256, sha(Buffer.from(now)));
-		assert.equal(effortLines(dir).at(-1)?.type, "effort-ended");
+		assert.equal(effortLines(dir).at(-2)?.type, "effort-ended");
 	});
 
 	it("waits to sign off until each proposed change is answered", async () => {
@@ -4516,7 +4649,8 @@ describe("ending an Effort: the final Report and sign-off", () => {
 
 		assert.match(pi.dialogs.at(-1)?.title ?? "", /Cancel Effort `crew-2026-11-02`\?/);
 		assert.equal(pi.claude.calls().filter((argv) => argv[0] === "stop").length, 2);
-		assert.deepEqual(effortLines(dir).at(-1), { type: "effort-ended", how: "cancelled", at: NOW.toISOString() });
+		assert.deepEqual(effortLines(dir).at(-2), { type: "effort-ended", how: "cancelled", at: NOW.toISOString() });
+		assert.deepEqual((effortLines(dir).at(-1) as WorktreesEnded | undefined)?.kept.map((each) => each.path), [dirty.path]);
 		assert.equal(approvals(dir).some((record) => record.act === "sign-off"), false);
 		assert.equal(existsSync(workspace), false);
 		assert.equal(existsSync(clean.path), false);
