@@ -266,14 +266,22 @@ session's scratchpad. The floor hook and `team_answer` work these out with one f
 `floor.mjs`, so they agree on every command. Once trusted, `$CLAUDE_JOB_DIR` in a command reads as
 the job folder, unless the command sets it; unquoted, only where bash can't split it.
 
-A name the command sets itself reads as the path it holds, only in its double-quoted form (`"$T"`,
-`"$T"/x`, `"${T}/x"`), and only when there's no doubt: a plain `T=value` of its own, set nowhere
-else in the line and never exported, read or unset, in a text with no group, subshell, function,
+A name the command sets itself reads as the path it holds (`"$T"`, `"$T"/x`, `"${T}/x"`; unquoted
+`$T/x` or `${T}/x` under the `$CLAUDE_JOB_DIR` rule: a value with no whitespace or glob character,
+and no `IFS` in the line), and only when there's no doubt: a plain `T=value` of its own, set
+nowhere else in the line and never exported, read or unset, in a text with no group, subshell,
 loop, `if`, `case`, `eval` or `source`; outside a `$(…)`, a pipeline or a backgrounded list; sure
 to have run before the delete (earlier in its `&&` chain, or leading an earlier list); and a value
 that is a literal absolute path or starts with `$PWD` (the directory known), the trusted
-`$CLAUDE_JOB_DIR` or such a name. So `T="$CLAUDE_JOB_DIR/tmp/smoke" && rm -rf "$T"` is inside;
-`T=$(pwd) && rm -rf "$T"`, `rm -rf $T` unquoted, and any name set twice are not.
+`$CLAUDE_JOB_DIR` or such a name. A function defined in the line (`K(){ …; }` or
+`function K { …; }`) doesn't stop this unless its body may change a name it doesn't spell out:
+`read`, `export`, `unset`, `declare`, `local`, `typeset`, `readonly`, `eval`, `source`, `.`,
+`mapfile`, `getopts`, `let`, `trap`, `printf -v`, or a command held in a variable; a body that
+isn't a `{ … }` group counts as one that may. An assignment in a body binds nothing, and a delete
+in a body is read where the body is written, not where it's called. So
+`T="$CLAUDE_JOB_DIR/tmp/smoke" && rm -rf "$T"` and `Q=/…/tmp/qa; rm -f $Q/a; K(){ node x "$@"; }`
+are inside; `T=$(pwd) && rm -rf "$T"`, `T='/…/a b'; rm -rf $T`, `K(){ eval "$1"; }` before the
+delete, and any name set twice are not.
 
 A request to a local host (`localhost`, `127.x`, `::1`, `0.0.0.0`) is no send, and the floor reads
 the host when it's written out, even with the port or path in a variable

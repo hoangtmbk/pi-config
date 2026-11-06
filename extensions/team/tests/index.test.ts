@@ -1761,7 +1761,8 @@ describe("handing off: team_handoff", () => {
 			'`rm -rf "$CLAUDE_JOB_DIR"/tmp/old`',
 			'`cd "$CLAUDE_JOB_DIR"/tmp/<folder>`',
 			"Don't put the folder in a variable",
-			"`T=$CLAUDE_JOB_DIR/tmp/x; rm -rf $T`",
+			'`T="$CLAUDE_JOB_DIR/tmp/x" && rm -rf "$T"`',
+			"no loop, `if`, `case`, `{ … }` group, `eval` or `source`",
 			"waits on the Lead",
 			// A local server's URL, written out (#142).
 			'`curl -X PUT -d v "http://127.0.0.1:$PORT/keys/a"`',
@@ -1770,7 +1771,8 @@ describe("handing off: team_handoff", () => {
 			assert.ok(prompt.includes(fact), `the preamble should say: ${fact}\n\n${prompt}`);
 		}
 		// Claude Code places the job folder under `$CLAUDE_CONFIG_DIR` when it is set, so no `~/.claude` path is promised.
-		for (const stale of ["~/.claude/jobs", "no shell variable"]) assert.ok(!prompt.includes(stale), `the preamble shouldn't say: ${stale}\n\n${prompt}`);
+		// An unquoted name set once, plainly, reads as the folder since #144, so it is no example of a delete that waits.
+		for (const stale of ["~/.claude/jobs", "no shell variable", "`T=$CLAUDE_JOB_DIR/tmp/x; rm -rf $T`"]) assert.ok(!prompt.includes(stale), `the preamble shouldn't say: ${stale}\n\n${prompt}`);
 	});
 
 	it("launches with `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` unset, even when pi has it set", async () => {
