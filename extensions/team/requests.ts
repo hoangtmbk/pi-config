@@ -45,6 +45,8 @@ export interface HeldRequest {
 	toolUseId?: string;
 	/** The folder Claude Code ran the call from, when the payload said: relative deletes are read from it. */
 	cwd?: string;
+	/** The session's scratchpad, when the payload named one: a delete in it isn't on the floor, as for the floor hook. */
+	scratchpad?: string;
 	at: string;
 	state: RequestState;
 }
@@ -89,6 +91,8 @@ export interface AnswerTerms {
 	workspace: string;
 	/** The requesting Teammate's own temp folders, such as its Claude Code job temp folder: a delete inside one isn't on the floor either. */
 	roots?: string[];
+	/** The requesting Teammate's Claude Code job folder, which the floor reads `$CLAUDE_JOB_DIR` in its command as. */
+	jobDir?: string;
 	/** The Playbook's grants and those the Brief's overrides add, less those it skips. */
 	grants: CitableGrant[];
 	/** The Brief's Delivery section, which the Lead cites as `delivery`; undefined when it says nothing. */
@@ -310,7 +314,7 @@ export function takeAnswer(held: HeldRequest, answer: RequestAnswer): TakenAnswe
 	if (escalation) {
 		return `${about} is what the Playbook's \`escalate\` entry \`${escalation.id}\` brings to the human even when you would allow it: move it to their pending items with \`team_escalate\`, or deny it with a reason.`;
 	}
-	const floor = held.tool === "Bash" && typeof held.input.command === "string" ? floorAction(held.input.command, { workspace: terms.workspace, ...(held.cwd === undefined ? {} : { cwd: held.cwd }), ...(terms.roots === undefined ? {} : { roots: terms.roots }) }) : undefined;
+	const floor = held.tool === "Bash" && typeof held.input.command === "string" ? floorAction(held.input.command, { workspace: terms.workspace, ...(held.cwd === undefined ? {} : { cwd: held.cwd }), ...(terms.roots === undefined ? {} : { roots: terms.roots }), ...(terms.jobDir === undefined ? {} : { jobDir: terms.jobDir }) }) : undefined;
 	if (floor) return takeFloorAnswer(held, answer, reason, terms, floor);
 	const logged = [`allowed ${call}: ${reason}`];
 	let updatedPermissions: SessionRule[] | undefined;

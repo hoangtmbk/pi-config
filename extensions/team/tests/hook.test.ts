@@ -251,6 +251,30 @@ describe("the hook script as the PreToolUse floor hook", () => {
 		const configured = await runHook(dir, "builder-1", bash("rm -f /cfg/jobs/bad941c8/tmp/x"), { HOME: "/home/qa", CLAUDE_CONFIG_DIR: "/cfg", CLAUDE_JOB_DIR: "/cfg/jobs/bad941c8" }, [WORKSPACE]);
 		assert.deepEqual(configured, { code: 0, output: "" });
 	});
+
+	it("reads `$CLAUDE_JOB_DIR` in a delete as the job folder once it is trusted, `cd` included, but never the folder itself or a reassigned one", async () => {
+		const dir = effortDir();
+		const job = { HOME: "/home/qa", CLAUDE_CONFIG_DIR: "", CLAUDE_JOB_DIR: "/home/qa/.claude/jobs/02878adf" };
+
+		for (const command of ["cd $CLAUDE_JOB_DIR/tmp/qa-gg && rm -rf mut && mkdir mut", "rm -rf $CLAUDE_JOB_DIR/tmp/old", 'rm -rf "${CLAUDE_JOB_DIR}/tmp/old"']) {
+			assert.deepEqual(await runHook(dir, "builder-1", bash(command), job, [WORKSPACE]), { code: 0, output: "" }, command);
+		}
+		for (const command of ["rm -rf $CLAUDE_JOB_DIR", "rm -rf $CLAUDE_JOB_DIR/tmp", "CLAUDE_JOB_DIR=/etc; rm -rf $CLAUDE_JOB_DIR/tmp/x", "export CLAUDE_JOB\\_DIR=/etc; rm -rf $CLAUDE_JOB_DIR/tmp/x"]) {
+			assert.match((await runHook(dir, "builder-1", bash(command), job, [WORKSPACE])).output, /floor: delete/, command);
+		}
+		// Untrusted, or not set: the variable is unknown.
+		for (const env of [{ ...job, CLAUDE_JOB_DIR: "/elsewhere/jobs/02878adf" }, { ...job, CLAUDE_JOB_DIR: "" }]) {
+			assert.match((await runHook(dir, "builder-1", bash("rm -rf /elsewhere/jobs/02878adf/tmp/x $CLAUDE_JOB_DIR/tmp/x"), env, [WORKSPACE])).output, /floor: delete/, env.CLAUDE_JOB_DIR);
+		}
+	});
+
+	it("with `CLAUDE_CONFIG_DIR=/x`, reads a delete under `/x/jobs/<id>/tmp` as inside and one under `~/.claude/jobs/<id>/tmp` as a floor delete", async () => {
+		const dir = effortDir();
+		const env = { HOME: "/home/qa", CLAUDE_CONFIG_DIR: "/x", CLAUDE_JOB_DIR: "/x/jobs/02878adf" };
+
+		assert.deepEqual(await runHook(dir, "builder-1", bash("rm -rf /x/jobs/02878adf/tmp/a"), env, [WORKSPACE]), { code: 0, output: "" });
+		assert.match((await runHook(dir, "builder-1", bash("rm -rf ~/.claude/jobs/02878adf/tmp/a"), env, [WORKSPACE])).output, /floor: delete/);
+	});
 });
 
 /**

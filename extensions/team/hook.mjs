@@ -51,9 +51,8 @@
 import { randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { connect } from "node:net";
-import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { floorAction } from "./floor.mjs";
+import { join } from "node:path";
+import { claudeConfigDir, floorAction, ownFolders } from "./floor.mjs";
 
 /** How long the doorbell may take before the hook gives up on it; the journal line is already written. */
 const DOORBELL_TIMEOUT_MS = 2_000;
@@ -181,29 +180,22 @@ function hold(journal, request) {
 }
 
 /**
- * The Teammate's own temp folders, where a delete isn't on the floor: its
- * Claude Code job temp folder, `$CLAUDE_JOB_DIR/tmp`, which Claude Code sets
- * for a background session and tells it to keep scratch files in, and the
- * session's scratchpad when the payload names one. `$CLAUDE_JOB_DIR` is
- * trusted only when it is a folder directly under `jobs` in Claude Code's
- * config folder (`$CLAUDE_CONFIG_DIR`, else `~/.claude`), as Claude Code
- * itself checks; `floorAction` drops a root that is relative, `/` or the
- * home folder itself.
+ * The floor hook's `ask` for a `PreToolUse` of a floor command, or undefined
+ * to let it through. A delete in the Teammate's own folders isn't on the
+ * floor: its Claude Code job temp folder, `$CLAUDE_JOB_DIR/tmp`, which Claude
+ * Code sets for a background session and tells it to keep scratch files in,
+ * and the session's scratchpad when the payload names one. `ownFolders`
+ * trusts `$CLAUDE_JOB_DIR` only directly under `jobs` in Claude Code's config
+ * folder, as `team_answer` does with the Teammate's short id; once trusted,
+ * the floor also reads `$CLAUDE_JOB_DIR` in the command as that folder.
  */
-function ownTempFolders(payload) {
-	const job = process.env.CLAUDE_JOB_DIR;
-	const config = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
-	const trusted = job && isAbsolute(job) && isAbsolute(config) && dirname(resolve(job)) === resolve(config, "jobs");
-	return [...(trusted ? [join(resolve(job), "tmp")] : []), ...(typeof payload.scratchpad_dir === "string" ? [payload.scratchpad_dir] : [])];
-}
-
-/** The floor hook's `ask` for a `PreToolUse` of a floor command, or undefined to let it through. */
 function floorAsk(payload) {
 	if (payload?.hook_event_name !== "PreToolUse" || payload.tool_name !== "Bash") return undefined;
 	const command = payload.tool_input?.command;
 	const root = workspace || payload.cwd;
 	if (typeof command !== "string" || typeof root !== "string") return undefined;
-	const floor = floorAction(command, { workspace: root, cwd: typeof payload.cwd === "string" ? payload.cwd : undefined, roots: ownTempFolders(payload) });
+	const own = ownFolders({ config: claudeConfigDir(), job: process.env.CLAUDE_JOB_DIR, scratchpad: payload.scratchpad_dir });
+	const floor = floorAction(command, { workspace: root, cwd: typeof payload.cwd === "string" ? payload.cwd : undefined, ...own });
 	if (floor === undefined) return undefined;
 	return {
 		hookSpecificOutput: {

@@ -231,6 +231,12 @@ Teammate's terminal meanwhile, and the first answer wins. Nothing is allowed by 
 
 The next Report logs every answer, rule and grant under Decided for you, with the Task.
 
+A delete is a floor action only outside the Teammate's own folders: its Workspace, its Claude Code
+job temp folder (`$CLAUDE_JOB_DIR/tmp`, under `$CLAUDE_CONFIG_DIR` or else `~/.claude`) and its
+session's scratchpad. The floor hook and `team_answer` work these out with one function in
+`floor.mjs`, so they agree on every command. Once trusted, `$CLAUDE_JOB_DIR` in a command reads as
+the job folder, unless the command sets it; unquoted, only where bash can't split it.
+
 ### Reviewing
 
 Once woken about a result, the Lead decides on it with `team_review`, which refuses while the

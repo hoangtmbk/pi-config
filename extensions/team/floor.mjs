@@ -35,11 +35,16 @@ import { posix } from "node:path";
  *
  * A path is read under `home` only when it starts with a home prefix the
  * shell is sure to expand ({@link HOME_START}) and nothing in the command
- * line names HOME otherwise ({@link namesHome}). Any other spelling of `~`
- * or a variable leaves the path unknown, so outside.
+ * line names HOME otherwise ({@link namesHome}). In the same way, a path is
+ * read under `jobDir`, the Teammate's trusted Claude Code job folder, only
+ * when it starts with `$CLAUDE_JOB_DIR/` or `${CLAUDE_JOB_DIR}/`
+ * ({@link JOB_START}) and nothing in the command line names CLAUDE_JOB_DIR
+ * otherwise ({@link namesJob}); unquoted, only when bash can't split it
+ * either ({@link splittable}). Any other spelling of `~` or a variable leaves
+ * the path unknown, so outside.
  *
  * @param {string} command the Bash command as the Teammate wrote it
- * @param {{ workspace: string, cwd?: string, roots?: string[], home?: string }} where the Workspace, the directory the command runs in (the Workspace when not given), the other folders a delete under counts as inside, and the home folder (this user's when not given)
+ * @param {{ workspace: string, cwd?: string, roots?: string[], home?: string, jobDir?: string }} where the Workspace, the directory the command runs in (the Workspace when not given), the other folders a delete under counts as inside, the home folder (this user's when not given), and the trusted value of `$CLAUDE_JOB_DIR` (unknown when not given)
  * @returns {{ kind: "push" | "publish" | "deploy" | "delete" | "send", command: string } | undefined}
  */
 export function floorAction(command, where) {
@@ -47,7 +52,12 @@ export function floorAction(command, where) {
 	const home = posix.resolve(where.home ?? homedir());
 	const own = (where.roots ?? []).filter((root) => posix.isAbsolute(root)).map((root) => posix.resolve(root));
 	const roots = [workspace, ...own.filter((root) => root !== "/" && root !== home)];
-	return scan(command, { roots, home: namesHome(command) ? undefined : home, cwd: where.cwd === undefined ? workspace : posix.resolve(where.cwd) }, 0);
+	const job = typeof where.jobDir === "string" && posix.isAbsolute(where.jobDir) && !namesJob(command) ? posix.resolve(where.jobDir) : undefined;
+	return scan(
+		command,
+		{ roots, home: namesHome(command) ? undefined : home, job, bareJob: job === undefined || splittable(job, command) ? undefined : job, cwd: where.cwd === undefined ? workspace : posix.resolve(where.cwd) },
+		0,
+	);
 }
 
 /**
@@ -57,6 +67,66 @@ export function floorAction(command, where) {
  */
 function namesHome(command) {
 	return /\bHOME\b/.test(command.replace(/\$\{HOME\}|\$HOME\b/g, ""));
+}
+
+/**
+ * Whether a command line names CLAUDE_JOB_DIR other than as
+ * `$CLAUDE_JOB_DIR` or `${CLAUDE_JOB_DIR}`, in any spelling: with quotes and
+ * backslashes taken out first, so `export CLAUDE_JOB\_DIR=…` and
+ * `declare "CLAUDE_JOB"_DIR=…` count, as does any `$'…'` string, which can
+ * spell the name in escapes. Then no `$CLAUDE_JOB_DIR` in it is read as the
+ * job folder.
+ */
+function namesJob(command) {
+	const rest = command.replace(/\$\{CLAUDE_JOB_DIR\}|\$CLAUDE_JOB_DIR(?![A-Za-z0-9_])/g, "");
+	return rest.includes("$'") || /CLAUDE_JOB_DIR/.test(unquoted(rest));
+}
+
+/**
+ * Whether bash may split or glob an unquoted expansion of `value` in this
+ * command line: the value holds whitespace or a glob character, or the line
+ * names IFS in any spelling. zsh doesn't split by default, but the floor
+ * can't tell which shell runs the line.
+ */
+function splittable(value, command) {
+	return /[\s*?[\]{}]/.test(value) || /IFS/.test(unquoted(command));
+}
+
+/** A command line with its quotes and backslashes taken out, so a name spelled in parts reads whole. */
+function unquoted(command) {
+	return command.replace(/[\\'"]/g, "");
+}
+
+/**
+ * Claude Code's config folder, where its job folders are: `$CLAUDE_CONFIG_DIR`,
+ * else `~/.claude`. pi's Teammates inherit pi's environment, so the floor
+ * hook and `team_answer` read the same one.
+ *
+ * @param {Record<string, string | undefined>} [env] the environment (this process's when not given)
+ * @param {string} [fallback] the folder when `CLAUDE_CONFIG_DIR` isn't set (`~/.claude` when not given)
+ * @returns {string}
+ */
+export function claudeConfigDir(env = process.env, fallback = posix.join(homedir(), ".claude")) {
+	return env.CLAUDE_CONFIG_DIR || fallback;
+}
+
+/**
+ * A Teammate's own folders, as both callers of {@link floorAction} work them
+ * out: its Claude Code job folder, trusted only when it is a folder directly
+ * under `jobs` in the config folder (as Claude Code itself checks), whose
+ * `tmp` is where Claude Code tells a background session to keep scratch
+ * files; and the session's scratchpad, when the hook payload names one. The
+ * result spreads into `floorAction`'s `where`.
+ *
+ * @param {{ config: string, job?: string, scratchpad?: unknown }} from the config folder ({@link claudeConfigDir}), the job folder (`$CLAUDE_JOB_DIR`, or `<config>/jobs/<short id>`), and the payload's `scratchpad_dir`
+ * @returns {{ jobDir?: string, roots: string[] }}
+ */
+export function ownFolders(from) {
+	const { config, job, scratchpad } = from;
+	const trusted = typeof job === "string" && posix.isAbsolute(job) && posix.isAbsolute(config) && posix.dirname(posix.resolve(job)) === posix.resolve(config, "jobs");
+	const jobDir = trusted ? posix.resolve(job) : undefined;
+	const roots = [...(jobDir === undefined ? [] : [posix.join(jobDir, "tmp")]), ...(typeof scratchpad === "string" ? [scratchpad] : [])];
+	return jobDir === undefined ? { roots } : { jobDir, roots };
 }
 
 /**
@@ -85,7 +155,12 @@ export function simpleCommands(command) {
 /** How deep `sh -c` and `eval` scripts are followed. */
 const MAX_DEPTH = 8;
 
-/** Scan one command text in its context; `cd` moves the context's directory for the commands after it. */
+/**
+ * Scan one command text in its context; `cd` moves the context's directory for
+ * the commands after it. A shell of its own (`sh -c`) may run without
+ * `CLAUDE_JOB_DIR`, under `sudo` or `env -i` say, so the job folder is
+ * unknown in its script; `eval` runs in this shell, so it keeps it.
+ */
 function scan(text, context, depth) {
 	let cwd = context.cwd;
 	for (const segment of segments(text)) {
@@ -93,12 +168,12 @@ function scan(text, context, depth) {
 		if (words.length === 0) continue;
 		const script = depth < MAX_DEPTH ? innerScript(words) : undefined;
 		if (script !== undefined) {
-			const inner = scan(script, { ...context, cwd }, depth + 1);
+			const inner = scan(script, { ...context, cwd, ...(words[0] === "eval" ? {} : { job: undefined, bareJob: undefined }) }, depth + 1);
 			if (inner) return inner;
 			continue;
 		}
 		if (words[0] === "cd" || words[0] === "pushd") {
-			cwd = changeDir(cwd, words[1] === undefined ? undefined : homeExpanded(words[1], context.home));
+			cwd = changeDir(cwd, words[1] === undefined ? undefined : expanded(words[1], context));
 			continue;
 		}
 		if (words[0] === "popd") {
@@ -128,22 +203,41 @@ const HOME_START = /~\/|\$HOME\/|\$\{HOME\}\/|"\$HOME"?\/|"\$\{HOME\}"?\//y;
 const HOME_PREFIX = /^(?:~|\$HOME|\$\{HOME\})(?=\/)/;
 
 /**
- * The mark {@link segments} puts before a word that starts with a
- * {@link HOME_START} prefix. No shell word can hold it, and {@link plain}
- * takes it off.
+ * The job folder prefixes the shell is sure to expand, as written at a word's
+ * start: `$CLAUDE_JOB_DIR` or `${CLAUDE_JOB_DIR}` as a whole double-quoted
+ * token, the `/` after it inside the quotes or not (group 1), or unquoted
+ * (group 2), which bash may split ({@link splittable}). Any other spelling,
+ * quoted or escaped in part, isn't one.
+ */
+const JOB_START = /("\$CLAUDE_JOB_DIR"?\/|"\$\{CLAUDE_JOB_DIR\}"?\/)|(\$CLAUDE_JOB_DIR\/|\$\{CLAUDE_JOB_DIR\}\/)/y;
+
+/** A job folder prefix once its quotes are gone, as it starts a {@link JOB} or {@link BARE_JOB} word. */
+const JOB_PREFIX = /^(?:\$CLAUDE_JOB_DIR|\$\{CLAUDE_JOB_DIR\})(?=\/)/;
+
+/**
+ * The marks {@link segments} puts before a word that starts with a
+ * {@link HOME_START} prefix, a double-quoted {@link JOB_START} prefix, or an
+ * unquoted one. No shell word can hold them, and {@link plain} takes them off.
  */
 const HOME = "\u0000";
+const JOB = "\u0001";
+const BARE_JOB = "\u0002";
 
-/** A word without its {@link HOME} mark. */
+/** A word without its mark. */
 function plain(word) {
-	return word.startsWith(HOME) ? word.slice(HOME.length) : word;
+	return word.startsWith(HOME) || word.startsWith(JOB) || word.startsWith(BARE_JOB) ? word.slice(1) : word;
 }
 
-/** A word with its home prefix read as `home` when it carries the {@link HOME} mark and `home` is known; any other word as it is written. */
-function homeExpanded(word, home) {
-	if (!word.startsWith(HOME)) return word;
+/**
+ * A word with its prefix read as the folder its mark names, when the context
+ * knows that folder: {@link HOME} as `home`, {@link JOB} as `job` and
+ * {@link BARE_JOB} as `bareJob`. Any other word as it is written.
+ */
+function expanded(word, context) {
 	const bare = plain(word);
-	return home === undefined ? bare : bare.replace(HOME_PREFIX, () => home);
+	if (word.startsWith(HOME)) return context.home === undefined ? bare : bare.replace(HOME_PREFIX, () => context.home);
+	const job = word.startsWith(JOB) ? context.job : word.startsWith(BARE_JOB) ? context.bareJob : undefined;
+	return job === undefined ? bare : bare.replace(JOB_PREFIX, () => job);
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +248,8 @@ function homeExpanded(word, home) {
  * and the text it was written as. A `$(…)` or backtick substitution is a
  * command of its own, listed before the command it sits in; its place in that
  * command's word reads as `$(…)`, an unknown value. A word that starts, as
- * written, with a {@link HOME_START} prefix carries the {@link HOME} mark.
+ * written, with a {@link HOME_START} or {@link JOB_START} prefix carries the
+ * mark for it.
  */
 function segments(text) {
 	const out = [];
@@ -165,15 +260,15 @@ function segments(text) {
 	let end = 0;
 	let redirect = false;
 	let atCommandStart = true;
-	// Whether the word, as written, starts with a home prefix the shell is sure to expand.
-	let homeStart = false;
+	// The mark for the prefix the word, as written, starts with, when the shell is sure to expand it.
+	let mark = "";
 	const endWord = () => {
 		if (!inWord) return;
 		if (redirect) redirect = false;
-		else words.push(homeStart ? `${HOME}${word}` : word);
+		else words.push(`${mark}${word}`);
 		word = "";
 		inWord = false;
-		homeStart = false;
+		mark = "";
 	};
 	const endSegment = () => {
 		endWord();
@@ -186,7 +281,9 @@ function segments(text) {
 		if (start < 0) start = i;
 		if (!inWord) {
 			HOME_START.lastIndex = i;
-			homeStart = HOME_START.test(text);
+			JOB_START.lastIndex = i;
+			const job = JOB_START.exec(text);
+			mark = HOME_START.test(text) ? HOME : job ? (job[1] === undefined ? BARE_JOB : JOB) : "";
 		}
 		inWord = true;
 	};
@@ -712,11 +809,11 @@ const DELETERS = new Set(["rm", "rmdir", "unlink", "shred", "srm", "trash", "tra
  * Is a path, as the command names it, outside the Workspace and the other
  * roots? A root itself counts as outside unless `within` says a deletion
  * there only reaches what is under it (as `find`'s starting point does).
- * A home prefix is the home folder only in a word with the {@link HOME}
- * mark; anything else unknown counts as outside.
+ * A home or job folder prefix is that folder only in a word with its mark
+ * ({@link expanded}); anything else unknown counts as outside.
  */
 function outside(written, context, within = false) {
-	const target = homeExpanded(written, context.home);
+	const target = expanded(written, context);
 	if (target === "" || target.startsWith("~") || target.includes("$") || target.includes("`")) return true;
 	if (!target.startsWith("/") && context.cwd === undefined) return true;
 	const resolved = posix.resolve(context.cwd ?? "/", target);
@@ -753,7 +850,7 @@ function make(args) {
 	return undefined;
 }
 
-/** The floor kind of one simple command, past its wrappers, or undefined. Only deletes read the {@link HOME} mark. */
+/** The floor kind of one simple command, past its wrappers, or undefined. Only deletes read the marks {@link segments} puts on words. */
 function classify(marked, context) {
 	const words = marked.map(plain);
 	const [head, ...args] = words;

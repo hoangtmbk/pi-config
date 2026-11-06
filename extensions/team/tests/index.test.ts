@@ -1731,6 +1731,8 @@ describe("handing off: team_handoff", () => {
 			"Stop every process you start in the background",
 			"before you write your result",
 			"name each one you leave running, with its pid and command",
+			"Record each one's pid when you start it (`$!`) and stop it by that pid",
+			"never by name or pattern (`pkill`, `killall`, `kill $(pgrep …)`)",
 			join(dir, "brief.md"),
 			join(dir, "clarifications.md"),
 		];
@@ -1739,16 +1741,18 @@ describe("handing off: team_handoff", () => {
 		assert.ok(!prompt.includes("Old configs still load"), "the preamble must not copy the Brief");
 	});
 
-	it("names the Teammate's job temp folder in the preamble, and asks for delete paths written out in full, with no shell variable", async () => {
+	it("names the Teammate's job temp folder in the preamble as `$CLAUDE_JOB_DIR/tmp`, and how a delete in it doesn't wait on the Lead", async () => {
 		const { pi } = await crewApproved();
 		await pi.call("team_plan", { tasks: CREW_PLAN });
 
 		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
 
 		const prompt = pi.claude.launches()[0].prompt ?? "";
-		for (const fact of ["`$CLAUDE_JOB_DIR/tmp`", "`~/.claude/jobs/<short id>/tmp`", "write its path out in full", "no shell variable"]) {
+		for (const fact of ["`$CLAUDE_JOB_DIR/tmp`", '`rm -rf "$CLAUDE_JOB_DIR"/tmp/old`', '`cd "$CLAUDE_JOB_DIR"/tmp/<folder>`', "through any other variable", "waits on the Lead"]) {
 			assert.ok(prompt.includes(fact), `the preamble should say: ${fact}\n\n${prompt}`);
 		}
+		// Claude Code places the job folder under `$CLAUDE_CONFIG_DIR` when it is set, so no `~/.claude` path is promised.
+		for (const stale of ["~/.claude/jobs", "no shell variable"]) assert.ok(!prompt.includes(stale), `the preamble shouldn't say: ${stale}\n\n${prompt}`);
 	});
 
 	it("launches with `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` unset, even when pi has it set", async () => {
@@ -2411,20 +2415,36 @@ const FLOOR_PLAYBOOK = CREW_PLAYBOOK.replace("permissions:\n", "permissions:\n  
  * requests are held. `roots` are the temp folders to use, when a command names one,
  * and `sessionId` the session's id, whose first eight characters are its short id.
  */
-async function floorAsking(commands: string[], floors = commands.length, roots?: TempRoots, sessionId = "c0ffee12-0000-4000-8000-000000000001") {
+async function floorAsking(
+	commands: string[],
+	floors = commands.length,
+	roots?: TempRoots,
+	sessionId = "c0ffee12-0000-4000-8000-000000000001",
+	options: { env?: Record<string, string | undefined>; held?: FakeHookStep[] } = {},
+) {
 	const crew = await crewApproved({
 		roots,
+		env: options.env,
 		playbook: FLOOR_PLAYBOOK,
 		overrides: ["overrides:", "  - rule: open-pr", '    change: "add grant: open the pull request the Delivery asks for"', "    reason: The human reviews every change as a PR."],
 		hooks: [
 			{ event: "SessionStart", payload: { source: "startup", session_id: sessionId } },
 			{ event: "UserPromptSubmit", payload: { prompt: "New Task `rename-key`" } },
 			...commands.map((command): FakeHookStep => ({ event: "PreToolUse", payload: { tool_name: "Bash", tool_input: { command } } })),
+			...(options.held ?? []),
 		],
 	});
 	holding.push(crew.pi.claude);
 	await crew.pi.call("team_plan", { tasks: CREW_PLAN });
-	await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+	// The Teammate's hooks run with the test runner's environment: no job folder of its own for the floor hook to trust.
+	const job = process.env.CLAUDE_JOB_DIR;
+	process.env.CLAUDE_JOB_DIR = "";
+	try {
+		await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+	} finally {
+		if (job === undefined) delete process.env.CLAUDE_JOB_DIR;
+		else process.env.CLAUDE_JOB_DIR = job;
+	}
 	const held = () => effortLines(crew.dir).filter((line) => line.type === "request-held");
 	await until(() => held().length === floors, "the Lead holds a request for each floor command");
 	const request = (command: string): string => {
@@ -2488,6 +2508,38 @@ describe("the floor: irreversible outward actions reach the human", () => {
 
 		await pi.call("team_answer", { request: request(own), decision: "allow", reason: "Its own scratch file." });
 		await assert.rejects(pi.call("team_answer", { request: request(other), decision: "allow", reason: "A scratch file." }), /floor delete/);
+	});
+
+	it("takes an uncited allow of a delete written with `$CLAUDE_JOB_DIR` in the Teammate's own job temp folder, `cd` included, but not of the temp folder itself", async () => {
+		const commands = ["rm -rf $CLAUDE_JOB_DIR/tmp/old", "cd $CLAUDE_JOB_DIR/tmp/qa-gg && rm -rf mut && mkdir mut", "rm -rf $CLAUDE_JOB_DIR/tmp"];
+		const { pi, request } = await floorAsking(commands);
+
+		await pi.call("team_answer", { request: request(commands[0]), decision: "allow", reason: "Its own scratch folder." });
+		await pi.call("team_answer", { request: request(commands[1]), decision: "allow", reason: "Its own scratch folder." });
+		await assert.rejects(pi.call("team_answer", { request: request(commands[2]), decision: "allow", reason: "Its own scratch folder." }), /floor delete/);
+	});
+
+	it("with `CLAUDE_CONFIG_DIR=/x`, reads a delete under `/x/jobs/<id>/tmp` as inside and one under `~/.claude/jobs/<id>/tmp` as a floor delete, as the hook does", async () => {
+		const roots = tempRoots();
+		const config = join(roots.scratch, "config");
+		const own = `rm -rf ${join(config, "jobs", "c0ffee12", "tmp", "a")}`;
+		const home = `rm -rf ${join(roots.claudeDir, "jobs", "c0ffee12", "tmp", "a")}`;
+		const { pi, request } = await floorAsking([own, home], 2, roots, undefined, { env: { CLAUDE_CONFIG_DIR: config } });
+
+		await pi.call("team_answer", { request: request(own), decision: "allow", reason: "Its own scratch file." });
+		await assert.rejects(pi.call("team_answer", { request: request(home), decision: "allow", reason: "A scratch file." }), /floor delete/);
+	});
+
+	it("takes an uncited allow of a delete in the session's scratchpad_dir, as the hook lets it through", async () => {
+		const roots = tempRoots();
+		const scratchpad = join(roots.scratch, "scratchpad");
+		const inside = `rm -rf ${join(scratchpad, "clone")}`;
+		const outside = `rm -rf ${join(roots.scratch, "other", "clone")}`;
+		const held = [inside, outside].map((command): FakeHookStep => ({ event: "PermissionRequest", payload: { tool_name: "Bash", tool_input: { command }, scratchpad_dir: scratchpad }, hold: true }));
+		const { pi, request } = await floorAsking([], 2, roots, undefined, { held });
+
+		await pi.call("team_answer", { request: request(inside), decision: "allow", reason: "Its own scratch folder." });
+		await assert.rejects(pi.call("team_answer", { request: request(outside), decision: "allow", reason: "A scratch folder." }), /floor delete/);
 	});
 
 	it("adds no job temp folder for a short id that isn't one plain path segment", async () => {

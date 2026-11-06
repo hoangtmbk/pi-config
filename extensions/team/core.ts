@@ -2849,6 +2849,7 @@ function journalEvent(state: EffortState, teammate: Teammate, input: Extract<Eff
 				input: typeof toolInput === "object" && toolInput !== null && !Array.isArray(toolInput) ? (toolInput as Record<string, unknown>) : {},
 				...(toolUseId === undefined ? {} : { toolUseId }),
 				...(text(payload.cwd) === undefined ? {} : { cwd: text(payload.cwd) }),
+				...(text(payload.scratchpad_dir) === undefined ? {} : { scratchpad: text(payload.scratchpad_dir) }),
 				at,
 				state: "held",
 			};
