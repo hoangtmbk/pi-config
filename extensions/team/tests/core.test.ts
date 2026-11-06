@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { awayText, currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, openEffort, openEscalations, openMerges, runningClause, type Step, step, taskStatus, type UsageItem, type UsageReading, usageText, waitingInTerminal, workdir } from "../core.ts";
+import { awayText, currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, needsClock, openEffort, openEscalations, openMerges, runningClause, type Step, step, taskStatus, type UsageItem, type UsageReading, usageText, WAITING_QUIET_MS, waitingInTerminal, workdir } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -456,6 +456,73 @@ describe("a Teammate's journal", () => {
 		assert.equal(result.state.teammates[0].activity, "idle");
 		assert.equal(result.state.teammates[0].doing, "waiting on its background work");
 		assert.deepEqual(result.state.sinceReport, fold(started).sinceReport, "no Report tells of it");
+	});
+
+	describe("a Teammate waiting on its background work that goes quiet", () => {
+		const background_tasks = [{ id: "b1", type: "shell", status: "running", description: "npm start" }];
+		// The Stop lands at 11:33.
+		const waiting = applied(started, event(3, "Stop", { last_assistant_message: "Which port should the server use?", background_tasks }));
+		const tick = (at: string): EffortInput => ({ kind: "tick", at });
+		const quietUntil = new Date(Date.parse("2026-11-02T11:33:00.000Z") + WAITING_QUIET_MS).toISOString();
+
+		it("wakes the Lead once, as a turn ended without a result, when nothing comes from it for WAITING_QUIET_MS", () => {
+			assert.equal(WAITING_QUIET_MS, 10 * 60_000);
+			const early = run(waiting, tick(new Date(Date.parse(quietUntil) - 1).toISOString()));
+			assert.ok(early.ok);
+			assert.deepEqual([early.append, early.actions], [[], []]);
+
+			const due = run(waiting, tick(quietUntil));
+
+			assert.ok(due.ok, due.ok ? "" : due.refusal);
+			assert.deepEqual(due.append.map((line) => [line.type, (line as { cursor: number }).cursor]), [["teammate-stopped", 3]]);
+			const [wake] = due.actions;
+			const text = wake?.kind === "wake-lead" ? wake.text : "";
+			assert.match(text, /`dev-1` ended its turn on Task `rename` without a result/);
+			assert.match(text, /nothing has come from it for 10 minutes/);
+			assert.match(text, /npm start/);
+			assert.match(text, /A Stop doesn't end its session/);
+			assert.match(text, /Which port should the server use\?/);
+			assert.equal(due.state.teammates[0].doing, "ended its turn without a result", "its prose question can be escalated");
+
+			const again = run([...waiting, ...due.append], tick(new Date(Date.parse(quietUntil) + 60_000).toISOString()));
+			assert.ok(again.ok);
+			assert.deepEqual([again.append, again.actions], [[], []], "once only");
+		});
+
+		it("cancels the wait on any further hook activity from the Teammate, a tool call included", () => {
+			const used = run(waiting, event(4, "PreToolUse", { tool_name: "Bash", tool_input: { command: "curl localhost:3000" } }));
+			assert.ok(used.ok, used.ok ? "" : used.refusal);
+			assert.deepEqual(used.append.map((line) => [line.type, (line as { cursor: number }).cursor]), [["teammate-active", 4]]);
+			assert.deepEqual(used.actions, []);
+			assert.deepEqual(used.state.sinceReport, fold(waiting).sinceReport, "no Report tells of it");
+
+			const after = run([...waiting, ...used.append], tick(quietUntil));
+			assert.ok(after.ok);
+			assert.deepEqual([after.append, after.actions], [[], []]);
+
+			const prompted = run(waiting, event(4, "UserPromptSubmit", { prompt: "<task-notification>b1 completed</task-notification>" }));
+			assert.ok(prompted.ok);
+			const afterPrompt = run([...waiting, ...prompted.append], tick(quietUntil));
+			assert.ok(afterPrompt.ok);
+			assert.deepEqual(afterPrompt.append, []);
+		});
+
+		it("restarts the wait on a later Stop that is waiting again", () => {
+			const again = applied(waiting, event(5, "Stop", { background_tasks }));
+			// That Stop lands at 11:35, two minutes on.
+			const result = run(again, tick(quietUntil));
+			assert.ok(result.ok);
+			assert.deepEqual(result.append, []);
+			const later = run(again, tick(new Date(Date.parse(quietUntil) + 2 * 60_000).toISOString()));
+			assert.ok(later.ok);
+			assert.deepEqual(later.append.map((line) => line.type), ["teammate-stopped"]);
+		});
+
+		it("keeps the clock running while a Teammate waits, so a restart's replay of effort.jsonl picks the wait up", () => {
+			assert.equal(needsClock(fold(started)), false);
+			assert.equal(needsClock(fold(waiting)), true);
+			assert.deepEqual(fold(waiting).teammates[0].waiting, { since: "2026-11-02T11:33:00.000Z", slug: "rename", on: ["npm start"], message: "Which port should the server use?" });
+		});
 	});
 
 	it("wakes the Lead as usual once the Teammate ends a turn with nothing in flight, after its background work woke it", () => {

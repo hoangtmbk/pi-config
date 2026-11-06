@@ -205,9 +205,12 @@ is also read when the Lead's prompt settles, so a lost doorbell loses nothing.
 - a `Stop` without a new result while the `Stop` hook lists the Teammate's own background tasks,
   Monitors or session crons as in flight (`background_tasks`, `session_crons`) is a wait: Claude
   Code prompts it again when they end. It logs a `teammate-waiting` line that no Report tells,
-  wakes nobody, and the row shows "waiting on its background work". A server left running in the
-  background counts too, so a Teammate that ends its turn on a question while one runs waits
-  until the human or the Lead looks.
+  wakes nobody, and the row shows "waiting on its background work". Any later journal line of the
+  Teammate (a tool call, a prompt, another Stop) ends the wait, with a `teammate-active` line when
+  nothing else records it. A wait quiet for 10 minutes (`WAITING_QUIET_MS`), such as one on a
+  server left running in the background, which never prompts it again, is logged as a turn ended
+  without a result and wakes the Lead once. The Lead's clock ticks while a Teammate waits, and the
+  wait is kept in `effort.jsonl`, so a restart picks it up.
 - any other `Stop` without a new result "ended its turn without a result", as Reports say. It wakes
   the Lead with the Teammate's last message, and tells it that a Stop doesn't end a session, that a
   Teammate waiting on its own background task or Monitor is prompted again when that ends, and

@@ -181,6 +181,13 @@ export interface Teammate {
 	activity?: "busy" | "idle";
 	/** How its last turn ended, while idle: `round 1 done`, {@link TURN_ENDED}, {@link WAITING}. */
 	doing?: string;
+	/**
+	 * Its last `Stop` was a wait on its own background work, and nothing has
+	 * come from it since: when it ended (`since`), on which Task, what it
+	 * listed as in flight and its last message. Any later journal line clears
+	 * it; past {@link WAITING_QUIET_MS} the tick wakes the Lead.
+	 */
+	waiting?: { since: string; slug: string; on: string[]; message: string };
 	/** The slug of the Task it was reused for, while its context is cleared and before the Task's pointer is sent. */
 	clearing?: string;
 	/** When it was stopped to make room under the cap; it no longer counts, nor is it reused. */
@@ -379,6 +386,8 @@ export type EffortLine =
 	| { type: "teammate-waiting"; teammate: string; cursor: number; slug: string; waitingOn: string[]; message: string; at: string }
 	/** A `Stop` for a round already done and waiting for review, after a late notice woke it: nothing new. No Report tells it. */
 	| { type: "teammate-idle"; teammate: string; cursor: number; at: string }
+	/** Any other journal line of a Teammate waiting on its background work, a tool call say: it isn't quiet, so its wait is over. No Report tells it. */
+	| { type: "teammate-active"; teammate: string; cursor: number; at: string }
 	/** A hook reported a permission mode other than the one last known: the mode the Teammate actually got. */
 	| { type: "teammate-mode"; teammate: string; cursor: number; mode: string; at: string }
 	/** A handoff found the Effort at its cap of live Teammates: the Task waits, its folder written. */
@@ -998,7 +1007,7 @@ export function openEffort(opened: { effortId: string; team: string; repo: strin
 }
 
 /** Lines a Report doesn't tell of: they only carry what other lines say. */
-const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested", "usage-read", "request-held", "request-answered", "takeover-input", "takeover-turn", "send-held", "launch-intended", "launch-abandoned", "teammate-waiting", "teammate-idle", "worktrees-ended"]);
+const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested", "usage-read", "request-held", "request-answered", "takeover-input", "takeover-turn", "send-held", "launch-intended", "launch-abandoned", "teammate-waiting", "teammate-idle", "teammate-active", "worktrees-ended"]);
 
 /** Fold one line into the state, keeping what the next Report tells of. */
 function apply(state: EffortState, line: EffortLine): EffortState {
@@ -1109,7 +1118,7 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 					if (teammate.id !== line.teammate) return teammate;
 					// What the old session knew goes with it: the new one starts from its launch, with no session rules.
 					// A card its old session's terminal killed the hook of goes too: the new session going on says nothing of it.
-					const { freshDue: _fresh, inbox: _inbox, activity: _activity, doing: _doing, limit: _limit, rules: _rules, clearing: _clearing, observedMode: _observed, mode: _mode, model: _model, denied: _denied, ...rest } = teammate;
+					const { freshDue: _fresh, inbox: _inbox, activity: _activity, doing: _doing, limit: _limit, rules: _rules, clearing: _clearing, observedMode: _observed, mode: _mode, model: _model, denied: _denied, waiting: _waiting, ...rest } = teammate;
 					return { ...rest, task: line.task, startedAt: line.at, relaunching: true, ...(line.mode === undefined ? {} : { mode: line.mode }), ...(line.model === undefined ? {} : { model: line.model }) };
 				}),
 			}, line.teammate);
@@ -1168,10 +1177,16 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "teammate-stopped":
 			return withLimit(endRequests(withTeammate(state, line, { activity: "idle", doing: TURN_ENDED }), line.teammate), line.teammate, undefined);
 		case "teammate-waiting":
-			return withLimit(endRequests(withTeammate(state, line, { activity: "idle", doing: WAITING }), line.teammate), line.teammate, undefined);
+			return withLimit(
+				endRequests(withTeammate(state, line, { activity: "idle", doing: WAITING, waiting: { since: line.at, slug: line.slug, on: line.waitingOn, message: line.message } }), line.teammate),
+				line.teammate,
+				undefined,
+			);
 		case "teammate-idle":
 			// The round stays done: its row keeps saying so.
 			return withLimit(endRequests(withTeammate(state, line, { activity: "idle" }), line.teammate), line.teammate, undefined);
+		case "teammate-active":
+			return withTeammate(state, line, {});
 		case "teammate-mode":
 			return withTeammate(state, line, { observedMode: line.mode });
 		case "task-dropped":
@@ -1424,11 +1439,19 @@ function merged(state: EffortState, slug: string): EffortState {
 	return { ...state, tasks: { ...state.tasks, [slug]: rest } };
 }
 
-/** The state with `line.teammate` changed by `change`, its cursor moved to the line's. */
+/**
+ * The state with `line.teammate` changed by `change`, its cursor moved to the
+ * line's. A journal line of it ends any wait on its background work, unless
+ * `change` starts one.
+ */
 function withTeammate(state: EffortState, line: { teammate: string; cursor: number }, change: Partial<Teammate>): EffortState {
 	return {
 		...state,
-		teammates: state.teammates.map((teammate) => (teammate.id === line.teammate ? { ...teammate, ...change, cursor: line.cursor } : teammate)),
+		teammates: state.teammates.map((teammate) => {
+			if (teammate.id !== line.teammate) return teammate;
+			const { waiting: _waiting, ...rest } = teammate;
+			return { ...rest, ...change, cursor: line.cursor };
+		}),
 	};
 }
 
@@ -2659,7 +2682,9 @@ function journal(state: EffortState, input: Extract<EffortInput, { kind: "journa
 	const teammate = state.teammates.find((each) => each.id === input.teammate);
 	if (!teammate) return { ok: false, refusal: `Effort \`${state.effortId}\` has no Teammate \`${input.teammate}\` to read a journal of.` };
 	if (input.cursor <= (teammate.cursor ?? 0)) return took(state, [], []);
-	const event = journalEvent(state, teammate, input);
+	const acted = journalEvent(state, teammate, input);
+	// A Teammate waiting on its background work that does anything at all isn't quiet: a line on record ends the wait.
+	const event = acted.ok && acted.append.length === 0 && teammate.waiting !== undefined ? took(state, [{ type: "teammate-active", teammate: teammate.id, cursor: input.cursor, at: input.line.at }], acted.actions, acted.reply) : acted;
 	const reported = text(input.line.payload?.permission_mode);
 	// Claude Code calls manual `default`.
 	const mode = reported === "default" ? "manual" : reported;
@@ -3169,7 +3194,8 @@ function tick(state: EffortState, input: Extract<EffortInput, { kind: "tick" }>)
 		}
 	}
 	const continued = continueAll(due, "since its limit reset", at);
-	return took(state, [...append, ...continued.append], [...actions, ...continued.actions]);
+	const quiet = quietWaits(after, now, at);
+	return took(state, [...append, ...continued.append, ...quiet.append], [...actions, ...continued.actions, ...quiet.actions]);
 }
 
 /**
@@ -3272,16 +3298,51 @@ function stopped(state: EffortState, teammate: Teammate, input: Extract<EffortIn
 		state,
 		[{ type: "teammate-stopped", teammate: teammate.id, cursor, slug: due.slug, message, at: line.at }],
 		[
-			{
-				kind: "wake-lead",
-				text: [
-					`\`${teammate.id}\` ended its turn on Task \`${due.slug}\` without writing a new ${input.result.path}.`,
-					"A Stop doesn't end its session: it stays live and takes your next message. A Teammate waiting on its own background task or Monitor is re-prompted when that ends, so if its last message says it is waiting on one, don't nudge it: leave it to finish, and you are woken when it does.",
-					`Its last message:\n\n${message || "(none)"}`,
-				].join(" "),
-			},
+			{ kind: "wake-lead", text: turnEndedText(`\`${teammate.id}\` ended its turn on Task \`${due.slug}\` without writing a new ${input.result.path}.`, message) },
 		],
 	);
+}
+
+/** How long a Teammate waiting on its background work may stay quiet before the Lead is woken about it, as a turn ended without a result. */
+export const WAITING_QUIET_MS = 10 * 60_000;
+
+/** The Lead's wake for a turn ended without a result: `what` happened, how to read it, and the Teammate's last message. */
+function turnEndedText(what: string, message: string): string {
+	return [
+		what,
+		"A Stop doesn't end its session: it stays live and takes your next message. A Teammate waiting on its own background task or Monitor is re-prompted when that ends, so if its last message says it is waiting on one, don't nudge it: leave it to finish, and you are woken when it does.",
+		`Its last message:\n\n${message || "(none)"}`,
+	].join(" ");
+}
+
+/**
+ * The Teammates whose wait on their background work has been quiet for
+ * {@link WAITING_QUIET_MS} by `now`: each counts as a turn ended without a
+ * result, and the Lead is woken once. A server left running in the
+ * background would otherwise keep the wait, and the Effort, going forever.
+ */
+function quietWaits(state: EffortState, now: number, at: string): { append: EffortLine[]; actions: EffortAction[] } {
+	const append: EffortLine[] = [];
+	const actions: EffortAction[] = [];
+	for (const teammate of live(state)) {
+		const waiting = teammate.waiting;
+		if (waiting === undefined || teammate.takeover !== undefined || now - Date.parse(waiting.since) < WAITING_QUIET_MS) continue;
+		append.push({ type: "teammate-stopped", teammate: teammate.id, cursor: teammate.cursor ?? 0, slug: waiting.slug, message: waiting.message, at });
+		const minutes = Math.round(WAITING_QUIET_MS / 60_000);
+		actions.push({
+			kind: "wake-lead",
+			text: turnEndedText(
+				`\`${teammate.id}\` ended its turn on Task \`${waiting.slug}\` without a result, and nothing has come from it for ${minutes} minutes. Its Stop listed background work still running (${waiting.on.map((each) => JSON.stringify(each)).join(", ")}): a run it waits on, or a server it left running, which never re-prompts it.`,
+				waiting.message,
+			),
+		});
+	}
+	return { append, actions };
+}
+
+/** Whether the held Effort needs the Lead's clock: a usage limit holds something back, or a Teammate waits on its background work. */
+export function needsClock(state: EffortState): boolean {
+	return usageHolds(state) || live(state).some((each) => each.waiting !== undefined);
 }
 
 /**

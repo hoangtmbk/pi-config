@@ -58,6 +58,7 @@ import {
 	type Step,
 	step,
 	USAGE_CHOICES,
+	needsClock,
 	usageHolds,
 	type UsageItem,
 	usageText,
@@ -427,7 +428,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 	/** Run the Lead's clock while a usage limit holds anything back in the held Effort, and only then. */
 	function syncClock(state: EffortState | undefined): void {
-		if (state && usageHolds(state)) stopClock ??= every(TICK_MS, tickEffort);
+		if (state && needsClock(state)) stopClock ??= every(TICK_MS, tickEffort);
 		else {
 			stopClock?.();
 			stopClock = undefined;

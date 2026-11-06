@@ -1916,6 +1916,61 @@ describe("a Teammate's events reach the Lead", () => {
 		assert.deepEqual(effortLines(dir).find((line) => line.type === "teammate-waiting")?.waitingOn, ["Signal when the playthrough exits"]);
 	});
 
+	/** builder-1 ends its turn on `rename-key` with a server left running in the background, then goes quiet. */
+	async function quietWait() {
+		const crew = await crewApproved({
+			hooks: [
+				{ event: "SessionStart", payload: { source: "startup" } },
+				{
+					event: "Stop",
+					payload: {
+						last_assistant_message: "Which port should the server use?",
+						background_tasks: [{ id: "b1", type: "shell", status: "running", description: "npm start", command: "npm start" }],
+						session_crons: [],
+					},
+				},
+			],
+		});
+		await crew.pi.call("team_plan", { tasks: CREW_PLAN });
+		await crew.pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await until(() => effortLines(crew.dir).some((line) => line.type === "teammate-waiting"), "builder-1 waits");
+		// The hook stamps the Stop with the real clock; the wait counts from it.
+		const since = Date.parse(String(effortLines(crew.dir).find((line) => line.type === "teammate-waiting")?.at));
+		return { ...crew, since };
+	}
+
+	it("wakes the Lead, once, when a Teammate waiting on its background work stays quiet for 10 minutes", async () => {
+		const { pi, dir, since } = await quietWait();
+
+		pi.travel(new Date(since + 10 * 60_000 - 1000).toISOString());
+		await pi.tick();
+		assert.equal(pi.sent.filter((message) => /nothing has come from it/.test(message.content)).length, 0);
+
+		pi.advance(1000);
+		await pi.tick();
+		const wakes = pi.sent.filter((message) => /nothing has come from it for 10 minutes/.test(message.content));
+		assert.equal(wakes.length, 1);
+		assert.match(wakes[0].content, /`builder-1` ended its turn on Task `rename-key` without a result/);
+		assert.match(wakes[0].content, /Which port should the server use\?/);
+		assert.equal(effortLines(dir).filter((line) => line.type === "teammate-stopped").length, 1);
+
+		pi.advance(60_000);
+		await pi.tick();
+		assert.equal(pi.sent.filter((message) => /nothing has come from it/.test(message.content)).length, 1, "once only");
+	});
+
+	it("picks a quiet wait up after pi restarts, from effort.jsonl alone", async () => {
+		const { pi, roots, repo, dir, since } = await quietWait();
+		await pi.emit("session_shutdown", { reason: "quit" });
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude });
+		again.travel(new Date(since + 10 * 60_000).toISOString());
+		await again.emit("session_start", { reason: "startup" });
+
+		assert.ok(again.sent.some((message) => /`builder-1` ended its turn on Task `rename-key` without a result, and nothing has come from it for 10 minutes/.test(message.content)), JSON.stringify(again.sent.map((message) => message.content)));
+		assert.equal(effortLines(dir).filter((line) => line.type === "teammate-stopped").length, 1);
+	});
+
 	it("drops an idle Notification and logs a PermissionDenied, waking nobody", async () => {
 		const { pi, dir } = await crewApproved({
 			hooks: [
