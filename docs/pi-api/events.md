@@ -116,6 +116,15 @@ keeps one stale target from sinking everything. Also:
 - The latest edit per target wins.
 - An edit whose target sits in a span a compaction removed validates but does nothing.
 
+## `agent_settled`
+
+`{ type: "agent_settled"; aborted: boolean }`, fired once a run is over, follow-ups included
+(`agent-session.js:683-700`). pi clears the run-active flag *before* emitting it, so a
+`pi.sendMessage` without `triggerTurn` from its handler is appended to the session at once and starts
+no turn. With `triggerTurn: true` it is deferred until every handler has returned, then starts a run.
+Use it to store a message that arrived mid-run without the extra turn a send during the run causes
+([limits.md](limits.md)).
+
 ## `session_before_compact`
 
 Fires for pi's own compactions: `/compact`, the threshold trigger (window − `reserveTokens`), and

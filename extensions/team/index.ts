@@ -384,6 +384,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	// Whether the Lead's model is working on a prompt, and what wakes about Teammates wait for it to settle.
 	let busy = false;
 	let waiting: string[] = [];
+	// The end-of-Effort message, held while the Lead's run is active and stored once it settles.
+	let endHeld: string | undefined;
 	// While the Effort is picked up again after a restart: what it has to tell the Lead, said once at the end.
 	let recovering: string[] | undefined;
 	// After a restart, the Teammates heard from since; the block marks the others' short ids unconfirmed.
@@ -904,6 +906,9 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 	pi.on("agent_settled", () => {
 		busy = false;
+		// pi marks the run over before this event, so the message is stored at once and starts no turn.
+		if (endHeld !== undefined) storeEnded(endHeld);
+		endHeld = undefined;
 		// A doorbell is only a nudge: whatever the journals hold now is applied, rung or not.
 		const texts = [...waiting, ...(effort ? applyJournals(effort) : [])];
 		waiting = [];
@@ -1834,10 +1839,19 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		syncLeadTools();
 		paintBlock();
 		ctx.ui.notify(notes.join(" "), unstopped.length > 0 ? "warning" : "info");
-		pi.sendMessage(
-			{ customType: "team-ended", content: `${lead.join(" ")} This session holds no Effort now, so the Team tools are off.`, display: true },
-			{ deliverAs: "nextTurn" },
-		);
+		const content = `${lead.join(" ")} This session holds no Effort now, so the Team tools are off.`;
+		// Anything sent during a run starts one more model turn, so the message waits for the run to settle.
+		if (busy) endHeld = content;
+		else storeEnded(content);
+	}
+
+	/**
+	 * Put the Lead's end-of-Effort message in its session now, while no run is
+	 * active: pi then appends it at once and starts no turn, so it is in the
+	 * session file even if pi exits before another prompt.
+	 */
+	function storeEnded(content: string): void {
+		pi.sendMessage({ customType: "team-ended", content, display: true }, { deliverAs: "followUp" });
 	}
 
 	/** A Playbook change the final Report proposed, in `/team pending`: adopt it for the next Effort, decline it, or leave it for later. */

@@ -14,6 +14,7 @@ Declared at `dist/core/extensions/types.d.ts:213-253`. The members whose behavio
 | `ctx.model` | the selected model, possibly a virtual one; `undefined` when none is selected |
 | `ctx.thinkingLevel` | the session's current level (`"off"` … `"max"`), or `undefined`; also `pi.getThinkingLevel()` |
 | `ctx.mode` / `ctx.hasUI` | `"tui" \| "rpc" \| "json" \| "print"`; `hasUI` is true in TUI and RPC |
+| `ctx.isIdle()` | false while a run is active *or a compaction runs* (`agent-session.js:1072-1074`). `pi.sendMessage` goes by the run alone (`isStreaming`), so track the run with `agent_start`/`agent_settled` ([events.md](events.md#agent_settled)) to know what a send will do |
 | `ctx.isProjectTrusted()` | whether project-local resources and `.pi/settings.json` are in effect |
 | `ctx.getContextUsage()` | see [events.md](events.md#context-pressure) |
 | `ctx.compact()` | aborts the current run first: [limits.md](limits.md) |
