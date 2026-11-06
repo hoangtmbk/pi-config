@@ -128,7 +128,6 @@ function fakePi(
 	const sent: SentMessage[] = [];
 	// What pi has written to the session file. A `nextTurn` message waits in memory for the next prompt (`agent-session.js:1853-1855`), and none comes here.
 	const stored: SentMessage[] = [];
-	let streaming = options.streaming ?? false;
 	const notifications: Notification[] = [];
 	const dialogs: Dialog[] = [];
 	const answers: (string | boolean | undefined)[] = [];
@@ -229,7 +228,7 @@ function fakePi(
 		hasUI: options.hasUI ?? true,
 		mode: options.mode ?? "tui",
 		cwd: options.cwd ?? roots.scratch,
-		isIdle: () => !streaming,
+		isIdle: () => !options.streaming,
 		sessionManager: {
 			getSessionFile: () => sessionFile,
 			getEntries: () => [...(options.sessionEntries ?? []), ...[...carried, ...entries].map((entry, index) => ({ type: "custom", id: `e${index}`, ...entry }))],
@@ -282,10 +281,6 @@ function fakePi(
 		sent,
 		/** The messages pi has written to the session file by now, oldest first: all but the `nextTurn` ones, which wait in memory for a prompt and go if pi exits first. */
 		stored,
-		/** Start or stop the Lead's run, as `ctx.isIdle()` sees it. */
-		stream(on: boolean) {
-			streaming = on;
-		},
 		notifications,
 		dialogs,
 		activations,
@@ -4696,17 +4691,30 @@ describe("ending an Effort: the final Report and sign-off", () => {
 		});
 	}
 
-	it("while the Lead streams, the end-of-Effort message waits for its next prompt, so it starts no extra turn", async () => {
-		const { pi } = await finalReported();
+	it("signed off while the Lead's run is active, the end-of-Effort message is held until the run settles, then stored at once with no turn, so it is there when pi exits right after", async () => {
+		const { pi, workspace } = await finalReported();
 
-		pi.stream(true);
+		// The human approves in `/team pending` while the Lead still answers the final Report, as in Effort `software-2026-11-06`.
+		await pi.emit("agent_start");
 		pi.answer("Approve");
 		await pi.team("pending");
+		assert.deepEqual(
+			pi.sent.filter((message) => message.customType === "team-ended"),
+			[],
+			"nothing is sent into the run, which would start one more model turn",
+		);
 
-		const ended = pi.sent.filter((message) => message.customType === "team-ended");
-		assert.equal(ended.length, 1);
-		assert.equal(ended[0].deliverAs, "nextTurn");
-		assert.notEqual(ended[0].triggerTurn, true);
+		await pi.emit("agent_settled", { aborted: false });
+		await pi.emit("session_shutdown");
+
+		const ended = pi.stored.filter((message) => message.customType === "team-ended");
+		assert.equal(ended.length, 1, "the message is in the session file");
+		assert.notEqual(ended[0].deliverAs, "nextTurn");
+		assert.notEqual(ended[0].triggerTurn, true, "it starts no turn");
+		assert.ok(ended[0].content.includes(workspace), ended[0].content);
+		await pi.emit("agent_start");
+		await pi.emit("agent_settled", { aborted: false });
+		assert.equal(pi.sent.filter((message) => message.customType === "team-ended").length, 1, "it is sent once");
 	});
 });
 
