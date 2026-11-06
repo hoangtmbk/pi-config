@@ -279,6 +279,8 @@ A request to a local host (`localhost`, `127.x`, `::1`, `0.0.0.0`) is no send, a
 the host when it's written out, even with the port or path in a variable
 (`"http://127.0.0.1:$PORT/keys/$KEY"`). A URL held in a variable (`"$URL/keys"`) has no host the
 floor can read, so a write to it is a send; the preamble tells Teammates to write local URLs out.
+The port variable's value isn't read, so one that held `x@host` would make curl send to `host`;
+that hole is tracked in #129.
 
 A `delivery` citation counts only when `reason` quotes, in double quotes, the words of the
 Delivery that cover the action, and the Report logs that passage. A Delivery that says nothing of a
