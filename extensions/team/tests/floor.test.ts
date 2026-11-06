@@ -308,7 +308,8 @@ describe("the floor classifier", () => {
 			['rm -rf "$CLAUDE_JOB_DIR"x/tmp/old', false],
 			["rm -rf $CLAUDE_JOB_DIR$SUB/tmp/old", false],
 			["rm -rf $CLAUDE_JOB_\\DIR/tmp/old", false],
-			["J=$CLAUDE_JOB_DIR/tmp; rm -rf $J/old", false],
+			// A name set to it reads as the folder, unquoted too where bash can't split it (#141, #144).
+			["J=$CLAUDE_JOB_DIR/tmp; rm -rf $J/old", true],
 			// A line that names CLAUDE_JOB_DIR otherwise, in any spelling, may change it.
 			["CLAUDE_JOB_DIR=/etc; rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
 			["CLAUDE_JOB_DIR=/etc rm -rf $CLAUDE_JOB_DIR/tmp/x", false],
@@ -415,9 +416,10 @@ describe("the floor classifier", () => {
 			['T=/work/effort/x; source ./env.sh; rm -rf "$T"', false],
 			['T=/work/effort/x; eval "$CMD"; rm -rf "$T"', false],
 			["T=/work/effort/x; sh -c 'rm -rf \"$T\"'", false],
-			// Unquoted, bash splits and globs it.
-			["T=/work/effort/x; rm -rf $T", false],
-			["T=/work/effort/x; rm -rf ${T}/y", false],
+			// Unquoted, only where bash can't split or glob it (#144).
+			["T=/work/effort/x; rm -rf $T", true],
+			["T=/work/effort/x; rm -rf ${T}/y", true],
+			["T='/work/effort/a b'; rm -rf $T", false],
 			// A name the shell gives a value of its own.
 			['RANDOM=/work/effort/x; rm -rf "$RANDOM"', false],
 		];
@@ -429,6 +431,81 @@ describe("the floor classifier", () => {
 
 		it("lists a quoted name's word for permission rules as it is written, unmarked", () => {
 			assert.deepEqual(simpleCommands('T=/work/effort/x && rm -rf "$T"/y "${T}"'), [["rm", "-rf", "$T/y", "${T}"]]);
+		});
+	});
+
+	describe("reads a name unquoted where bash can't split it, and past a function that can't change it (#144)", () => {
+		const where = { workspace: WORKSPACE, home: "/home/qa", jobDir: "/abs/own", roots: ["/abs/own/tmp"] };
+		/** `[command, inside]`, each read with the Teammate's own job folder and the Workspace as its directory. */
+		const commands: [string, boolean][] = [
+			// The deletes the dogfood run held, cut down.
+			["Q=/abs/own/tmp/qa\nrm -f $Q/a", true],
+			['Q=/abs/own/tmp/qa\nrm -f "$Q"/a; K(){ node x "$@"; }', true],
+			// Unquoted, a literal with no whitespace or glob character, on a line that doesn't name IFS.
+			["Q=/abs/own/tmp/qa; rm -f $Q/a $Q/b", true],
+			["Q=/abs/own/tmp/qa; rm -rf ${Q}/a", true],
+			["Q=/abs/own/tmp/qa; rm -rf $Q", true],
+			["Q=/abs/own/tmp/qa && cd $Q && rm -f a", true],
+			["T=$CLAUDE_JOB_DIR/tmp/x; rm -rf $T/y", true],
+			["A=/abs/own/tmp; B=$A/qa; rm -rf $B/y", true],
+			["Q='/abs/own/tmp/a b'; rm -f $Q/x", false],
+			['Q="/abs/own/tmp/a b"; rm -f $Q/x', false],
+			["Q=/abs/own/tmp/a\\ b; rm -f $Q/x", false],
+			["Q='/abs/own/tmp/a*'; rm -f $Q/x", false],
+			["Q='/abs/own/tmp/[ab]'; rm -f $Q/x", false],
+			["IFS=/; Q=/abs/own/tmp/qa; rm -f $Q/x", false],
+			["Q=/abs/own/tmp/qa; IFS=/ rm -f $Q/x", false],
+			["Q=/abs/own/tmp/qa; rm -f $Q.bak", false],
+			["Q=/abs/own/tmp/qa; rm -f $Qx/a", false],
+			["Q=/abs/own/tmp; rm -rf $Q", false],
+			// A function whose body can't change the name.
+			['Q=/abs/own/tmp/qa; K(){ node x "$@"; }; K set a 1; rm -f "$Q"/a', true],
+			['K() { node x "$@"; }\nQ=/abs/own/tmp/qa\nrm -f $Q/a', true],
+			["K()\n{\n  node x \"$@\"\n}\nQ=/abs/own/tmp/qa; rm -f $Q/a", true],
+			['function K { node x "$@"; }; Q=/abs/own/tmp/qa; rm -f $Q/a', true],
+			['function K() { echo "$Q"; }; Q=/abs/own/tmp/qa; rm -f $Q/a', true],
+			['Q=/abs/own/tmp/qa; K(){ if [ -f "$1" ]; then cat "$1"; fi; }; K "$Q"/a; rm -f $Q/a', true],
+			["Q=/abs/own/tmp/qa; K(){ printf '%s\\n' \"$@\"; X=1; }; rm -f $Q/a", true],
+			['Q=/abs/own/tmp/qa; K(){ out=$(node x "$@"); echo "$out"; }; rm -f $Q/a', true],
+			['Q=/abs/own/tmp/qa; K(){ case "$1" in a) node x;; esac; }; rm -f $Q/a', true],
+			// A function whose body may change it, or that the floor can't read.
+			['Q=/abs/own/tmp/qa; K(){ Q=/etc; }; K; rm -f "$Q"/x', false],
+			['Q=/abs/own/tmp/qa; K(){ eval "$1"; }; K "$X"; rm -f "$Q"/x', false],
+			['Q=/abs/own/tmp/qa; K(){ if true; then eval "$1"; fi; }; K "$X"; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ command eval "$1"; }; K "$X"; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ X=1 eval "$1"; }; K "$X"; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ case "$1" in a) eval "$2";; esac; }; K a "$X"; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ builtin eval "$1"; }; K "$X"; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; function K { \\eval "$1"; }; K "$X"; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ source ./env.sh; }; K; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ . ./env.sh; }; K; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ declare -g "$1=/etc"; }; K "$N"; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ local "$1"; }; K "$N"; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ typeset "$1=/etc"; }; K "$N"; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ export "$1=/etc"; }; K "$N"; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ read -r "$1"; }; K "$N" < f; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ unset "$1"; }; K "$N"; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ printf -v "$1" %s /etc; }; K "$N"; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ "$@"; }; K eval "$X"; rm -f $Q/x', false],
+			['Q=/abs/own/tmp/qa; K(){ $CMD; }; K; rm -f $Q/x', false],
+			["Q=/abs/own/tmp/qa; K() ( node x ); K; rm -f $Q/x", false],
+			["Q=/abs/own/tmp/qa; K(){ node x; rm -f $Q/x", false],
+			// A function body runs where it's called: a delete in it before the name is set doesn't read it.
+			["K(){ rm -rf $Q/x; }; Q=/abs/own/tmp/qa; K", false],
+			// An assignment in a function body binds nothing.
+			['K(){ T=/abs/own/tmp/qa; }; rm -rf "$T"/x', false],
+			// Groups outside a function's body still end the following of names.
+			["{ :; }; Q=/abs/own/tmp/qa; rm -f $Q/x", false],
+		];
+		for (const [command, inside] of commands) {
+			it(`${JSON.stringify(command)} is ${inside ? "inside" : "a floor delete"}`, () => {
+				assert.equal(floorAction(command, where)?.kind, inside ? undefined : "delete");
+			});
+		}
+
+		it("lists an unquoted name's word and a function's header for permission rules as written, unmarked", () => {
+			assert.deepEqual(simpleCommands("Q=/x; rm -f $Q/y ${Q}"), [["rm", "-f", "$Q/y", "${Q}"]]);
+			assert.deepEqual(simpleCommands('K(){ node x "$@"; }; function L { git push; }'), [["K"], ["node", "x", "$@"], ["function", "L"], ["git", "push"]]);
 		});
 	});
 
