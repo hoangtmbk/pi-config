@@ -15,7 +15,8 @@
  * match takes no allow at all: it goes to the human through `team_escalate`.
  */
 
-import { type FloorAction, floorAction, simpleCommands } from "./floor.mjs";
+import { homedir } from "node:os";
+import { type FloorAction, type FloorWhere, floorAction, simpleCommands } from "./floor.mjs";
 
 /** Where a held request stands. */
 export type RequestState =
@@ -85,14 +86,18 @@ export interface CitableGrant {
 	from: "Playbook" | "Brief";
 }
 
-/** What the approved Playbook and Brief let the Lead allow, read when it answers. */
-export interface AnswerTerms {
+/** A Teammate's own folders, as the floor judges its deletes against them: worked out once for the wake and for `team_answer`. */
+export interface TeammateFolders {
 	/** Where the requesting Teammate works: a delete inside it isn't on the floor. */
 	workspace: string;
 	/** The requesting Teammate's own temp folders, such as its Claude Code job temp folder: a delete inside one isn't on the floor either. */
 	roots?: string[];
 	/** The requesting Teammate's Claude Code job folder, which the floor reads `$CLAUDE_JOB_DIR` in its command as. */
 	jobDir?: string;
+}
+
+/** What the approved Playbook and Brief let the Lead allow, read when it answers. */
+export interface AnswerTerms extends TeammateFolders {
 	/** The Playbook's grants and those the Brief's overrides add, less those it skips. */
 	grants: CitableGrant[];
 	/** The Brief's Delivery section, which the Lead cites as `delivery`; undefined when it says nothing. */
@@ -212,8 +217,77 @@ export function answersText(held: HeldRequest, given: Record<string, string | st
 		.join("; ");
 }
 
-/** The text that wakes the Lead with a request. */
-export function askText(held: HeldRequest): string {
+/** The floor action a held `Bash` request takes, as `team_answer`'s guard reads it: against the Teammate's own folders, from the folder Claude Code ran it in. */
+export function heldFloor(held: HeldRequest, folders: TeammateFolders): FloorAction | undefined {
+	if (held.tool !== "Bash" || typeof held.input.command !== "string") return undefined;
+	return floorAction(held.input.command, floorWhere(held, folders));
+}
+
+function floorWhere(held: HeldRequest, folders: TeammateFolders): FloorWhere {
+	return {
+		workspace: folders.workspace,
+		...(held.cwd === undefined ? {} : { cwd: held.cwd }),
+		...(folders.roots === undefined ? {} : { roots: folders.roots }),
+		...(folders.jobDir === undefined ? {} : { jobDir: folders.jobDir }),
+	};
+}
+
+/** The top-level folder an absolute path is in, such as `/Users` for `/Users/u/x`; undefined for a relative path or `/`. */
+function topFolder(path: string | undefined): string | undefined {
+	const first = path?.startsWith("/") ? path.split("/")[1] : undefined;
+	return first ? `/${first}` : undefined;
+}
+
+/**
+ * Whether the floor can't read where a floor delete lands, asked of the floor
+ * itself rather than read again here: it reads the command once more with
+ * every top-level folder a path in it could start in counted among the
+ * Teammate's own, so every path it can read is inside. A delete it still finds
+ * goes through what it can't follow (a name, `~`, a `cd` or `xargs`), unless
+ * that delete names `/` or a whole top-level folder, which no folder holds.
+ */
+function deleteUnread(held: HeldRequest, folders: TeammateFolders): boolean {
+	const command = typeof held.input.command === "string" ? held.input.command : "";
+	const tops = new Set<string>();
+	for (const path of [folders.workspace, held.cwd, folders.jobDir, ...(folders.roots ?? []), homedir()]) {
+		const top = topFolder(path);
+		if (top !== undefined) tops.add(top);
+	}
+	for (const [, first] of command.matchAll(/\/([^/\s'"`;|&()<>$\\]+)/g)) tops.add(`/${first}`);
+	const probe = floorAction(command, { ...floorWhere(held, folders), roots: [...(folders.roots ?? []), ...tops] });
+	if (probe?.kind !== "delete") return false;
+	return !simpleCommands(probe.command).some((words) => words.slice(1).some((word) => /^\/[^/]*\/*$/.test(word)));
+}
+
+/** Where a Teammate's own folders are, each named with its path where this request tells it. */
+function ownFoldersText(held: HeldRequest, folders: TeammateFolders): string {
+	const job = folders.jobDir === undefined ? "`$CLAUDE_JOB_DIR/tmp`" : `\`${folders.jobDir}/tmp\``;
+	const scratchpad = held.scratchpad === undefined ? "(none named in this request)" : `\`${held.scratchpad}\``;
+	return `${held.teammate}'s own folders are its Workspace \`${folders.workspace}\`, its job temp folder ${job} and its scratchpad ${scratchpad}: a delete the floor reads under one of them isn't on the floor.`;
+}
+
+/**
+ * What the floor read of a held `Bash` request, as `team_answer`'s guard reads
+ * it, for the Lead's wake: the kind and the command that takes it, and for a
+ * delete, whether the floor read its target outside the Teammate's own folders
+ * or couldn't read it, with those folders named. Undefined when it takes no
+ * floor action.
+ */
+function floorReadText(held: HeldRequest, folders: TeammateFolders): string | undefined {
+	const floor = heldFloor(held, folders);
+	if (!floor) return undefined;
+	const cite = "an irreversible outward action, which you allow only citing what covers it as `grant`";
+	if (floor.kind !== "delete") return `The floor reads it as a ${floor.kind} (\`${floor.command}\`), ${cite}.`;
+	const own = ownFoldersText(held, folders);
+	if (!deleteUnread(held, folders)) return `The floor reads it as a delete outside ${held.teammate}'s own folders (\`${floor.command}\`), ${cite}. ${own}`;
+	return [
+		`The floor reads it as a delete whose target it can't read (\`${floor.command}\`): a path through a name, \`~\`, a \`cd\` or \`xargs\` it can't follow counts as outside ${held.teammate}'s own folders, wherever it lands. ${own}`,
+		`Even if you can see it lands in them, it stays a floor action: cite what covers it, move it to the human with \`team_escalate\` because the floor can't read its target, not because the folder is outside, or deny it asking ${held.teammate} to write the path out so the floor can read it.`,
+	].join(" ");
+}
+
+/** The text that wakes the Lead with a request; `folders`, the Teammate's own, let it say what the floor read of a `Bash` command. */
+export function askText(held: HeldRequest, folders?: TeammateFolders): string {
 	const on = held.task === undefined ? "" : ` on Task \`${held.task}\``;
 	const live = `It is also live in ${held.teammate}'s terminal; the first answer wins. Nothing is allowed by default: if the Brief doesn't settle it, deny it or move it to the human with \`team_escalate\`.`;
 	if (held.tool === QUESTION_TOOL) {
@@ -226,11 +300,13 @@ export function askText(held: HeldRequest): string {
 			`Answer from the Brief with \`team_answer\` and \`answers\` keyed by each question's exact text: one label where it says "one of", a list of labels where it says "any of". Or deny it with a reason. ${live}`,
 		].join("\n");
 	}
+	const floor = folders === undefined ? undefined : floorReadText(held, folders);
 	return [
 		`\`${held.teammate}\` asks permission to use \`${held.tool}\`${on} (\`${held.request}\`):`,
 		"",
 		JSON.stringify(held.input, null, 2),
 		"",
+		...(floor === undefined ? [] : [floor, ""]),
 		`Answer from the Brief with \`team_answer\`: allow or deny, with a reason. An allow may add a session \`rule\` such as \`Bash(npm test:*)\`, and name the \`grant\` it relies on. ${live}`,
 	].join("\n");
 }
@@ -314,7 +390,7 @@ export function takeAnswer(held: HeldRequest, answer: RequestAnswer): TakenAnswe
 	if (escalation) {
 		return `${about} is what the Playbook's \`escalate\` entry \`${escalation.id}\` brings to the human even when you would allow it: move it to their pending items with \`team_escalate\`, or deny it with a reason.`;
 	}
-	const floor = held.tool === "Bash" && typeof held.input.command === "string" ? floorAction(held.input.command, { workspace: terms.workspace, ...(held.cwd === undefined ? {} : { cwd: held.cwd }), ...(terms.roots === undefined ? {} : { roots: terms.roots }), ...(terms.jobDir === undefined ? {} : { jobDir: terms.jobDir }) }) : undefined;
+	const floor = heldFloor(held, terms);
 	if (floor) return takeFloorAnswer(held, answer, reason, terms, floor);
 	const logged = [`allowed ${call}: ${reason}`];
 	let updatedPermissions: SessionRule[] | undefined;
@@ -351,7 +427,10 @@ function takeFloorAnswer(held: HeldRequest, answer: RequestAnswer, reason: strin
 			: `Cite what covers it as \`grant\`: ${backticked(citable)}${terms.delivery === undefined ? "" : ` (\`${DELIVERY}\` is the Brief's Delivery, cited only by quoting in \`reason\` the words of it that cover this ${floor.kind})`}`;
 	const otherwise = `If none does, move it to the human with \`team_escalate\`, deny it with a reason, or leave it to the human in the terminal.${floor.kind === "delete" ? SCRATCH : ""}`;
 	const grant = answer.grant?.trim() ?? "";
-	if (grant === "") return `${about} is a ${action}: an irreversible outward action, which you allow only citing what covers it. ${options}. ${otherwise}`;
+	const own = `${held.teammate}'s own folders (its Workspace, job temp folder and scratchpad)`;
+	const what =
+		floor.kind !== "delete" ? "" : deleteUnread(held, terms) ? `a delete whose target the floor can't read, so it counts as outside ${own}, ` : `a delete outside ${own}, `;
+	if (grant === "") return `${about} is a ${action}: ${what}an irreversible outward action, which you allow only citing what covers it. ${options}. ${otherwise}`;
 	const found = terms.grants.find(({ id }) => id === grant);
 	if (!found && !(grant === DELIVERY && terms.delivery !== undefined)) return `There is no grant \`${grant}\` to cite for ${about}, a ${action}. ${options}. ${otherwise}`;
 	if (answer.rule !== undefined) return `${about} is a ${action}, so its allow adds no session \`rule\`: each floor action comes to you on its own. Answer again without the \`rule\`.`;

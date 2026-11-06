@@ -43,6 +43,8 @@ interface Dialog {
 
 interface RegisteredTool {
 	name: string;
+	/** What the Lead reads of the tool. */
+	description?: string;
 	defaultActive?: boolean;
 	execute(id: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: unknown): Promise<ToolResult>;
 	renderResult?(result: ToolResult, options: { expanded: boolean; isPartial: boolean }, theme: unknown, context: unknown): Drawn;
@@ -2645,6 +2647,37 @@ describe("the floor: irreversible outward actions reach the human", () => {
 
 		await pi.call("team_answer", { request: request(inside), decision: "allow", reason: "Its own scratch folder." });
 		await assert.rejects(pi.call("team_answer", { request: request(outside), decision: "allow", reason: "A scratch folder." }), /floor delete/);
+	});
+
+	it("wakes the Lead with what the floor read of a held delete, naming the Teammate's own folders as team_answer's guard works them out (#145)", async () => {
+		const roots = tempRoots();
+		const outside = "rm -rf /etc/app-cache";
+		const unread = "Q=$(cat qa.path) && rm -f $Q/merge.json";
+		const { pi, request } = await floorAsking([outside, unread], 2, roots);
+		const job = join(roots.claudeDir, "jobs", "c0ffee12", "tmp");
+		const wake = (command: string): string => {
+			const found = teammateWakes(pi.sent).find((message) => message.content.includes(`(\`${request(command)}\`)`));
+			assert.ok(found, `no wake about \`${command}\``);
+			return found.content;
+		};
+
+		const out = wake(outside);
+		assert.ok(out.includes("The floor reads it as a delete outside builder-1's own folders (`rm -rf /etc/app-cache`)"), out);
+		assert.ok(out.includes(`its job temp folder \`${job}\``), out);
+		assert.match(out, /builder-1's own folders are its Workspace `[^`]+`/);
+		const read = wake(unread);
+		assert.ok(read.includes("The floor reads it as a delete whose target it can't read (`rm -f $Q/merge.json`)"), read);
+		assert.ok(read.includes(`its job temp folder \`${job}\``), read);
+		await assert.rejects(pi.call("team_answer", { request: request(unread), decision: "allow", reason: "Its own scratch file." }), /can't read, so it counts as outside builder-1's own folders \(its Workspace, job temp folder and scratchpad\)/);
+	});
+
+	it("describes a floor delete to the Lead as outside the Teammate's own folders, and a Report's unauthorized as the record's word only (#145)", () => {
+		const pi = fakePi(tempRoots());
+		const answer = pi.tools.get("team_answer")?.description ?? "";
+		assert.ok(answer.includes("delete outside the Teammate's own folders (its Workspace, job temp folder and scratchpad)"), answer);
+		assert.doesNotMatch(answer, /outside the Workspace/);
+		const report = pi.tools.get("team_report")?.description ?? "";
+		assert.match(report, /unauthorized, not allowed or denied only from the record, such as a request you or the human denied, never from your own reading/);
 	});
 
 	it("adds no job temp folder for a short id that isn't one plain path segment", async () => {

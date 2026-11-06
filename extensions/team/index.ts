@@ -57,6 +57,7 @@ import {
 	worktreesEndedNotes,
 	type Step,
 	step,
+	teammateFolders,
 	USAGE_CHOICES,
 	needsClock,
 	usageHolds,
@@ -70,7 +71,7 @@ import {
 	workdir,
 } from "./core.ts";
 import { EVERY_ROLE, listTeams, loadTeam, type Playbook, type Role, sha256, type Team, type TeamRoots, teamInForce } from "./definitions.ts";
-import { claudeConfigDir, ownFolders } from "./floor.mjs";
+import { claudeConfigDir } from "./floor.mjs";
 import { briefApprovalTitle, intakePrompt, openedText, skipsText } from "./intake.ts";
 import { adoptable, hasEnded, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
 import {
@@ -800,6 +801,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 					tz,
 					...(models ? { models } : {}),
 					sent,
+					claudeDir,
 				});
 				if (!result.ok) break;
 				appendLines(held.paths, result.append);
@@ -2336,6 +2338,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			"Write the next Report to the human: your headline and Brief coverage, with the sections the extension adds from the Effort's log (what happened since the last Report, the plan, what waits on the human, what was decided for them, Teammate modes, work found outside the Brief).",
 			"Write the plan Report once you have planned, and another whenever the human asks with `/team report` or the Effort reaches a milestone.",
 			"The plan Report lists each Playbook rule the Brief skips, with its reason, read from the Brief; say in the headline which of them your tools can't carry out.",
+			"Say an action was unauthorized, not allowed or denied only from the record, such as a request you or the human denied, never from your own reading of what it did: a delete the floor let through in a Teammate's own folders (its Workspace, job temp folder and scratchpad) needed no grant.",
 			"Saved as `reports/<nnn>.md` and shown to the human in chat; you get back only where it went. Refused until the human approves the Brief.",
 		].join(" "),
 		promptSnippet: "Write a Report to the human: where the Effort stands and Brief coverage",
@@ -2403,7 +2406,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		description: [
 			"Answer a Teammate's held request: a permission prompt or an AskUserQuestion its hook holds open while the prompt stays live in its terminal.",
 			"For a permission, `decision` is `allow` or `deny` with a `reason`; an allow may add a session `rule` for the same tool and name the `grant` it relies on.",
-			"A floor action (push, publish, deploy, send, delete outside the Workspace) is allowed only citing as `grant` a Playbook grant, a Brief override grant, or `delivery` (the Brief's Delivery, with `reason` quoting in double quotes the words of it that cover the action; a Delivery that doesn't mention the action doesn't cover it), and takes no `rule`; one the Playbook's `escalate` entries ask about goes to the human with `team_escalate`.",
+			"A floor action is a push, publish, deploy, send, or delete outside the Teammate's own folders (its Workspace, job temp folder and scratchpad); the wake about a request says what the floor read of it.",
+			"A floor action is allowed only citing as `grant` a Playbook grant, a Brief override grant, or `delivery` (the Brief's Delivery, with `reason` quoting in double quotes the words of it that cover the action; a Delivery that doesn't mention the action doesn't cover it), and takes no `rule`; one the Playbook's `escalate` entries ask about goes to the human with `team_escalate`.",
 			"Never answer a held delete by moving scratch into the Workspace, in a deny reason or a Task, when an acceptance criterion puts it elsewhere: that changes the criterion, which only the human does.",
 			"For an AskUserQuestion, `answers` maps each question's exact text to a label, or a list of labels for a multiSelect question.",
 			"The first answer wins: refused once the human answered in the terminal, or the hook gave up holding it. Nothing is allowed by default, and the next Report logs what you decided.",
@@ -2423,12 +2427,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			// What the approved Brief lets you allow on the floor, deletes judged against the Teammate's own folder and
 			// its own temp folders, worked out as its floor hook works them out: the job folder its short id names, and
 			// the scratchpad its request's payload named.
+			// The same folders the wake about the request named.
 			const asking = state.teammateRequests[params.request];
-			const asker = asking?.teammate;
 			const records = state.brief && state.workspace ? approved(held, ctx) : undefined;
-			const shortId = state.teammates.find((teammate) => teammate.id === asker)?.shortId;
-			const own = ownFolders({ config: claudeDir, ...(shortId === undefined ? {} : { job: join(claudeDir, "jobs", shortId) }), scratchpad: asking?.scratchpad });
-			const terms = records && state.workspace ? { ...answerTerms(records.playbook, records.brief, (asker && workdir(state, asker)) ?? state.workspace.path), ...own } : undefined;
+			const folders = teammateFolders(state, asking?.teammate, claudeDir, asking?.scratchpad);
+			const terms = records && folders ? { ...answerTerms(records.playbook, records.brief, folders.workspace), ...folders } : undefined;
 			const answer = {
 				kind: "answer-request" as const,
 				request: params.request,
