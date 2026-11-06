@@ -17,8 +17,9 @@
  * It reads the command the way a shell would, well enough for a guardrail:
  * quotes and escapes, `;` `&&` `||` `|` `&` and newlines between commands,
  * `$(…)` and backticks, `sh -c` and `eval` scripts, env assignments and
- * wrappers such as `sudo`, `env` and `npx`, `cd` for where a relative delete
- * lands, and simple assignments of a path that a later delete uses. It is a
+ * wrappers such as `sudo`, `env` and `npx`, a `cd` that surely runs in this
+ * shell for where a relative delete lands, and simple assignments of a path
+ * that a later delete uses. It is a
  * guardrail, not a security boundary: a command built to hide what it does
  * will get past it.
  */
@@ -159,27 +160,111 @@ export function simpleCommands(command) {
 const MAX_DEPTH = 8;
 
 /**
- * Scan one command text in its context; `cd` moves the context's directory for
- * the commands after it, and a plain assignment may bind a name for them
- * ({@link bindings}). A shell of its own (`sh -c`) may run without
- * `CLAUDE_JOB_DIR`, under `sudo` or `env -i` say, so the job folder is
- * unknown in its script; `eval` runs in this shell, so it keeps it. Neither
- * sees the names this text binds.
+ * Scan one command text in its context; a `cd` may move the context's
+ * directory for the commands after it ({@link moves}), and a plain assignment
+ * may bind a name for them ({@link bindings}). A shell of its own (`sh -c`)
+ * may run without `CLAUDE_JOB_DIR`, under `sudo` or `env -i` say, so the job
+ * folder is unknown in its script; `eval` runs in this shell, so it keeps it.
+ * Neither sees the names this text binds.
  */
 function scan(text, context, depth) {
-	let cwd = context.cwd;
 	const all = segments(text);
 	const names = bindings(all, context.command);
+	const folder = moves(all, context.cwd);
 	for (const segment of all) {
-		const here = { ...context, cwd, vars: names.visible() };
+		const here = { ...context, cwd: folder.cwd(), vars: names.visible() };
 		const kind = scanSegment(segment, here, depth);
 		if (kind) return kind;
-		const { words } = unwrap(segment.words);
-		if (words[0] === "cd" || words[0] === "pushd") cwd = changeDir(cwd, words[1] === undefined ? undefined : expanded(words[1], here));
-		else if (words[0] === "popd") cwd = undefined;
+		folder.after(segment, here);
 		if (!segment.nested) names.after(segment, here);
 	}
 	return undefined;
+}
+
+/**
+ * The directory a command text's commands run in, followed simply and
+ * conservatively. A `cd` or `pushd` moves it only when it surely runs in this
+ * shell before the commands after it, and the floor takes it to succeed:
+ *
+ * - it is a plain `cd <folder>` or `pushd <folder>` (or `builtin cd`), with
+ *   no option, at this text's own level: not in a `$(…)`, a process
+ *   substitution, a `( … )`, a `{ … }` group, a function's body or a compound
+ *   command, and not led by `!`, `time` or `coproc`, nor run by another
+ *   program (`env`, `xargs`);
+ * - it leads its list, after only plain assignments and other such `cd`s, each
+ *   joined to the next by `&&`, and is itself followed by `&&`, the list's end,
+ *   or `|| exit` that ends the list; so it isn't in a pipeline, behind `&&` or
+ *   `||`, or in a list that `&` backgrounds.
+ *
+ * Any other `cd`, `pushd` or `popd`, and any `eval`, `source` or `.` (which
+ * run code in this shell out of sight), leaves the directory unknown from
+ * there, and a relative delete in an unknown directory is outside. So does a
+ * list that a `cd` led, past an `||` (which runs when the `cd` failed), when it
+ * is backgrounded, or past a group or subshell, whose separators after it the
+ * floor doesn't keep.
+ */
+function moves(all, start) {
+	let cwd = start;
+	// Where the walk is in the list: whether only plain assignments and moving `cd`s joined by `&&` have run
+	// since it began, and whether a `cd` in it moved the directory.
+	let head = true;
+	let moved = false;
+	const after = (segment, context) => {
+		const change = dirChange(segment);
+		if (segment.nested) {
+			if (change) cwd = undefined;
+			return;
+		}
+		const inner = segment.inner || segment.body;
+		const exits = segment.sep === "||" && exitsAfter(all, segment);
+		if (change) {
+			if (change.clean && head && !inner && (segment.sep === "&&" || segment.sep === ";" || exits)) {
+				cwd = change.target === undefined ? undefined : changeDir(cwd, expanded(change.target, context));
+				moved = true;
+			} else cwd = undefined;
+		}
+		const assigns = !inner && segment.words.every((_, k) => segment.values[k] !== undefined);
+		head = head && (change?.clean || assigns) && segment.sep === "&&";
+		if (moved && (inner || segment.sep === "&" || (segment.sep === "||" && !exits))) cwd = undefined;
+		if (LIST_END.has(segment.sep)) {
+			head = true;
+			moved = false;
+		}
+	};
+	return { cwd: () => cwd, after };
+}
+
+/** The separators that end a list. */
+const LIST_END = new Set([";", "&", "(", ")"]);
+
+/**
+ * Whether a command may change the directory: a `cd`, `pushd` or `popd`, or
+ * an `eval`, `source` or `.`. `clean` when it is a plain `cd` or `pushd` with
+ * one folder and no option, as {@link moves} may follow, its folder `target`.
+ */
+function dirChange(segment) {
+	let words = segment.words;
+	let led = false;
+	while (words.length > 0 && (COMPOUND_OPEN.has(words[0]) || COMPOUND_LEADS.has(words[0]))) {
+		words = words.slice(1);
+		led = true;
+	}
+	const run = unwrap(words).words;
+	const head = run[0];
+	if (head === "eval" || head === "source" || head === ".") return { clean: false };
+	if (head !== "cd" && head !== "pushd" && head !== "popd") return undefined;
+	let written = words;
+	while (written.length > 0 && ASSIGNMENT.test(written[0])) written = written.slice(1);
+	if (written[0] === "builtin") written = written.slice(1);
+	const clean = !led && head !== "popd" && written[0] === head && run.length === 2 && !plain(run[1]).startsWith("-");
+	return clean ? { clean, target: run[1] } : { clean };
+}
+
+/** Whether the command after `segment` at its level is a plain `exit` that ends its list, as `cd X || exit 1;` has. */
+function exitsAfter(all, segment) {
+	const next = all.slice(all.indexOf(segment) + 1).find((other) => !other.nested);
+	if (next === undefined || next.inner || next.body || next.sep !== ";") return false;
+	return next.words[0] === "exit" && (next.words.length === 1 || (next.words.length === 2 && /^\d+$/.test(next.words[1])));
 }
 
 /** The floor action of one simple command, or undefined; a `sh -c` or `eval` script is scanned through. */
@@ -325,7 +410,7 @@ function valuePath(from, value, context, command) {
 }
 
 function changeDir(cwd, target) {
-	if (target === undefined || target === "-" || target.startsWith("~") || target.includes("$") || cwd === undefined && !target.startsWith("/")) return undefined;
+	if (target === undefined || target.startsWith("-") || target.startsWith("~") || target.includes("$") || cwd === undefined && !target.startsWith("/")) return undefined;
 	return posix.resolve(cwd ?? "/", target);
 }
 
@@ -433,10 +518,16 @@ function expanded(word, context) {
  * `body`. A header whose body isn't a `{ … }` group, or never closes, is
  * `unreadable`.
  *
+ * A process substitution, `<(…)` or `>(…)`, is read as a `$(…)` is.
+ *
  * Each also has the separator after it as `sep` (`;` for a newline or the
  * end, `&&`, `||`, `|`, `&`, `(` or `)`), whether a `{` or `}` group word
- * other than a function body's came before it (`grouped`), and per word in
- * `values`: for a plain assignment
+ * other than a function body's came before it (`grouped`), whether it runs
+ * inside a `( … )`, a `{ … }` group or a compound command (`if`, `while`,
+ * `until`, `for`, `select`, `case`), comes after a here-document's start
+ * (whose lines are read as commands, though they may be none), or is led by
+ * a compound command's word, `!`, `time` or `coproc` (`inner`), and per word
+ * in `values`: for a plain assignment
  * word (`NAME=…`, the name and `=` unquoted and unescaped), the name its value
  * starts with ({@link VALUE_START}), or "" for none; undefined for any other
  * word.
@@ -455,6 +546,30 @@ function segments(text) {
 	// How many `{` groups are open, and the function bodies among them, each with its depth and header.
 	let depth = 0;
 	const bodies = [];
+	// How many `(` are open, and the compound commands (`if`, loops, `case`) open, by their opening word.
+	let parens = 0;
+	const compounds = [];
+	// Whether a here-document has begun: its lines are read as commands, though they may be none.
+	let heredoc = false;
+	// Whether a command is in a subshell, a group other than a function body or a compound command, after
+	// a here-document's start, or is led by a compound command's word, `!`, `time` or `coproc`; this
+	// updates the open compound commands.
+	const inner = (sep) => {
+		let led = false;
+		for (const word of words) {
+			if (COMPOUND_OPEN.has(word)) {
+				compounds.push(word);
+				led = true;
+				if (COMPOUND_HEADER.has(word)) break;
+			} else if (COMPOUND_CLOSE.has(word)) {
+				// In a `case`, a word before `)` is a pattern.
+				if (!(compounds.at(-1) === "case" && sep === ")") && COMPOUND_CLOSE.get(word).includes(compounds.at(-1))) compounds.pop();
+				led = true;
+			} else if (COMPOUND_LEADS.has(word)) led = true;
+			else break;
+		}
+		return led || heredoc || parens > 0 || depth > bodies.length || compounds.length > 0;
+	};
 	// The mark for the prefix the word, as written, starts with, when the shell is sure to expand it.
 	let mark = "";
 	// Whether the word so far is written in plain characters only: no quote, escape or substitution.
@@ -477,7 +592,7 @@ function segments(text) {
 	};
 	const endSegment = (sep = ";") => {
 		endWord();
-		if (words.length > 0) out.push({ words, values, text: text.slice(start, end).trim(), sep, nested: false, grouped, body: bodies.length > 0 });
+		if (words.length > 0) out.push({ words, values, text: text.slice(start, end).trim(), sep, nested: false, grouped, body: bodies.length > 0, inner: inner(sep) });
 		words = [];
 		values = [];
 		start = -1;
@@ -485,7 +600,7 @@ function segments(text) {
 	};
 	// The words so far as a function's header, its body read next.
 	const header = () => {
-		const segment = { words, values, text: text.slice(start, end).trim(), sep: ";", nested: false, grouped, body: bodies.length > 0, define: true, unreadable: false };
+		const segment = { words, values, text: text.slice(start, end).trim(), sep: ";", nested: false, grouped, body: bodies.length > 0, inner: inner(";"), define: true, unreadable: false };
 		out.push(segment);
 		words = [];
 		values = [];
@@ -596,13 +711,25 @@ function segments(text) {
 			i++;
 			continue;
 		}
+		if ((c === "<" || c === ">") && text[i + 1] === "(") {
+			// A process substitution runs in a shell of its own, as a `$(…)` does.
+			begin(i);
+			literal = false;
+			const close = matchParen(text, i + 1);
+			substitution(text.slice(i + 2, close));
+			i = close + 1;
+			end = i;
+			continue;
+		}
 		if (c === ">" || c === "<" || (c === "&" && text[i + 1] === ">")) {
 			if (inWord && /^\d+$/.test(word)) {
 				word = "";
 				inWord = false;
 			}
 			endWord();
+			const from = i;
 			while (i < text.length && "<>&|".includes(text[i])) i++;
+			if (text.startsWith("<<", from) && !text.startsWith("<<<", from)) heredoc = true;
 			redirect = true;
 			// `2>&1` names a descriptor, not a file: nothing to skip.
 			if (/^\d/.test(text[i] ?? "") && text[i - 1] === "&") redirect = false;
@@ -632,6 +759,8 @@ function segments(text) {
 			// `&&` and `||` are one separator; `|&` is a pipe.
 			const double = (c === "&" || c === "|") && text[i + 1] === c;
 			endSegment(c === "\n" ? ";" : double ? `${c}${c}` : c);
+			if (c === "(") parens++;
+			else if (c === ")") parens = Math.max(0, parens - 1);
 			i += double || (c === "|" && text[i + 1] === "&") ? 2 : 1;
 			continue;
 		}
@@ -656,6 +785,16 @@ function segments(text) {
 	for (const { segment } of bodies) segment.unreadable = true;
 	return out;
 }
+
+/** The words that open a compound command, and those of them whose words up to the next separator are a header, not a command. */
+const COMPOUND_OPEN = new Set(["if", "while", "until", "for", "select", "case"]);
+const COMPOUND_HEADER = new Set(["for", "select", "case"]);
+
+/** The words that close a compound command, each with the words it closes. */
+const COMPOUND_CLOSE = new Map([["fi", ["if"]], ["done", ["while", "until", "for", "select"]], ["esac", ["case"]]]);
+
+/** The words that may lead a command inside a compound command, or run it apart from a plain command. */
+const COMPOUND_LEADS = new Set(["then", "elif", "else", "do", "!", "time", "coproc"]);
 
 /** Whether the words so far are a function's name, `name` or `function name`, as a `(` or `{` after them would make a header. */
 function isHeader(words) {

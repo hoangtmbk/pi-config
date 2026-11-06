@@ -296,6 +296,19 @@ in a body is read where the body is written, not where it's called. So
 are inside; `T=$(pwd) && rm -rf "$T"`, `T='/…/a b'; rm -rf $T`, `K(){ eval "$1"; }` before the
 delete, and any name set twice are not.
 
+A relative delete is read against the folder the command runs in, and a `cd` moves that folder only
+when it surely runs in this shell before the delete: a plain `cd <folder>` or `pushd <folder>`
+leading its list (after only plain assignments or other such `cd`s, joined by `&&`), followed by
+`&&`, the list's end or `|| exit`. The floor takes such a `cd` to succeed, so `cd X; rm -rf build`
+reads `build` in X, though bash runs it where it was if the `cd` fails. Any other `cd` makes the folder unknown from there, and a
+relative delete in an unknown folder is a floor delete: one in a `( … )`, `$(…)`, `<(…)`, a
+`{ … }` group, a function's body, an `if`, loop, `case` or `coproc`, a pipeline, a here-document's
+lines, behind `&&` or `||`, backgrounded with `&`, run by `env` or `xargs`, with an option, or
+`popd`. So do `eval`, `source` and `.`, and a list a `cd` led, past an `||`, a `&` or a group. So
+`cd sub && rm -rf build`, `cd sub; rm -rf build` and `cd sub || exit 1; rm -rf build` are inside;
+after `cd /`, `(cd /ws); rm -rf etc`, `true || cd /ws; rm -rf etc` and `K(){ cd /ws; }; rm -rf etc`
+are not.
+
 A request to a local host (`localhost`, `127.x`, `::1`, `0.0.0.0`) is no send, and the floor reads
 the host when it's written out, even with the port or path in a variable
 (`"http://127.0.0.1:$PORT/keys/$KEY"`). A URL held in a variable (`"$URL/keys"`) has no host the
