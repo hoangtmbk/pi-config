@@ -348,18 +348,43 @@ function takeFloorAnswer(held: HeldRequest, answer: RequestAnswer, reason: strin
 	const options =
 		citable.length === 0
 			? "The Playbook and the Brief cover no floor action"
-			: `Cite what covers it as \`grant\`: ${backticked(citable)}${terms.delivery === undefined ? "" : ` (\`${DELIVERY}\` is the Brief's Delivery)`}`;
-	const otherwise = "If none does, move it to the human with `team_escalate`, deny it with a reason, or leave it to the human in the terminal.";
+			: `Cite what covers it as \`grant\`: ${backticked(citable)}${terms.delivery === undefined ? "" : ` (\`${DELIVERY}\` is the Brief's Delivery, cited only by quoting in \`reason\` the words of it that cover this ${floor.kind})`}`;
+	const otherwise = `If none does, move it to the human with \`team_escalate\`, deny it with a reason, or leave it to the human in the terminal.${floor.kind === "delete" ? SCRATCH : ""}`;
 	const grant = answer.grant?.trim() ?? "";
 	if (grant === "") return `${about} is a ${action}: an irreversible outward action, which you allow only citing what covers it. ${options}. ${otherwise}`;
 	const found = terms.grants.find(({ id }) => id === grant);
 	if (!found && !(grant === DELIVERY && terms.delivery !== undefined)) return `There is no grant \`${grant}\` to cite for ${about}, a ${action}. ${options}. ${otherwise}`;
 	if (answer.rule !== undefined) return `${about} is a ${action}, so its allow adds no session \`rule\`: each floor action comes to you on its own. Answer again without the \`rule\`.`;
-	const relied = found ? `grant \`${found.id}\` (${found.from === "Playbook" ? "Playbook" : "Brief override"}: ${found.allow})` : `the Brief's Delivery (${terms.delivery})`;
+	const passage = found ? undefined : deliveryPassage(reason, terms.delivery ?? "");
+	if (!found && passage === undefined) {
+		return `A \`${DELIVERY}\` citation names what in the Delivery covers ${about}, a ${action}: quote those words of it in \`reason\`, in double quotes. The Delivery reads "${terms.delivery}". If it says nothing that covers a ${floor.kind}, it doesn't cover this one. ${otherwise}`;
+	}
+	const relied = found ? `grant \`${found.id}\` (${found.from === "Playbook" ? "Playbook" : "Brief override"}: ${found.allow})` : `the Brief's Delivery ("${passage}")`;
 	return {
 		decision: { behavior: "allow" },
 		logged: [`allowed ${held.teammate}'s \`${held.tool}\` \`${gist(held.input)}\`: ${reason}`, `used ${relied} for ${held.teammate}'s ${action}`],
 	};
+}
+
+/** What a floor delete's refusal adds: the floor is no reason to change where a criterion keeps its scratch. */
+const SCRATCH =
+	" Don't get a delete past the floor by moving scratch into the Workspace, in a deny reason or a Task, when an acceptance criterion puts it elsewhere: that changes the criterion, which only the human does.";
+
+/**
+ * The passage of the Delivery that `reason` quotes in double quotes (`"…"`,
+ * `“…”` or backticks), as quoted, or undefined when it quotes none: a quote
+ * of two words or more found in the Delivery, ignoring case, spacing and a
+ * full stop at its end.
+ */
+function deliveryPassage(reason: string, delivery: string): string | undefined {
+	const loose = (text: string): string => text.toLowerCase().replace(/\s+/g, " ").trim();
+	const within = loose(delivery);
+	for (const [, ...parts] of reason.matchAll(/"([^"]+)"|“([^”]+)”|`([^`]+)`/g)) {
+		const quote = (parts.find((part) => part !== undefined) ?? "").trim();
+		const words = loose(quote).replace(/[.]$/, "");
+		if (words.split(" ").length >= 2 && within.includes(words)) return quote;
+	}
+	return undefined;
 }
 
 /**

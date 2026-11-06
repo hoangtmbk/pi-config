@@ -1724,8 +1724,42 @@ describe("a Teammate's held requests", () => {
 				"used grant `push-effort-branch` (Playbook: Push the Effort's branch to origin.) for dev-1's floor push `git -C . push origin HEAD`",
 			]);
 			assert.deepEqual(logged(run(pushing, answer("req-0000000c", { decision: "allow", reason: "the PR", grant: "open-pr", terms: TERMS })))[1], "used grant `open-pr` (Brief override: Open the PR the Delivery asks for.) for dev-1's floor push `git -C . push origin HEAD`");
-			assert.deepEqual(logged(run(pushing, answer("req-0000000c", { decision: "allow", reason: "the PR", grant: "delivery", terms: TERMS })))[1], "used the Brief's Delivery (One PR against main.) for dev-1's floor push `git -C . push origin HEAD`");
-			assert.deepEqual(decision(run(pushing, answer("req-0000000c", { decision: "allow", reason: "the PR", grant: "delivery", terms: TERMS }))), { behavior: "allow" });
+			assert.deepEqual(logged(run(pushing, answer("req-0000000c", { decision: "allow", reason: 'The Delivery asks for "one PR against main"', grant: "delivery", terms: TERMS })))[1], 'used the Brief\'s Delivery ("one PR against main") for dev-1\'s floor push `git -C . push origin HEAD`');
+			assert.deepEqual(decision(run(pushing, answer("req-0000000c", { decision: "allow", reason: "The Delivery: `One PR against main.`", grant: "delivery", terms: TERMS }))), { behavior: "allow" });
+		});
+
+		describe("takes a `delivery` citation only when `reason` quotes what in the Delivery covers the action (#142)", () => {
+			const NOTHING = { ...TERMS, delivery: "Deliver the tested implementation as commits on the Effort branch. No push or PR is requested." };
+			const sending = bash(1, "req-00000010", 'curl -X PUT -d v "$URL/keys/a"');
+			for (const [reason, why] of [
+				["the Delivery covers it", "quotes nothing"],
+				['"QA against a local server"', "quotes what the Delivery doesn't say"],
+				['"commits"', "quotes a single word"],
+				["'the tested implementation'", "single quotes aren't a quote of it"],
+			]) {
+				it(`refuses one that ${why}`, () => {
+					const text = refusal(sending, answer("req-00000010", { decision: "allow", reason, grant: "delivery", terms: NOTHING }));
+					assert.match(text, /quote/);
+					assert.match(text, /No push or PR is requested\./);
+					assert.match(text, /team_escalate/);
+				});
+			}
+
+			it("logs the passage quoted, not the whole Delivery", () => {
+				const result = run(sending, answer("req-00000010", { decision: "allow", reason: 'It says “commits on the Effort branch”', grant: "delivery", terms: NOTHING }));
+				assert.deepEqual(logged(result)[1], 'used the Brief\'s Delivery ("commits on the Effort branch") for dev-1\'s floor send `curl -X PUT -d v "$URL/keys/a"`');
+			});
+
+			it("says so in the refusal of an uncited allow", () => {
+				assert.match(refusal(sending, answer("req-00000010", { decision: "allow", reason: "a local server", terms: NOTHING })), /`delivery`.*quot/);
+			});
+		});
+
+		it("tells the Lead not to move a criterion's scratch into the Workspace to get a delete past the floor (#141)", () => {
+			const text = refusal(bash(1, "req-00000011", "rm -rf /tmp/scratch"), answer("req-00000011", { decision: "allow", reason: "scratch", terms: TERMS }));
+			assert.match(text, /floor delete/);
+			assert.match(text, /criterion/);
+			assert.match(text, /Workspace/);
 		});
 
 		it("adds no session rule for a floor action, so each one comes back to be answered", () => {

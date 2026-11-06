@@ -17,9 +17,10 @@
  * It reads the command the way a shell would, well enough for a guardrail:
  * quotes and escapes, `;` `&&` `||` `|` `&` and newlines between commands,
  * `$(…)` and backticks, `sh -c` and `eval` scripts, env assignments and
- * wrappers such as `sudo`, `env` and `npx`, and `cd` for where a relative
- * delete lands. It is a guardrail, not a security boundary: a command built to
- * hide what it does will get past it.
+ * wrappers such as `sudo`, `env` and `npx`, `cd` for where a relative delete
+ * lands, and simple assignments of a path that a later delete quotes. It is a
+ * guardrail, not a security boundary: a command built to hide what it does
+ * will get past it.
  */
 
 import { homedir } from "node:os";
@@ -40,8 +41,10 @@ import { posix } from "node:path";
  * when it starts with `$CLAUDE_JOB_DIR/` or `${CLAUDE_JOB_DIR}/`
  * ({@link JOB_START}) and nothing in the command line names CLAUDE_JOB_DIR
  * otherwise ({@link namesJob}); unquoted, only when bash can't split it
- * either ({@link splittable}). Any other spelling of `~` or a variable leaves
- * the path unknown, so outside.
+ * either ({@link splittable}). A double-quoted name the command itself sets
+ * reads as the path it holds, under the conservative rules of
+ * {@link bindings}. Any other spelling of `~` or a variable leaves the path
+ * unknown, so outside.
  *
  * @param {string} command the Bash command as the Teammate wrote it
  * @param {{ workspace: string, cwd?: string, roots?: string[], home?: string, jobDir?: string }} where the Workspace, the directory the command runs in (the Workspace when not given), the other folders a delete under counts as inside, the home folder (this user's when not given), and the trusted value of `$CLAUDE_JOB_DIR` (unknown when not given)
@@ -55,7 +58,7 @@ export function floorAction(command, where) {
 	const job = typeof where.jobDir === "string" && posix.isAbsolute(where.jobDir) && !namesJob(command) ? posix.resolve(where.jobDir) : undefined;
 	return scan(
 		command,
-		{ roots, home: namesHome(command) ? undefined : home, job, bareJob: job === undefined || splittable(job, command) ? undefined : job, cwd: where.cwd === undefined ? workspace : posix.resolve(where.cwd) },
+		{ command, roots, home: namesHome(command) ? undefined : home, job, bareJob: job === undefined || splittable(job, command) ? undefined : job, cwd: where.cwd === undefined ? workspace : posix.resolve(where.cwd) },
 		0,
 	);
 }
@@ -157,33 +160,143 @@ const MAX_DEPTH = 8;
 
 /**
  * Scan one command text in its context; `cd` moves the context's directory for
- * the commands after it. A shell of its own (`sh -c`) may run without
+ * the commands after it, and a plain assignment may bind a name for them
+ * ({@link bindings}). A shell of its own (`sh -c`) may run without
  * `CLAUDE_JOB_DIR`, under `sudo` or `env -i` say, so the job folder is
- * unknown in its script; `eval` runs in this shell, so it keeps it.
+ * unknown in its script; `eval` runs in this shell, so it keeps it. Neither
+ * sees the names this text binds.
  */
 function scan(text, context, depth) {
 	let cwd = context.cwd;
-	for (const segment of segments(text)) {
-		const { words, xargs } = unwrap(segment.words);
-		if (words.length === 0) continue;
-		const script = depth < MAX_DEPTH ? innerScript(words) : undefined;
-		if (script !== undefined) {
-			const inner = scan(script, { ...context, cwd, ...(words[0] === "eval" ? {} : { job: undefined, bareJob: undefined }) }, depth + 1);
-			if (inner) return inner;
-			continue;
-		}
-		if (words[0] === "cd" || words[0] === "pushd") {
-			cwd = changeDir(cwd, words[1] === undefined ? undefined : expanded(words[1], context));
-			continue;
-		}
-		if (words[0] === "popd") {
-			cwd = undefined;
-			continue;
-		}
-		const kind = classify(words, { ...context, cwd, xargs });
-		if (kind) return { kind, command: segment.text };
+	const all = segments(text);
+	const names = bindings(all, context.command);
+	for (const segment of all) {
+		const here = { ...context, cwd, vars: names.visible() };
+		const kind = scanSegment(segment, here, depth);
+		if (kind) return kind;
+		const { words } = unwrap(segment.words);
+		if (words[0] === "cd" || words[0] === "pushd") cwd = changeDir(cwd, words[1] === undefined ? undefined : expanded(words[1], here));
+		else if (words[0] === "popd") cwd = undefined;
+		if (!segment.nested) names.after(segment, here);
 	}
 	return undefined;
+}
+
+/** The floor action of one simple command, or undefined; a `sh -c` or `eval` script is scanned through. */
+function scanSegment(segment, context, depth) {
+	const { words, xargs } = unwrap(segment.words);
+	if (words.length === 0 || words[0] === "cd" || words[0] === "pushd" || words[0] === "popd") return undefined;
+	const script = depth < MAX_DEPTH ? innerScript(words) : undefined;
+	if (script !== undefined) return scan(script, { ...context, vars: undefined, ...(words[0] === "eval" ? {} : { job: undefined, bareJob: undefined }) }, depth + 1);
+	const kind = classify(words, { ...context, xargs });
+	return kind ? { kind, command: segment.text } : undefined;
+}
+
+/**
+ * The names a command text sets for the commands after it, followed simply
+ * and conservatively. A name is bound to a path only when all of these hold;
+ * any doubt leaves it unknown, so a delete through it stays outside:
+ *
+ * - it is set by a plain assignment that is a whole simple command
+ *   (`NAME=value`, not `NAME=value cmd`, `export` or `read`), at this text's
+ *   own level: not in a `$(…)`, a pipeline or a list that `&` backgrounds;
+ * - the whole command line names it nowhere else but as `$NAME` or
+ *   `${NAME}` ({@link mentions}), so nothing sets it twice, exports, reads or
+ *   unsets it, and it isn't one the shell gives a value of its own
+ *   ({@link SHELL_NAMES});
+ * - the text has no group, subshell, function, loop, `if` or `case`, and no
+ *   `eval`, `source` or `.` ({@link TRACK_STOP}), any of which may set it out
+ *   of sight;
+ * - its value is a path the floor already reads: a literal absolute path, or
+ *   one that starts with `$PWD` (while the directory is known and nothing
+ *   names PWD otherwise), the trusted `$CLAUDE_JOB_DIR`, or a name bound
+ *   before it, and holds no other `$`;
+ * - it is sure to have run where the name is used: earlier in the same `&&`
+ *   chain, or in an earlier list it starts (after only plain assignments of
+ *   known paths, by `&&`), and that list isn't backgrounded.
+ *
+ * Where it is used, it is read only in the double-quoted form ({@link VAR_START}).
+ */
+function bindings(all, command) {
+	const bound = new Map();
+	const tracking = all.every(
+		(segment) =>
+			segment.nested ||
+			(!segment.grouped && segment.sep !== "(" && segment.sep !== ")" && !TRACK_STOP.has(plain(segment.words[0] ?? "")) && !TRACK_STOP.has(unwrap(segment.words).words[0] ?? "")),
+	);
+	// Where the walk is: the list's number, whether every separator since the list began is `&&`, whether every
+	// command since it began is a plain assignment of a known path, and whether the last separator was `|`.
+	let list = 0;
+	let chain = true;
+	let known = true;
+	let piped = false;
+	const visible = () => {
+		const vars = new Map();
+		for (const [name, binding] of bound) if ((binding.list === list && chain) || (binding.list < list && binding.certain)) vars.set(name, binding.path);
+		return vars;
+	};
+	const after = (segment, context) => {
+		const assigns = segment.words.every((_, k) => segment.values[k] !== undefined);
+		if (tracking && assigns && !piped && segment.sep !== "|" && segment.sep !== "&") {
+			const vars = new Map(context.vars);
+			for (const [k, word] of segment.words.entries()) {
+				const name = word.slice(0, word.indexOf("="));
+				const path = SHELL_NAMES.has(name) || mentions(name, command) !== 1 ? undefined : valuePath(segment.values[k], word.slice(name.length + 1), { ...context, vars }, command);
+				if (path === undefined) known = false;
+				else {
+					vars.set(name, path);
+					bound.set(name, { path, list, certain: chain && known });
+				}
+			}
+		} else known = false;
+		if (segment.sep === "&&") piped = false;
+		else if (segment.sep === "||") {
+			chain = false;
+			piped = false;
+		} else if (segment.sep === "|") piped = true;
+		else {
+			if (segment.sep === "&") for (const [name, binding] of bound) if (binding.list === list) bound.delete(name);
+			list++;
+			chain = true;
+			known = true;
+			piped = false;
+		}
+	};
+	return { visible, after };
+}
+
+/** Words that end the following of names in a text: a construct that may set a name out of sight. */
+const TRACK_STOP = new Set(["if", "then", "elif", "else", "fi", "for", "while", "until", "select", "do", "done", "case", "esac", "function", "coproc", "eval", "source", "."]);
+
+/** Names bash or zsh gives a value of their own, or that the floor reads otherwise: never bound. */
+const SHELL_NAMES = new Set([
+	...["HOME", "PWD", "OLDPWD", "IFS", "PATH", "CDPATH", "CLAUDE_JOB_DIR", "RANDOM", "SRANDOM", "SECONDS", "LINENO", "BASHPID", "PPID", "UID", "EUID", "GROUPS"],
+	...["FUNCNAME", "HISTCMD", "EPOCHSECONDS", "EPOCHREALTIME", "OPTIND", "OPTARG", "REPLY", "PIPESTATUS", "SHLVL", "DIRSTACK", "ERRNO", "TTYIDLE"],
+	...["argv", "status", "pipestatus", "path", "cdpath", "fpath", "manpath", "mailpath", "psvar"],
+]);
+
+/**
+ * How often a command line names `name` other than as `$name` or `${name}`,
+ * in any spelling: with quotes and backslashes taken out first. Any `$'…'`
+ * string, which can spell a name in escapes, counts as naming it twice.
+ */
+function mentions(name, command) {
+	const rest = command.replace(new RegExp(`\\$\\{${name}\\}|\\$${name}(?![A-Za-z0-9_])`, "g"), "");
+	if (rest.includes("$'")) return 2;
+	return (unquoted(rest).match(new RegExp(`(?<![A-Za-z0-9_])${name}(?![A-Za-z0-9_])`, "g")) ?? []).length;
+}
+
+/**
+ * The path a plain assignment's value holds, as {@link bindings} reads it, or
+ * undefined. `from` is the name the value starts with, or "" for none.
+ */
+function valuePath(from, value, context, command) {
+	if (from === "") return value.startsWith("/") && !value.includes("$") ? value : undefined;
+	const braced = `\${${from}}`;
+	const rest = value.slice(value.startsWith(braced) ? braced.length : from.length + 1);
+	if (rest.includes("$")) return undefined;
+	const base = from === "CLAUDE_JOB_DIR" ? context.job : from === "PWD" ? (mentions("PWD", command) === 0 ? context.cwd : undefined) : SHELL_NAMES.has(from) ? undefined : context.vars.get(from);
+	return base === undefined ? undefined : `${base}${rest}`;
 }
 
 function changeDir(cwd, target) {
@@ -215,26 +328,55 @@ const JOB_START = /("\$CLAUDE_JOB_DIR"?\/|"\$\{CLAUDE_JOB_DIR\}"?\/)|(\$CLAUDE_J
 const JOB_PREFIX = /^(?:\$CLAUDE_JOB_DIR|\$\{CLAUDE_JOB_DIR\})(?=\/)/;
 
 /**
+ * A name at a word's start, as a whole double-quoted token: `"$NAME"` or
+ * `"${NAME}"`, with the quote closing right after it or a `/` after it inside
+ * the quotes (group 1 or 2 the name). Unquoted, bash may split or glob it, so
+ * it isn't one. The name is read as a path only when the command itself sets
+ * it ({@link bindings}).
+ */
+const VAR_START = /"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})(?=["/])/y;
+
+/**
+ * A name at the start of a plain assignment's value: `$NAME`, `${NAME}`,
+ * either double-quoted or not, followed by a `/` or the value's end (group 1
+ * or 2 the name). An assignment's value is never split or globbed, so the
+ * unquoted form is as sure as the quoted one.
+ */
+const VALUE_START = /"?\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})"?(?=\/|[\s;&|)]|$)/y;
+
+/**
  * The marks {@link segments} puts before a word that starts with a
- * {@link HOME_START} prefix, a double-quoted {@link JOB_START} prefix, or an
- * unquoted one. No shell word can hold them, and {@link plain} takes them off.
+ * {@link HOME_START} prefix, a double-quoted {@link JOB_START} prefix, an
+ * unquoted one, or a {@link VAR_START} name (as `VAR name VAR`, since the
+ * quotes that ended the name are gone). No shell word can hold them, and
+ * {@link plain} takes them off.
  */
 const HOME = "\u0000";
 const JOB = "\u0001";
 const BARE_JOB = "\u0002";
+const VAR = "\u0003";
 
 /** A word without its mark. */
 function plain(word) {
+	if (word.startsWith(VAR)) return word.slice(word.indexOf(VAR, 1) + 1);
 	return word.startsWith(HOME) || word.startsWith(JOB) || word.startsWith(BARE_JOB) ? word.slice(1) : word;
 }
 
 /**
  * A word with its prefix read as the folder its mark names, when the context
- * knows that folder: {@link HOME} as `home`, {@link JOB} as `job` and
- * {@link BARE_JOB} as `bareJob`. Any other word as it is written.
+ * knows that folder: {@link HOME} as `home`, {@link JOB} as `job`,
+ * {@link BARE_JOB} as `bareJob` and {@link VAR} as the path the context's
+ * `vars` hold for the name. Any other word as it is written.
  */
 function expanded(word, context) {
 	const bare = plain(word);
+	if (word.startsWith(VAR)) {
+		const name = word.slice(1, word.indexOf(VAR, 1));
+		const value = context.vars?.get(name);
+		if (value === undefined) return bare;
+		const braced = `\${${name}}`;
+		return value + bare.slice(bare.startsWith(braced) ? braced.length : name.length + 1);
+	}
 	if (word.startsWith(HOME)) return context.home === undefined ? bare : bare.replace(HOME_PREFIX, () => context.home);
 	const job = word.startsWith(JOB) ? context.job : word.startsWith(BARE_JOB) ? context.bareJob : undefined;
 	return job === undefined ? bare : bare.replace(JOB_PREFIX, () => job);
@@ -246,10 +388,17 @@ function expanded(word, context) {
 /**
  * The simple commands in a shell text, each with its words (quotes removed)
  * and the text it was written as. A `$(…)` or backtick substitution is a
- * command of its own, listed before the command it sits in; its place in that
- * command's word reads as `$(…)`, an unknown value. A word that starts, as
- * written, with a {@link HOME_START} or {@link JOB_START} prefix carries the
- * mark for it.
+ * command of its own, `nested`, listed before the command it sits in; its
+ * place in that command's word reads as `$(…)`, an unknown value. A word that
+ * starts, as written, with a {@link HOME_START}, {@link JOB_START} or
+ * {@link VAR_START} prefix carries the mark for it.
+ *
+ * Each also has the separator after it as `sep` (`;` for a newline or the
+ * end, `&&`, `||`, `|`, `&`, `(` or `)`), whether a `{` or `}` group word came
+ * before it (`grouped`), and per word in `values`: for a plain assignment
+ * word (`NAME=…`, the name and `=` unquoted and unescaped), the name its value
+ * starts with ({@link VALUE_START}), or "" for none; undefined for any other
+ * word.
  */
 function segments(text) {
 	const out = [];
@@ -260,20 +409,33 @@ function segments(text) {
 	let end = 0;
 	let redirect = false;
 	let atCommandStart = true;
+	// Whether a `{` or `}` group word has been read so far.
+	let grouped = false;
 	// The mark for the prefix the word, as written, starts with, when the shell is sure to expand it.
 	let mark = "";
+	// Whether the word so far is written in plain characters only: no quote, escape or substitution.
+	let literal = true;
+	// For a plain assignment word, the name its value starts with ({@link VALUE_START}), or "" for none.
+	let value;
+	let values = [];
 	const endWord = () => {
 		if (!inWord) return;
 		if (redirect) redirect = false;
-		else words.push(`${mark}${word}`);
+		else {
+			words.push(`${mark}${word}`);
+			values.push(value);
+		}
 		word = "";
 		inWord = false;
 		mark = "";
+		literal = true;
+		value = undefined;
 	};
-	const endSegment = () => {
+	const endSegment = (sep = ";") => {
 		endWord();
-		if (words.length > 0) out.push({ words, text: text.slice(start, end).trim() });
+		if (words.length > 0) out.push({ words, values, text: text.slice(start, end).trim(), sep, nested: false, grouped });
 		words = [];
+		values = [];
 		start = -1;
 		atCommandStart = true;
 	};
@@ -282,13 +444,15 @@ function segments(text) {
 		if (!inWord) {
 			HOME_START.lastIndex = i;
 			JOB_START.lastIndex = i;
+			VAR_START.lastIndex = i;
 			const job = JOB_START.exec(text);
-			mark = HOME_START.test(text) ? HOME : job ? (job[1] === undefined ? BARE_JOB : JOB) : "";
+			const named = VAR_START.exec(text);
+			mark = HOME_START.test(text) ? HOME : job ? (job[1] === undefined ? BARE_JOB : JOB) : named ? `${VAR}${named[1] ?? named[2]}${VAR}` : "";
 		}
 		inWord = true;
 	};
 	const substitution = (inner) => {
-		out.push(...segments(inner));
+		out.push(...segments(inner).map((segment) => ({ ...segment, nested: true })));
 		word += "$(…)";
 	};
 	let i = 0;
@@ -296,6 +460,7 @@ function segments(text) {
 		const c = text[i];
 		if (c === "\\") {
 			begin(i);
+			literal = false;
 			if (text[i + 1] === "\n") i += 2;
 			else {
 				word += text[i + 1] ?? "";
@@ -306,6 +471,7 @@ function segments(text) {
 		}
 		if (c === "'") {
 			begin(i);
+			literal = false;
 			const close = text.indexOf("'", i + 1);
 			const stop = close < 0 ? text.length : close;
 			word += text.slice(i + 1, stop);
@@ -315,6 +481,7 @@ function segments(text) {
 		}
 		if (c === '"') {
 			begin(i);
+			literal = false;
 			i++;
 			while (i < text.length && text[i] !== '"') {
 				if (text[i] === "\\" && '"\\$`'.includes(text[i + 1] ?? "")) {
@@ -337,6 +504,7 @@ function segments(text) {
 		}
 		if (c === "$" && text[i + 1] === "(") {
 			begin(i);
+			literal = false;
 			const close = matchParen(text, i + 1);
 			substitution(text.slice(i + 2, close));
 			i = close + 1;
@@ -345,6 +513,7 @@ function segments(text) {
 		}
 		if (c === "`") {
 			begin(i);
+			literal = false;
 			const close = text.indexOf("`", i + 1);
 			const stop = close < 0 ? text.length : close;
 			substitution(text.slice(i + 1, stop));
@@ -376,11 +545,14 @@ function segments(text) {
 			continue;
 		}
 		if (c === "\n" || c === ";" || c === "&" || c === "|" || c === "(" || c === ")") {
-			endSegment();
-			i++;
+			// `&&` and `||` are one separator; `|&` is a pipe.
+			const double = (c === "&" || c === "|") && text[i + 1] === c;
+			endSegment(c === "\n" ? ";" : double ? `${c}${c}` : c);
+			i += double || (c === "|" && text[i + 1] === "&") ? 2 : 1;
 			continue;
 		}
 		if ((c === "{" || c === "}") && !inWord && atCommandStart && /[\s;]/.test(text[i + 1] ?? " ")) {
+			grouped = true;
 			i++;
 			continue;
 		}
@@ -388,6 +560,11 @@ function segments(text) {
 		word += c;
 		i++;
 		end = i;
+		if (c === "=" && literal && value === undefined && /^[A-Za-z_][A-Za-z0-9_]*=$/.test(word)) {
+			VALUE_START.lastIndex = i;
+			const named = VALUE_START.exec(text);
+			value = named ? (named[1] ?? named[2]) : "";
+		}
 	}
 	endSegment();
 	return out;
@@ -706,17 +883,31 @@ function gsutil(args) {
 	return undefined;
 }
 
-/** Hosts that are this machine, so a request to them stays inside. */
+/** Hosts that are this machine, written out in full, so a request to them stays inside. */
 function isLocalHost(host) {
-	const bare = host.toLowerCase().replace(/^\[|\]$/g, "");
-	return bare === "localhost" || bare.endsWith(".localhost") || /^127\./.test(bare) || bare === "::1" || bare === "0.0.0.0" || bare === "host.docker.internal";
+	const bare = host.toLowerCase().replace(/^\[(.*)\]$/, "$1");
+	return bare === "localhost" || /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.localhost$/.test(bare) || /^127(?:\.\d{1,3}){1,3}$/.test(bare) || bare === "::1" || bare === "0.0.0.0" || bare === "host.docker.internal";
 }
 
-/** The host a URL-ish word names, or undefined when the word isn't one. */
+/** A port as a URL may write it: digits, or one variable such as `$PORT` or `${PORT}`. */
+const URL_PORT = String.raw`(?::(?:\d*|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\}))?`;
+
+/**
+ * The host a URL-ish word names, or undefined when the word isn't one. The
+ * host is read only when it is written out: a variable in the port or the
+ * path leaves it readable (`http://127.0.0.1:$PORT/keys/$KEY`), one in the
+ * host or the user part doesn't, and then the whole authority is the host,
+ * which no local host matches. A variable port is taken to be a number, as
+ * the Teammate preamble asks; one built to hold an `@` would get past this.
+ */
 function hostOf(word) {
-	const scheme = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]*@)?(\[[^\]]+\]|[^/:?#]+)/i.exec(word);
-	if (scheme) return scheme[1];
-	const bare = /^(?:[^@/\s]*@)?(localhost|\[[^\]]+\]|[a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::\d+)?(?:[/?#]|$)/i.exec(word);
+	const scheme = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(word);
+	if (scheme) {
+		const authority = scheme[1];
+		const read = new RegExp(String.raw`^(?:[^@$]*@)?(\[[^\]$]*\]|[^:@$\[\]]*)${URL_PORT}$`).exec(authority);
+		return read ? read[1] : authority;
+	}
+	const bare = new RegExp(String.raw`^(?:[^@/?#\s$]*@)?(localhost|\[[^\]]+\]|[a-z0-9-]+(?:\.[a-z0-9-]+)+)${URL_PORT}(?:[/?#]|$)`, "i").exec(word);
 	return bare ? bare[1] : undefined;
 }
 

