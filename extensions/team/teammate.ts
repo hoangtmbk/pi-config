@@ -77,6 +77,7 @@ export function teammatePrompt(preamble: PreambleFor, rolePrompt: string): strin
 		"- Your own scratch folder is your Claude Code job temp folder, `$CLAUDE_JOB_DIR/tmp` (`~/.claude/jobs/<short id>/tmp`; `echo $CLAUDE_JOB_DIR` prints it). To delete something there, write its path out in full, starting `/` or `~/`, with no shell variable such as `$CLAUDE_JOB_DIR` or `$J`: a delete whose path holds one counts as outside the Workspace and waits on the Lead.",
 		"- The Workspace is fresh: installing dependencies is yours to do before you build or test.",
 		"- Stop every process you start in the background (a server, a browser, a watcher) before you write your result: stopping your session doesn't stop them. In your result, name each one you leave running, with its pid and command.",
+		"- To wait on a long run, end your turn with a `Monitor` or background task watching it: you are prompted again when it ends, so there is no need to poll or sleep in a loop. Ending your turn doesn't end your session.",
 		"",
 		"# Your Role",
 		"",

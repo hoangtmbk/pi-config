@@ -179,7 +179,7 @@ export interface Teammate {
 	observedMode?: string;
 	/** Absent until a prompt first lands: then `busy`, and `idle` once it stops. */
 	activity?: "busy" | "idle";
-	/** How its last turn ended, while idle: `round 1 done`, `stopped short`. */
+	/** How its last turn ended, while idle: `round 1 done`, {@link TURN_ENDED}, {@link WAITING}. */
 	doing?: string;
 	/** The slug of the Task it was reused for, while its context is cleared and before the Task's pointer is sent. */
 	clearing?: string;
@@ -373,8 +373,12 @@ export type EffortLine =
 	| { type: "task-done"; teammate: string; cursor: number; slug: string; round: number; at: string }
 	/** A `SessionEnd` that wasn't a clear, a resume or the extension's own `claude stop`: the Teammate's session is over. */
 	| { type: "teammate-crashed"; teammate: string; cursor: number; reason: string; at: string }
-	/** A `Stop` without a new result: the Teammate stopped short, saying this last. */
+	/** A `Stop` without a new result and nothing in flight: the Teammate ended its turn without a result, saying this last. */
 	| { type: "teammate-stopped"; teammate: string; cursor: number; slug: string; message: string; at: string }
+	/** A `Stop` without a new result while its own background tasks, Monitors or session crons are in flight: it waits to be re-prompted when they end. No Report tells it. */
+	| { type: "teammate-waiting"; teammate: string; cursor: number; slug: string; waitingOn: string[]; message: string; at: string }
+	/** A `Stop` for a round already done and waiting for review, after a late notice woke it: nothing new. No Report tells it. */
+	| { type: "teammate-idle"; teammate: string; cursor: number; at: string }
 	/** A hook reported a permission mode other than the one last known: the mode the Teammate actually got. */
 	| { type: "teammate-mode"; teammate: string; cursor: number; mode: string; at: string }
 	/** A handoff found the Effort at its cap of live Teammates: the Task waits, its folder written. */
@@ -435,7 +439,14 @@ export type EffortLine =
 	| { type: "usage-answered"; id: string; choice: string; at: string }
 	/** The Effort is over: the human signed off its final Report, or cancelled it. Nothing more is taken. */
 	| { type: "effort-ended"; how: Ended["how"]; at: string }
-	/** The Lead moved a held request, or a stopped-short Teammate's prose question, to the human's pending items. */
+	/**
+	 * What the Effort's end did with its worktrees, after `effort-ended`: each
+	 * one removed or kept (and why), with what was found still running in it,
+	 * none of which the Team stops; `error` when they couldn't be listed. Every
+	 * branch is kept. No Report tells it.
+	 */
+	| { type: "worktrees-ended"; removed: EndedWorktree[]; kept: (EndedWorktree & { why: string })[]; error?: string; at: string }
+	/** The Lead moved a held request, or a Teammate's prose question from a turn it ended without a result, to the human's pending items. */
 	| ({ type: "escalated" } & Omit<Escalation, "answered">)
 	/** The human answered an escalated item: in `/team pending`, or in chat with the Lead relaying it. */
 	| ({ type: "escalation-answered"; id: string } & NonNullable<Escalation["answered"]>)
@@ -464,7 +475,7 @@ export interface Escalation {
 	teammate: string;
 	/** The Task in the Teammate's context when it asked. */
 	task?: string;
-	/** A permission prompt or an `AskUserQuestion` its hook holds, or a question in a stopped-short Teammate's last message. */
+	/** A permission prompt or an `AskUserQuestion` its hook holds, or a question in the last message of a Teammate whose turn ended without a result. */
 	kind: "permission" | "question" | "prose";
 	/** What is asked, as the human reads it. */
 	question: string;
@@ -641,6 +652,34 @@ export function runningClause(running: readonly RunningProcess[]): string | unde
 	});
 	const which = running.length === 1 ? `pid ${shown[0]} is` : `pids ${shown.slice(0, -1).join(", ")} and ${shown.at(-1)} are`;
 	return `${which} still running in it, and the Team doesn't stop ${running.length === 1 ? "it" : "them"}: \`kill ${running.map((each) => each.pid).join(" ")}\` does`;
+}
+
+/** One of an Effort's worktrees as its end left it: where, on which branch, and what was found still running in it. */
+export interface EndedWorktree {
+	path: string;
+	branch: string;
+	running: RunningProcess[];
+}
+
+/**
+ * What an Effort's end did with its worktrees, as the notes the human and
+ * the Lead are told: which were removed, which were kept and why, what is
+ * still running in each, and that every branch is kept.
+ */
+export function worktreesEndedNotes(line: Extract<EffortLine, { type: "worktrees-ended" }>): string[] {
+	const notes: string[] = [];
+	if (line.error !== undefined) notes.push(`Its worktrees are left in place: ${line.error}.`);
+	if (line.removed.length > 0) notes.push(`Removed the clean worktrees ${line.removed.map((each) => each.path).join(", ")}.`);
+	for (const each of line.removed) {
+		const running = runningClause(each.running);
+		if (running !== undefined) notes.push(`${each.path} is removed, but ${running}.`);
+	}
+	for (const each of line.kept) {
+		const running = runningClause(each.running);
+		notes.push(`Kept ${each.path} (\`${each.branch}\`): ${each.why}${running === undefined ? "" : `; ${running}`}.`);
+	}
+	notes.push("Every branch is kept.");
+	return notes;
 }
 
 /** `text` as one Markdown code span: fenced with one backtick more than its longest run of them, and padded when it holds any. */
@@ -827,7 +866,7 @@ export type EffortInput =
 	| { kind: "usage"; reading: UsageReading }
 	/** `team_answer` of a held request. */
 	| ({ kind: "answer-request"; at: string } & RequestAnswer)
-	/** `team_escalate`: a held `request`, or a stopped-short `teammate`'s prose `question`, moved to the human with the Lead's summary. */
+	/** `team_escalate`: a held `request`, or the prose `question` of a `teammate` whose turn ended without a result, moved to the human with the Lead's summary. */
 	| { kind: "escalate"; request?: string; teammate?: string; question?: string; summary: string; brief?: string; at: string }
 	/** The human's answer to an escalated item in `/team pending`. */
 	| { kind: "answer-escalation"; id: string; decision?: "allow" | "deny"; reason?: string; answers?: Record<string, string | string[]>; text?: string; at: string }
@@ -959,7 +998,7 @@ export function openEffort(opened: { effortId: string; team: string; repo: strin
 }
 
 /** Lines a Report doesn't tell of: they only carry what other lines say. */
-const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested", "usage-read", "request-held", "request-answered", "takeover-input", "takeover-turn", "send-held", "launch-intended", "launch-abandoned"]);
+const UNREPORTED: ReadonlySet<EffortLine["type"]> = new Set(["effort-opened", "teammate-started", "teammate-session", "prompt-landed", "report-written", "teammate-attached", "clear-requested", "usage-read", "request-held", "request-answered", "takeover-input", "takeover-turn", "send-held", "launch-intended", "launch-abandoned", "teammate-waiting", "teammate-idle", "worktrees-ended"]);
 
 /** Fold one line into the state, keeping what the next Report tells of. */
 function apply(state: EffortState, line: EffortLine): EffortState {
@@ -1027,6 +1066,8 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		}
 		case "effort-ended":
 			return { ...state, pending: [], ended: { how: line.how, at: line.at } };
+		case "worktrees-ended":
+			return state;
 		case "plan-written":
 			return { ...state, plan: line.tasks };
 		case "teammate-started": {
@@ -1125,7 +1166,12 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "merge-failed":
 			return merged(state, line.slug);
 		case "teammate-stopped":
-			return withLimit(endRequests(withTeammate(state, line, { activity: "idle", doing: "stopped short" }), line.teammate), line.teammate, undefined);
+			return withLimit(endRequests(withTeammate(state, line, { activity: "idle", doing: TURN_ENDED }), line.teammate), line.teammate, undefined);
+		case "teammate-waiting":
+			return withLimit(endRequests(withTeammate(state, line, { activity: "idle", doing: WAITING }), line.teammate), line.teammate, undefined);
+		case "teammate-idle":
+			// The round stays done: its row keeps saying so.
+			return withLimit(endRequests(withTeammate(state, line, { activity: "idle" }), line.teammate), line.teammate, undefined);
 		case "teammate-mode":
 			return withTeammate(state, line, { observedMode: line.mode });
 		case "task-dropped":
@@ -1661,13 +1707,14 @@ function noRequestText(state: EffortState, request: string): string {
 }
 
 /**
- * `team_escalate`: move a held request, or a stopped-short Teammate's prose
- * question, to the human's pending items with the Lead's summary. Only the
- * Task that asked waits on it; the rest of the Effort goes on.
+ * `team_escalate`: move a held request, or the prose question of a Teammate
+ * whose turn ended without a result, to the human's pending items with the
+ * Lead's summary. Only the Task that asked waits on it; the rest of the
+ * Effort goes on.
  */
 function escalate(state: EffortState, input: Extract<EffortInput, { kind: "escalate" }>): Step {
 	if ((input.request === undefined) === (input.teammate === undefined)) {
-		return { ok: false, refusal: "Escalate either a held `request` by its id, or a stopped-short `teammate` with its `question`; not both, and not neither." };
+		return { ok: false, refusal: "Escalate either a held `request` by its id, or a `teammate` whose turn ended without a result with its `question`; not both, and not neither." };
 	}
 	const summary = input.summary.trim();
 	if (summary === "") return { ok: false, refusal: "An escalation needs a `summary` for the human: what is asked, and why the Brief doesn't settle it." };
@@ -1689,8 +1736,11 @@ function escalate(state: EffortState, input: Extract<EffortInput, { kind: "escal
 	const teammate = teammateOf(state, input.teammate ?? "");
 	if (typeof teammate === "string") return { ok: false, refusal: teammate };
 	if (teammate.ended) return { ok: false, refusal: `Teammate \`${teammate.id}\` has ended, so there is nobody to take the human's answer.` };
-	if (teammate.doing !== "stopped short") {
-		return { ok: false, refusal: `Teammate \`${teammate.id}\` hasn't stopped short on a question: escalate a prose question only from a Teammate whose turn stopped short asking one; a held request is escalated by its \`request\` id.` };
+	if (teammate.doing !== TURN_ENDED) {
+		return {
+			ok: false,
+			refusal: `Teammate \`${teammate.id}\` hasn't ended its turn without a result on a question: escalate a prose question only from a Teammate whose turn ended without a result asking one; a held request is escalated by its \`request\` id.`,
+		};
 	}
 	const question = input.question?.trim() ?? "";
 	if (question === "") return { ok: false, refusal: `Escalating ${teammate.id}'s prose question needs the \`question\`, as its last message asked it.` };
@@ -3167,16 +3217,48 @@ function answerUsage(state: EffortState, input: Extract<EffortInput, { kind: "an
 	}
 }
 
+/** How a Teammate's turn that ended without a new result shows, in its row and to `team_escalate`. */
+export const TURN_ENDED = "ended its turn without a result";
+
+/** How a Teammate shows while it waits on its own background work to re-prompt it. */
+export const WAITING = "waiting on its background work";
+
+/** The background task statuses a `Stop` hook lists as still in flight. */
+const IN_FLIGHT: ReadonlySet<string> = new Set(["running", "pending"]);
+
 /**
- * A `Stop`. Done means the round's result is written and not yet reported;
- * anything else is stopped short, and the Lead gets the last thing it said.
+ * What a `Stop` says is still in flight in the session and will re-prompt it
+ * when it ends: each background task or Monitor still running, and each
+ * session cron (a `ScheduleWakeup`, a `/loop`), by its description. Claude
+ * Code's `Stop` hook input lists them in `background_tasks` and
+ * `session_crons`, so a hook can tell a session that is done from one paused
+ * waiting for its background work to wake it. Empty when neither is listed,
+ * as from a Claude Code too old to send them.
+ */
+function inFlight(payload: Record<string, unknown> | undefined): string[] {
+	const listed = (value: unknown): Record<string, unknown>[] => (Array.isArray(value) ? value.filter((each): each is Record<string, unknown> => typeof each === "object" && each !== null) : []);
+	const tasks = listed(payload?.background_tasks)
+		.filter((each) => IN_FLIGHT.has(text(each.status) ?? ""))
+		.map((each) => text(each.description) ?? text(each.command) ?? text(each.id) ?? "a background task");
+	const crons = listed(payload?.session_crons).map((each) => text(each.prompt) ?? text(each.description) ?? text(each.id) ?? "a session cron");
+	return [...tasks, ...crons];
+}
+
+/**
+ * A `Stop`. Done means the round's result is written and not yet reported. A
+ * Stop for a round already reported, after a late notice woke the Teammate,
+ * changes nothing: the round is done and waiting for review. A Stop while
+ * the Teammate's own background work is in flight is a wait: it is
+ * re-prompted when that work ends, so the Lead isn't woken. Anything else
+ * ended its turn without a result, and the Lead gets the last thing it said.
  */
 function stopped(state: EffortState, teammate: Teammate, input: Extract<EffortInput, { kind: "journal" }>): Step {
 	const due = currentResult(state, teammate.id);
 	if (!due) return took(state, [], []);
 	const { cursor, line } = input;
-	const fresh = input.result.written && state.tasks[due.slug]?.reported !== due.round;
-	if (fresh) {
+	// The cursor still moves past it, so a re-read after a send-back doesn't take it for the next round's.
+	if (state.tasks[due.slug]?.reported === due.round) return took(state, [{ type: "teammate-idle", teammate: teammate.id, cursor, at: line.at }], []);
+	if (input.result.written) {
 		return took(
 			state,
 			[{ type: "task-done", teammate: teammate.id, cursor, slug: due.slug, round: due.round, at: line.at }],
@@ -3184,13 +3266,19 @@ function stopped(state: EffortState, teammate: Teammate, input: Extract<EffortIn
 		);
 	}
 	const message = text(line.payload?.last_assistant_message) ?? "";
+	const waitingOn = inFlight(line.payload);
+	if (waitingOn.length > 0) return took(state, [{ type: "teammate-waiting", teammate: teammate.id, cursor, slug: due.slug, waitingOn, message, at: line.at }], []);
 	return took(
 		state,
 		[{ type: "teammate-stopped", teammate: teammate.id, cursor, slug: due.slug, message, at: line.at }],
 		[
 			{
 				kind: "wake-lead",
-				text: `\`${teammate.id}\` stopped short on Task \`${due.slug}\`: it stopped without writing a new ${input.result.path}. Its last message:\n\n${message || "(none)"}`,
+				text: [
+					`\`${teammate.id}\` ended its turn on Task \`${due.slug}\` without writing a new ${input.result.path}.`,
+					"A Stop doesn't end its session: it stays live and takes your next message. A Teammate waiting on its own background task or Monitor is re-prompted when that ends, so if its last message says it is waiting on one, don't nudge it: leave it to finish, and you are woken when it does.",
+					`Its last message:\n\n${message || "(none)"}`,
+				].join(" "),
 			},
 		],
 	);
@@ -3591,7 +3679,7 @@ function told(line: EffortLine, state: EffortState): string | undefined {
 		case "task-done":
 			return `${line.teammate} finished round ${line.round} of Task \`${line.slug}\``;
 		case "teammate-stopped":
-			return `${line.teammate} stopped short on Task \`${line.slug}\``;
+			return `${line.teammate} ended its turn on Task \`${line.slug}\` without a result`;
 		case "escalated":
 			return `escalated ${escalationText(line, state, false)} (\`${line.id}\`) to you: ${line.summary}`;
 		case "escalation-answered": {

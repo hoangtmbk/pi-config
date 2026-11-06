@@ -88,7 +88,9 @@ Acceptance criteria (`- **AC1** …`, unique ids), Scope, Decide for me / Ask me
 sections the Playbook adds under `## Brief sections`. It then calls `team_request_approval` with
 checkpoint `brief`, which refuses the draft naming each problem: a missing section, a repeated or
 missing criterion id, an override naming a rule the Playbook doesn't have, a wrong repo or sha.
-Before writing the Brief the Lead checks each Playbook rule against what its tools can do. A Role's
+Before writing the Brief the Lead checks each Playbook rule against what its tools can do: only
+the bold-id rules, since an override can name only those; the guidance around them isn't checked,
+so a Playbook's guidance should describe only what the Lead or the extension does. A Role's
 model is set by its Role file, or for this Effort by the Brief's `roles:`, which an approved Brief
 change can change again from the Role's next launch on; so a rule asking for a model per Role is
 carried out there. There is no per-Task choice: a cheaper model for simpler Tasks means a separate
@@ -144,8 +146,9 @@ A new Teammate starts as `claude --bg` in the Workspace, named
   launch prompt, which Claude Code hands the mod as if you had typed it, so it is not a Takeover);
 - `prompt.md`, appended to the system prompt: a preamble naming the Teammate, its Role, the Lead
   as its only contact, `AskUserQuestion` for questions, the Task-folder convention, the paths of
-  `brief.md` and `clarifications.md`, and that installing dependencies in the fresh Workspace is
-  its job, then the Role's prompt;
+  `brief.md` and `clarifications.md`, that installing dependencies in the fresh Workspace is
+  its job, and that it waits on a long run by ending its turn with a `Monitor` or background task
+  watching it, since that doesn't end its session, then the Role's prompt;
 - `mcp.json`, when the Role has `mcpServers`.
 
 The Effort directory is added with `--add-dir`, `EnterPlanMode` is always disallowed, and the
@@ -196,8 +199,19 @@ is also read when the Lead's prompt settles, so a lost doorbell loses nothing.
 - `UserPromptSubmit` is logged as a message having landed, and `PermissionDenied` is logged;
 - an idle `Notification` is dropped;
 - a `Stop` after the round's `result-<n>.md` is written means the round is done, and wakes the
-  Lead with the Task and the result's path. A `Stop` without a new result is "stopped short", and
-  wakes the Lead with the Teammate's last message.
+  Lead with the Task and the result's path. A later `Stop` for that round, before the Lead reviews
+  it (a late background notice woke the Teammate), logs a `teammate-idle` line that no Report
+  tells, wakes nobody, and leaves the row at "round n done".
+- a `Stop` without a new result while the `Stop` hook lists the Teammate's own background tasks,
+  Monitors or session crons as in flight (`background_tasks`, `session_crons`) is a wait: Claude
+  Code prompts it again when they end. It logs a `teammate-waiting` line that no Report tells,
+  wakes nobody, and the row shows "waiting on its background work". A server left running in the
+  background counts too, so a Teammate that ends its turn on a question while one runs waits
+  until the human or the Lead looks.
+- any other `Stop` without a new result "ended its turn without a result", as Reports say. It wakes
+  the Lead with the Teammate's last message, and tells it that a Stop doesn't end a session, that a
+  Teammate waiting on its own background task or Monitor is prompted again when that ends, and
+  not to nudge one.
 
 Wakes that come while the Lead is busy are sent together as one follow-up once its prompt settles.
 
@@ -287,10 +301,14 @@ Approving sign-off records the Report's sha256 in `approvals.jsonl`, stops every
 the Effort; sending it back wakes the Lead with your note and drops the proposed changes. At the
 end clean worktrees are removed and every branch is kept; a dirty worktree is kept and named.
 `/team cancel` ends the Effort the same way without a Report. An ended Effort can't be adopted.
+What the end did goes on record after `effort-ended` as a `worktrees-ended` line, each worktree
+`removed` or `kept` with its `why` and the processes found `running` in it, and to the Lead in the
+message that ends the Effort, which tells it not to use a removed worktree and to leave any process
+named there to the human.
 
 A process still running in a worktree (a server a Teammate started with `&`, which `claude stop`
-doesn't reach) is named by pid and command in the final Report's Worktrees section and in the
-notice as the worktree goes, and is never stopped; so is one left in an isolated Task's worktree
+doesn't reach) is named by pid and command in the final Report's Worktrees section, and as the
+worktree goes in the notice, the `worktrees-ended` line and the Lead's message, and is never stopped; so is one left in an isolated Task's worktree
 when an accept or a drop removes it. A Teammate's own session, and what is still attached to it,
 isn't named, since stopping the Teammate stops those. The session is known by the pid `claude
 agents --json` gives it: if that list gives no pids, a live session may be named too.
