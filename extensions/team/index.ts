@@ -5,7 +5,10 @@
  * and checked by `definitions.ts`; what `/team start` says is decided by
  * `start.ts`; an Effort's state is folded and stepped by `core.ts`, and its
  * files are kept by `records.ts`; the `claude` executable is known only to
- * `claude.ts`.
+ * `claude.ts`. How Teammates are stopped is `stopping.ts`'s, when the Lead
+ * hears from the extension `lead-wakes.ts`'s, what `/team pending` asks
+ * `dialogs.ts`'s, and what an Effort's end does with its worktrees
+ * `ending.ts`'s.
  *
  * Every path root is injected through {@link TeamDeps}, so tests point the
  * extension at temp folders and a fake `claude`, and nothing reaches the
@@ -22,10 +25,10 @@ import { Type } from "typebox";
 import { attachTarget, chooseAttach, pickerLabel } from "./attach.ts";
 import { renderTeamBlock, teamStatus } from "./block.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
+import { agentsList, CLEAR_MARKER, getUsage, humanStatusLine, installMod, launchBackground, sendToInbox, statusLineReading, stillListed, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
 import { leadCost } from "./cost.ts";
 import { approveOrSendBack, askEscalation, askUsage } from "./dialogs.ts";
 import { endedLeadText, endEffortWorktrees } from "./ending.ts";
-import { agentsList, CLEAR_MARKER, getUsage, humanStatusLine, installMod, launchBackground, sendToInbox, statusLineReading, stillListed, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
 import {
 	awayText,
 	BRIEF,
