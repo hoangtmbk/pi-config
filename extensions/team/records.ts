@@ -14,7 +14,7 @@ import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSyn
 import { join, relative, sep } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { type Clarification, type EffortLine, type EffortState, type JournalLine, type PendingApproval, type Report, taskStatus, type Workspace } from "./core.ts";
-import { BRIEF_SKELETON, isKebabCase, type Playbook, type Role, readSnapshot, type Snapshot, sha256 } from "./definitions.ts";
+import { BRIEF_SKELETON, isKebabCase, isMapping, type Playbook, quoteList, type Role, readSnapshot, type Snapshot, sha256 } from "./definitions.ts";
 import type { AnswerTerms, CitableGrant } from "./requests.ts";
 
 /** The files of one Effort, all under `<agent dir>/team/efforts/<effort-id>/`. */
@@ -91,10 +91,15 @@ export function createEffort(agentDir: string, team: string, now: Date): { effor
 
 /** The Effort's lines, oldest first. */
 export function readLines(paths: EffortPaths): EffortLine[] {
-	return readFileSync(paths.log, "utf8")
+	return jsonLines<EffortLine>(paths.log);
+}
+
+/** Each non-blank line of a JSONL file, parsed. */
+function jsonLines<T>(file: string): T[] {
+	return readFileSync(file, "utf8")
 		.split("\n")
 		.filter((line) => line.trim() !== "")
-		.map((line) => JSON.parse(line) as EffortLine);
+		.map((line) => JSON.parse(line) as T);
 }
 
 export function appendLines(paths: EffortPaths, lines: readonly EffortLine[]): void {
@@ -278,10 +283,7 @@ export function promoteBrief(
 /** The approved acts `approvals.jsonl` records, oldest first; none when it is missing. */
 export function readApprovals(paths: EffortPaths): ApprovalRecord[] {
 	if (!existsSync(paths.approvals)) return [];
-	return readFileSync(paths.approvals, "utf8")
-		.split("\n")
-		.filter((line) => line.trim() !== "")
-		.map((line) => JSON.parse(line) as ApprovalRecord);
+	return jsonLines<ApprovalRecord>(paths.approvals);
 }
 
 /**
@@ -397,7 +399,7 @@ export function validateBrief(text: string, expected: BriefExpectations): string
 	try {
 		parsed = parseFrontmatter(text);
 	} catch (error) {
-		return [`the Brief's frontmatter is not valid YAML: ${(error instanceof Error ? error.message : String(error)).split("\n")[0]}`];
+		return [`the Brief's frontmatter is not valid YAML: ${firstLine(error)}`];
 	}
 	if (!isMapping(parsed.frontmatter)) return ["the Brief's frontmatter must be a YAML mapping of fields between `---` lines"];
 	return [...checkFrontmatter(parsed.frontmatter, expected), ...checkBody(parsed.body, expected)];
@@ -452,7 +454,7 @@ export function briefRoles(text: string, roles: readonly Role[]): Role[] {
 	try {
 		fields = parseFrontmatter(text).frontmatter;
 	} catch (error) {
-		throw new Error(`The Brief's frontmatter isn't valid YAML, so the launch options it sets per Role can't be read: ${(error instanceof Error ? error.message : String(error)).split("\n")[0]}`);
+		throw new Error(`The Brief's frontmatter isn't valid YAML, so the launch options it sets per Role can't be read: ${firstLine(error)}`);
 	}
 	const set = isMapping(fields) && isMapping(fields.roles) ? fields.roles : {};
 	return roles.map((role) => {
@@ -516,17 +518,15 @@ function checkOverrides(overrides: unknown, playbook: Playbook): string[] {
 function sections(body: string): Map<string, string[]> {
 	const found = new Map<string, string[]>();
 	let current: string[] | undefined;
-	let level = 0;
 	for (const line of body.split("\n")) {
 		const heading = HEADING.exec(line);
 		if (heading && heading[1].length >= 2) {
-			level = heading[1].length;
 			current = [];
 			found.set(heading[2].toLowerCase(), current);
 			continue;
 		}
-		if (heading && heading[1].length < 2) current = undefined;
-		else if (heading && heading[1].length <= level) current = undefined;
+		// The title ends the section before it, and belongs to none.
+		if (heading) current = undefined;
 		current?.push(line);
 	}
 	return found;
@@ -592,13 +592,19 @@ export function briefCriteria(text: string): string[] {
  * work starts.
  */
 export function briefSkips(text: string): { rule: string; reason: string }[] {
-	const { frontmatter } = parseFrontmatter(text);
-	const overrides = isMapping(frontmatter) && Array.isArray(frontmatter.overrides) ? frontmatter.overrides.filter(isMapping) : [];
-	return overrides.flatMap((each) =>
-		typeof each.rule === "string" && typeof each.change === "string" && each.change.trim() === SKIP
-			? [{ rule: each.rule, reason: typeof each.reason === "string" ? each.reason.replace(/\s+/g, " ").trim() : "" }]
-			: [],
+	return briefOverrides(parseFrontmatter(text).frontmatter).flatMap((each) =>
+		isSkip(each) ? [{ rule: each.rule, reason: typeof each.reason === "string" ? each.reason.replace(/\s+/g, " ").trim() : "" }] : [],
 	);
+}
+
+/** The overrides a Brief's parsed frontmatter lists, each a mapping; none when it lists none. */
+function briefOverrides(frontmatter: unknown): Record<string, unknown>[] {
+	return isMapping(frontmatter) && Array.isArray(frontmatter.overrides) ? frontmatter.overrides.filter(isMapping) : [];
+}
+
+/** Whether an override skips the Playbook id its `rule` names. */
+function isSkip(override: Record<string, unknown>): override is Record<string, unknown> & { rule: string } {
+	return typeof override.rule === "string" && typeof override.change === "string" && override.change.trim() === SKIP;
 }
 
 /**
@@ -609,8 +615,8 @@ export function briefSkips(text: string): { rule: string; reason: string }[] {
  */
 export function answerTerms(playbook: Playbook, text: string, workspace: string): AnswerTerms {
 	const { frontmatter, body } = parseFrontmatter(text);
-	const overrides = isMapping(frontmatter) && Array.isArray(frontmatter.overrides) ? frontmatter.overrides.filter(isMapping) : [];
-	const skipped = new Set(overrides.flatMap((each) => (typeof each.rule === "string" && typeof each.change === "string" && each.change.trim() === SKIP ? [each.rule] : [])));
+	const overrides = briefOverrides(frontmatter);
+	const skipped = new Set(overrides.flatMap((each) => (isSkip(each) ? [each.rule] : [])));
 	const added = overrides.flatMap((each): CitableGrant[] => {
 		const change = typeof each.change === "string" ? each.change.trim() : "";
 		return typeof each.rule === "string" && change.startsWith(ADD_GRANT) ? [{ id: each.rule, allow: change.slice(ADD_GRANT.length).trim(), from: "Brief" }] : [];
@@ -669,13 +675,14 @@ export function writeTask(paths: EffortPaths, folder: string, body: string): str
 	const dir = join(paths.tasks, folder);
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "task.md"), body);
-	if (!existsSync(paths.clarifications)) {
-		writeFileSync(paths.clarifications, CLARIFICATIONS_HEADER);
-	}
+	startClarifications(paths);
 	return dir;
 }
 
-const CLARIFICATIONS_HEADER = "# Clarifications\n\nAnswers to questions the human was asked during this Effort. They count as part of the Brief.\n";
+/** Write `clarifications.md` with its header, unless it is there already. */
+function startClarifications(paths: EffortPaths): void {
+	if (!existsSync(paths.clarifications)) writeFileSync(paths.clarifications, "# Clarifications\n\nAnswers to questions the human was asked during this Effort. They count as part of the Brief.\n");
+}
 
 /**
  * Append the human's answer to an escalated question to `clarifications.md`,
@@ -683,7 +690,7 @@ const CLARIFICATIONS_HEADER = "# Clarifications\n\nAnswers to questions the huma
  * only ever appended to, so `brief.md` and its sha stay as approved.
  */
 export function appendClarification(paths: EffortPaths, entry: Clarification): void {
-	if (!existsSync(paths.clarifications)) writeFileSync(paths.clarifications, CLARIFICATIONS_HEADER);
+	startClarifications(paths);
 	const when = `${entry.at.slice(0, 10)} ${entry.at.slice(11, 16)}`;
 	const lines = [
 		"",
@@ -713,16 +720,13 @@ export function writeFeedback(paths: EffortPaths, folder: string, round: number,
 	return path;
 }
 
-function isMapping(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function bulletList(lines: readonly string[]): string {
 	return lines.map((line) => `- ${line}`).join("\n");
 }
 
-function quoteList(items: readonly string[]): string {
-	return items.map((item) => `\`${item}\``).join(", ");
+/** The first line of a thrown error's message. */
+function firstLine(error: unknown): string {
+	return (error instanceof Error ? error.message : String(error)).split("\n")[0];
 }
 
 /** `lead.json`: the live Lead's bridge, which the hook script rings. */
