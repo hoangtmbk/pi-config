@@ -570,7 +570,6 @@ describe("the floor classifier", () => {
 			["cd /ws/sub; rm -rf build", true],
 			["cd /ws/sub\nrm -rf build", true],
 			["cd /; cd /ws && rm -rf etc", true],
-			["cd /; cd /ws; rm -rf etc", true],
 			["cd / && cd /ws && rm -rf etc", true],
 			["cd /ws/sub && make | tee log && rm -rf build", true],
 			["cd /ws/sub && grep x f; rm -rf build", true],
@@ -582,6 +581,24 @@ describe("the floor classifier", () => {
 			['cd /; bash -c "cd /ws && rm -rf etc"', true],
 			["if true; then :; fi; cd /ws/sub && rm -rf build", true],
 			["(cd /tmp && make); cd /ws/sub && rm -rf build", true],
+			// A `cd` that `;` or a newline follows may fail: the folder before it and its own both count (#146).
+			["cd /; cd /ws; rm -rf etc", false],
+			["cd /; cd /ws/missing; rm -rf etc", false],
+			["cd /; cd /ws/missing\nrm -rf etc", false],
+			["cd /; cd /ws && make; rm -rf etc", false],
+			["cd /ws/sub; cd /; rm -rf etc", false],
+			["cd sub; rm -rf build", true],
+			["cd sub; cd deeper; rm -rf build", true],
+			["cd sub; rm -rf ../build", false],
+			["cd sub && rm -rf ../build", true],
+			["cd sub; rm -rf ../../etc", false],
+			["cd /ws/a; cd /ws/b; cd /ws/c; rm -rf x", true],
+			["cd a; cd b; cd c; rm -rf x", false],
+			["cd /; cd /ws || exit; cd sub && rm -rf x", true],
+			["cd sub; T=$PWD/x; rm -rf \"$T\"", false],
+			// A line that names CDPATH may send a `cd` anywhere.
+			["CDPATH=/; cd ws && rm -rf etc", false],
+			["export CDPATH=/x; cd /ws/sub && rm -rf build", false],
 			// A `cd` that `find -exec` runs leaves this shell where it was.
 			["cd /ws; find . -exec cd / \\;; rm -rf etc", true],
 		];

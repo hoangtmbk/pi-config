@@ -59,7 +59,7 @@ export function floorAction(command, where) {
 	const job = typeof where.jobDir === "string" && posix.isAbsolute(where.jobDir) && !namesJob(command) ? posix.resolve(where.jobDir) : undefined;
 	return scan(
 		command,
-		{ command, roots, home: namesHome(command) ? undefined : home, job, bareJob: job === undefined || splittable(job, command) ? undefined : job, cwd: where.cwd === undefined ? workspace : posix.resolve(where.cwd) },
+		{ command, roots, home: namesHome(command) ? undefined : home, job, bareJob: job === undefined || splittable(job, command) ? undefined : job, cwds: [where.cwd === undefined ? workspace : posix.resolve(where.cwd)] },
 		0,
 	);
 }
@@ -170,9 +170,9 @@ const MAX_DEPTH = 8;
 function scan(text, context, depth) {
 	const all = segments(text);
 	const names = bindings(all, context.command);
-	const folder = moves(all, context.cwd);
+	const folder = moves(all, context.cwds, context.command);
 	for (const segment of all) {
-		const here = { ...context, cwd: folder.cwd(), vars: names.visible() };
+		const here = { ...context, cwds: folder.cwds(), vars: names.visible() };
 		const kind = scanSegment(segment, here, depth);
 		if (kind) return kind;
 		folder.after(segment, here);
@@ -182,9 +182,10 @@ function scan(text, context, depth) {
 }
 
 /**
- * The directory a command text's commands run in, followed simply and
- * conservatively. A `cd` or `pushd` moves it only when it surely runs in this
- * shell before the commands after it, and the floor takes it to succeed:
+ * The folders a command text's commands may run in, followed simply and
+ * conservatively, or undefined when the floor can't tell. A `cd` or `pushd`
+ * moves them only when it surely runs in this shell before the commands after
+ * it:
  *
  * - it is a plain `cd <folder>` or `pushd <folder>` (or `builtin cd`), with
  *   no option, at this text's own level: not in a `$(…)`, a process
@@ -196,42 +197,66 @@ function scan(text, context, depth) {
  *   or `|| exit` that ends the list; so it isn't in a pipeline, behind `&&` or
  *   `||`, or in a list that `&` backgrounds.
  *
- * Any other `cd`, `pushd` or `popd`, and any `eval`, `source` or `.` (which
- * run code in this shell out of sight), leaves the directory unknown from
- * there, and a relative delete in an unknown directory is outside. So does a
- * list that a `cd` led, past an `||` (which runs when the `cd` failed), when it
- * is backgrounded, or past a group or subshell, whose separators after it the
- * floor doesn't keep.
+ * The rest of its `&&` chain runs only when it succeeded, so in its folder.
+ * After its list, it may have failed, so the folders are those from before the
+ * list and its folder both, unless `|| exit` guards it; past
+ * {@link MAX_FOLDERS} of them, unknown.
+ *
+ * Any other `cd`, `pushd` or `popd`, any `cd` in a line that names CDPATH,
+ * and any `eval`, `source` or `.` (which run code in this shell out of
+ * sight), leaves the folder unknown from there, and a relative delete in an
+ * unknown folder is outside. So does a list that a `cd` led, past an `||`
+ * (which runs when the `cd` failed), when it is backgrounded, or past a group
+ * or subshell, whose separators after it the floor doesn't keep.
  */
-function moves(all, start) {
-	let cwd = start;
+function moves(all, start, command) {
+	const cdpath = /CDPATH/.test(unquoted(command));
+	let cwds = start;
 	// Where the walk is in the list: whether only plain assignments and moving `cd`s joined by `&&` have run
-	// since it began, and whether a `cd` in it moved the directory.
+	// since it began, whether a `cd` in it moved the folders and which they were before, and whether
+	// `|| exit` guards the list's `cd`s.
 	let head = true;
 	let moved = false;
+	let before;
+	let guarded = false;
 	const after = (segment, context) => {
 		const change = dirChange(segment);
 		if (segment.nested) {
-			if (change) cwd = undefined;
+			if (change) cwds = undefined;
 			return;
 		}
 		const inner = segment.inner || segment.body;
 		const exits = segment.sep === "||" && exitsAfter(all, segment);
 		if (change) {
-			if (change.clean && head && !inner && (segment.sep === "&&" || segment.sep === ";" || exits)) {
-				cwd = change.target === undefined ? undefined : changeDir(cwd, expanded(change.target, context));
+			if (change.clean && !cdpath && head && !inner && (segment.sep === "&&" || segment.sep === ";" || exits)) {
+				if (!moved) before = cwds;
 				moved = true;
-			} else cwd = undefined;
+				cwds = change.target === undefined ? undefined : changeDir(cwds, expanded(change.target, context));
+				guarded ||= exits;
+			} else cwds = undefined;
 		}
 		const assigns = !inner && segment.words.every((_, k) => segment.values[k] !== undefined);
 		head = head && (change?.clean || assigns) && segment.sep === "&&";
-		if (moved && (inner || segment.sep === "&" || (segment.sep === "||" && !exits))) cwd = undefined;
+		if (moved && (inner || segment.sep === "&" || (segment.sep === "||" && !exits))) cwds = undefined;
 		if (LIST_END.has(segment.sep)) {
+			if (moved && !guarded) cwds = union(before, cwds);
 			head = true;
 			moved = false;
+			before = undefined;
+			guarded = false;
 		}
 	};
-	return { cwd: () => cwd, after };
+	return { cwds: () => cwds, after };
+}
+
+/** How many folders a command may run in that {@link moves} keeps before it calls the folder unknown. */
+const MAX_FOLDERS = 4;
+
+/** The folders of both lists, or undefined when either is unknown or there are more than {@link MAX_FOLDERS}. */
+function union(a, b) {
+	if (a === undefined || b === undefined) return undefined;
+	const all = [...new Set([...a, ...b])];
+	return all.length > MAX_FOLDERS ? undefined : all;
 }
 
 /** The separators that end a list. */
@@ -296,7 +321,7 @@ function scanSegment(segment, context, depth) {
  *   doesn't spell out ({@link mayChange}); an assignment in a body binds
  *   nothing;
  * - its value is a path the floor already reads: a literal absolute path, or
- *   one that starts with `$PWD` (while the directory is known and nothing
+ *   one that starts with `$PWD` (while the folder is one known folder and nothing
  *   names PWD otherwise), the trusted `$CLAUDE_JOB_DIR`, or a name bound
  *   before it, and holds no other `$`;
  * - it is sure to have run where the name is used: earlier in the same `&&`
@@ -405,13 +430,15 @@ function valuePath(from, value, context, command) {
 	const braced = `\${${from}}`;
 	const rest = value.slice(value.startsWith(braced) ? braced.length : from.length + 1);
 	if (rest.includes("$")) return undefined;
-	const base = from === "CLAUDE_JOB_DIR" ? context.job : from === "PWD" ? (mentions("PWD", command) === 0 ? context.cwd : undefined) : SHELL_NAMES.has(from) ? undefined : context.vars.get(from);
+	const base = from === "CLAUDE_JOB_DIR" ? context.job : from === "PWD" ? (mentions("PWD", command) === 0 && context.cwds?.length === 1 ? context.cwds[0] : undefined) : SHELL_NAMES.has(from) ? undefined : context.vars.get(from);
 	return base === undefined ? undefined : `${base}${rest}`;
 }
 
-function changeDir(cwd, target) {
-	if (target === undefined || target.startsWith("-") || target.startsWith("~") || target.includes("$") || cwd === undefined && !target.startsWith("/")) return undefined;
-	return posix.resolve(cwd ?? "/", target);
+/** The folders a `cd` to `target` lands in from each of `cwds`, or undefined when the floor can't tell. */
+function changeDir(cwds, target) {
+	if (target === undefined || target.startsWith("-") || target.startsWith("~") || target.includes("$")) return undefined;
+	if (target.startsWith("/")) return [posix.resolve(target)];
+	return cwds === undefined ? undefined : [...new Set(cwds.map((cwd) => posix.resolve(cwd, target)))];
 }
 
 /**
@@ -1244,9 +1271,11 @@ const DELETERS = new Set(["rm", "rmdir", "unlink", "shred", "srm", "trash", "tra
 function outside(written, context, within = false) {
 	const target = expanded(written, context);
 	if (target === "" || target.startsWith("~") || target.includes("$") || target.includes("`")) return true;
-	if (!target.startsWith("/") && context.cwd === undefined) return true;
-	const resolved = posix.resolve(context.cwd ?? "/", target);
-	return !context.roots.some((root) => resolved.startsWith(`${root}/`) || (within && resolved === root));
+	if (!target.startsWith("/") && context.cwds === undefined) return true;
+	return (target.startsWith("/") ? ["/"] : context.cwds).some((cwd) => {
+		const resolved = posix.resolve(cwd, target);
+		return !context.roots.some((root) => resolved.startsWith(`${root}/`) || (within && resolved === root));
+	});
 }
 
 function remove(name, args, context) {
