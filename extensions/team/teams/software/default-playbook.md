@@ -67,8 +67,10 @@ Besides the sections every Brief has, a Brief for this Team has:
   and each of those Tasks is an `isolated` handoff: its own worktree and branch, merged into the
   Effort's branch when the Lead accepts it. Otherwise dev Tasks run one after another.
 - The Lead staffs QA only once there's an integrated change to verify. The Lead doesn't stop
-  Teammates: once the architect's last Task is accepted, the extension stops it when another
-  Role's Task needs its slot under `maxTeammates`.
+  Teammates: when a Task needs a slot under `maxTeammates`, the extension stops an idle one, first
+  one whose Role has nothing left to do, then a dev idle with an `isolated` Task in review (its
+  worktree and branch stay for the merge or a send-back), and the architect a later review needs
+  only last. So the architect's review of parallel dev Tasks can start while they wait for it.
 
 ## Order of work
 

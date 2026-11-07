@@ -400,8 +400,12 @@ export type EffortLine =
 	| ({ type: "task-queued" } & QueuedTask)
 	/** An idle Teammate whose Task is accepted was reused for Task `slug`: its context is cleared before the pointer goes. */
 	| { type: "clear-requested"; teammate: string; slug: string; at: string }
-	/** An idle Teammate whose Task is accepted was stopped to make room under the cap. */
-	| { type: "teammate-retired"; teammate: string; at: string }
+	/**
+	 * An idle Teammate was stopped to make room under the cap: one whose Task
+	 * is accepted, or one idle with isolated Task `inReview` in review, whose
+	 * worktree and branch stay for a send-back or the merge.
+	 */
+	| { type: "teammate-retired"; teammate: string; inReview?: string; at: string }
 	/**
 	 * An idle Teammate whose Role's launch options an approved Brief change
 	 * altered was stopped and launched afresh, under the same id and name, for
@@ -430,6 +434,12 @@ export type EffortLine =
 	| { type: "resumed"; by: PauseSetter; at: string }
 	/** A Task queued while paused waits on, once the Effort runs, for this reason instead. */
 	| { type: "task-requeued"; slug: string; why: string; at: string }
+	/**
+	 * The queue can't drain by itself: the `queued` Tasks wait at the cap on
+	 * live Teammates idle with Tasks in review that they depend on, `waitsOn`.
+	 * The Lead was woken with it, once.
+	 */
+	| { type: "queue-stuck"; queued: string[]; waitsOn: string[]; at: string }
 	/** A usage reading: a Teammate's status line, or `get_usage`. */
 	| ({ type: "usage-read" } & UsageReading)
 	/** A `PermissionRequest` the Teammate's hook holds open for the first answer, the Lead's or the human's in the terminal. */
@@ -738,6 +748,8 @@ export interface EffortState {
 	teammates: Teammate[];
 	/** Tasks handed off while at the cap, in handoff order: each starts by itself when a Teammate frees up. */
 	queue: QueuedTask[];
+	/** The last queue the Lead was told can't drain by itself, as {@link stuckKey} has it; absent before the first. */
+	stuck?: string;
 	/** The last Report's number; 0 before the first. */
 	reports: number;
 	/** The lines a Report tells of since the last one, oldest first. */
@@ -1239,6 +1251,8 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		}
 		case "task-requeued":
 			return { ...state, queue: state.queue.map((queued) => (queued.slug === line.slug ? { ...queued, why: line.why } : queued)) };
+		case "queue-stuck":
+			return { ...state, stuck: stuckKey(line.queued, line.waitsOn) };
 		case "report-written":
 			return state;
 		case "usage-read": {
@@ -1562,12 +1576,18 @@ export function fold(lines: readonly EffortLine[]): EffortState {
 /** Take one input: the lines it appends and what the shell must do, or why it is refused. */
 export function step(state: EffortState, input: EffortInput): Step {
 	const result = stepOnce(state, input);
-	if (result.ok && result.append.some(freesRoom)) return { ...result, actions: [...result.actions, { kind: "start-queued" }] };
+	if (result.ok && result.append.some((line) => freesRoom(line, result.state))) return { ...result, actions: [...result.actions, { kind: "start-queued" }] };
 	return result;
 }
 
-/** A line after which a queued Task may start: a usage pause or a model hold lifted, or a Teammate crashed, freeing room under the cap. */
-function freesRoom(line: EffortLine): boolean {
+/**
+ * A line after which a queued Task may start: a usage pause or a model hold
+ * lifted, or a Teammate crashed, freeing room under the cap; or, with a Task
+ * queued, a round done, whose Teammate the ladder may stop to make room (its
+ * Task isolated) or which may leave the queue unable to drain by itself.
+ */
+function freesRoom(line: EffortLine, state: EffortState): boolean {
+	if (line.type === "task-done") return state.queue.length > 0;
 	return (line.type === "resumed" && line.by === "usage") || line.type === "model-released" || line.type === "teammate-crashed";
 }
 
@@ -2433,7 +2453,8 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 		const teammate = state.teammates.find((each) => each.id === handed?.teammate);
 		const replanned = tasks.find((task) => task.slug === slug);
 		append.push({ type: "task-dropped", slug, at: input.at });
-		const live = teammate !== undefined && teammate.ended === undefined && teammate.task === slug;
+		// One stopped to make room while its isolated Task was in review is stopped already.
+		const live = teammate !== undefined && isLive(teammate) && teammate.task === slug;
 		if (live) {
 			append.push({ type: "teammate-ended", teammate: teammate.id, how: "stopped", at: input.at });
 			actions.push({ kind: "stop-teammate", teammate: teammate.id, shortId: teammate.shortId ?? teammate.name });
@@ -2567,11 +2588,14 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 		);
 	}
 	const why = waitReason(state, max);
+	const waiting: EffortLine = { type: "task-queued", ...wanted, why };
+	// Queued behind Tasks it depends on, in review, with nothing else to free room: the Lead hears so now, not when nothing happens.
+	const stuck = stuckNotice(apply(state, waiting), max, input.at);
 	return took(
 		state,
-		[{ type: "task-queued", ...wanted, why }],
+		[waiting, ...stuck.append],
 		[{ kind: "write-task", slug: task.slug, folder }, { kind: "write-plan" }],
-		`queued ${pointer}: ${why}. It starts by itself when a Teammate frees up, and \`team_review\` says so when an acceptance starts it.`,
+		`queued ${pointer}: ${why}. It starts by itself when a Teammate frees up, and \`team_review\` says so when an acceptance starts it.${stuck.text === undefined ? "" : ` ${stuck.text}`}`,
 	);
 }
 
@@ -2599,8 +2623,8 @@ function free(state: EffortState, teammate: Teammate): boolean {
 /**
  * The staffing ladder, for a Task about to start: reuse an idle Teammate of
  * its Role whose Task is accepted (cleared first, never mid-Task); else start
- * a new one under the cap; else, at the cap, stop a free Teammate of a Role
- * with no Task queued and start one in its place. Undefined when none applies,
+ * a new one under the cap; else, at the cap, stop the idle Teammate
+ * {@link swapOut} picks and start one in its place. Undefined when none applies,
  * and the Task queues. A queued Task taken here leaves the queue.
  *
  * A reused Teammate `agents` doesn't list has idle-stopped: its inbox is
@@ -2641,17 +2665,79 @@ function staff(
 		};
 	}
 	if (live(state).length < max) return start(state, task, model);
-	const roles = new Set(state.queue.filter((queued) => queued.slug !== task.slug).map((queued) => queued.role));
-	const idle = live(state).find((teammate) => teammate.shortId !== undefined && free(state, teammate) && !roles.has(teammate.role));
-	if (!idle?.shortId) return undefined;
-	const retired: EffortLine = { type: "teammate-retired", teammate: idle.id, at: task.at };
+	const out = swapOut(state, task);
+	if (!out?.shortId) return undefined;
+	const inReview = free(state, out) ? undefined : out.task;
+	const retired: EffortLine = { type: "teammate-retired", teammate: out.id, ...(inReview === undefined ? {} : { inReview }), at: task.at };
 	const started = start(apply(state, retired), task, model);
 	return {
 		append: [retired, ...started.append],
-		actions: [{ kind: "stop-teammate", teammate: idle.id, shortId: idle.shortId }, ...started.actions],
+		actions: [{ kind: "stop-teammate", teammate: out.id, shortId: out.shortId }, ...started.actions],
 		who: started.who,
-		note: `It stopped idle \`${idle.id}\`, whose Task is accepted, to stay within the cap of ${max} live Teammates.`,
+		note:
+			inReview === undefined
+				? `It stopped idle \`${out.id}\`, whose Task is accepted, to stay within the cap of ${max} live Teammates.`
+				: `It stopped \`${out.id}\`, idle with isolated Task \`${inReview}\` in review, to stay within the cap of ${max} live Teammates: its worktree and branch stay, so accepting it still merges them, and a send-back starts a Teammate of its Role on them again.`,
 	};
+}
+
+/**
+ * Whom the staffing ladder stops at the cap to make room for `task`, best
+ * first: an idle Teammate whose Task is accepted and whose Role has no other
+ * Task left in the plan; then one idle with an isolated Task in review, whose
+ * worktree and branch stay; then an idle one whose Role no Task waiting on
+ * `task` needs; and only then the idle one such a Task needs (the architect
+ * a review of `task` will want). An idle Teammate whose Role has a Task
+ * queued is kept for that Task.
+ */
+function swapOut(state: EffortState, task: QueuedTask): Teammate | undefined {
+	const queuedRoles = new Set(state.queue.filter((queued) => queued.slug !== task.slug).map((queued) => queued.role));
+	const known = live(state).filter((teammate) => teammate.shortId !== undefined);
+	const idle = known.filter((teammate) => free(state, teammate) && !queuedRoles.has(teammate.role));
+	const plan = state.plan ?? [];
+	const todo = plan.filter((planned) => planned.slug !== task.slug && !["accepted", "dropped"].includes(taskStatus(state, planned.slug)));
+	const after = dependents(plan, task.slug);
+	const needed = new Set(todo.filter((planned) => after.has(planned.slug)).map((planned) => planned.role));
+	return (
+		idle.find((teammate) => !todo.some((planned) => planned.role === teammate.role)) ??
+		known.find((teammate) => idleInReview(state, teammate)) ??
+		idle.find((teammate) => !needed.has(teammate.role)) ??
+		idle[0]
+	);
+}
+
+/** The slugs of the planned Tasks that wait on `slug`, directly or through others. */
+function dependents(plan: readonly PlannedTask[], slug: string): Set<string> {
+	const found = new Set<string>();
+	let grew = true;
+	while (grew) {
+		grew = false;
+		for (const planned of plan) {
+			if (found.has(planned.slug) || !planned.dependsOn.some((on) => on === slug || found.has(on))) continue;
+			found.add(planned.slug);
+			grew = true;
+		}
+	}
+	return found;
+}
+
+/**
+ * Whether `teammate` sits idle with an isolated Task in review: stopping it
+ * loses nothing the Task needs, since its worktree and branch stay for the
+ * merge, and a send-back gives the next round to a Teammate launched there.
+ */
+function idleInReview(state: EffortState, teammate: Teammate): boolean {
+	const task = state.tasks[teammate.task];
+	return (
+		task?.worktree !== undefined &&
+		task.teammate === teammate.id &&
+		task.merging === undefined &&
+		taskStatus(state, teammate.task) === "in review" &&
+		teammate.activity !== "busy" &&
+		teammate.clearing === undefined &&
+		teammate.takeover === undefined &&
+		teammate.relaunching === undefined
+	);
 }
 
 /** Why a Teammate starts afresh when an approved Brief change altered its Role's launch options. */
@@ -2732,10 +2818,83 @@ function waitReason(state: EffortState, max: number): string {
 	return `cap ${max} reached; ${list === undefined ? "waits for a Teammate to free up" : `waits for ${list}`}`;
 }
 
+/** The cap a queued Task's reason names (`cap 3 reached; …`), or undefined for a reason other than the cap. */
+function capIn(why: string): number | undefined {
+	const match = /^cap (\d+) reached;/.exec(why);
+	return match ? Number(match[1]) : undefined;
+}
+
+/** Whether the cap `max` is above the one some queued Task waits at, so the queue should drain now. */
+export function capRaised(state: EffortState, max: number): boolean {
+	return state.queue.some((queued) => (capIn(queued.why) ?? max) < max);
+}
+
+/**
+ * Why a queued Task waits, read now under the cap `max`: a reason that names
+ * the cap is worked out afresh, so it never names a cap no longer in force.
+ * Any other reason (a pause, a hold) is the one on record.
+ */
+export function queuedWhy(state: EffortState, queued: QueuedTask, max: number): string {
+	if (capIn(queued.why) === undefined) return queued.why;
+	return live(state).length < max ? `cap ${max} has room now; it starts by itself` : waitReason(state, max);
+}
+
+/**
+ * The queued Tasks that can't start by themselves, with the Tasks they wait
+ * on: at the cap, every live Teammate idle, and a queued Task depending on
+ * Tasks in review whose Teammates hold the room. None of those can be
+ * stopped to make room (the ladder would have), so nothing moves until the
+ * Lead does. Undefined while anything else may still free room.
+ */
+function stuckQueue(state: EffortState, max: number): { queued: string[]; waitsOn: string[] } | undefined {
+	if (heldPauses(state).length > 0) return undefined;
+	const teammates = live(state);
+	if (teammates.length < max) return undefined;
+	const working = teammates.some((teammate) => teammate.activity === "busy" || !["in review", "accepted"].includes(taskStatus(state, teammate.task)));
+	if (working) return undefined;
+	const inReview = teammates.map((teammate) => teammate.task).filter((slug) => taskStatus(state, slug) === "in review");
+	const waiting = state.queue.flatMap((queued) => {
+		if (holdOn(state, queued.role) || briefHeld(state, queued.slug)) return [];
+		const on = state.plan?.find((planned) => planned.slug === queued.slug)?.dependsOn ?? [];
+		const held = inReview.filter((slug) => on.includes(slug));
+		return held.length > 0 ? [{ slug: queued.slug, held }] : [];
+	});
+	if (waiting.length === 0) return undefined;
+	return { queued: waiting.map((each) => each.slug), waitsOn: [...new Set(waiting.flatMap((each) => each.held))] };
+}
+
+/** One stuck queue, so the Lead is told of it once. */
+function stuckKey(queued: readonly string[], waitsOn: readonly string[]): string {
+	return `${queued.join(",")}|${waitsOn.join(",")}`;
+}
+
+/** The Lead's wake about a queue that can't drain by itself: the cycle, and the ways out. */
+function stuckText(stuck: { queued: string[]; waitsOn: string[] }, max: number): string {
+	const one = stuck.queued.length === 1;
+	return [
+		`Queued Task${one ? "" : "s"} ${quoted(stuck.queued)} can't start, and nothing will start ${one ? "it" : "them"} by itself:`,
+		`the cap of ${max} live Teammates is full, every live Teammate is idle, and ${one ? "it depends" : "they depend"} on ${quoted(stuck.waitsOn)}, in review, whose Teammates hold the room until you accept or send them back.`,
+		"Only a Teammate idle with an isolated Task in review can be stopped to make room, and none of these is one.",
+		`If you are holding ${quoted(stuck.waitsOn)} for ${one ? "this Task" : "these Tasks"}, nothing moves.`,
+		`Ways out: accept or send back one of them; drop or re-plan a Task with \`team_plan\`; or ask the human to raise pi's \`maxTeammates\` and \`/reload\`, which starts the queued Task by itself.`,
+	].join(" ");
+}
+
+/**
+ * The line and the wake for a queue that can't drain by itself, unless the
+ * Lead was told of this one already.
+ */
+function stuckNotice(state: EffortState, max: number, at: string): { append: EffortLine[]; text?: string } {
+	const stuck = stuckQueue(state, max);
+	if (!stuck || stuckKey(stuck.queued, stuck.waitsOn) === state.stuck) return { append: [] };
+	return { append: [{ type: "queue-stuck", ...stuck, at }], text: stuckText(stuck, max) };
+}
+
 /**
  * Start the first queued Task, in handoff order, that the staffing ladder can
  * staff now; one it can't stays queued. Nothing to start is a step with no
- * lines and no reply.
+ * reply: what it appends brings each queued Task's reason up to date, and a
+ * queue that can't drain by itself wakes the Lead, once.
  */
 function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }>): Step {
 	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
@@ -2752,18 +2911,17 @@ function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }
 			`Queued Task \`${queued.slug}\` ${staffed.who} (tasks/${queued.folder}/task.md).${staffed.note ? ` ${staffed.note}` : ""}`,
 		);
 	}
-	// A Task queued while paused or held still waits once the Effort runs: it gets the reason it waits for now, with no reply.
+	// A Task queued while paused or held, or at another cap, still waits: it gets the reason it waits for now, with no reply.
 	const why = waitReason(state, max);
-	return took(
-		state,
-		state.queue.flatMap((queued): EffortLine[] => {
-			if (queued.why !== "paused" && !queued.why.startsWith("held:")) return [];
-			const hold = holdOn(state, queued.role);
-			const now = briefHeld(state, queued.slug) ?? (hold ? heldWhy(hold) : why);
-			return now === queued.why ? [] : [{ type: "task-requeued", slug: queued.slug, why: now, at: input.at }];
-		}),
-		[],
-	);
+	const requeued = state.queue.flatMap((queued): EffortLine[] => {
+		const cap = capIn(queued.why);
+		if (queued.why !== "paused" && !queued.why.startsWith("held:") && (cap === undefined || cap === max)) return [];
+		const hold = holdOn(state, queued.role);
+		const now = briefHeld(state, queued.slug) ?? (hold ? heldWhy(hold) : why);
+		return now === queued.why ? [] : [{ type: "task-requeued", slug: queued.slug, why: now, at: input.at }];
+	});
+	const stuck = stuckNotice(state, max, input.at);
+	return took(state, [...requeued, ...stuck.append], stuck.text === undefined ? [] : [{ kind: "wake-lead", text: stuck.text }]);
 }
 
 /**
@@ -3531,7 +3689,8 @@ function review(state: EffortState, input: Extract<EffortInput, { kind: "review"
 		};
 	}
 	const current = state.teammates.find((each) => each.id === task.teammate);
-	if (current?.ended !== undefined) return restaff(state, input, task, feedback, `send-back ${sendBacks + 1} of ${input.sendBackLimit}`);
+	// Ended, or stopped to make room while its isolated Task was in review: the ladder gives the next round to another.
+	if (current !== undefined && !isLive(current)) return restaff(state, input, task, feedback, `send-back ${sendBacks + 1} of ${input.sendBackLimit}`);
 	const inbox = current?.inbox;
 	if (!inbox) {
 		return {
@@ -3562,7 +3721,8 @@ function restaff(state: EffortState, input: Extract<EffortInput, { kind: "review
 	const after = apply(state, back);
 	const wanted: QueuedTask = { slug: input.slug, folder: task.folder, role: task.role, why: "", at: input.at, ...(input.mode === undefined ? {} : { mode: input.mode }) };
 	const write: EffortAction = { kind: "write-feedback", folder: task.folder, round: task.round, feedback };
-	const sent = `Sent Task \`${input.slug}\` back (${count}) with feedback-${task.round}.md. \`${task.teammate}\` has ended`;
+	const retired = state.teammates.find((each) => each.id === task.teammate)?.retiredAt !== undefined;
+	const sent = `Sent Task \`${input.slug}\` back (${count}) with feedback-${task.round}.md. \`${task.teammate}\` ${retired ? "was stopped to make room" : "has ended"}`;
 	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
 	const pauses = heldPauses(after);
 	const hold = holdOn(after, task.role);
@@ -3861,7 +4021,11 @@ function told(line: EffortLine, state: EffortState): string | undefined {
 		case "task-queued":
 			return `queued Task \`${line.slug}\`: ${line.why}`;
 		case "teammate-retired":
-			return `stopped idle ${line.teammate} to make room`;
+			return line.inReview === undefined
+				? `stopped idle ${line.teammate} to make room`
+				: `stopped ${line.teammate}, idle with Task \`${line.inReview}\` in review, to make room; its worktree and branch stay`;
+		case "queue-stuck":
+			return `the queue couldn't drain by itself: ${quoted(line.queued)} waited at the cap on ${quoted(line.waitsOn)} in review`;
 		case "task-done":
 			return `${line.teammate} finished round ${line.round} of Task \`${line.slug}\``;
 		case "teammate-stopped":

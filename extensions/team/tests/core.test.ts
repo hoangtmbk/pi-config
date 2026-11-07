@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { awayText, currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, needsClock, openEffort, openEscalations, openMerges, runningClause, type Step, step, taskStatus, type UsageItem, type UsageReading, usageText, WAITING_QUIET_MS, waitingInTerminal, workdir } from "../core.ts";
+import { awayText, capRaised, currentResult, type EffortAction, type EffortInput, type EffortLine, type EffortState, fold, freshStatusLine, heldPauses, type JournalLine, needsClock, openEffort, openEscalations, openMerges, runningClause, type Step, step, taskStatus, type UsageItem, type UsageReading, usageText, WAITING_QUIET_MS, waitingInTerminal, workdir } from "../core.ts";
 
 const OPENED = openEffort({
 	effortId: "software-2026-11-02",
@@ -1105,6 +1105,254 @@ describe("staffing a handoff", () => {
 		assert.ok(second.ok, second.ok ? "" : second.refusal);
 		assert.deepEqual([second.append, second.actions, second.reply], [[], [], undefined]);
 		assert.deepEqual(second.state.queue.map((each) => each.slug), ["tests"]);
+	});
+
+	it("tells a cap raised above the one a Task queued at, and a drain under it starts that Task with nothing freed (#148)", () => {
+		const queued = applied(applied(planned, handoff("rename", { max: 1 })), handoff("docs", { max: 1 }));
+
+		assert.equal(capRaised(fold(queued), 1), false);
+		assert.equal(capRaised(fold(queued), 2), true);
+		const result = drain(queued, 2);
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.match(result.reply ?? "", /^Queued Task `docs` started dev-2/);
+		assert.deepEqual(result.state.queue, []);
+		assert.equal(capRaised(result.state, 2), false);
+	});
+
+	it("brings a cap reason up to date when a drain under another cap starts nothing, so a raised cap is told once", () => {
+		const queued = applied(applied(applied(planned, handoff("rename", { max: 1 })), handoff("docs", { max: 1 })), handoff("tests", { max: 1 }));
+		const two = drain(queued, 2);
+		assert.ok(two.ok, two.ok ? "" : two.refusal);
+
+		const after = drain([...queued, ...two.append], 2);
+
+		assert.ok(after.ok, after.ok ? "" : after.refusal);
+		assert.equal(after.reply, undefined);
+		assert.deepEqual(after.append, [{ type: "task-requeued", slug: "tests", why: "cap 2 reached; waits for 001 and 002", at: "2026-11-02T13:00:05.000Z" }]);
+		assert.equal(capRaised(after.state, 2), false);
+	});
+});
+
+describe("staffing parallel Tasks that a review of them follows, at the cap (#147)", () => {
+	const WORKSPACE = { kind: "git-worktree", path: "/work/app/.claude/worktrees/team-software-2026-11-02", branch: "team/software-2026-11-02", base: "c".repeat(40), from: "main" } as const;
+	const approved = applied(applied([OPENED], request("b".repeat(64))), { kind: "answer", id: "r1", answer: "approved", workspace: WORKSPACE, at: "2026-11-02T11:00:00.000Z" });
+	const DEVS = ["http", "cli", "soak"];
+	const SLICES = [
+		{ slug: "design", role: "architect", goal: "Design the slices.", criteria: ["AC1"] },
+		{ slug: "http", role: "dev", goal: "Build the HTTP slice.", dependsOn: ["design"], criteria: ["AC1"] },
+		{ slug: "cli", role: "dev", goal: "Build the CLI slice.", dependsOn: ["design"], criteria: ["AC1"] },
+		{ slug: "soak", role: "dev", goal: "Build the soak slice.", dependsOn: ["design"], criteria: ["AC1"] },
+		{ slug: "design-review-slices", role: "architect", goal: "Review the slices against the design.", dependsOn: DEVS, criteria: ["AC1"] },
+	];
+	const TASKS = "/agent/team/efforts/software-2026-11-02/tasks";
+	const T0 = "2026-11-02T11:30:00.000Z";
+
+	function plan(tasks: Extract<EffortInput, { kind: "plan" }>["tasks"], at = "2026-11-02T11:10:00.000Z"): Extract<EffortInput, { kind: "plan" }> {
+		return { kind: "plan", tasks, criteria: ["AC1"], roles: ["architect", "dev", "qa"], at };
+	}
+
+	function handoff(slug: string, isolated = false, at = T0): Extract<EffortInput, { kind: "handoff" }> {
+		return { kind: "handoff", slug, at, ...(isolated ? { isolated: true } : {}) };
+	}
+
+	/** Apply a step that must succeed, checking the Effort never has more than the default cap of 3 live Teammates. */
+	function go(lines: EffortLine[], input: EffortInput): EffortLine[] {
+		const after = applied(lines, input);
+		const live = fold(after).teammates.filter((teammate) => teammate.retiredAt === undefined && teammate.ended === undefined);
+		assert.ok(live.length <= 3, `${live.length} live Teammates: ${live.map((teammate) => teammate.id).join(", ")}`);
+		return after;
+	}
+
+	function teammateOf(lines: EffortLine[], slug: string): string {
+		const teammate = fold(lines).tasks[slug]?.teammate;
+		assert.ok(teammate, `Task ${slug} has no Teammate`);
+		return teammate;
+	}
+
+	/** The Stop of `id`'s round with its result written, its SessionStart first if it has none yet. */
+	function stopInput(lines: EffortLine[], id: string): EffortInput {
+		const state = fold(lines);
+		const teammate = state.teammates.find((each) => each.id === id);
+		assert.ok(teammate, `no Teammate ${id}`);
+		const due = currentResult(state, id);
+		const result = { path: `${TASKS}/${due?.folder}/result-${due?.round}.md`, written: true };
+		return { kind: "journal", teammate: id, cursor: (teammate.cursor ?? 0) + 1, line: { from: "hook", at: T0, event: "Stop", payload: { last_assistant_message: "Done." } }, result };
+	}
+
+	/** Play the round of Task `slug`'s Teammate to a Stop with its result written. */
+	function done(lines: EffortLine[], slug: string): EffortLine[] {
+		const id = teammateOf(lines, slug);
+		const teammate = fold(lines).teammates.find((each) => each.id === id);
+		let out = lines;
+		if (teammate?.sessionId === undefined) {
+			out = go(out, {
+				kind: "journal",
+				teammate: id,
+				cursor: (teammate?.cursor ?? 0) + 1,
+				line: { from: "hook", at: T0, event: "SessionStart", payload: { session_id: `${id.padEnd(8, "0")}-0000-4000-8000-000000000001`, source: "startup" }, inbox: { socket: `/tmp/cc-socks/${id}.sock`, token: `token-${id}` } },
+				result: { path: "", written: false },
+			});
+		}
+		return settle(go(out, stopInput(out, id)));
+	}
+
+	/** Start what the queue lets start, as the shell does after an acceptance or a line that frees room. */
+	function settle(lines: EffortLine[]): EffortLine[] {
+		let out = lines;
+		for (;;) {
+			const drained = run(out, { kind: "drain", at: "2026-11-02T13:00:05.000Z" });
+			assert.ok(drained.ok, drained.ok ? "" : drained.refusal);
+			out = go(out, { kind: "drain", at: "2026-11-02T13:00:05.000Z" });
+			if (drained.reply === undefined) return out;
+		}
+	}
+
+	/** Accept Task `slug`'s round, merging an isolated one's branch first as the shell does, then drain. */
+	function accept(lines: EffortLine[], slug: string): EffortLine[] {
+		const task = fold(lines).tasks[slug];
+		const verdict = go(lines, { kind: "review", slug, verdict: "accept", result: { path: `${TASKS}/${task?.folder}/result-${task?.round}.md`, written: true }, sendBackLimit: 2, at: "2026-11-02T13:00:00.000Z" });
+		const merged = task?.worktree ? go(verdict, { kind: "merge-result", slug, commit: "d".repeat(40), at: "2026-11-02T13:00:01.000Z" }) : verdict;
+		return settle(merged);
+	}
+
+	/** Design accepted, then the three dev Tasks handed off in order, `isolated` or not. */
+	function devsHandedOff(isolated: boolean): EffortLine[] {
+		let lines = accept(done(go(applied(approved, plan(SLICES)), handoff("design")), "design"), "design");
+		for (const slug of DEVS) lines = go(lines, handoff(slug, isolated));
+		return lines;
+	}
+
+	/** The isolated dev Tasks in review, and the review handed off. */
+	function reviewHandedOff(): { lines: EffortLine[]; reply: string } {
+		let lines = devsHandedOff(true);
+		for (const slug of DEVS) lines = done(lines, slug);
+		const review = run(lines, handoff("design-review-slices", false, "2026-11-02T14:00:00.000Z"));
+		assert.ok(review.ok, review.ok ? "" : review.refusal);
+		return { lines: go(lines, handoff("design-review-slices", false, "2026-11-02T14:00:00.000Z")), reply: review.reply ?? "" };
+	}
+
+	it("gets design, three isolated dev Tasks on it and the review of all three accepted at a cap of 3, with no cap change", () => {
+		const { lines: reviewing, reply } = reviewHandedOff();
+
+		assert.match(reply, /^started architect-\d on Task `design-review-slices`/);
+		assert.match(reply, /stopped `dev-1`, idle with isolated Task `http` in review.*worktree and branch stay.*send-back/);
+		let lines = accept(done(reviewing, "design-review-slices"), "design-review-slices");
+		for (const slug of DEVS) lines = accept(lines, slug);
+
+		const state = fold(lines);
+		assert.deepEqual(
+			SLICES.map((task) => [task.slug, taskStatus(state, task.slug)]),
+			SLICES.map((task) => [task.slug, "accepted"]),
+		);
+		assert.deepEqual(state.queue, []);
+	});
+
+	it("tells the next Report that a Teammate idle in review was stopped to make room, and that its worktree stays", () => {
+		const { lines } = reviewHandedOff();
+
+		const result = run(lines, { kind: "report", headline: "On track.", criteria: ["AC1"], modes: [], at: "2026-11-02T14:30:00.000Z" });
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		const since = result.actions.find((action) => action.kind === "write-report");
+		assert.match(JSON.stringify(since), /stopped dev-1, idle with Task `http` in review, to make room; its worktree and branch stay/);
+	});
+
+	it("sends back a Task whose Teammate was stopped while in review to a Teammate in the same worktree and on the same branch", () => {
+		const { lines } = reviewHandedOff();
+		const before = fold(lines).tasks.http;
+		assert.ok(before.worktree);
+
+		const result = run(lines, {
+			kind: "review",
+			slug: "http",
+			verdict: "send_back",
+			feedback: "The handler drops the trailing slash.",
+			result: { path: `${TASKS}/${before.folder}/result-1.md`, written: true },
+			sendBackLimit: 2,
+			at: "2026-11-02T14:10:00.000Z",
+		});
+
+		assert.ok(result.ok, result.ok ? "" : result.refusal);
+		assert.deepEqual(result.append.map((line) => line.type), ["task-sent-back", "teammate-retired", "teammate-started", "task-reassigned"]);
+		assert.ok(!result.actions.some((action) => action.kind === "add-task-workspace" || action.kind === "send-back"), JSON.stringify(result.actions));
+		const id = result.state.tasks.http.teammate;
+		assert.notEqual(id, "dev-1");
+		assert.deepEqual(result.state.tasks.http.worktree, before.worktree);
+		assert.equal(workdir(result.state, id), before.worktree.path);
+		assert.equal(result.state.tasks.http.round, 2);
+		assert.match(result.reply ?? "", /`dev-1` was stopped to make room.*started `dev-4`.*result-2\.md/);
+	});
+
+	describe("prefers whom it stops at the cap", () => {
+		const PREFS = [
+			{ slug: "design", role: "architect", goal: "Design the slices.", criteria: ["AC1"] },
+			{ slug: "tests", role: "qa", goal: "Write the tests.", criteria: ["AC1"] },
+			{ slug: "more-tests", role: "qa", goal: "Write more tests.", criteria: ["AC1"] },
+			{ slug: "http", role: "dev", goal: "Build the HTTP slice.", criteria: ["AC1"] },
+			{ slug: "cli", role: "dev", goal: "Build the CLI slice.", criteria: ["AC1"] },
+			{ slug: "review", role: "architect", goal: "Review the slices.", dependsOn: ["http", "cli"], criteria: ["AC1"] },
+		];
+		/** architect-1 and qa-1 idle with their Tasks accepted, dev-1 on isolated `http`: the cap of 3 is full. */
+		const full = go(accept(done(go(accept(done(go(applied(approved, plan(PREFS)), handoff("design")), "design"), "design"), handoff("tests")), "tests"), "tests"), handoff("http", true));
+
+		function stopped(lines: EffortLine[]): string | undefined {
+			const result = run(lines, handoff("cli", true, "2026-11-02T14:00:00.000Z"));
+			assert.ok(result.ok, result.ok ? "" : result.refusal);
+			const retired = result.append.find((line) => line.type === "teammate-retired");
+			return retired?.type === "teammate-retired" ? retired.teammate : undefined;
+		}
+
+		it("first, an idle Teammate whose Role has no Task left to do", () => {
+			const replanned = go(done(full, "http"), plan(PREFS.filter((task) => task.slug !== "more-tests"), "2026-11-02T13:30:00.000Z"));
+
+			assert.equal(stopped(replanned), "qa-1");
+		});
+
+		it("next, a Teammate idle with an isolated Task in review", () => {
+			assert.equal(stopped(done(full, "http")), "dev-1");
+		});
+
+		it("never the idle Teammate a Task depending on the one starting needs, while another can go", () => {
+			assert.equal(stopped(full), "qa-1");
+		});
+
+		it("the idle Teammate a dependent Task needs only when no other can go, and never one idle in review on a Task that isn't isolated", () => {
+			const shared = go(accept(done(go(accept(done(go(applied(approved, plan(PREFS)), handoff("design")), "design"), "design"), handoff("tests")), "tests"), "tests"), handoff("http"));
+			const qaBusy = go(done(shared, "http"), handoff("more-tests"));
+
+			assert.equal(fold(qaBusy).tasks["more-tests"].teammate, "qa-1");
+			assert.equal(stopped(qaBusy), "architect-1");
+		});
+	});
+
+	it("wakes the Lead once when the queue can't drain: every live Teammate idle on a Task in review that the queued Task depends on", () => {
+		let lines = devsHandedOff(false);
+		const queued = run(lines, handoff("design-review-slices", false, "2026-11-02T14:00:00.000Z"));
+		assert.ok(queued.ok, queued.ok ? "" : queued.refusal);
+		assert.match(queued.reply ?? "", /^queued Task `design-review-slices`/);
+		lines = [...lines, ...queued.append];
+
+		const first = run(lines, stopInput(lines, teammateOf(lines, "http")));
+		assert.ok(first.ok, first.ok ? "" : first.refusal);
+		assert.ok(first.actions.some((action) => action.kind === "start-queued"), "a round done with a Task queued drains the queue");
+		lines = done(done(lines, "http"), "cli");
+		assert.ok(!lines.some((line) => line.type === "queue-stuck"), "not while a Teammate still works");
+		lines = go(lines, stopInput(lines, teammateOf(lines, "soak")));
+
+		const drained = run(lines, { kind: "drain", at: "2026-11-02T14:20:00.000Z" });
+
+		assert.ok(drained.ok, drained.ok ? "" : drained.refusal);
+		const wakes = drained.actions.filter((action) => action.kind === "wake-lead");
+		assert.equal(wakes.length, 1);
+		const text = wakes[0]?.kind === "wake-lead" ? wakes[0].text : "";
+		assert.match(text, /Queued Task `design-review-slices` can't start/);
+		assert.match(text, /cap of 3/);
+		assert.match(text, /`http`.*`cli`.*`soak`/s);
+		assert.match(text, /`maxTeammates`/);
+		const again = run([...lines, ...drained.append], { kind: "drain", at: "2026-11-02T14:21:00.000Z" });
+		assert.ok(again.ok);
+		assert.deepEqual(again.actions, [], "once");
 	});
 });
 

@@ -132,15 +132,35 @@ Task with no judgment from the Lead, down a ladder:
    first (below), so it starts the new Task fresh, under the same short id.
 2. **Start** a new Teammate of the Role (`builder-1`, `builder-2`, …) while fewer than
    `maxTeammates` are live.
-3. **Swap**: at the cap, stop (`claude stop`) an idle Teammate whose Task is accepted and whose
-   Role has no queued Task, and start one in its place.
-4. **Queue** the Task, saying why (`cap 3 reached; waits for 001, 002 and 003`). `team_review`
-   starts queued Tasks, in handoff order, when an acceptance frees a Teammate; a Teammate's crash
-   frees room under the cap the same way.
+3. **Swap**: at the cap, stop (`claude stop`) an idle Teammate and start one in its place. It
+   picks, in this order:
+   1. an idle Teammate whose Task is accepted and whose Role has no other Task left in the plan;
+   2. a Teammate idle with an `isolated` Task in review. Its worktree and branch stay, so
+      accepting the Task still merges them, and a send-back starts a Teammate of its Role there
+      (below);
+   3. an idle Teammate whose Task is accepted and whose Role no Task waiting on this one needs;
+   4. only then the idle Teammate that a Task waiting on this one needs (the architect a review of
+      the Task will want).
+
+   It never stops a Teammate whose Role has a Task queued, or one working, taken over, or idle
+   with a Task in review that isn't isolated.
+4. **Queue** the Task, saying why (`cap 3 reached; waits for 001, 002 and 003`). Queued Tasks
+   start, in handoff order, when room may have opened: an acceptance (`team_review` says what
+   started), a Teammate's crash, a round done while a Task is queued (its Teammate may now be
+   swapped out), a pause or a hold lifted, and a raised cap (below).
 
 Every live Teammate counts toward the cap, working or idle. `maxTeammates` is a pi setting
-(default 3), read after `/reload`. Starts are at least 5 s apart. The reply says which Teammate
-was started or reused, or that the Task is queued and why. A Teammate fills one Role for life.
+(default 3), read at session start and after `/reload`. Once it reads higher than the cap a Task
+queued at, the queue drains then, and the Lead is told what started. A queued Task's reason is
+read against the cap in force, so `team_status` and the Team block never name a cap that no longer
+holds. Starts are at least 5 s apart. The reply says which Teammate was started or reused, or that
+the Task is queued and why, and the Report says who was stopped to make room. A Teammate fills one
+Role for life.
+
+A queue can stall: at the cap, every live Teammate idle, and a queued Task depending on Tasks in
+review whose Teammates can't be swapped out (their Tasks aren't isolated). Then the Lead is woken
+once, naming the queued Task, the Tasks it waits on and the ways out: accept or send back one of
+them, re-plan, or ask the human to raise `maxTeammates`. The handoff that queues it says so at once.
 
 A new Teammate starts as `claude --bg` in the Workspace, named
 `team-<effort-id>-<teammate-id>`. The launch passes the Role's flags, the mode in force
@@ -168,7 +188,9 @@ A Task handed off with `isolated: true` gets a worktree and branch of its own, c
 Effort branch's tip when its Teammate starts: `…/team-<effort-id>-task-<nnn>/` beside the
 Workspace (never inside it) on branch `team/<effort-id>-task-<nnn>`, with what your repo's
 `.worktreeinclude` lists copied in. Its Teammate always starts fresh there, never reused, and a
-Teammate restaffed after a crash launches in the same worktree. Only what it commits merges.
+Teammate restaffed after a crash, or for a send-back once the ladder stopped its Teammate idle in
+review, launches in the same worktree on the same branch, with the pointer to the rounds so far.
+Only what it commits merges.
 
 Accepting it with `team_review` writes a `merge-intended` line to `effort.jsonl`, then merges the
 branch into the Effort branch with `--no-ff`. Once merged, the Task is accepted, its Teammate

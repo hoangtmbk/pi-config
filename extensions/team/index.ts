@@ -28,6 +28,7 @@ import {
 	awayText,
 	BRIEF,
 	BRIEF_CHANGE,
+	capRaised,
 	changeSnapshot,
 	currentResult,
 
@@ -431,7 +432,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		syncClock(state);
 		if (!surface) return;
 		const seen = effort ? seenStatusLines(effort) : {};
-		const lines = state ? renderTeamBlock(teamStatus(state, { adoptionsPending: pending.length, ...(confirmed ? { confirmed } : {}), statusLinesSeen: seen }), now().getTime(), { maxTeammates: maxTeammates() }) : undefined;
+		const max = maxTeammates();
+		const lines = state ? renderTeamBlock(teamStatus(state, { adoptionsPending: pending.length, ...(confirmed ? { confirmed } : {}), statusLinesSeen: seen, maxTeammates: max }), now().getTime(), { maxTeammates: max }) : undefined;
 		if (lines && !stopUsage) stopUsage = every(USAGE_FRESH_MS, readUsage);
 		if (!lines) endUsage();
 		if (lines === shown || (lines && shown && lines.length === shown.length && lines.every((line, index) => line === shown?.[index]))) return;
@@ -720,8 +722,9 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	/**
 	 * One beat of the Lead's clock: what a usage limit holds back is let go
 	 * once its reset has passed, and a Teammate due a retry or its reset's
-	 * grace is sent `continue`. A beat still running when the next comes
-	 * skips that one.
+	 * grace is sent `continue`. A cap raised above the one a Task queued at
+	 * starts queued Tasks. A beat still running when the next comes skips
+	 * that one. Picking the Effort up (session start, `/reload`) beats once.
 	 */
 	async function tickEffort(): Promise<void> {
 		const held = effort;
@@ -729,13 +732,28 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		ticking = true;
 		try {
 			const result = step(effortState(held), { kind: "tick", at: now().toISOString() });
-			if (!result.ok || result.append.length === 0) return;
-			appendLines(held.paths, result.append);
-			paintBlock();
-			wakeAboutTeammates(await afterUsage(held, result));
+			if (result.ok && result.append.length > 0) {
+				appendLines(held.paths, result.append);
+				paintBlock();
+				wakeAboutTeammates(await afterUsage(held, result));
+			}
+			await drainRaisedCap(held);
 		} finally {
 			ticking = false;
 		}
+	}
+
+	/**
+	 * Start the queued Tasks a raised `maxTeammates` makes room for, once it
+	 * reads higher than the cap a Task queued at, and tell the Lead what
+	 * started. pi reads the setting at start and on `/reload` only.
+	 */
+	async function drainRaisedCap(held: HeldEffort): Promise<void> {
+		const max = maxTeammates();
+		if (!leadCtx || !capRaised(effortState(held), max)) return;
+		const started = await startQueued(held, effortState(held), leadCtx);
+		paintBlock();
+		if (started.length > 0) wakeAboutTeammates([`pi's \`maxTeammates\` is now ${max}, above the cap the queue waited at. ${started.join(" ")}`]);
 	}
 
 	/**
@@ -944,7 +962,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	// `/tree` moves along the session's branches, but the Effort lives in its files: the Lead hears where it stands on its next turn.
 	pi.on("session_tree", () => {
 		if (!effort) return;
-		const status = teamStatus(effortState(effort), { adoptionsPending: pending.length });
+		const status = teamStatus(effortState(effort), { adoptionsPending: pending.length, maxTeammates: maxTeammates() });
 		const text = `This session still leads Effort \`${effort.effortId}\` (${effort.paths.dir}), whichever branch of the tree you are on: its state lives in its files. Its status, as \`team_status\` gives it:\n\n${JSON.stringify(status, null, 2)}`;
 		pi.sendMessage({ customType: "team-status", content: text, display: true }, { deliverAs: "nextTurn" });
 	});
@@ -1445,8 +1463,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			const drained = step(state, { kind: "drain", at: now().toISOString(), maxTeammates: maxTeammates(), ...(agents ? { agents } : {}), ...(models ? { models } : {}) });
 			if (!drained.ok) break;
 			if (drained.reply === undefined) {
-				// Nothing starts; the lines left say why each queued Task still waits, now that a pause no longer does.
+				// Nothing starts; the lines left say why each queued Task still waits, now that a pause or the old cap no longer does.
 				appendLines(held.paths, drained.append);
+				// A queue that can't drain by itself wakes the Lead, once.
+				wakeAboutTeammates(drained.actions.flatMap((action) => (action.kind === "wake-lead" ? [action.text] : [])));
 				break;
 			}
 			try {
@@ -2157,7 +2177,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		name: "team_handoff",
 		label: "Hand off",
 		description: [
-			"Hand a planned Task to a Teammate of its Role, which the extension staffs: it reuses an idle Teammate of the Role (clearing its context first), else starts one as a Claude Code background session in the Effort's Workspace while under the human's `maxTeammates`, else stops an idle Teammate no queued Task needs and starts one, else queues the Task until a Teammate frees up.",
+			"Hand a planned Task to a Teammate of its Role, which the extension staffs: it reuses an idle Teammate of the Role (clearing its context first), else starts one as a Claude Code background session in the Effort's Workspace while under the human's `maxTeammates`, else stops an idle Teammate and starts one (first one whose Role has nothing left to do, then one idle with an isolated Task in review, whose worktree and branch stay, and last the one a Task waiting on this one needs), else queues the Task until a Teammate frees up.",
 			"`body` becomes the Task's `task.md`: make it self-contained, listing the Effort's `brief.md` and `clarifications.md` among its inputs, since the Teammate has no earlier conversation. It restates the acceptance criteria as the Brief has them: never move where a criterion keeps scratch (into the Workspace, say) to keep deletes off the floor.",
 			"While the Effort is paused, by the human, by you or by a usage limit, the Task queues with `paused` and starts by itself once every pause is lifted.",
 			"Returns which Teammate was started or reused, or that the Task is queued and why. Refused until the human approves the Brief, and for a Task already handed off or queued (running, in review, sent back or accepted).",
@@ -2276,7 +2296,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		async execute() {
 			if (!effort) throw new Error("No Effort is open in this session, so there is no status to give; the human opens one with `/team start <team>`.");
 			const state = effortState(effort);
-			const block = teamStatus(state, { adoptionsPending: pending.length, statusLinesSeen: seenStatusLines(effort) });
+			const block = teamStatus(state, { adoptionsPending: pending.length, statusLinesSeen: seenStatusLines(effort), maxTeammates: maxTeammates() });
 			// One `claude agents --json` for every row: what Claude Code says of each session, or `missing` once it is gone (idle-stopped).
 			const agents = await agentsList(paths.claudePath);
 			const status = {
