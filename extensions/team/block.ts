@@ -25,7 +25,7 @@
  */
 
 import { sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
-import { type EffortState, heldPauses, isLive, openEscalations, type PauseSetter, type TakeoverTrigger, type Teammate, type UsageWindow, usageSource, waitingConfirm, waitingInTerminal } from "./core.ts";
+import { type EffortState, heldPauses, isLive, openEscalations, type PauseSetter, queuedWhy, type TakeoverTrigger, type Teammate, type UsageWindow, usageSource, waitingConfirm, waitingInTerminal } from "./core.ts";
 
 /** The widest the frame may get, borders included. */
 export const MAX_WIDTH = 96;
@@ -152,12 +152,15 @@ export interface StatusExtras {
 	 * logged times stand.
 	 */
 	statusLinesSeen?: Readonly<Record<string, string>>;
+	/** The cap of live Teammates in force, which a queued Task's reason is read against; absent, the reason on record stands. */
+	maxTeammates?: number;
 }
 
 /**
  * The Effort's status, as the block shows it and `team_status` returns it:
  * live Teammates only, since one stopped to make room under the cap is gone,
- * and the queued Tasks by folder.
+ * and the queued Tasks by folder, each with why it waits under the cap in
+ * force now.
  */
 export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockData {
 	const handed = Object.keys(state.tasks).length > 0 || state.queue.length > 0;
@@ -172,7 +175,7 @@ export function teamStatus(state: EffortState, extras: StatusExtras): TeamBlockD
 		tasks: { accepted: Object.values(state.tasks).filter((task) => task.accepted !== undefined).length, planned: state.plan?.length ?? 0 },
 		// A Teammate stopped to make room, or that ended (stopped with its dropped Task, or crashed), is gone for this Effort.
 		teammates,
-		queued: state.queue.map((queued) => ({ task: queued.folder, role: queued.role, why: queued.why })),
+		queued: state.queue.map((queued) => ({ task: queued.folder, role: queued.role, why: extras.maxTeammates === undefined ? queued.why : queuedWhy(state, queued, extras.maxTeammates) })),
 		waitingOnYou: state.pending.length + waitingInTerminal(state).length + openEscalations(state).length + extras.adoptionsPending + (state.usageItems?.length ?? 0) + (waitingConfirm(state) ? 1 : 0),
 		reports: state.reports,
 		...pauseRows(state),

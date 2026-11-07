@@ -3111,6 +3111,42 @@ describe("staffing: the ladder and clearing between Tasks", () => {
 		assert.match(readFileSync(join(dir, "plan.md"), "utf8"), /## survey\n[\s\S]*?- Status: [a-z ]+, with `scout-1` \(tasks\/002-scout-survey\/\)/);
 		assert.ok(!(teamBlock(pi) ?? []).some((line) => line.startsWith("│ builder-1")), "a stopped Teammate leaves the block");
 	});
+
+	it("starts a Task queued at `maxTeammates` once the human raises it and runs `/reload`, with no pause, telling the Lead what started (#148)", async () => {
+		const { pi, roots, repo, dir } = await crewApproved({ settings: { maxTeammates: 1 }, hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		await pi.call("team_plan", { tasks: STAFF_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		assert.match(await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" }), /: cap 1 reached; waits for 001\./);
+		await pi.emit("session_shutdown", { reason: "reload" });
+
+		const again = fakePi(roots, { cwd: repo, entries: pi.allEntries(), claude: pi.claude, settings: { maxTeammates: 2 } });
+		await again.emit("session_start", { reason: "reload" });
+
+		await until(() => pi.claude.launches().length === 2, "the queued Task starts under the raised cap");
+		assert.ok(
+			again.sent.some((message) => /`maxTeammates` is now 2, above the cap the queue waited at\. Queued Task `survey` started scout-1/.test(message.content)),
+			JSON.stringify(again.sent.map((message) => message.content)),
+		);
+		assert.deepEqual(effortLines(dir).filter((line) => line.type === "paused" || line.type === "resumed"), []);
+		assert.deepEqual((JSON.parse(await again.call("team_status", {})) as { queued: unknown[] }).queued, []);
+	});
+
+	it("never shows a queued Task waiting at a cap lower than the one in force (#148)", async () => {
+		const settings: Record<string, unknown> = { maxTeammates: 1 };
+		const { pi } = await crewApproved({ settings, hooks: [{ event: "SessionStart", payload: { source: "startup" } }] });
+		await pi.call("team_plan", { tasks: STAFF_PLAN });
+		await pi.call("team_handoff", { slug: "rename-key", body: "# Rename\n" });
+		await pi.call("team_handoff", { slug: "survey", body: "# Survey\n" });
+
+		// The setting reads higher before anything has drained the queue.
+		settings.maxTeammates = 2;
+		const status = JSON.parse(await pi.call("team_status", {})) as { queued: { why: string }[] };
+
+		assert.deepEqual(status.queued.map((queued) => queued.why), ["cap 2 has room now; it starts by itself"]);
+		// The block is drawn again as the Lead's turn settles.
+		await pi.emit("agent_settled");
+		assert.ok(!(teamBlock(pi) ?? []).some((line) => line.includes("cap 1 reached")), (teamBlock(pi) ?? []).join("\n"));
+	});
 });
 
 /** `builder-1` takes `rename-key`'s pointer in session `c0ffee12`, then the human types a prompt of their own in its terminal. */

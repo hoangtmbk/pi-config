@@ -384,6 +384,16 @@ describe("team_status data", () => {
 		);
 	});
 
+	it("reads a queued Task's cap reason against the cap in force, never naming one a raised cap no longer holds (#148)", () => {
+		const capped = (input: EffortInput): EffortInput => ({ ...input, maxTeammates: 1 }) as EffortInput;
+		const state = fold(through([REQUEST, APPROVE, PLAN, capped(handoff("design")), capped(handoff("ttl"))]));
+		const why = (maxTeammates?: number) => teamStatus(state, { adoptionsPending: 0, ...(maxTeammates === undefined ? {} : { maxTeammates }) }).queued.map((queued) => queued.why);
+
+		assert.deepEqual(why(1), ["cap 1 reached; waits for 001"]);
+		assert.deepEqual(why(2), ["cap 2 has room now; it starts by itself"]);
+		assert.deepEqual(why(), ["cap 1 reached; waits for 001"], "with no cap given, the reason on record");
+	});
+
 	it("is working once a Task is queued, though none has started", () => {
 		const capped = through([REQUEST, APPROVE, PLAN, { ...handoff("design"), maxTeammates: 0 } as EffortInput]);
 
