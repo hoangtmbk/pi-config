@@ -21,9 +21,9 @@ import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { attachTarget, chooseAttach, pickerLabel } from "./attach.ts";
 import { renderTeamBlock, teamStatus } from "./block.ts";
-import { leadCost } from "./cost.ts";
-import { leadWakes } from "./lead-wakes.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
+import { leadCost } from "./cost.ts";
+import { approveOrSendBack, askEscalation, askUsage } from "./dialogs.ts";
 import { agentsList, CLEAR_MARKER, getUsage, humanStatusLine, installMod, launchBackground, sendToInbox, statusLineReading, stillListed, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
 import {
 	awayText,
@@ -38,7 +38,6 @@ import {
 	type EffortState,
 	type EndedWorktree,
 	type Escalation,
-	escalationText,
 	type FinalFacts,
 	fold,
 	freshStatusLine,
@@ -57,10 +56,8 @@ import {
 	type Step,
 	step,
 	teammateFolders,
-	USAGE_CHOICES,
 	needsClock,
 	type UsageItem,
-	usageText,
 	USAGE_FRESH_MS,
 	type UsageReading,
 	type Workspace,
@@ -72,6 +69,7 @@ import { EVERY_ROLE, listTeams, loadTeam, type Playbook, type Role, sha256, type
 import { claudeConfigDir } from "./floor.mjs";
 import { briefApprovalTitle, intakePrompt, openedText, skipsText } from "./intake.ts";
 import { adoptable, hasEnded, holderText, ledFrom, type Leader, leaveLead, liveLead, POINTER, pointerIn, takeLead } from "./lead.ts";
+import { leadWakes } from "./lead-wakes.ts";
 import {
 	answerTerms,
 	appendClarification,
@@ -110,12 +108,11 @@ import {
 	writeTask,
 } from "./records.ts";
 import { repoRoot } from "./repo.ts";
-import { askedInFull, askedQuestions, terminalText } from "./requests.ts";
+import { terminalText } from "./requests.ts";
 import { REPORT_OVERLAY, type ReportChrome, ReportView, type ReportTui } from "./reports-view.ts";
 import { addTaskWorkspace, addWorkspace, type EffortWorktree, effortWorktrees, endWorktrees, mergeEvidence, mergeTaskWorkspace, removeTaskWorkspace } from "./workspace.ts";
 import {
 	ADOPT_PLAYBOOK,
-	APPROVE,
 	adoptedText,
 	adoptionRequested,
 	adoptPlaybook,
@@ -128,7 +125,6 @@ import {
 	plannedMode,
 	pendingAdoptionTitle,
 	requestAdoption,
-	SEND_BACK,
 	sentBackText,
 	setupTeam,
 	type TeamSetup,
@@ -248,11 +244,6 @@ const SendParams = Type.Object({
 	message: Type.String({ description: "A short prose message, at most 2000 characters; longer instructions belong in a Task." }),
 });
 
-/** The `/team pending` choices for an escalated permission, and the end of a multiSelect question's picks. */
-const ALLOW = "Allow";
-const DENY = "Deny";
-const DONE = "Done";
-
 /** What a `team_report` result carries for the human's view of it in chat; the Lead reads only its short `content`. */
 interface ReportDetails {
 	n: number;
@@ -314,14 +305,6 @@ const TICK_MS = 60_000;
 
 /** What a Teammate a usage limit stopped is sent once it resets, as the human would type it. */
 const CONTINUE = "continue";
-
-/** What each usage-item choice reads as in `/team pending`. */
-const USAGE_LABELS: Record<string, string> = {
-	stay: "Stay paused until it resets",
-	cancel: "Cancel the Effort: stop every Teammate and end it without sign-off",
-	retry: "Retry: send it `continue` again",
-	leave: "Leave it to the Lead",
-};
 
 /** The paths the extension runs against once defaults are filled in. */
 interface Paths extends TeamRoots {
@@ -1076,7 +1059,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			ctx.ui.notify(`The Brief of Effort \`${state.effortId}\` (request \`${item.id}\`) can't be approved: ${found.error}.`, "error");
 			return;
 		}
-		const picked = await approveOrSendBack(briefApprovalTitle(item, { effortId: state.effortId, team: found.team, playbook: found.playbook, repo: state.repo }), ctx);
+		const picked = await approveOrSendBack(ctx.ui, briefApprovalTitle(item, { effortId: state.effortId, team: found.team, playbook: found.playbook, repo: state.repo }));
 		if (!picked) return;
 		if (picked.answer === "approved") {
 			// Checked again against what is in force now, since the snapshot may have waited a while.
@@ -1452,7 +1435,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 	/** One adoption in `/team pending`: approve, send back with a note, or leave it for later. */
 	async function answerAdoption(item: PendingAdoption, ctx: ExtensionCommandContext): Promise<void> {
-		const picked = await approveOrSendBack(pendingAdoptionTitle(item), ctx);
+		const picked = await approveOrSendBack(ctx.ui, pendingAdoptionTitle(item));
 		if (!picked) return;
 		if (picked.answer === "approved") {
 			const adopted = adoptPlaybook(paths.agentDir, item, now());
@@ -1471,9 +1454,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 	/** One usage item in `/team pending`: the choices its kind offers, or leave it for later. */
 	async function answerUsage(held: HeldEffort, item: UsageItem, ctx: ExtensionCommandContext): Promise<void> {
-		const choices = USAGE_CHOICES[item.why];
-		const answer = await ctx.ui.select(usageText(item, effortState(held).teammates), [...choices.map((choice) => USAGE_LABELS[choice]), LATER]);
-		const choice = choices.find((each) => USAGE_LABELS[each] === answer);
+		const choice = await askUsage(ctx.ui, item, effortState(held).teammates);
 		if (choice === undefined) return;
 		const state = effortState(held);
 		const result = stepOrNotify(ctx, state, { kind: "answer-usage", id: item.id, choice, at: now().toISOString() });
@@ -1507,7 +1488,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			wakeAboutTeammates(applyJournals(held));
 			const escalation = openEscalations(effortState(held)).find((each) => each.id === id);
 			if (!escalation) continue;
-			const answer = await askEscalation(held, escalation, ctx);
+			const answer = await askEscalation(ctx.ui, escalation, effortState(held));
 			if (!answer || effort !== held) continue;
 			wakeAboutTeammates(applyJournals(held));
 			const result = step(effortState(held), { kind: "answer-escalation", id, ...answer, at: now().toISOString() });
@@ -1518,57 +1499,6 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			const failed = await carryOutAnswer(held, result);
 			if (failed) ctx.ui.notify(failed, "error");
 		}
-	}
-
-	/** The human's answer to one escalated item, from its dialogs, or undefined when they leave it for later. */
-	async function askEscalation(
-		held: HeldEffort,
-		escalation: Escalation,
-		ctx: ExtensionCommandContext,
-	): Promise<{ decision?: "allow" | "deny"; reason?: string; answers?: Record<string, string | string[]>; text?: string } | undefined> {
-		const state = effortState(held);
-		const head = [
-			`\`${escalation.id}\`: ${escalationText(escalation, state)}, escalated by the Lead: ${escalation.summary}`,
-			...(escalation.brief === undefined ? [] : [`The Brief says: ${escalation.brief}`]),
-		];
-		if (escalation.kind === "prose") {
-			const title = [...head, `${escalation.teammate} asks: ${escalation.question}`, `Your answer goes to ${escalation.teammate} and into clarifications.md:`].join("\n");
-			const text = (await ctx.ui.input(title))?.trim();
-			return text ? { text } : undefined;
-		}
-		if (escalation.kind === "permission") {
-			// The whole call, not the line the Report shows: the human decides on what would run.
-			const request = state.teammateRequests[escalation.id];
-			const asks = request ? askedInFull(request) : escalation.question;
-			const picked = await ctx.ui.select([...head, asks.includes("\n") ? `It asks for ${asks}` : `It asks for ${asks}.`].join("\n"), [ALLOW, DENY, LATER]);
-			if (picked !== ALLOW && picked !== DENY) return undefined;
-			const decision = picked === ALLOW ? "allow" : "deny";
-			const reason = await ctx.ui.input(decision === "deny" ? `Why not? ${escalation.teammate} reads it:` : "Why? The Lead and the next Report read it:");
-			if (reason === undefined) return undefined;
-			return { decision, reason: reason.trim() || `the human ${decision === "allow" ? "allowed" : "denied"} it in /team pending` };
-		}
-		const request = state.teammateRequests[escalation.id];
-		if (!request) return undefined;
-		const answers: Record<string, string | string[]> = {};
-		for (const [n, asked] of askedQuestions(request).entries()) {
-			const title = [...(n === 0 ? head : [`\`${escalation.id}\`, question ${n + 1}:`]), `"${asked.question}"${asked.multiSelect ? " (pick any, then Done)" : ""}`].join("\n");
-			if (!asked.multiSelect) {
-				const label = await ctx.ui.select(title, [...asked.labels, LATER]);
-				if (label === undefined || !asked.labels.includes(label)) return undefined;
-				answers[asked.question] = label;
-				continue;
-			}
-			const picks = new Set<string>();
-			while (picks.size < asked.labels.length) {
-				const left = asked.labels.filter((label) => !picks.has(label));
-				const label = await ctx.ui.select(title, [...left, ...(picks.size > 0 ? [DONE] : []), LATER]);
-				if (label === DONE) break;
-				if (label === undefined || !left.includes(label)) return undefined;
-				picks.add(label);
-			}
-			answers[asked.question] = asked.labels.filter((label) => picks.has(label));
-		}
-		return { answers };
 	}
 
 	/**
@@ -1595,6 +1525,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		paintBlock();
 		return undefined;
 	}
+
 	/**
 	 * The Effort's requests in `/team pending`: each proposed Playbook change
 	 * first, since sign-off waits for them, then sign-off, then a Brief. Each
@@ -1614,16 +1545,6 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			else if (item.checkpoint === BRIEF_CHANGE) await answerBriefChange(held, item, ctx);
 			else await answerCheckpoint(held, item, ctx);
 		}
-	}
-
-	/** Approve, send back with a note, or leave for later: what the human answers to `title`; undefined leaves the item waiting. */
-	async function approveOrSendBack(title: string, ctx: ExtensionCommandContext): Promise<{ answer: "approved"; note?: undefined } | { answer: "sent-back"; note: string } | undefined> {
-		const answer = await ctx.ui.select(title, [APPROVE, SEND_BACK, LATER]);
-		if (answer === APPROVE) return { answer: "approved" };
-		if (answer !== SEND_BACK) return undefined;
-		const note = (await ctx.ui.input("Note for the Lead: what should change?"))?.trim();
-		// Backing out of the note leaves the item waiting, as "later" does.
-		return note ? { answer: "sent-back", note } : undefined;
 	}
 
 	/**
@@ -1647,7 +1568,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			),
 			"Approving makes exactly this snapshot brief.md; the Team and Playbook snapshots stay as they are.",
 		].join("\n");
-		const picked = await approveOrSendBack(title, ctx);
+		const picked = await approveOrSendBack(ctx.ui, title);
 		if (!picked) return;
 		if (picked.answer === "approved") {
 			const problems = briefChangeProblems(item.snapshot, current, state);
@@ -1676,7 +1597,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 	/** An approval at a Playbook checkpoint or \`escalate\` id in \`/team pending\`: approving records the file with its sha, as the human was asked about it. */
 	async function answerCheckpoint(held: HeldEffort, item: PendingApproval, ctx: ExtensionCommandContext): Promise<void> {
-		const picked = await approveOrSendBack(`Approve checkpoint \`${item.checkpoint}\` of Effort \`${held.effortId}\` (request \`${item.id}\`)? ${item.path} (sha256 ${item.sha256})`, ctx);
+		const picked = await approveOrSendBack(ctx.ui, `Approve checkpoint \`${item.checkpoint}\` of Effort \`${held.effortId}\` (request \`${item.id}\`)? ${item.path} (sha256 ${item.sha256})`);
 		if (!picked) return;
 		if (picked.answer === "approved" && !unchangedSince(item.path, item.sha256)) {
 			ctx.ui.notify(`${item.path} changed since checkpoint \`${item.checkpoint}\` was asked (request \`${item.id}\`, sha256 ${item.sha256}), so it isn't approved. Nothing changed; send it back, or ask again.`, "error");
@@ -1704,7 +1625,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			`Sign off the final Report of Effort \`${held.effortId}\`: ${item.path} (sha256 ${item.sha256})?`,
 			"Signing off stops every Teammate and ends the Effort; its clean worktrees are removed and every branch is kept.",
 		].join("\n");
-		const picked = await approveOrSendBack(title, ctx);
+		const picked = await approveOrSendBack(ctx.ui, title);
 		if (!picked) return;
 		// What is signed off is the file as the human was asked about it.
 		if (picked.answer === "approved" && !unchangedSince(item.path, item.sha256)) {
