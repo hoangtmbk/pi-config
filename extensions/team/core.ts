@@ -1699,6 +1699,12 @@ function heldWhy(hold: ModelHold): string {
 	return `held: ${hold.kind === "consent" ? "usage-credit confirm" : `${LIMIT_NAMES[hold.kind]} limit`}${hold.reset === undefined ? "" : ` ${untilText(hold.reset, hold.at)}`}`;
 }
 
+/** Why a queued Task waits on a hold rather than on room: a Brief change holding it, or a hold on its Role's model family; undefined when neither holds it. */
+function heldReason(state: EffortState, queued: QueuedTask): string | undefined {
+	const hold = holdOn(state, queued.role);
+	return briefHeld(state, queued.slug) ?? (hold ? heldWhy(hold) : undefined);
+}
+
 /** A usage item, as `/team pending` and the Report name it. */
 export function usageText(item: UsageItem, teammates: readonly Teammate[] = []): string {
 	if (item.why === "far-reset") {
@@ -2250,9 +2256,14 @@ function ending(state: EffortState, how: Ended["how"], at: string): EffortLine[]
 	return [...live(state).map((teammate): EffortLine => ({ type: "teammate-ended", teammate: teammate.id, how: "stopped", at })), { type: "effort-ended", how, at }];
 }
 
-/** `claude stop` for each live Teammate, by its short id, or its `--name` before it has one. */
+/** `claude stop` for each live Teammate. */
 function stops(state: EffortState): EffortAction[] {
-	return live(state).map((teammate) => ({ kind: "stop-teammate", teammate: teammate.id, shortId: teammate.shortId ?? teammate.name }));
+	return live(state).map(stopTeammate);
+}
+
+/** `claude stop` for `teammate`, by its short id, or its `--name` before it has one. */
+function stopTeammate(teammate: Teammate): EffortAction {
+	return { kind: "stop-teammate", teammate: teammate.id, shortId: teammate.shortId ?? teammate.name };
 }
 
 /** Why an ended Effort takes nothing more. */
@@ -2455,7 +2466,7 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 		const live = teammate !== undefined && isLive(teammate) && teammate.task === slug;
 		if (live) {
 			append.push({ type: "teammate-ended", teammate: teammate.id, how: "stopped", at: input.at });
-			actions.push({ kind: "stop-teammate", teammate: teammate.id, shortId: teammate.shortId ?? teammate.name });
+			actions.push(stopTeammate(teammate));
 		}
 		// Its worktree goes once its Teammate is stopped; the shell keeps one with uncommitted changes or unmerged commits.
 		if (handed?.worktree) actions.push({ kind: "remove-task-workspace", slug, ...handed.worktree });
@@ -2549,52 +2560,23 @@ function handoff(state: EffortState, input: Extract<EffortInput, { kind: "handof
 	};
 	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
 	const pointer = `Task \`${task.slug}\` (tasks/${folder}/task.md)`;
+	const write: EffortAction = { kind: "write-task", slug: task.slug, folder };
+	const queuedLine = (why: string): EffortLine => ({ type: "task-queued", ...wanted, why });
+	const queue = (why: string, reply: string, after: EffortLine[] = []): Step => took(state, [queuedLine(why), ...after], [write, { kind: "write-plan" }], `queued ${pointer}: ${reply}`);
 	const pauses = heldPauses(state);
-	if (pauses.length > 0) {
-		return took(
-			state,
-			[{ type: "task-queued", ...wanted, why: "paused" }],
-			[{ kind: "write-task", slug: task.slug, folder }, { kind: "write-plan" }],
-			`queued ${pointer}: ${pauses.map(pauseText).join(", and ")}. It starts by itself once every pause is lifted (${pauses.map(lifter).join("; ")}).`,
-		);
-	}
+	if (pauses.length > 0) return queue("paused", `${pauses.map(pauseText).join(", and ")}. It starts by itself once every pause is lifted (${pauses.map(lifter).join("; ")}).`);
 	const briefHold = briefHeld(state, task.slug);
 	if (briefHold) {
-		return took(
-			state,
-			[{ type: "task-queued", ...wanted, why: briefHold }],
-			[{ kind: "write-task", slug: task.slug, folder }, { kind: "write-plan" }],
-			`queued ${pointer}: held by Brief change \`${state.briefHold?.request}\`, which the human hasn't approved, while other Tasks go on. It starts by itself once they approve a Brief change.`,
-		);
+		return queue(briefHold, `held by Brief change \`${state.briefHold?.request}\`, which the human hasn't approved, while other Tasks go on. It starts by itself once they approve a Brief change.`);
 	}
 	const hold = holdOn(state, task.role);
-	if (hold) {
-		return took(
-			state,
-			[{ type: "task-queued", ...wanted, why: heldWhy(hold) }],
-			[{ kind: "write-task", slug: task.slug, folder }, { kind: "write-plan" }],
-			`queued ${pointer}: Role \`${task.role}\` is held by ${holdText(hold)}, while other Roles go on. It starts by itself once the hold lifts.`,
-		);
-	}
+	if (hold) return queue(heldWhy(hold), `Role \`${task.role}\` is held by ${holdText(hold)}, while other Roles go on. It starts by itself once the hold lifts.`);
 	const staffed = staff(state, wanted, max, input.agents, input.models);
-	if (staffed) {
-		return took(
-			state,
-			staffed.append,
-			[{ kind: "write-task", slug: task.slug, folder }, ...staffed.actions, { kind: "write-plan" }],
-			`${staffed.who} on ${pointer}.${staffed.note ? ` ${staffed.note}` : ""}`,
-		);
-	}
+	if (staffed) return took(state, staffed.append, [write, ...staffed.actions, { kind: "write-plan" }], `${staffed.who} on ${pointer}.${staffed.note ? ` ${staffed.note}` : ""}`);
 	const why = waitReason(state, max);
-	const waiting: EffortLine = { type: "task-queued", ...wanted, why };
 	// Queued behind Tasks it depends on, in review, with nothing else to free room: the Lead hears so now, not when nothing happens.
-	const stuck = stuckNotice(apply(state, waiting), max, input.at);
-	return took(
-		state,
-		[waiting, ...stuck.append],
-		[{ kind: "write-task", slug: task.slug, folder }, { kind: "write-plan" }],
-		`queued ${pointer}: ${why}. It starts by itself when a Teammate frees up, and \`team_review\` says so when an acceptance starts it.${stuck.text === undefined ? "" : ` ${stuck.text}`}`,
-	);
+	const stuck = stuckNotice(apply(state, queuedLine(why)), max, input.at);
+	return queue(why, `${why}. It starts by itself when a Teammate frees up, and \`team_review\` says so when an acceptance starts it.${stuck.text === undefined ? "" : ` ${stuck.text}`}`, stuck.append);
 }
 
 /** The number of the next Task folder: one past the highest yet, queued ones included, since a dropped Task handed off again takes a new one. */
@@ -2644,7 +2626,7 @@ function staff(
 	max: number,
 	agents?: readonly string[],
 	models?: Readonly<Record<string, string>>,
-): { append: EffortLine[]; actions: EffortAction[]; who: string; note?: string } | undefined {
+): Staffed | undefined {
 	const model = models === undefined ? undefined : (models[task.role] ?? null);
 	// An isolated Task needs a Teammate launched in its own worktree, so it never reuses one.
 	const reused = task.isolated ? undefined : live(state).find((teammate) => teammate.role === task.role && teammate.inbox !== undefined && free(state, teammate));
@@ -2670,7 +2652,7 @@ function staff(
 	const started = start(apply(state, retired), task, model);
 	return {
 		append: [retired, ...started.append],
-		actions: [{ kind: "stop-teammate", teammate: out.id, shortId: out.shortId }, ...started.actions],
+		actions: [stopTeammate(out), ...started.actions],
 		who: started.who,
 		note:
 			inReview === undefined
@@ -2768,16 +2750,15 @@ const FRESH_FOR_IDLE =
  * session is stopped (its conversation kept), and a new one launched under
  * the same id and name, at a Task boundary, never mid-Task, on `model`.
  */
-function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask, note: string, model?: string | null): { append: EffortLine[]; actions: EffortAction[]; who: string; note: string } {
-	const last = Math.max(...state.teammates.map((each) => Date.parse(each.startedAt)));
-	const at = new Date(Math.max(Date.parse(task.at), last + STAGGER_MS)).toISOString();
+function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask, note: string, model?: string | null): Staffed {
+	const at = staggered(state, task.at);
 	return {
 		append: [
 			takenBy(state, task, teammate.id, undefined, model),
 			{ type: "teammate-relaunched", teammate: teammate.id, task: task.slug, ...(task.mode === undefined ? {} : { mode: task.mode }), ...(model === undefined ? {} : { model }), at },
 		],
 		actions: [
-			{ kind: "stop-teammate", teammate: teammate.id, shortId: teammate.shortId ?? teammate.name },
+			stopTeammate(teammate),
 			{ kind: "launch-teammate", teammate: { id: teammate.id, role: teammate.role, name: teammate.name }, task: { slug: task.slug, folder: task.folder }, at },
 		],
 		who: `started ${teammate.id} afresh`,
@@ -2785,12 +2766,20 @@ function relaunch(state: EffortState, teammate: Teammate, task: QueuedTask, note
 	};
 }
 
+/** What the staffing ladder does for a Task: the lines and actions, who takes it, and anything else the reply says. */
+type Staffed = { append: EffortLine[]; actions: EffortAction[]; who: string; note?: string };
+
+/** When a launch asked for at `at` goes: no sooner than {@link STAGGER_MS} after the last Teammate's start. */
+function staggered(state: EffortState, at: string): string {
+	const last = Math.max(...state.teammates.map((teammate) => Date.parse(teammate.startedAt)));
+	return new Date(Math.max(Date.parse(at), last + STAGGER_MS)).toISOString();
+}
+
 /** Start the next Teammate of the Task's Role on it, on `model`, no sooner than {@link STAGGER_MS} after the last start. */
-function start(state: EffortState, task: QueuedTask, model?: string | null): { append: EffortLine[]; actions: EffortAction[]; who: string } {
+function start(state: EffortState, task: QueuedTask, model?: string | null): Staffed {
 	const id = `${task.role}-${state.teammates.filter((teammate) => teammate.role === task.role).length + 1}`;
 	const name = `team-${state.effortId}-${id}`;
-	const last = Math.max(...state.teammates.map((teammate) => Date.parse(teammate.startedAt)));
-	const at = new Date(Math.max(Date.parse(task.at), last + STAGGER_MS)).toISOString();
+	const at = staggered(state, task.at);
 	const worktree = task.isolated && state.workspace ? taskWorktree(state.workspace, task.folder) : undefined;
 	const launch: EffortAction = { kind: "launch-teammate", teammate: { id, role: task.role, name }, task: { slug: task.slug, folder: task.folder }, at };
 	return {
@@ -2852,7 +2841,7 @@ function stuckQueue(state: EffortState, max: number): { queued: string[]; waitsO
 	if (working) return undefined;
 	const inReview = teammates.map((teammate) => teammate.task).filter((slug) => taskStatus(state, slug) === "in review");
 	const waiting = state.queue.flatMap((queued) => {
-		if (holdOn(state, queued.role) || briefHeld(state, queued.slug)) return [];
+		if (heldReason(state, queued) !== undefined) return [];
 		const on = state.plan?.find((planned) => planned.slug === queued.slug)?.dependsOn ?? [];
 		const held = inReview.filter((slug) => on.includes(slug));
 		return held.length > 0 ? [{ slug: queued.slug, held }] : [];
@@ -2898,7 +2887,7 @@ function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }
 	const max = input.maxTeammates ?? DEFAULT_MAX_TEAMMATES;
 	if (heldPauses(state).length > 0) return took(state, [], []);
 	for (const queued of state.queue) {
-		if (holdOn(state, queued.role) || briefHeld(state, queued.slug)) continue;
+		if (heldReason(state, queued) !== undefined) continue;
 		// It starts now, whenever it was queued.
 		const staffed = staff(state, { ...queued, at: input.at }, max, input.agents, input.models);
 		if (!staffed) continue;
@@ -2914,8 +2903,7 @@ function drain(state: EffortState, input: Extract<EffortInput, { kind: "drain" }
 	const requeued = state.queue.flatMap((queued): EffortLine[] => {
 		const cap = capIn(queued.why);
 		if (queued.why !== "paused" && !queued.why.startsWith("held:") && (cap === undefined || cap === max)) return [];
-		const hold = holdOn(state, queued.role);
-		const now = briefHeld(state, queued.slug) ?? (hold ? heldWhy(hold) : why);
+		const now = heldReason(state, queued) ?? why;
 		return now === queued.why ? [] : [{ type: "task-requeued", slug: queued.slug, why: now, at: input.at }];
 	});
 	const stuck = stuckNotice(state, max, input.at);
@@ -3775,7 +3763,7 @@ function mergeResult(state: EffortState, input: Extract<EffortInput, { kind: "me
 			...(ending ? [{ type: "teammate-ended", teammate: ending.id, how: "stopped", at: input.at } as const] : []),
 		],
 		[
-			...(ending ? [{ kind: "stop-teammate", teammate: ending.id, shortId: ending.shortId ?? ending.name } as const] : []),
+			...(ending ? [stopTeammate(ending)] : []),
 			{ kind: "remove-task-workspace", slug: input.slug, path, branch },
 			{ kind: "write-plan" },
 		],
