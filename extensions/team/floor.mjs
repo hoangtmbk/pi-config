@@ -44,11 +44,13 @@ import { posix } from "node:path";
  * either ({@link splittable}). A name the command itself sets reads as the
  * path it holds, under the conservative rules of {@link bindings}; unquoted,
  * under the same rule as `$CLAUDE_JOB_DIR`. Any other spelling of `~` or a
- * variable leaves the path unknown, so outside.
+ * variable leaves the path unknown, so outside. A delete says whether that is
+ * why it is on the floor: `unread` when none of its targets is one the floor
+ * read outside, only ones it couldn't read.
  *
  * @param {string} command the Bash command as the Teammate wrote it
  * @param {{ workspace: string, cwd?: string, roots?: string[], home?: string, jobDir?: string }} where the Workspace, the directory the command runs in (the Workspace when not given), the other folders a delete under counts as inside, the home folder (this user's when not given), and the trusted value of `$CLAUDE_JOB_DIR` (unknown when not given)
- * @returns {{ kind: "push" | "publish" | "deploy" | "delete" | "send", command: string } | undefined}
+ * @returns {{ kind: "push" | "publish" | "deploy" | "delete" | "send", command: string, unread?: boolean } | undefined}
  */
 export function floorAction(command, where) {
 	const workspace = posix.resolve(where.workspace);
@@ -310,8 +312,9 @@ function scanSegment(segment, context, depth) {
 	if (words.length === 0) return undefined;
 	const script = depth < MAX_DEPTH ? innerScript(words) : undefined;
 	if (script !== undefined) return scan(script, { ...context, vars: undefined, ...(words[0] === "eval" ? {} : { job: undefined, bareJob: undefined }) }, depth + 1);
-	const kind = classify(words, { ...context, xargs });
-	return kind ? { kind, command: segment.text } : undefined;
+	const found = classify(words, { ...context, xargs });
+	if (found === undefined) return undefined;
+	return typeof found === "string" ? { kind: found, command: segment.text } : { ...found, command: segment.text };
 }
 
 /**
@@ -1336,26 +1339,39 @@ const MAILERS = new Set(["mail", "mailx", "sendmail", "msmtp", "mutt"]);
 const DELETERS = new Set(["rm", "rmdir", "unlink", "shred", "srm", "trash", "trash-put"]);
 
 /**
- * Is a path, as the command names it, outside the Workspace and the other
- * roots? A root itself counts as outside unless `within` says a deletion
- * there only reaches what is under it (as `find`'s starting point does).
- * A home or job folder prefix is that folder only in a word with its mark
- * ({@link expanded}); anything else unknown counts as outside.
+ * Where a path, as the command names it, lands: `inside` the Workspace and
+ * the other roots, `outside` them, or `unread` when the floor can't read
+ * where (a name it doesn't follow, `~`, a substitution, or a relative path
+ * in a folder it can't tell), which counts as outside. A root itself counts
+ * as outside unless `within` says a deletion there only reaches what is
+ * under it (as `find`'s starting point does). A home or job folder prefix is
+ * that folder only in a word with its mark ({@link expanded}).
  */
-function outside(written, context, within = false) {
+function landing(written, context, within = false) {
 	const target = expanded(written, context);
-	if (target === "" || target.startsWith("~") || target.includes("$") || target.includes("`")) return true;
-	if (!target.startsWith("/") && context.cwds === undefined) return true;
-	return (target.startsWith("/") ? ["/"] : context.cwds).some((cwd) => {
+	if (target === "" || target.startsWith("~") || target.includes("$") || target.includes("`")) return "unread";
+	if (!target.startsWith("/") && context.cwds === undefined) return "unread";
+	const outside = (target.startsWith("/") ? ["/"] : context.cwds).some((cwd) => {
 		const resolved = posix.resolve(cwd, target);
 		return !context.roots.some((root) => resolved.startsWith(`${root}/`) || (within && resolved === root));
 	});
+	return outside ? "outside" : "inside";
 }
 
+/**
+ * A delete whose targets land where `landings` say: none when every one is
+ * inside, else a floor delete, `unread` when none of its targets that aren't
+ * inside is one the floor read outside.
+ */
+function deletion(landings) {
+	if (landings.every((each) => each === "inside")) return undefined;
+	return { kind: "delete", unread: !landings.includes("outside") };
+}
+
+/** `rm` and its kin; one that `xargs` runs deletes targets read from stdin, which the floor can't read. */
 function remove(name, args, context) {
-	if (context.xargs) return "delete";
 	const targets = name === "shred" ? positionals(args, ["-n", "--iterations", "-s", "--size", "--random-source"]) : positionals(args);
-	return targets.some((target) => outside(target, context)) ? "delete" : undefined;
+	return deletion([...(context.xargs ? ["unread"] : []), ...targets.map((target) => landing(target, context))]);
 }
 
 /** `find` that deletes what it finds: `-delete`, or `-exec rm` and its kin. The starting points are what it deletes under. */
@@ -1370,7 +1386,7 @@ function find(args, context) {
 		}
 		roots.push(word);
 	}
-	return (roots.length === 0 ? ["."] : roots).some((root) => outside(root, context, true)) ? "delete" : undefined;
+	return deletion((roots.length === 0 ? ["."] : roots).map((root) => landing(root, context, true)));
 }
 
 function make(args) {
@@ -1378,7 +1394,11 @@ function make(args) {
 	return targets.map(scriptKind).find((kind) => kind !== undefined);
 }
 
-/** The floor kind of one simple command, past its wrappers, or undefined. Only deletes read the marks {@link segments} puts on words. */
+/**
+ * The floor kind of one simple command, past its wrappers, or undefined; a
+ * delete as {@link deletion} gives it. Only deletes read the marks
+ * {@link segments} puts on words.
+ */
 function classify(marked, context) {
 	const words = marked.map(plain);
 	const [head, ...args] = words;

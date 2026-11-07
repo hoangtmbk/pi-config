@@ -7,6 +7,8 @@ export type FloorKind = "push" | "publish" | "deploy" | "delete" | "send";
 export interface FloorAction {
 	kind: FloorKind;
 	command: string;
+	/** For a delete: true when none of its targets is one the floor read outside, only ones it can't read (a name, `~`, a `cd` or `xargs` it can't follow). */
+	unread?: boolean;
 }
 
 /** Where a command runs: the Workspace, and its own directory (the Workspace when not given). */
