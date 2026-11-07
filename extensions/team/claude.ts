@@ -19,6 +19,9 @@ import { fileURLToPath } from "node:url";
 import type { Inbox, UsageReading, UsageWindow } from "./core.ts";
 import type { PermissionMode, Role } from "./definitions.ts";
 
+/** This extension's folder, which the scripts and the mod Claude Code runs are bundled in. */
+const HERE = dirname(fileURLToPath(import.meta.url));
+
 /** The Claude Code version this extension was built and tried against. */
 export const MIN_CLAUDE_VERSION = "2.1.316";
 
@@ -119,9 +122,14 @@ const LAUNCH_TIMEOUT_MS = 60_000;
 export function launchBackground(claudePath: string, cwd: string, args: string[]): Promise<{ error: string } | undefined> {
 	const env = { ...process.env };
 	delete env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD;
+	return runClaude(claudePath, args, { cwd, env, timeout: LAUNCH_TIMEOUT_MS }).then((ran) => ("error" in ran ? ran : undefined));
+}
+
+/** Run `claude` with `args`: its stdout, or the first line of what it complained of, stderr before the error's own message. */
+function runClaude(claudePath: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv; timeout: number }): Promise<{ stdout: string } | { error: string }> {
 	return new Promise((resolve) => {
-		execFile(claudePath, args, { cwd, env, timeout: LAUNCH_TIMEOUT_MS, encoding: "utf8" }, (error, _stdout, stderr) => {
-			resolve(error ? { error: (stderr.trim() || error.message).split("\n")[0] } : undefined);
+		execFile(claudePath, args, { ...options, encoding: "utf8" }, (error, stdout, stderr) => {
+			resolve(error ? { error: (stderr.trim() || error.message).split("\n")[0] } : { stdout });
 		});
 	});
 }
@@ -134,11 +142,7 @@ const STOP_TIMEOUT_MS = 30_000;
  * conversation. Returns an error to show the Lead when it fails.
  */
 export function stopBackground(claudePath: string, shortId: string): Promise<{ error: string } | undefined> {
-	return new Promise((resolve) => {
-		execFile(claudePath, ["stop", shortId], { timeout: STOP_TIMEOUT_MS, encoding: "utf8" }, (error, _stdout, stderr) => {
-			resolve(error ? { error: (stderr.trim() || error.message).split("\n")[0] } : undefined);
-		});
-	});
+	return runClaude(claudePath, ["stop", shortId], { timeout: STOP_TIMEOUT_MS }).then((ran) => ("error" in ran ? ran : undefined));
 }
 
 /** Long enough for a live session's inbox to take one message. */
@@ -223,25 +227,22 @@ export async function agentPids(claudePath: string): Promise<Map<string, number>
 }
 
 /** Each named entry `claude agents --json` prints, read leniently (see {@link agentsList}). */
-function listedAgents(claudePath: string): Promise<Map<string, Record<string, unknown>> | { error: string }> {
-	return new Promise((resolve) => {
-		execFile(claudePath, ["agents", "--json"], { timeout: AGENTS_TIMEOUT_MS, encoding: "utf8" }, (error, stdout, stderr) => {
-			if (error) return resolve({ error: (stderr.trim() || error.message).split("\n")[0] });
-			let parsed: unknown;
-			try {
-				parsed = JSON.parse(stdout);
-			} catch {
-				return resolve({ error: "`claude agents --json` printed something that isn't JSON" });
-			}
-			const holder = isObject(parsed) ? parsed : {};
-			const list = Array.isArray(parsed) ? parsed : [holder.agents, holder.sessions].find(Array.isArray);
-			const agents = new Map<string, Record<string, unknown>>();
-			for (const entry of (list ?? []) as unknown[]) {
-				if (isObject(entry) && typeof entry.name === "string") agents.set(entry.name, entry);
-			}
-			resolve(agents);
-		});
-	});
+async function listedAgents(claudePath: string): Promise<Map<string, Record<string, unknown>> | { error: string }> {
+	const ran = await runClaude(claudePath, ["agents", "--json"], { timeout: AGENTS_TIMEOUT_MS });
+	if ("error" in ran) return ran;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(ran.stdout);
+	} catch {
+		return { error: "`claude agents --json` printed something that isn't JSON" };
+	}
+	const holder = isObject(parsed) ? parsed : {};
+	const list = Array.isArray(parsed) ? parsed : [holder.agents, holder.sessions].find(Array.isArray);
+	const agents = new Map<string, Record<string, unknown>>();
+	for (const entry of (list ?? []) as unknown[]) {
+		if (isObject(entry) && typeof entry.name === "string") agents.set(entry.name, entry);
+	}
+	return agents;
 }
 
 /**
@@ -330,14 +331,14 @@ export function teammateArgs(launch: TeammateLaunch): string[] {
  * journal. Claude Code runs hook commands with a shell, outside pi, so the
  * command names the Node that runs pi.
  */
-export const HOOK_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "hook.mjs");
+export const HOOK_SCRIPT = join(HERE, "hook.mjs");
 
 /**
  * Every Teammate's status line command: it runs the human's own and keeps the
  * JSON Claude Code gave it as the Teammate's `statusline.json`, the freshest
  * usage reading there is.
  */
-export const STATUSLINE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "statusline.mjs");
+export const STATUSLINE_SCRIPT = join(HERE, "statusline.mjs");
 
 /**
  * The status line command Claude Code would run for the human in `workspace`:
@@ -365,7 +366,7 @@ function numberOr(value: unknown): number | undefined {
 }
 
 function objectOr(value: unknown): Record<string, unknown> | undefined {
-	return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+	return isObject(value) ? value : undefined;
 }
 
 /** A window from its percent and reset, or undefined when the percent isn't given. */
@@ -517,8 +518,9 @@ export interface SettingsFrom {
  * A Teammate's `--settings`. Claude Code adds these to the human's own
  * settings, merging `permissions` and `hooks`, so they hold only keys that
  * add: the hooks, the permission rules and `crossSessionInbound`, which lets
- * the Lead's messages in, and `env`, which tells the mod how to journal. The one key that replaces is `statusLine.command`
- * (the rest of the human's `statusLine` still applies), and its command,
+ * the Lead's messages in, and `env`, which tells the mod how to journal. The
+ * one key that replaces is `statusLine.command` (the rest of the human's
+ * `statusLine` still applies), and its command,
  * {@link STATUSLINE_SCRIPT}, runs the human's own and prints what it prints.
  */
 export function teammateSettings(from: SettingsFrom): Record<string, unknown> {
@@ -550,7 +552,7 @@ export function teammateSettings(from: SettingsFrom): Record<string, unknown> {
 }
 
 /** The Team's mod as this extension ships it; Claude Code loads a copy ({@link installMod}). */
-export const BUNDLED_MOD = join(dirname(fileURLToPath(import.meta.url)), "mod");
+export const BUNDLED_MOD = join(HERE, "mod");
 
 /**
  * The inbox message the mod turns into a `/clear` rather than a turn. Its
