@@ -1204,16 +1204,12 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "merge-failed":
 			return merged(state, line.slug);
 		case "teammate-stopped":
-			return withLimit(endRequests(withTeammate(state, line, { activity: "idle", doing: TURN_ENDED }), line.teammate), line.teammate, undefined);
+			return turnEnded(state, line, { activity: "idle", doing: TURN_ENDED });
 		case "teammate-waiting":
-			return withLimit(
-				endRequests(withTeammate(state, line, { activity: "idle", doing: WAITING, waiting: { since: line.at, slug: line.slug, on: line.waitingOn, message: line.message } }), line.teammate),
-				line.teammate,
-				undefined,
-			);
+			return turnEnded(state, line, { activity: "idle", doing: WAITING, waiting: { since: line.at, slug: line.slug, on: line.waitingOn, message: line.message } });
 		case "teammate-idle":
 			// The round stays done: its row keeps saying so.
-			return withLimit(endRequests(withTeammate(state, line, { activity: "idle" }), line.teammate), line.teammate, undefined);
+			return turnEnded(state, line, { activity: "idle" });
 		case "teammate-active":
 			return withTeammate(state, line, {});
 		case "teammate-mode":
@@ -1303,12 +1299,12 @@ function applyLine(state: EffortState, line: EffortLine): EffortState {
 		case "message-sent":
 			return state;
 		case "task-done": {
-			const advanced = withLimit(endRequests(withTeammate(state, line, { activity: "idle", doing: `round ${line.round} done` }), line.teammate), line.teammate, undefined);
+			const advanced = turnEnded(state, line, { activity: "idle", doing: `round ${line.round} done` });
 			const task = advanced.tasks[line.slug];
 			return task ? { ...advanced, tasks: { ...advanced.tasks, [line.slug]: { ...task, reported: line.round } } } : advanced;
 		}
 		case "teammate-limited":
-			return withLimit(endRequests(withTeammate(state, line, { activity: "idle", doing: limitDoing(line.limit) }), line.teammate), line.teammate, line.limit);
+			return turnEnded(state, line, { activity: "idle", doing: limitDoing(line.limit) }, line.limit);
 		case "limit-cleared":
 			return withLimit(withTeammate(state, line, {}), line.teammate, undefined);
 		case "teammate-continued": {
@@ -1370,6 +1366,11 @@ function withLimit(state: EffortState, teammate: string, limit: TeammateLimit | 
 			return limit === undefined ? rest : { ...rest, limit };
 		}),
 	};
+}
+
+/** `line.teammate`'s turn ended, changing it by `change`: none of its requests waits any more, and its limit is `limit`, or none. */
+function turnEnded(state: EffortState, line: { teammate: string; cursor: number }, change: Partial<Teammate>, limit?: TeammateLimit): EffortState {
+	return withLimit(endRequests(withTeammate(state, line, change), line.teammate), line.teammate, limit);
 }
 
 /** A prompt landed on `teammate`: its auto-wait, if armed, is spent, and a limit that isn't retried on the ladder is over. */
@@ -2034,6 +2035,16 @@ function requestName(item: Pick<PendingApproval, "checkpoint">): string {
 	return `checkpoint \`${item.checkpoint}\``;
 }
 
+/** The parts given, joined into one text; an undefined part is left out. */
+function sentences(...parts: (string | undefined)[]): string {
+	return parts.filter((part) => part !== undefined).join(" ");
+}
+
+/** The line recording the human's answer to `item`, with their note and what else the answer carries. */
+function answeredLine(item: PendingApproval, input: Extract<EffortInput, { kind: "answer" }>, carries: { workspace?: Workspace; refresh?: string[]; renew?: string[] } = {}): EffortLine {
+	return { type: "approval-answered", id: item.id, answer: input.answer, ...(input.note === undefined ? {} : { note: input.note }), ...carries, at: input.at };
+}
+
 function requestApproval(state: EffortState, input: Extract<EffortInput, { kind: "request-approval" }>): Step {
 	const refusal = refuseRequest(state, input.checkpoint, input);
 	if (refusal !== undefined) return { ok: false, refusal };
@@ -2042,7 +2053,7 @@ function requestApproval(state: EffortState, input: Extract<EffortInput, { kind:
 	const { kind: _kind, checkpoints: _checkpoints, affects, ...asked } = input;
 	const line: EffortLine = { type: "approval-requested", id, ...asked, ...(input.checkpoint === BRIEF_CHANGE ? { affects: [...(affects ?? [])] } : {}) };
 	const holds = affects ?? [];
-	const reply = [
+	const reply = sentences(
 		input.checkpoint === BRIEF
 			? `Asked the human to approve the Brief of Effort \`${state.effortId}\` as request \`${id}\`: ${input.path} (sha256 ${input.sha256}).`
 			: `Asked the human to approve ${requestName(input)} of Effort \`${state.effortId}\` as request \`${id}\`: ${input.path} (sha256 ${input.sha256}).`,
@@ -2055,9 +2066,7 @@ function requestApproval(state: EffortState, input: Extract<EffortInput, { kind:
 		input.checkpoint === BRIEF
 			? "They answer it in `/team pending`; approving promotes exactly this snapshot, so later edits to the draft don't count. Stop here and wait for their answer."
 			: "They answer it in `/team pending`; approving approves exactly this snapshot, so later edits to the draft don't count. Go on with what it doesn't hold, and wait for their answer before what it does.",
-	]
-		.filter((part) => part !== undefined)
-		.join(" ");
+	);
 	return took(state, [line], [], reply);
 }
 
@@ -2085,28 +2094,19 @@ function answer(state: EffortState, input: Extract<EffortInput, { kind: "answer"
 	}
 	if (item.checkpoint === BRIEF_CHANGE) return answerBriefChange(state, item, input);
 	if (item.checkpoint !== BRIEF) return answerCheckpoint(state, item, input);
-	const line: EffortLine = {
-		type: "approval-answered",
-		id: input.id,
-		answer: input.answer,
-		...(input.note === undefined ? {} : { note: input.note }),
-		...(input.answer === "approved" && input.workspace !== undefined ? { workspace: input.workspace } : {}),
-		at: input.at,
-	};
+	const line = answeredLine(item, input, input.answer === "approved" && input.workspace !== undefined ? { workspace: input.workspace } : {});
 	if (input.answer === "approved") {
 		return took(state, [line], [
 			{ kind: "promote-brief", approval: item, at: input.at },
 			{
 				kind: "wake-lead",
-				text: [
+				text: sentences(
 					`The human approved the Brief of Effort \`${state.effortId}\` (request \`${item.id}\`, sha256 ${item.sha256}). It is now brief.md in the Effort's directory and is never edited.`,
 					input.workspace
 						? `The Workspace is ${input.workspace.path}, on branch \`${input.workspace.branch}\` cut from \`${input.workspace.from}\` at ${input.workspace.base}.`
 						: undefined,
 					"Plan the Tasks with `team_plan`, then write the plan Report with `team_report` before handing any off.",
-				]
-					.filter((part) => part !== undefined)
-					.join(" "),
+				),
 			},
 		]);
 	}
@@ -2137,15 +2137,7 @@ function answerBriefChange(state: EffortState, item: PendingApproval, input: Ext
 					.filter((teammate) => !refresh.includes(teammate.role) && (teammate.rules?.length ?? 0) > 0)
 					.map((teammate) => teammate.id)
 			: [];
-	const line: EffortLine = {
-		type: "approval-answered",
-		id: item.id,
-		answer: input.answer,
-		...(input.note === undefined ? {} : { note: input.note }),
-		...(refresh.length > 0 ? { refresh: [...refresh] } : {}),
-		...(renew.length > 0 ? { renew } : {}),
-		at: input.at,
-	};
+	const line = answeredLine(item, input, { ...(refresh.length > 0 ? { refresh: [...refresh] } : {}), ...(renew.length > 0 ? { renew } : {}) });
 	const tasks = holds.length === 0 ? undefined : `Task${holds.length === 1 ? "" : "s"} ${quoted(holds)}`;
 	const one = holds.length === 1;
 	if (input.answer === "approved") {
@@ -2166,27 +2158,23 @@ function answerBriefChange(state: EffortState, item: PendingApproval, input: Ext
 			{ kind: "promote-brief-change", approval: item, at: input.at },
 			{
 				kind: "wake-lead",
-				text: [
+				text: sentences(
 					`The human approved the Brief change of Effort \`${state.effortId}\` (request \`${item.id}\`, sha256 ${item.sha256}). It is now brief.md in the Effort's directory.`,
 					tasks ? `${tasks} ${one ? "is" : "are"} released: a queued one starts by itself.` : undefined,
 					fresh,
 					ruled,
-				]
-					.filter((part) => part !== undefined)
-					.join(" "),
+				),
 			},
 		]);
 	}
 	return took(state, [line], [
 		{
 			kind: "wake-lead",
-			text: [
+			text: sentences(
 				`The human sent back the Brief change of Effort \`${state.effortId}\` (request \`${item.id}\`) with this note:\n\n${input.note ?? ""}\n`,
 				tasks ? `${tasks} ${one ? "stays" : "stay"} held until a Brief change is approved; every other Task goes on.` : undefined,
 				`Revise ${item.path} with them, then ask again with \`team_request_approval\` at checkpoint \`${BRIEF_CHANGE}\`.`,
-			]
-				.filter((part) => part !== undefined)
-				.join(" "),
+			),
 		},
 	]);
 }
@@ -2197,7 +2185,7 @@ function answerBriefChange(state: EffortState, item: PendingApproval, input: Ext
  * wakes the Lead.
  */
 function answerCheckpoint(state: EffortState, item: PendingApproval, input: Extract<EffortInput, { kind: "answer" }>): Step {
-	const line: EffortLine = { type: "approval-answered", id: item.id, answer: input.answer, ...(input.note === undefined ? {} : { note: input.note }), at: input.at };
+	const line = answeredLine(item, input);
 	if (input.answer === "approved") {
 		return took(state, [line], [
 			{ kind: "record-checkpoint", approval: item, at: input.at },
@@ -2220,19 +2208,17 @@ function answerCheckpoint(state: EffortState, item: PendingApproval, input: Extr
  * note and leaves the Teammates running.
  */
 function answerSignOff(state: EffortState, item: PendingApproval, input: Extract<EffortInput, { kind: "answer" }>): Step {
-	const line: EffortLine = { type: "approval-answered", id: item.id, answer: input.answer, ...(input.note === undefined ? {} : { note: input.note }), at: input.at };
+	const line = answeredLine(item, input);
 	if (input.answer === "sent-back") {
 		const dropped = state.pending.filter((each) => each.checkpoint === PLAYBOOK_CHANGE);
 		return took(state, [line], [
 			{
 				kind: "wake-lead",
-				text: [
+				text: sentences(
 					`The human sent back the final Report of Effort \`${state.effortId}\` (request \`${item.id}\`) with this note:\n\n${input.note ?? ""}\n\nThe Teammates are still running.`,
 					dropped.length > 0 ? `The Playbook changes it proposed (${quoted(dropped.map((each) => each.change?.id ?? each.id))}) are dropped; propose them again in the next final Report if they still apply.` : undefined,
 					"Re-plan with `team_plan` if the work needs more Tasks, then write a new final Report with `team_report` and `final: true`, which asks for sign-off again.",
-				]
-					.filter((part) => part !== undefined)
-					.join(" "),
+				),
 			},
 		]);
 	}
@@ -2297,13 +2283,11 @@ function requestSignOff(state: EffortState, input: Extract<EffortInput, { kind: 
 		state,
 		[signOff, ...changes],
 		[],
-		[
+		sentences(
 			`Asked the human to sign off the final Report of Effort \`${state.effortId}\` as request \`${signOff.id}\`: ${input.path} (sha256 ${input.sha256}).`,
 			offered.length > 0 ? `Each proposed Playbook change is its own request: ${offered.join(", ")}.` : undefined,
 			"They answer in `/team pending`. Signing off stops every Teammate and ends the Effort; a send-back comes back to you with a note. Stop here and wait.",
-		]
-			.filter((part) => part !== undefined)
-			.join(" "),
+		),
 	);
 }
 
