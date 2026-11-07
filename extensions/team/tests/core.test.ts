@@ -1488,6 +1488,27 @@ describe("clearing between Tasks", () => {
 		assert.match(result.reply ?? "", /^reused dev-1 on Task `docs`/);
 	});
 
+	it("queues a handoff a Brief change holds, keeps it queued on a drain, and starts it on the drain after the change is approved", () => {
+		const asked = applied(running, { kind: "request-approval", checkpoint: "brief-change", path: "/agent/team/efforts/software-2026-11-02/brief.draft.md", sha256: "c".repeat(64), snapshot: "---\n---\n", affects: ["docs"], at: "2026-11-02T12:10:00.000Z" });
+
+		const held = run(asked, { kind: "handoff", slug: "docs", at: "2026-11-02T12:20:00.000Z" });
+
+		assert.ok(held.ok, held.ok ? "" : held.refusal);
+		assert.deepEqual(held.append, [{ type: "task-queued", slug: "docs", folder: "002-dev-docs", role: "dev", why: "held: Brief change r2", at: "2026-11-02T12:20:00.000Z" }]);
+		assert.deepEqual(held.actions, [{ kind: "write-task", slug: "docs", folder: "002-dev-docs" }, { kind: "write-plan" }]);
+		assert.equal(held.reply, "queued Task `docs` (tasks/002-dev-docs/task.md): held by Brief change `r2`, which the human hasn't approved, while other Tasks go on. It starts by itself once they approve a Brief change.");
+		const queued = [...asked, ...held.append];
+		const still = run(queued, { kind: "drain", at: "2026-11-02T12:30:00.000Z" });
+		assert.ok(still.ok, still.ok ? "" : still.refusal);
+		assert.deepEqual([still.append, still.actions, still.reply], [[], [], undefined]);
+
+		const released = run(applied(queued, { kind: "answer", id: "r2", answer: "approved", at: "2026-11-02T12:40:00.000Z" }), { kind: "drain", at: "2026-11-02T12:41:00.000Z" });
+
+		assert.ok(released.ok, released.ok ? "" : released.refusal);
+		assert.equal(released.reply, "Queued Task `docs` started dev-2 (tasks/002-dev-docs/task.md).");
+		assert.deepEqual(released.state.queue, []);
+	});
+
 	it("starts afresh at its next Task a Teammate holding a session rule once an approved Brief change alters what the Lead answers under; one without a rule is cleared as before", () => {
 		const ruled: EffortLine = { type: "request-answered", teammate: "dev-1", request: "p1", task: "rename", decision: { behavior: "allow" }, rule: "Bash(npm test:*)", at: "2026-11-02T12:05:00.000Z" };
 		const done_ = applied([...running, ruled], hook(2, "Stop", { session_id: FIRST }, true));
