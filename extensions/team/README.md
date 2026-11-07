@@ -590,6 +590,10 @@ a checklist of what needs a person or a real pi: a composer prompt journalling i
 
 ```
 index.ts         wiring: the /team command and its subcommand table
+lead-wakes.ts    when the Lead hears from the extension: at once, or held until its run settles
+stopping.ts      stopping Teammates by short id, and the sessions a worktree check spares
+dialogs.ts       the /team pending dialogs
+ending.ts        what an Effort's end does with its worktrees, and what the Lead is told (#132)
 definitions.ts   Teams, Roles and Playbooks: discovery, validation, adoption state
 start.ts         what /team start says, and what it asks the Lead (pure)
 core.ts          the Effort core: a pure state machine over effort.jsonl
