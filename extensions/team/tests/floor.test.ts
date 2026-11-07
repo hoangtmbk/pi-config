@@ -509,6 +509,111 @@ describe("the floor classifier", () => {
 		});
 	});
 
+	describe("follows a `cd` only where it surely runs in this shell, and reads the folder as unknown after any other (#146)", () => {
+		const where = { workspace: "/ws", cwd: "/ws" };
+		/** `[command, inside]`, each read with `/ws` as the Workspace and the directory it runs in. */
+		const commands: [string, boolean][] = [
+			// The cases the issue found: each deletes /etc.
+			["cd /; (cd /ws); rm -rf etc", false],
+			["cd /; true || cd /ws; rm -rf etc", false],
+			["cd /; false && cd /ws; rm -rf etc", false],
+			["cd /; echo $(cd /ws); rm -rf etc", false],
+			["cd /; echo `cd /ws`; rm -rf etc", false],
+			["cd /; K(){ cd /ws; }; rm -rf etc", false],
+			["cd /; function K { cd /ws; }; rm -rf etc", false],
+			["cd /; cd /ws &\nrm -rf etc", false],
+			// A `cd` in a compound command, a group, a process substitution or a coprocess.
+			["cd /; if true; then cd /ws; fi; rm -rf etc", false],
+			["cd /ws; if true; then cd /; fi; rm -rf etc", false],
+			["cd /; if cd /ws; then :; fi; rm -rf etc", false],
+			["cd /; while false; do\ncd /ws\ndone\nrm -rf etc", false],
+			["cd /; until true; do cd /ws; done; rm -rf etc", false],
+			["cd /; for d in /ws; do cd $d; done; rm -rf etc", false],
+			["cd /; for d in /ws; do\ncd /ws\ndone\nrm -rf etc", false],
+			["cd /; select d in /ws; do cd /ws; break; done; rm -rf etc", false],
+			["cd /; case x in y) cd /ws;; esac; rm -rf etc", false],
+			["cd /; case x in\n(y) cd /ws;;\nesac\nrm -rf etc", false],
+			["cd /; case x in a) :;; done) cd /ws;; esac; rm -rf etc", false],
+			["cd /; coproc cd /ws; rm -rf etc", false],
+			["cd /; { cd /ws; } &\nrm -rf etc", false],
+			["cd /; { cd /ws; }; rm -rf etc", false],
+			["cd /; cat <(cd /ws); rm -rf etc", false],
+			["cd /; diff <(cd /ws) >(cd /ws); rm -rf etc", false],
+			["cd /; X=$(cd /ws && pwd); rm -rf etc", false],
+			["cd /; ! cd /ws; rm -rf etc", false],
+			// A here-document's lines may be no commands at all.
+			["cd /; cat <<EOF\ncd /ws\nEOF\nrm -rf etc", false],
+			["cd /; cat <<-EOF\n\tcd /ws\n\tEOF\nrm -rf etc", false],
+			["cd /ws; cat <<< x; rm -rf etc", true],
+			// A `cd` in a pipeline, or run by another program, never moves this shell.
+			["cd /; cd /ws | cat; rm -rf etc", false],
+			["cd /; echo | cd /ws; rm -rf etc", false],
+			["cd /; echo /ws | xargs cd; rm -rf etc", false],
+			["cd /; env cd /ws; rm -rf etc", false],
+			["cd /; find /ws -maxdepth 0 -exec cd {} \\;; rm -rf etc", false],
+			["cd /; bash -c 'cd /ws'; rm -rf etc", false],
+			// Code run in this shell out of sight may change the folder.
+			['cd /ws; eval "cd /"; rm -rf etc', false],
+			["cd /ws; source ./env.sh; rm -rf etc", false],
+			["cd /ws; . ./env.sh; rm -rf etc", false],
+			// After a leading `cd` chain, past a `||`, a backgrounded list or a group the floor can't see through.
+			["cd /; cd /ws && make || rm -rf etc", false],
+			["cd /; cd /ws && make &\nrm -rf etc", false],
+			["cd /; cd /ws && { make; } || rm -rf etc", false],
+			["cd /; cd /ws && (make) || rm -rf etc", false],
+			["cd /; cd /ws || return; rm -rf etc", false],
+			["cd /; cd /ws || exit &\nrm -rf etc", false],
+			["cd /ws; cd -L /; rm -rf etc", false],
+			["cd /; popd; rm -rf etc", false],
+			// A plain `cd` at a list's head, alone or leading an `&&` chain, still moves the folder.
+			["cd /ws/sub && rm -rf build", true],
+			["cd /ws/sub; rm -rf build", true],
+			["cd /ws/sub\nrm -rf build", true],
+			["cd /; cd /ws && rm -rf etc", true],
+			["cd / && cd /ws && rm -rf etc", true],
+			["cd /ws/sub && make | tee log && rm -rf build", true],
+			["cd /ws/sub && grep x f; rm -rf build", true],
+			["cd /; cd /ws || exit 1; rm -rf etc", true],
+			["cd /; cd /ws || exit\nrm -rf etc", true],
+			["cd /; T=/ws && cd $T && rm -rf etc", true],
+			["cd /; pushd /ws && rm -rf etc", true],
+			["cd /; builtin cd /ws && rm -rf etc", true],
+			['cd /; bash -c "cd /ws && rm -rf etc"', true],
+			["if true; then :; fi; cd /ws/sub && rm -rf build", true],
+			["(cd /tmp && make); cd /ws/sub && rm -rf build", true],
+			// A `cd` that `;` or a newline follows may fail: the folder before it and its own both count (#146).
+			["cd /; cd /ws; rm -rf etc", false],
+			["cd /; cd /ws/missing; rm -rf etc", false],
+			["cd /; cd /ws/missing\nrm -rf etc", false],
+			["cd /; cd /ws && make; rm -rf etc", false],
+			["cd /ws/sub; cd /; rm -rf etc", false],
+			["cd sub; rm -rf build", true],
+			["cd sub; cd deeper; rm -rf build", true],
+			["cd sub; rm -rf ../build", false],
+			["cd sub && rm -rf ../build", true],
+			["cd sub; rm -rf ../../etc", false],
+			["cd /ws/a; cd /ws/b; cd /ws/c; rm -rf x", true],
+			["cd a; cd b; cd c; rm -rf x", false],
+			["cd /; cd /ws || exit; cd sub && rm -rf x", true],
+			["cd sub; T=$PWD/x; rm -rf \"$T\"", false],
+			// A line that names CDPATH may send a `cd` anywhere.
+			["CDPATH=/; cd ws && rm -rf etc", false],
+			["export CDPATH=/x; cd /ws/sub && rm -rf build", false],
+			// A `cd` that `find -exec` runs leaves this shell where it was.
+			["cd /ws; find . -exec cd / \\;; rm -rf etc", true],
+		];
+		for (const [command, inside] of commands) {
+			it(`${JSON.stringify(command)} is ${inside ? "inside" : "a floor delete"}`, () => {
+				assert.equal(floorAction(command, where)?.kind, inside ? undefined : "delete");
+			});
+		}
+
+		it("reads a command in a process substitution as a command of its own", () => {
+			assert.equal(floorAction("cat <(rm -rf /etc)", where)?.kind, "delete");
+			assert.deepEqual(simpleCommands("diff <(git show a) >(tee b)"), [["git", "show", "a"], ["tee", "b"], ["diff", "$(…)", "$(…)"]]);
+		});
+	});
+
 	describe("the Teammate's own folders, worked out once for the hook and team_answer", () => {
 		it("reads Claude Code's config folder from `CLAUDE_CONFIG_DIR`, else `~/.claude`", () => {
 			assert.equal(claudeConfigDir({ CLAUDE_CONFIG_DIR: "/x" }, "/home/qa/.claude"), "/x");

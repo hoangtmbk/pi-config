@@ -285,7 +285,7 @@ and no `IFS` in the line), and only when there's no doubt: a plain `T=value` of 
 nowhere else in the line and never exported, read or unset, in a text with no group, subshell,
 loop, `if`, `case`, `eval` or `source`; outside a `$(…)`, a pipeline or a backgrounded list; sure
 to have run before the delete (earlier in its `&&` chain, or leading an earlier list); and a value
-that is a literal absolute path or starts with `$PWD` (the directory known), the trusted
+that is a literal absolute path or starts with `$PWD` (the folder one known folder), the trusted
 `$CLAUDE_JOB_DIR` or such a name. A function defined in the line (`K(){ …; }` or
 `function K { …; }`) doesn't stop this unless its body may change a name it doesn't spell out:
 `read`, `export`, `unset`, `declare`, `local`, `typeset`, `readonly`, `eval`, `source`, `.`,
@@ -295,6 +295,21 @@ in a body is read where the body is written, not where it's called. So
 `T="$CLAUDE_JOB_DIR/tmp/smoke" && rm -rf "$T"` and `Q=/…/tmp/qa; rm -f $Q/a; K(){ node x "$@"; }`
 are inside; `T=$(pwd) && rm -rf "$T"`, `T='/…/a b'; rm -rf $T`, `K(){ eval "$1"; }` before the
 delete, and any name set twice are not.
+
+A relative delete is read against the folder the command runs in, and a `cd` moves that folder only
+when it surely runs in this shell before the delete: a plain `cd <folder>` or `pushd <folder>`
+leading its list (after only plain assignments or other such `cd`s, joined by `&&`), followed by
+`&&`, the list's end or `|| exit`. The rest of its `&&` chain runs in its folder. After its list
+the `cd` may have failed, unless `|| exit` guards it, so a relative path is inside only if it is
+inside read against both the folder before and the `cd`'s own; past four such folders, the folder
+is unknown. Any other `cd` makes the folder unknown from there, and a relative delete in an unknown
+folder is a floor delete: one in a `( … )`, `$(…)`, `<(…)`, a `{ … }` group, a function's body,
+an `if`, loop, `case` or `coproc`, a pipeline, a here-document's lines, behind `&&` or `||`,
+backgrounded with `&`, run by `env` or `xargs`, with an option, `popd`, and any `cd` in a line that
+names `CDPATH`. So do `eval`, `source` and `.`, and a list a `cd` led, past an `||`, a `&` or a
+group. So, from the Workspace, `cd sub && rm -rf build`, `cd sub; rm -rf build` and
+`cd sub || exit 1; rm -rf build` are inside; after `cd /`, `cd /ws/missing; rm -rf etc`,
+`(cd /ws); rm -rf etc`, `true || cd /ws; rm -rf etc` and `K(){ cd /ws; }; rm -rf etc` are not.
 
 A request to a local host (`localhost`, `127.x`, `::1`, `0.0.0.0`) is no send, and the floor reads
 the host when it's written out, even with the port or path in a variable
