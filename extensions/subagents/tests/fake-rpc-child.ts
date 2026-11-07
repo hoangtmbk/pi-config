@@ -22,6 +22,9 @@
  *  - `FAKE_RPC_EXIT_CODE` and `FAKE_RPC_EXIT_AFTER` — die with that code once
  *    that many prompts have been served (default 0: die before the parent's
  *    first prompt, which is what a child that cannot start looks like).
+ *  - `FAKE_RPC_EXIT_DELAY_MS` — with `FAKE_RPC_EXIT_AFTER` 0, die that long
+ *    after starting rather than at once: a child that cannot start, but is slow
+ *    to say so, as a real pi is on a loaded machine.
  *  - `FAKE_RPC_PID_OUT` — a path to write its own pid to, so a test can ask the
  *    operating system whether the process is really gone, or send it the
  *    SIGUSR2 that releases a turn held on `fake:await_release` (see below).
@@ -115,7 +118,12 @@ function die(code: number): void {
 	process.stdin.destroy();
 }
 
-if (exitCode !== undefined && exitAfter === 0) die(exitCode);
+const exitDelayMs = Number(process.env.FAKE_RPC_EXIT_DELAY_MS ?? 0);
+
+if (exitCode !== undefined && exitAfter === 0) {
+	if (exitDelayMs > 0) setTimeout(() => die(exitCode), exitDelayMs);
+	else die(exitCode);
+}
 
 /** How many prompts have arrived, which is what picks this turn's script. */
 let promptCount = 0;

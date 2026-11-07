@@ -113,7 +113,8 @@ export interface SpawnOptions {
 	env?: Record<string, string>;
 	/**
 	 * The child exited before it was asked to. Called at most once, and never for
-	 * a child `stop` took down — a deliberate stop is not a failure.
+	 * a child `stop` took down — a deliberate stop is not a failure. Nor for one
+	 * that died before taking its task: that is this call rejecting instead.
 	 *
 	 * This is the only way a Run can stop without settling, so a Run whose caller
 	 * ignores it is a Run that can be waited on forever.
@@ -252,9 +253,17 @@ export async function spawnRun(options: SpawnOptions): Promise<RunChild> {
 
 	// At most once, and never for a child `stop` took down: a Run is failed by
 	// its child dying, and being told twice would deliver twice.
+	//
+	// Nor for a child that dies before it has taken its task. That child never
+	// started, and this call says so by rejecting — `prompt` is refused by a dead
+	// child — so reporting the exit too would fail the Run twice, once as a crash
+	// and once as a spawn. `RpcClient.start` only catches an exit inside its own
+	// fixed wait; a child slower than that to die, as any is on a loaded machine,
+	// dies here instead, and must read the same as one that died inside it.
+	let starting = true;
 	let reported = false;
 	const reportExit = (code: number | null, signal: string | null) => {
-		if (stopped || reported) return;
+		if (stopped || reported || starting) return;
 		reported = true;
 		options.onExit?.({
 			exitCode: code ?? undefined,
@@ -277,10 +286,9 @@ export async function spawnRun(options: SpawnOptions): Promise<RunChild> {
 		await client.start();
 		const childProcess = processOf(client);
 		childProcess?.once("exit", reportExit);
-		// A child killed on the way up has already emitted its exit by now, and
-		// nothing would ever hear it: `RpcClient.start` only refuses an exit *code*,
-		// so a signalled child gets this far alive as far as it is concerned.
-		if (hasExited(client)) reportExit(childProcess?.exitCode ?? null, childProcess?.signalCode ?? null);
+		// A child killed on the way up gets this far alive as far as `start` is
+		// concerned — it only refuses an exit *code* — but its exit has been
+		// recorded all the same, and the `prompt` below is refused for it.
 		// Handed over here and not a line sooner: `RpcClient` has no process to
 		// signal until `start` has resolved, so a `stop` from before this point
 		// would return having killed nothing and let the child come up behind it.
@@ -290,6 +298,13 @@ export async function spawnRun(options: SpawnOptions): Promise<RunChild> {
 		await stop();
 		throw error;
 	}
+
+	// Taken: from here a dying child is a Run failing, not one that never
+	// started. One that died between taking its task and this line exited
+	// unheard, so it is asked after rather than listened for.
+	starting = false;
+	const childProcess = processOf(client);
+	if (hasExited(client)) reportExit(childProcess?.exitCode ?? null, childProcess?.signalCode ?? null);
 
 	return child;
 }
