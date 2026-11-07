@@ -294,13 +294,13 @@ export interface UsageItem {
 export const USAGE_CHOICES = { "far-reset": ["stay", "cancel"], retries: ["retry", "leave"] } as const;
 
 /** The waits between the retries of a failure that clears by itself: 1, 2 and 5 minutes; a failure after the last is the human's. */
-export const RETRY_MS: readonly number[] = [60_000, 120_000, 300_000];
+const RETRY_MS: readonly number[] = [60_000, 120_000, 300_000];
 
 /** How long after a limit's reset a Teammate it stopped is sent `continue`, so the reset has surely happened. */
-export const GRACE_MS = 120_000;
+const GRACE_MS = 120_000;
 
 /** A usage pause whose reset is further than this asks the human whether to stay paused or cancel. */
-export const FAR_RESET_MS = 24 * 3_600_000;
+const FAR_RESET_MS = 24 * 3_600_000;
 
 /** A Teammate's inbox socket, which Claude Code gives its hooks in the environment. */
 export interface Inbox {
@@ -965,8 +965,6 @@ export type EffortAction =
 	| { kind: "write-task"; slug: string; folder: string }
 	/** Launch the Teammate on the Task, not before `at`: starts are staggered {@link STAGGER_MS} apart. */
 	| { kind: "launch-teammate"; teammate: Omit<Teammate, "task" | "startedAt">; task: { slug: string; folder: string }; at: string }
-	/** Stop the Teammate's background session, `claude stop <short id>`. */
-	| { kind: "stop-teammate"; teammate: string; shortId: string }
 	/**
 	 * Send the Teammate the clear marker over its inbox, which the mod turns
 	 * into a `/clear`; the Task's pointer follows once its `SessionStart`
@@ -1675,18 +1673,18 @@ function lifter(pause: Pause): string {
 }
 
 /** When a limit lifts, as replies and the Team block name it: `until 15:45 UTC`, with the date when it isn't the day of `from`. */
-export function untilText(reset: string, from: string): string {
+function untilText(reset: string, from: string): string {
 	const day = reset.slice(0, 10) === from.slice(0, 10) ? "" : `${reset.slice(0, 10)} `;
 	return `until ${day}${clock(reset)} UTC`;
 }
 
 /** The hold on `role`'s model family, when one holds it. */
-export function holdOn(state: EffortState, role: string): ModelHold | undefined {
+function holdOn(state: EffortState, role: string): ModelHold | undefined {
 	return Object.values(state.holds ?? {}).find((hold) => hold?.roles.includes(role));
 }
 
 /** A hold, as a reply names it: `an Opus limit until 15:45 UTC`. */
-export function holdText(hold: ModelHold): string {
+function holdText(hold: ModelHold): string {
 	if (hold.kind === "consent") return `a usage-credit confirm waiting in ${hold.teammate ?? "a Teammate"}'s terminal, which only the human answers`;
 	return `${hold.kind === "opus" ? "an Opus" : "a Sonnet"} limit${hold.reset === undefined ? "" : ` ${untilText(hold.reset, hold.at)}`}`;
 }
@@ -2485,7 +2483,7 @@ function plan(state: EffortState, input: Extract<EffortInput, { kind: "plan" }>)
 }
 
 /** How many Teammates may be live at once when pi's `maxTeammates` setting is absent. */
-export const DEFAULT_MAX_TEAMMATES = 3;
+const DEFAULT_MAX_TEAMMATES = 3;
 
 /** The cap pi's `maxTeammates` setting `set` gives: a whole number of 1 or more, else the default with what is wrong with it. */
 export function maxTeammatesSetting(set: unknown): { max: number; problem?: string } {
@@ -2497,7 +2495,7 @@ export function maxTeammatesSetting(set: unknown): { max: number; problem?: stri
 }
 
 /** The least time between two Teammate launches, so a burst of handoffs doesn't start them all at once. */
-export const STAGGER_MS = 5000;
+const STAGGER_MS = 5000;
 
 /**
  * Hand a planned Task off. Its folder is numbered in handoff order and named
@@ -2960,7 +2958,7 @@ function journal(state: EffortState, input: Extract<EffortInput, { kind: "journa
 }
 
 /** The commands that only look, which never start a Takeover. */
-export const READ_ONLY_COMMANDS: readonly string[] = ["context", "cost", "usage", "status", "help"];
+const READ_ONLY_COMMANDS: readonly string[] = ["context", "cost", "usage", "status", "help"];
 
 /** The hook events that show a card the terminal killed the hook of was a No: the Teammate went on without the call. */
 const AFTER_A_NO: ReadonlySet<string> = new Set(["Stop", "UserPromptSubmit", "Notification"]);
@@ -2994,7 +2992,7 @@ function triggerOf(line: JournalLine, sent: readonly string[] | undefined): Take
 }
 
 /** What started a Takeover, as the Lead and the Team block say it: `typed a prompt`. */
-export function takeoverText(trigger: TakeoverTrigger): string {
+function takeoverText(trigger: TakeoverTrigger): string {
 	switch (trigger.kind) {
 		case "prompt":
 			return "typed a prompt";
@@ -3008,7 +3006,7 @@ export function takeoverText(trigger: TakeoverTrigger): string {
 }
 
 /** Whether the human holds Teammate `id` in a Takeover. */
-export function underTakeover(state: EffortState, id: string): boolean {
+function underTakeover(state: EffortState, id: string): boolean {
 	return state.teammates.find((each) => each.id === id)?.takeover !== undefined;
 }
 
@@ -3381,12 +3379,12 @@ function continueAll(teammates: readonly Teammate[], why: string, at: string): {
 	};
 }
 
-/** A limited Teammate the Effort may send `continue`: live, still idle, reachable, and with no auto-wait of Claude Code's armed. */
 /** Whether a usage limit holds anything back that the shell's clock lets go: the usage pause, a model hold, or a Teammate a limit stopped. */
 export function usageHolds(state: EffortState): boolean {
 	return state.pauses?.usage !== undefined || Object.keys(state.holds ?? {}).length > 0 || live(state).some((each) => each.limit !== undefined);
 }
 
+/** A limited Teammate the Effort may send `continue`: live, still idle, reachable, and with no auto-wait of Claude Code's armed. */
 function continuable(state: EffortState): Teammate[] {
 	return live(state).filter((each) => each.limit !== undefined && each.limit.armed === undefined && each.activity === "idle" && each.inbox !== undefined && each.takeover === undefined);
 }
@@ -3512,10 +3510,10 @@ function answerUsage(state: EffortState, input: Extract<EffortInput, { kind: "an
 }
 
 /** How a Teammate's turn that ended without a new result shows, in its row and to `team_escalate`. */
-export const TURN_ENDED = "ended its turn without a result";
+const TURN_ENDED = "ended its turn without a result";
 
 /** How a Teammate shows while it waits on its own background work to re-prompt it. */
-export const WAITING = "waiting on its background work";
+const WAITING = "waiting on its background work";
 
 /** The background task statuses a `Stop` hook lists as still in flight. */
 const IN_FLIGHT: ReadonlySet<string> = new Set(["running", "pending"]);
@@ -3836,7 +3834,6 @@ const ON_RECORD: ReadonlySet<EffortAction["kind"]> = new Set(["promote-brief-cha
  * sign-off ends the Effort. Nothing done is done twice. What the evidence
  * can't settle stays open, and the Lead is told.
  */
-
 function recover(state: EffortState, input: Extract<EffortInput, { kind: "recover" }>): Step {
 	let next = state;
 	const append: EffortLine[] = [];
