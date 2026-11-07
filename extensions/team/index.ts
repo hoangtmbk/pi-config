@@ -31,7 +31,6 @@ import {
 	capRaised,
 	changeSnapshot,
 	currentResult,
-
 	type EffortAction,
 	type EffortInput,
 	type EffortLine,
@@ -61,7 +60,6 @@ import {
 	teammateFolders,
 	USAGE_CHOICES,
 	needsClock,
-	usageHolds,
 	type UsageItem,
 	usageText,
 	USAGE_FRESH_MS,
@@ -97,7 +95,6 @@ import {
 	promoteBrief,
 	promoteBriefChange,
 	protectedRecords,
-	readApprovals,
 	recordedApprovals,
 	readJournal,
 	readLead,
@@ -565,6 +562,16 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		await bridge;
 	}
 
+	/** Close the Lead bridge, if one is open or opening; one that failed to open has nothing to close. */
+	async function closeBridge(): Promise<void> {
+		const open = bridge;
+		bridge = undefined;
+		await open?.then(
+			(opened) => opened.close(),
+			() => {},
+		);
+	}
+
 	/**
 	 * Lead the Effort and hold it in this session, or say why not. `records`:
 	 * the Effort's records, for a Lead that hasn't read them (an adoption, a
@@ -807,15 +814,14 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			if (stopping.has(id)) continue;
 			const sent = sentTo(held, state, id);
 			for (const read of readJournal(held.paths, id, cursor ?? 0)) {
-				const due = currentResult(state, id);
-				const path = resultFile(held.paths, due);
+				const due = dueResult(held.paths, currentResult(state, id));
 				if (models === null) models = roleModels(held);
 				const result = step(state, {
 					kind: "journal",
 					teammate: id,
 					cursor: read.cursor,
 					line: read.line,
-					result: { path, written: path !== "" && existsSync(path) },
+					result: due,
 					tz,
 					...(models ? { models } : {}),
 					sent,
@@ -891,9 +897,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		}
 		wakeAboutTeammates(applyJournals(held));
 		const input = (): Extract<EffortInput, { kind: "handback" }> => {
-			const due = currentResult(effortState(held), teammate);
-			const path = resultFile(held.paths, due);
-			return { kind: "handback", teammate, ...(note === undefined ? {} : { note }), result: { path, written: path !== "" && existsSync(path) }, at: now().toISOString() };
+			const due = dueResult(held.paths, currentResult(effortState(held), teammate));
+			return { kind: "handback", teammate, ...(note === undefined ? {} : { note }), result: due, at: now().toISOString() };
 		};
 		const probe = step(effortState(held), input());
 		if (!probe.ok) {
@@ -944,18 +949,12 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	});
 
 	pi.on("session_shutdown", async () => {
-		stopClock?.();
-		stopClock = undefined;
+		syncClock(undefined);
 		// The block shows only while this session holds the Effort.
 		if (shown) surface?.setWidget(BLOCK_KEY, undefined, { placement: "aboveEditor" });
 		shown = undefined;
 		endUsage();
-		const open = bridge;
-		bridge = undefined;
-		await open?.then(
-			(opened) => opened.close(),
-			() => {},
-		);
+		await closeBridge();
 	});
 
 	// Leaving the session leaves the Effort with no live Lead, marked in `lead.json` for whoever leads it next.
@@ -1085,20 +1084,9 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			ctx.ui.notify(`The Brief of Effort \`${state.effortId}\` (request \`${item.id}\`) can't be approved: ${found.error}.`, "error");
 			return;
 		}
-		const answer = await ctx.ui.select(briefApprovalTitle(item, { effortId: state.effortId, team: found.team, playbook: found.playbook, repo: state.repo }), [
-			APPROVE,
-			SEND_BACK,
-			LATER,
-		]);
-		let note: string | undefined;
-		if (answer === SEND_BACK) {
-			note = (await ctx.ui.input("Note for the Lead: what should change?"))?.trim();
-			// Backing out of the note leaves the item waiting, as "later" does.
-			if (!note) return;
-		} else if (answer !== APPROVE) {
-			return;
-		}
-		if (answer === APPROVE) {
+		const picked = await approveOrSendBack(briefApprovalTitle(item, { effortId: state.effortId, team: found.team, playbook: found.playbook, repo: state.repo }), ctx);
+		if (!picked) return;
+		if (picked.answer === "approved") {
 			// Checked again against what is in force now, since the snapshot may have waited a while.
 			const problems = validateBrief(item.snapshot, { team: state.team, repo: state.repo, playbook: found.playbook, roles: found.team.roles.map((role) => role.name) });
 			if (problems.length > 0) {
@@ -1107,7 +1095,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			}
 		}
 		const at = now().toISOString();
-		const answered = { kind: "answer", id: item.id, answer: answer === APPROVE ? "approved" : "sent-back", note, at } as const;
+		const answered = { kind: "answer", id: item.id, answer: picked.answer, note: picked.note, at } as const;
 		let result = step(state, answered);
 		if (!result.ok) {
 			ctx.ui.notify(result.refusal, "error");
@@ -1115,7 +1103,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		}
 		// The core is pure, so the answer is known to stand before the Workspace changes the human's repo.
 		let workspace: Workspace | undefined;
-		if (answer === APPROVE) {
+		if (picked.answer === "approved") {
 			const added = addEffortWorkspace(state, found.team);
 			if ("error" in added) {
 				ctx.ui.notify(`The Brief of Effort \`${state.effortId}\` (request \`${item.id}\`) can't be approved yet: ${added.error}. Nothing was approved; answer it again from \`/team pending\` once that is fixed.`, "error");
@@ -1130,7 +1118,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			if (action.kind === "promote-brief") promoteBrief(held.paths, { approval: action.approval, playbookFile: found.playbook.filePath, teamDir: found.team.dir, workspace, at });
 		}
 		appendLines(held.paths, result.append);
-		if (answer === APPROVE) {
+		if (picked.answer === "approved") {
 			const where = workspace ? ` Workspace: ${workspace.path} on \`${workspace.branch}\`, from \`${workspace.from}\` at ${workspace.base}.` : "";
 			ctx.ui.notify(`Approved the Brief of Effort \`${state.effortId}\`: ${held.paths.brief}, sha256 ${item.sha256}.${where}`, "info");
 		}
@@ -1513,8 +1501,9 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 	/** One adoption in `/team pending`: approve, send back with a note, or leave it for later. */
 	async function answerAdoption(item: PendingAdoption, ctx: ExtensionCommandContext): Promise<void> {
-		const answer = await ctx.ui.select(pendingAdoptionTitle(item), [APPROVE, SEND_BACK, LATER]);
-		if (answer === APPROVE) {
+		const picked = await approveOrSendBack(pendingAdoptionTitle(item), ctx);
+		if (!picked) return;
+		if (picked.answer === "approved") {
 			const adopted = adoptPlaybook(paths.agentDir, item, now());
 			pending = pending.filter((waiting) => waiting !== item);
 			const startsTeam = setup?.team === item.team && setup.startsTeam;
@@ -1523,12 +1512,9 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			ctx.ui.notify(`Adopted the \`${item.team}\` Playbook: ${adopted}.`, "info");
 			wakeLead("team-pending", adoptedText(item, adopted));
 			if (startsTeam) await land(pickTeam(listTeams(paths), item.team), ctx);
-		} else if (answer === SEND_BACK) {
-			const note = (await ctx.ui.input("Note for the Lead: what should change?"))?.trim();
-			// Backing out of the note leaves the item waiting, as "later" does.
-			if (!note) return;
+		} else {
 			pending = pending.filter((waiting) => waiting !== item);
-			wakeLead("team-pending", sentBackText(item, note));
+			wakeLead("team-pending", sentBackText(item, picked.note));
 		}
 	}
 
@@ -1680,7 +1666,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	}
 
 	/** Approve, send back with a note, or leave for later: what the human answers to `title`; undefined leaves the item waiting. */
-	async function approveOrSendBack(title: string, ctx: ExtensionCommandContext): Promise<{ answer: "approved" | "sent-back"; note?: string } | undefined> {
+	async function approveOrSendBack(title: string, ctx: ExtensionCommandContext): Promise<{ answer: "approved"; note?: undefined } | { answer: "sent-back"; note: string } | undefined> {
 		const answer = await ctx.ui.select(title, [APPROVE, SEND_BACK, LATER]);
 		if (answer === APPROVE) return { answer: "approved" };
 		if (answer !== SEND_BACK) return undefined;
@@ -1767,22 +1753,15 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			`Sign off the final Report of Effort \`${held.effortId}\`: ${item.path} (sha256 ${item.sha256})?`,
 			"Signing off stops every Teammate and ends the Effort; its clean worktrees are removed and every branch is kept.",
 		].join("\n");
-		const answer = await ctx.ui.select(title, [APPROVE, SEND_BACK, LATER]);
-		let note: string | undefined;
-		if (answer === SEND_BACK) {
-			note = (await ctx.ui.input("Note for the Lead: what should change?"))?.trim();
-			// Backing out of the note leaves the item waiting, as "later" does.
-			if (!note) return;
-		} else if (answer !== APPROVE) {
-			return;
-		}
+		const picked = await approveOrSendBack(title, ctx);
+		if (!picked) return;
 		// What is signed off is the file as the human was asked about it.
-		if (answer === APPROVE && !unchangedSince(item.path, item.sha256)) {
+		if (picked.answer === "approved" && !unchangedSince(item.path, item.sha256)) {
 			ctx.ui.notify(`The final Report ${item.path} changed since sign-off was asked (request \`${item.id}\`, sha256 ${item.sha256}), so it isn't signed off. Nothing changed; send it back for a new final Report.`, "error");
 			return;
 		}
 		const state = effortState(held);
-		const result = stepOrNotify(ctx, state, { kind: "answer", id: item.id, answer: answer === APPROVE ? "approved" : "sent-back", note, at: now().toISOString() });
+		const result = stepOrNotify(ctx, state, { kind: "answer", id: item.id, answer: picked.answer, note: picked.note, at: now().toISOString() });
 		if (!result) return;
 		await carryOutEnd(held, state, result, ctx);
 	}
@@ -1847,12 +1826,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		const lead = [said, ...told];
 		if (ended.removed.length > 0) lead.push("A removed worktree is gone: don't `cd` into it or run anything there; its branch keeps the work.");
 		if ([...ended.removed, ...ended.kept].some((each) => each.running.length > 0)) lead.push("Never stop a process named here yourself: tell the human, who decides.");
-		const open = bridge;
-		bridge = undefined;
-		await open?.then(
-			(opened) => opened.close(),
-			() => {},
-		);
+		await closeBridge();
 		try {
 			await leaveLead(held.paths, leader(ctx), now().toISOString());
 		} catch (error) {
@@ -2230,15 +2204,14 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 			// pi checks the call against ReviewParams first; this stays loud for a caller that doesn't.
 			const verdict = VERDICTS.find((each) => each === params.verdict);
 			if (verdict === undefined) throw new Error(`\`verdict\` is \`accept\` or \`send_back\`, not \`${params.verdict}\`.`);
-			const due = state.tasks[params.slug];
-			const path = resultFile(held.paths, due);
+			const due = dueResult(held.paths, state.tasks[params.slug]);
 			const { roles, playbook } = approved(held);
 			const result = step(state, {
 				kind: "review",
 				slug: params.slug,
 				verdict,
 				feedback: params.feedback,
-				result: { path, written: path !== "" && existsSync(path) },
+				result: due,
 				sendBackLimit: playbook.sendBackLimit,
 				at: now().toISOString(),
 				mode: plannedMode(state.plan, params.slug, roles, playbook),
@@ -2605,6 +2578,12 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 function bullets(lines: readonly string[]): string {
 	return lines.map((line) => `- ${line}`).join("\n");
+}
+
+/** The result file of the round `due`, as the core weighs it: its path (empty when no round is due) and whether it is written. */
+function dueResult(paths: EffortPaths, due: { folder: string; round: number } | undefined): { path: string; written: boolean } {
+	const path = resultFile(paths, due);
+	return { path, written: path !== "" && existsSync(path) };
 }
 
 /** How long a worktree check waits for the sessions `claude stop` ended to exit, since it can return first. */
