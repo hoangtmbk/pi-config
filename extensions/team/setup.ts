@@ -12,7 +12,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { PlaybookChange } from "./core.ts";
-import { EVERY_ROLE, PERMISSION_MODES, type PermissionMode, type Playbook, parsePlaybook, playbookPaths, type Role, sha256, type Team } from "./definitions.ts";
+import { EVERY_ROLE, PERMISSION_MODES, type PermissionMode, type Playbook, parsePlaybook, playbookPaths, quoteList, type Role, sha256, type Team } from "./definitions.ts";
 import { availableTeams, findTeam } from "./start.ts";
 
 /** The checkpoint id the Lead names to ask for a Playbook's adoption. */
@@ -102,7 +102,7 @@ function setupPrompt(team: Team, draftPath: string, seed: DraftSeed): string {
 		return [
 			opening,
 			"",
-			`The Team ships no default Playbook, so draft one with the human. Grill them, one question at a time, until you know how they want the Team run: when you must stop and bring them something (checkpoints), what you may allow a Teammate without asking (grants), what must always reach them (escalate entries), each Role's permission mode and rules, and how many times a Task may be sent back. Roles: ${team.roles.map((role) => `\`${role.name}\``).join(", ")}.`,
+			`The Team ships no default Playbook, so draft one with the human. Grill them, one question at a time, until you know how they want the Team run: when you must stop and bring them something (checkpoints), what you may allow a Teammate without asking (grants), what must always reach them (escalate entries), each Role's permission mode and rules, and how many times a Task may be sent back. Roles: ${quoteList(team.roles.map((role) => role.name))}.`,
 			"",
 			`Write the draft to \`${draftPath}\` with your file tools, in this format:`,
 			"",
@@ -110,7 +110,7 @@ function setupPrompt(team: Team, draftPath: string, seed: DraftSeed): string {
 			playbookExample(team),
 			"```",
 			"",
-			`Every key shown is optional; no other key is allowed. Ids are kebab-case and unique across rules, checkpoints, grants and escalate entries. A Role's \`mode\` is one of ${PERMISSION_MODES.map((mode) => `\`${mode}\``).join(", ")}; \`*\` applies to every Role. Rules are the body's bullets that start with a bold id.`,
+			`Every key shown is optional; no other key is allowed. Ids are kebab-case and unique across rules, checkpoints, grants and escalate entries. A Role's \`mode\` is one of ${quoteList(PERMISSION_MODES)}; \`*\` applies to every Role. Rules are the body's bullets that start with a bold id.`,
 			"",
 			asking,
 		].join("\n");
@@ -201,10 +201,6 @@ export function plannedMode(plan: readonly { slug: string; role: string }[] | un
 	return role ? modeInForce(playbook, role) : undefined;
 }
 
-function quoted(names: readonly string[]): string {
-	return names.map((name) => `\`${name}\``).join(", ");
-}
-
 /**
  * What in a draft doesn't do what it looks like it does: a per-Role `allow`
  * rule the mode in force drops, and an `escalate` entry with no `ask:` list,
@@ -218,7 +214,7 @@ export function playbookWarnings(playbook: Playbook, roles: readonly Role[]): st
 		if (inAuto.length === 0) continue;
 		for (const rule of permissions.allow.filter(droppedInAuto)) {
 			warnings.push(
-				`\`roles.${key}\` allows \`${rule}\`, which won't take effect for ${quoted(inAuto)}: in \`auto\`, the mode in force there, Claude Code drops broad allow rules (any-command Bash, interpreter wildcards, package-manager run commands, \`Agent\`, \`Monitor\`).`,
+				`\`roles.${key}\` allows \`${rule}\`, which won't take effect for ${quoteList(inAuto)}: in \`auto\`, the mode in force there, Claude Code drops broad allow rules (any-command Bash, interpreter wildcards, package-manager run commands, \`Agent\`, \`Monitor\`).`,
 			);
 		}
 	}
