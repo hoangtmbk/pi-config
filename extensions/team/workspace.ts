@@ -35,18 +35,37 @@ function git(cwd: string, args: string[], input?: string): string {
 	}
 }
 
+/** What `git` prints, or undefined when it fails. */
+function gitOutput(cwd: string, args: string[]): string | undefined {
+	try {
+		return git(cwd, args);
+	} catch {
+		return undefined;
+	}
+}
+
 /** Whether `git` succeeds, for the questions git answers with its exit code. */
 function gitSucceeds(cwd: string, args: string[]): boolean {
+	return gitOutput(cwd, args) !== undefined;
+}
+
+/** `run`'s result, or the message of a {@link GitError} it throws; anything else thrown is a bug and goes on up. */
+function gitOr<T>(run: () => T): T | { error: string } {
 	try {
-		git(cwd, args);
-		return true;
-	} catch {
-		return false;
+		return run();
+	} catch (error) {
+		if (error instanceof GitError) return { error: error.message };
+		throw error;
 	}
 }
 
 function hasBranch(repo: string, branch: string): boolean {
 	return gitSucceeds(repo, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+}
+
+/** Whether the worktree at `dir` is in the middle of a merge: `MERGE_HEAD` is there. */
+function hasMergeHead(dir: string): boolean {
+	return gitSucceeds(dir, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
 }
 
 /**
@@ -57,12 +76,7 @@ function hasBranch(repo: string, branch: string): boolean {
  * progress.
  */
 function defaultBranch(repo: string): string {
-	let remote: string | undefined;
-	try {
-		remote = git(repo, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]).trim();
-	} catch {
-		remote = undefined;
-	}
+	const remote = gitOutput(repo, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])?.trim();
 	if (remote) {
 		const name = remote.replace(/^origin\//, "");
 		if (hasBranch(repo, name)) return name;
@@ -70,12 +84,7 @@ function defaultBranch(repo: string): string {
 			`the repo's default branch is \`${name}\` (from \`origin/HEAD\`), but there is no local branch \`${name}\` to cut the Effort's branch from; create it with \`git branch ${name} ${remote}\``,
 		);
 	}
-	let configured: string | undefined;
-	try {
-		configured = git(repo, ["config", "init.defaultBranch"]).trim() || undefined;
-	} catch {
-		configured = undefined;
-	}
+	const configured = gitOutput(repo, ["config", "init.defaultBranch"])?.trim() || undefined;
 	const candidates = [...new Set([configured, "main", "master"].filter((name): name is string => name !== undefined))];
 	const found = candidates.find((name) => hasBranch(repo, name));
 	if (found) return found;
@@ -139,7 +148,7 @@ export function addWorkspace(kind: WorkspaceKind, repo: string, effortId: string
 
 function addWorktree(repo: string, effortId: string): { workspace: Workspace; copied: string[] } | { error: string } {
 	const { path, branch } = workspaceFor(repo, effortId);
-	try {
+	return gitOr(() => {
 		const from = defaultBranch(repo);
 		if (hasBranch(repo, branch)) {
 			throw new GitError(`branch \`${branch}\` already exists; an Effort's branch is its own, so delete it (\`git branch -D ${branch}\`) only if nothing on it is wanted`);
@@ -150,10 +159,7 @@ function addWorktree(repo: string, effortId: string): { workspace: Workspace; co
 		git(repo, ["worktree", "add", "--quiet", "-b", branch, path, base]);
 		const copied = copyIncluded(repo, path);
 		return { workspace: { kind: "git-worktree", path, branch, base, from }, copied };
-	} catch (error) {
-		if (error instanceof GitError) return { error: error.message };
-		throw error;
-	}
+	});
 }
 
 /**
@@ -162,15 +168,12 @@ function addWorktree(repo: string, effortId: string): { workspace: Workspace; co
  * copy what the repo's `.worktreeinclude` lists into it, as for the Workspace.
  */
 export function addTaskWorkspace(repo: string, task: { path: string; branch: string; from: string }): { copied: string[] } | { error: string } {
-	try {
+	return gitOr(() => {
 		if (hasBranch(repo, task.branch)) throw new GitError(`branch \`${task.branch}\` already exists`);
 		if (existsSync(task.path)) throw new GitError(`${task.path} already exists`);
 		git(repo, ["worktree", "add", "--quiet", "-b", task.branch, task.path, task.from]);
 		return { copied: copyIncluded(repo, task.path) };
-	} catch (error) {
-		if (error instanceof GitError) return { error: error.message };
-		throw error;
-	}
+	});
 }
 
 /**
@@ -182,9 +185,9 @@ export function addTaskWorkspace(repo: string, task: { path: string; branch: str
  * With `abort`, a half-merge a restart left behind is aborted first.
  */
 export function mergeTaskWorkspace(merge: { into: string; path: string; branch: string; slug: string; folder: string; abort?: boolean }): { commit?: string } | { error: string } {
-	try {
+	return gitOr((): { commit?: string } | { error: string } => {
 		// A merge a restart cut short left MERGE_HEAD behind: it is undone first, then done again.
-		if (merge.abort && gitSucceeds(merge.into, ["rev-parse", "-q", "--verify", "MERGE_HEAD"])) git(merge.into, ["merge", "--abort"]);
+		if (merge.abort && hasMergeHead(merge.into)) git(merge.into, ["merge", "--abort"]);
 		const dirty = changed(merge.into);
 		if (dirty.length > 0) return { error: `the Effort's Workspace ${merge.into} has uncommitted changes (${listed(dirty)}); commit or remove them first` };
 		const left = changed(merge.path);
@@ -196,15 +199,13 @@ export function mergeTaskWorkspace(merge: { into: string; path: string; branch: 
 			git(merge.into, ["merge", "--no-ff", "--no-edit", "-m", `Merge Task ${merge.folder.slice(0, 3)} ${merge.slug} (${merge.branch})`, merge.branch]);
 		} catch (error) {
 			if (!(error instanceof GitError)) throw error;
-			const conflicted = gitSucceeds(merge.into, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]) ? git(merge.into, ["diff", "--name-only", "--diff-filter=U"]).split("\n").filter(Boolean) : [];
-			if (gitSucceeds(merge.into, ["rev-parse", "-q", "--verify", "MERGE_HEAD"])) git(merge.into, ["merge", "--abort"]);
+			const half = hasMergeHead(merge.into);
+			const conflicted = half ? git(merge.into, ["diff", "--name-only", "--diff-filter=U"]).split("\n").filter(Boolean) : [];
+			if (half) git(merge.into, ["merge", "--abort"]);
 			return { error: conflicted.length > 0 ? `merging it would conflict in ${listed(conflicted)}, so the merge was aborted` : error.message };
 		}
 		return { commit: git(merge.into, ["rev-parse", "HEAD"]).trim() };
-	} catch (error) {
-		if (error instanceof GitError) return { error: error.message };
-		throw error;
-	}
+	});
 }
 
 /**
@@ -217,7 +218,7 @@ export function mergeTaskWorkspace(merge: { into: string; path: string; branch: 
 export function mergeEvidence(into: string, branch: string): MergeEvidence | undefined {
 	if (!existsSync(into)) return undefined;
 	try {
-		if (gitSucceeds(into, ["rev-parse", "-q", "--verify", "MERGE_HEAD"])) return { state: "half-done" };
+		if (hasMergeHead(into)) return { state: "half-done" };
 		if (!gitSucceeds(into, ["rev-parse", "-q", "--verify", `refs/heads/${branch}`])) return undefined;
 		if (!gitSucceeds(into, ["merge-base", "--is-ancestor", branch, "HEAD"])) return { state: "not-started" };
 		const tip = git(into, ["rev-parse", branch]).trim();
