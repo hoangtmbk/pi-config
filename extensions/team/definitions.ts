@@ -162,7 +162,6 @@ export interface TeamRoots {
 	bundledTeamsDir?: string;
 }
 
-/** The files that hold a Team's adopted Playbook. */
 /** Where a Team's Playbook lives under the agent dir, once adopted and while drafted. */
 export interface PlaybookPaths {
 	/** The folder holding every Team's Playbook files. */
@@ -220,7 +219,8 @@ function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-function quoteList(items: readonly string[]): string {
+/** Each item in backticks, joined with commas: how an error or a prompt names ids, fields and Roles. */
+export function quoteList(items: readonly string[]): string {
 	return items.map((item) => `\`${item}\``).join(", ");
 }
 
@@ -231,7 +231,8 @@ function byCodepoint(a: string, b: string): number {
 
 type Fields = Record<string, unknown>;
 
-function isMapping(value: unknown): value is Fields {
+/** A YAML or JSON mapping: a plain object, not an array or null. */
+export function isMapping(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -657,19 +658,9 @@ function readTeam(dir: string, name: string, source: TeamSource, agentDir: strin
 	problems.push(...check.problems);
 
 	const rolesDir = join(dir, "roles");
-	const roleFiles = readdirSafe(rolesDir)
-		.filter((file) => file.endsWith(".md"))
-		.sort(byCodepoint);
-	if (roleFiles.length === 0) problems.push({ filePath: rolesDir, reason: "holds no Roles; a Team needs at least one `roles/<role>.md`" });
-	const roles: Role[] = [];
-	for (const file of roleFiles) {
-		const parsed = parseRole(join(rolesDir, file), source);
-		if (parsed.role) roles.push(parsed.role);
-		problems.push(...parsed.problems);
-	}
-	// Every Role file's name, parsed or not, so one bad Role doesn't turn a
-	// Playbook naming it into a second, misleading error.
-	const roleNames = roleFiles.map((file) => basename(file, ".md"));
+	const { roles, roleNames, problems: roleProblems } = readRoles(rolesDir, source);
+	if (roleNames.length === 0) problems.push({ filePath: rolesDir, reason: "holds no Roles; a Team needs at least one `roles/<role>.md`" });
+	problems.push(...roleProblems);
 
 	let defaultPlaybook: Playbook | undefined;
 	const defaultFile = join(dir, "default-playbook.md");
@@ -685,8 +676,24 @@ function readTeam(dir: string, name: string, source: TeamSource, agentDir: strin
 	return { name, description, workspace, body, source, dir, roles, defaultPlaybook, adoption, problems };
 }
 
-function readdirSafe(dir: string): string[] {
-	return entriesOf(dir).map((entry) => entry.name);
+/**
+ * The Roles of a `roles/` folder that parse, with the problems of those that
+ * don't, and every Role file's name, parsed or not, so one bad Role doesn't
+ * turn a Playbook naming it into a second, misleading error.
+ */
+function readRoles(rolesDir: string, source: TeamSource): { roles: Role[]; roleNames: string[]; problems: ConfigError[] } {
+	const files = entriesOf(rolesDir)
+		.map((entry) => entry.name)
+		.filter((file) => file.endsWith(".md"))
+		.sort(byCodepoint);
+	const roles: Role[] = [];
+	const problems: ConfigError[] = [];
+	for (const file of files) {
+		const parsed = parseRole(join(rolesDir, file), source);
+		if (parsed.role) roles.push(parsed.role);
+		problems.push(...parsed.problems);
+	}
+	return { roles, roleNames: files.map((file) => basename(file, ".md")), problems };
 }
 
 /**
@@ -721,18 +728,8 @@ export interface Snapshot {
  * copies are read as the human's own.
  */
 export function readSnapshot(teamDir: string, playbookFile: string): Snapshot | { problems: ConfigError[] } {
-	const rolesDir = join(teamDir, "roles");
-	const problems: ConfigError[] = [];
-	const roles: Role[] = [];
-	const files = readdirSafe(rolesDir)
-		.filter((file) => file.endsWith(".md"))
-		.sort(byCodepoint);
-	for (const file of files) {
-		const parsed = parseRole(join(rolesDir, file), "user");
-		if (parsed.role) roles.push(parsed.role);
-		problems.push(...parsed.problems);
-	}
-	const parsed = parsePlaybook(playbookFile, { source: "user", roleNames: files.map((file) => basename(file, ".md")) });
+	const { roles, roleNames, problems } = readRoles(join(teamDir, "roles"), "user");
+	const parsed = parsePlaybook(playbookFile, { source: "user", roleNames });
 	problems.push(...parsed.problems);
 	if (problems.length > 0 || !parsed.playbook) return { problems };
 	return { roles, playbook: parsed.playbook };

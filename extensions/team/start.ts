@@ -4,7 +4,7 @@
  * is handed.
  */
 
-import type { ConfigError, Playbook, Team } from "./definitions.ts";
+import { type ConfigError, type Playbook, quoteList, type Team } from "./definitions.ts";
 
 /** What `/team start` says back, by how it lands in pi. */
 export type StartOutcome =
@@ -17,17 +17,13 @@ export type StartOutcome =
 	/** Open an Effort on the Team and its adopted Playbook, and tell the human `text` with where it is. */
 	| { kind: "intake"; team: Team; playbook: Playbook; text: string };
 
-function names(teams: readonly Team[]): string {
-	return teams.map((team) => `\`${team.name}\``).join(", ");
-}
-
 function problemLines(problems: readonly ConfigError[]): string {
 	return problems.map((problem) => `- ${problem.filePath}: ${problem.reason}`).join("\n");
 }
 
 /** "Teams: …" for an error that must say which Teams would have worked. */
 export function availableTeams(teams: readonly Team[]): string {
-	return teams.length > 0 ? `Teams: ${names(teams)}.` : "There are no Teams.";
+	return teams.length > 0 ? `Teams: ${quoteList(teams.map((team) => team.name))}.` : "There are no Teams.";
 }
 
 /**
@@ -51,7 +47,8 @@ export function findTeam(
  * `/team start <name>`: the named Team, if it exists and every file of it is
  * right, goes on to intake on its adopted Playbook. A Team with no adopted
  * Playbook goes through Team setup first, and so does one whose adopted
- * Playbook was edited by hand, since that edit was never agreed. A broken adoption record is a config error like any other here.
+ * Playbook was edited by hand, since that edit was never agreed. A broken
+ * adoption record is a config error like any other here.
  */
 export function pickTeam(teams: readonly Team[], name: string): StartOutcome {
 	const found = findTeam(teams, name, "start");
@@ -68,7 +65,7 @@ export function pickTeam(teams: readonly Team[], name: string): StartOutcome {
 				text: `Team \`${name}\`'s Playbook ${team.adoption.filePath} was edited after it was adopted, so Team setup runs first. ${then}`,
 			};
 		case "adopted": {
-			const roles = team.roles.map((role) => `\`${role.name}\``).join(", ");
+			const roles = quoteList(team.roles.map((role) => role.name));
 			const playbook = `adopted ${team.adoption.adoptedAt} (${team.adoption.playbook.filePath}).`;
 			return { kind: "intake", team, playbook: team.adoption.playbook, text: `Team \`${name}\` picked: Roles ${roles}. Playbook: ${playbook}` };
 		}
