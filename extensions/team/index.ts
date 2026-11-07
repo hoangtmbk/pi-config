@@ -22,6 +22,7 @@ import { Type } from "typebox";
 import { attachTarget, chooseAttach, pickerLabel } from "./attach.ts";
 import { renderTeamBlock, teamStatus } from "./block.ts";
 import { leadCost } from "./cost.ts";
+import { leadWakes } from "./lead-wakes.ts";
 import { type Bridge, openBridge } from "./bridge.ts";
 import { agentsList, CLEAR_MARKER, getUsage, humanStatusLine, installMod, launchBackground, sendToInbox, statusLineReading, stillListed, teammateArgs, teammateSettings, trustFolder, versionWarning } from "./claude.ts";
 import {
@@ -384,13 +385,11 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 * on record by then: append that line first, or stop it {@link whileStopping}.
 	 */
 	const stops = teammateStops(paths.claudePath, now);
-	// Whether the Lead's model is working on a prompt, and what wakes about Teammates wait for it to settle.
-	let busy = false;
-	let waiting: string[] = [];
-	// The end-of-Effort message, held while the Lead's run is active and stored once it settles.
-	let endHeld: string | undefined;
-	// While the Effort is picked up again after a restart: what it has to tell the Lead, said once at the end.
-	let recovering: string[] | undefined;
+	// What the Lead is told, now or once its run settles; the end-of-Effort message is stored without a turn.
+	const wakes = leadWakes({
+		wake: wakeLead,
+		store: (content) => pi.sendMessage({ customType: "team-ended", content, display: true }, { deliverAs: "followUp" }),
+	});
 	// After a restart, the Teammates heard from since; the block marks the others' short ids unconfirmed.
 	let confirmed: Set<string> | undefined;
 	// Where the Team block goes, when pi has a UI, and the lines it last showed.
@@ -605,7 +604,7 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 	 */
 	async function pickUp(held: HeldEffort, records?: readonly string[]): Promise<void> {
 		const away: string[] = [];
-		recovering = away;
+		wakes.collectInto(away);
 		try {
 			const names = await listedNames();
 			confirmed = new Set(effortState(held).teammates.filter((teammate) => names?.includes(teammate.name)).map((teammate) => teammate.id));
@@ -620,12 +619,10 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		} catch (error) {
 			away.push(`Picking Effort \`${held.effortId}\` up after the restart stopped short: ${error instanceof Error ? error.message : String(error)}. Stop and tell the human.`);
 		} finally {
-			recovering = undefined;
+			wakes.collectInto(undefined);
 		}
 		const text = awayText(effortState(held), away, records);
-		if (text === undefined) return;
-		if (busy) waiting.push(text);
-		else wakeLead("team-away", text);
+		if (text !== undefined) wakes.away(text);
 	}
 
 	/** The `--name`s `claude agents --json` lists, or undefined when it can't be read. */
@@ -924,24 +921,16 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 
 	/** Wake the Lead about its Teammates now, or with everything else once its prompt settles. */
 	function wakeAboutTeammates(texts: string[]): void {
-		if (recovering) recovering.push(...texts);
-		else if (busy) waiting.push(...texts);
-		else if (texts.length > 0) wakeLead("team-teammate", texts.join("\n\n"));
+		wakes.teammates(texts);
 	}
 
 	pi.on("agent_start", () => {
-		busy = true;
+		wakes.started();
 	});
 
+	// A held end message is stored, then the journals are applied: a doorbell is only a nudge, so whatever they hold now counts, rung or not.
 	pi.on("agent_settled", () => {
-		busy = false;
-		// pi marks the run over before this event, so the message is stored at once and starts no turn.
-		if (endHeld !== undefined) storeEnded(endHeld);
-		endHeld = undefined;
-		// A doorbell is only a nudge: whatever the journals hold now is applied, rung or not.
-		const texts = [...waiting, ...(effort ? applyJournals(effort) : [])];
-		waiting = [];
-		wakeAboutTeammates(texts);
+		wakes.settled(() => (effort ? applyJournals(effort) : []));
 	});
 
 	pi.on("session_start", (_event, ctx) => {
@@ -1798,19 +1787,8 @@ export function registerTeam(pi: ExtensionAPI, deps: TeamDeps = {}): void {
 		syncLeadTools();
 		paintBlock();
 		ctx.ui.notify(notes.join(" "), unstopped.length > 0 ? "warning" : "info");
-		const content = `${lead.join(" ")} This session holds no Effort now, so the Team tools are off.`;
-		// Anything sent during a run starts one more model turn, so the message waits for the run to settle.
-		if (busy) endHeld = content;
-		else storeEnded(content);
-	}
-
-	/**
-	 * Put the Lead's end-of-Effort message in its session now, while no run is
-	 * active: pi then appends it at once and starts no turn, so it is in the
-	 * session file even if pi exits before another prompt.
-	 */
-	function storeEnded(content: string): void {
-		pi.sendMessage({ customType: "team-ended", content, display: true }, { deliverAs: "followUp" });
+		// Stored with no turn, so it is in the session file even if pi exits before another prompt (#143).
+		wakes.ended(`${lead.join(" ")} This session holds no Effort now, so the Team tools are off.`);
 	}
 
 	/** A Playbook change the final Report proposed, in `/team pending`: adopt it for the next Effort, decline it, or leave it for later. */
