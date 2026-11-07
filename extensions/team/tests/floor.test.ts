@@ -614,6 +614,69 @@ describe("the floor classifier", () => {
 		});
 	});
 
+	describe("skips a here-document's lines when it follows a `cd`, and reads the folder as unknown when their end never comes (#149)", () => {
+		const job = "/x/jobs/02878adf";
+		const where = { workspace: "/ws", cwd: "/ws", jobDir: job, roots: [`${job}/tmp`] };
+		/** `[command, inside]`, each read with `/ws` as the Workspace and the directory it runs in, and the job folder's `tmp` as the Teammate's own. */
+		const commands: [string, boolean][] = [
+			// The issue's replay: only a here-document in the `cd`'s list lost the folder.
+			['cd "$CLAUDE_JOB_DIR"/tmp/merged && echo hi\ncp a ./fp.mjs && node fp.mjs; rm fp.mjs', true],
+			['cd "$CLAUDE_JOB_DIR"/tmp/merged && cat > x <<\'EOF\'\nhello\nEOF\ncp a ./fp.mjs && node fp.mjs; rm fp.mjs', true],
+			['cd "$CLAUDE_JOB_DIR"/tmp/merged && cat > x <<\'EOF\'\nhello\nEOF\nrm fp.mjs', true],
+			["cat > x <<'EOF'\nhello\nEOF\nrm fp.mjs", true],
+			// Done when: the `cd` and the cwd are both the Teammate's own; from `/`, not.
+			['cd "$CLAUDE_JOB_DIR"/tmp/x && cat > f <<\'EOF\'\nbody\nEOF\nrm f', true],
+			["cd / && cat > f <<'EOF'\nbody\nEOF\nrm etc", false],
+			// A `cd` written in a here-document's lines doesn't move the folder.
+			["cd /; cat <<'EOF'\ncd /ws\nEOF\nrm -rf etc", false],
+			["cd /ws && cat <<'EOF'\ncd /\nEOF\nrm -rf etc", false],
+			// `<<-` ends at a tab-indented delimiter; `<<` doesn't, so its end never comes.
+			['cd "$CLAUDE_JOB_DIR"/tmp/x && cat > f <<-EOF\n\tbody\n\tEOF\nrm f', true],
+			['cd "$CLAUDE_JOB_DIR"/tmp/x && cat > f <<EOF\n\tbody\n\tEOF\nrm f', false],
+			// A quoted or an unquoted delimiter.
+			['cd "$CLAUDE_JOB_DIR"/tmp/x && cat > f <<"EOF"\nbody\nEOF\nrm f', true],
+			['cd "$CLAUDE_JOB_DIR"/tmp/x && cat > f <<EOF\nbody $X\nEOF\nrm f', true],
+			['cd "$CLAUDE_JOB_DIR"/tmp/x && cat > f <<\\EOF\nbody\nEOF\nrm f', true],
+			// Two here-documents on one line: their bodies follow in order.
+			['cd "$CLAUDE_JOB_DIR"/tmp/x && cat <<A <<\'B\' > f\na\nA\nb\nB\nrm f', true],
+			['cd "$CLAUDE_JOB_DIR"/tmp/x && cat <<A > f; cat <<B > g\na\nA\nb\nB\nrm f g', true],
+			['cd "$CLAUDE_JOB_DIR"/tmp/x && cat <<A <<B > f\na\nA\nb\nrm f', false],
+			// A here-document whose end never comes leaves the folder unknown from its start.
+			['cd "$CLAUDE_JOB_DIR"/tmp/x && cat > f <<\'EOF\'\nbody\nrm f', false],
+			['cd "$CLAUDE_JOB_DIR"/tmp/x; cat > f <<\'EOF\'\nbody\nrm f', false],
+			["cat > f <<'EOF'\nbody\nrm f", false],
+			// A `cd` after the here-document ends follows the usual rules.
+			['cat > f <<\'EOF\'\nbody\nEOF\ncd "$CLAUDE_JOB_DIR"/tmp/x && rm f', true],
+			["cat <<'EOF'\nbody\nEOF\ncd /ws/sub; rm -rf build", true],
+			["cat <<'EOF'\nbody\nEOF\ncd /; rm -rf etc", false],
+			["cat <<'EOF'\nbody\nEOF\ncd /; cd /ws && make || rm -rf etc", false],
+			["cat <<'EOF'\nbody\nEOF\ncd /; (cd /ws); rm -rf etc", false],
+			// The `cd`'s `&&` chain goes on past the body, on the line or after it.
+			["cd /ws/sub && cat <<'EOF' && rm -rf build\nbody\nEOF", true],
+			["cd /ws/sub && cat <<'EOF' &&\nbody\nEOF\nrm -rf build", true],
+			["cd /; cd /ws && cat <<'EOF' &&\nbody\nEOF\nrm -rf etc", true],
+			["cd /; cd /ws && cat <<'EOF'\nbody\nEOF\nrm -rf etc", false],
+			// A body's quote doesn't run on past its end, and a substitution in an unquoted body still runs.
+			["cat > f <<'EOF'\ndon't\nEOF\nrm -rf /etc", false],
+			["cat > f <<EOF\n$(rm -rf /etc)\nEOF", false],
+			// The held request, req-be3070db in Effort software-2026-11-07-2.
+			[
+				"cd \"$CLAUDE_JOB_DIR\"/tmp/merged && cat > \"$CLAUDE_JOB_DIR\"/tmp/fp.mjs <<'EOF'\nimport { chooseOp } from \"./scripts/soak.js\";\nconst r=0.45;\nconsole.log(\"design putShare\", (1-r)*(0.4/0.55), \"design getThr\", (1-r)*(0.4/0.55)+r);\nconsole.log(\"impl putThr\", (1-r)*8/11, \"impl getThr\", 1-(1-r)*3/11);\nconsole.log(\"design at 0.85 ->\", 0.85 < (1-r)*(0.4/0.55)+r ? \"get\" : \"del\", \"; impl at 0.85 ->\", chooseOp(0.85, r));\n// monotonic / sanity sweep\nlet bad=0, maxErr=0;\nfor (let i=0;i<=100000;i++){const x=i/100000; const rest=1-x; const p=rest*8/11, g=1-rest*3/11;\n if (!(p<=g)) bad++; maxErr=Math.max(maxErr, Math.abs((g-p)-x));}\nconsole.log(\"ratios with putThr>getThr:\", bad, \"max |getShare - ratio|:\", maxErr);\nconsole.log(\"ratio0: putThr\", 8/11, \"getThr\", 1-3/11, \"gap\", (1-3/11)-8/11);\n// is there any roll that gives get at ratio 0?\nconsole.log(\"get at ratio0 for roll=8/11:\", chooseOp(8/11,0));\nconsole.log(\"ratio1 roll 0 ->\", chooseOp(0,1), \" roll 0.9999999 ->\", chooseOp(0.9999999,1));\nEOF\ncp \"$CLAUDE_JOB_DIR\"/tmp/fp.mjs ./fp.mjs && node fp.mjs; rm fp.mjs",
+				true,
+			],
+		];
+		for (const [command, inside] of commands) {
+			it(`${JSON.stringify(command)} is ${inside ? "inside" : "a floor delete"}`, () => {
+				assert.equal(floorAction(command, where)?.kind, inside ? undefined : "delete");
+			});
+		}
+
+		it("still reads a here-document's lines for floor actions, as a shell fed them would run them", () => {
+			assert.equal(floorAction("bash <<'EOF'\ngit push origin main\nEOF", where)?.kind, "push");
+			assert.deepEqual(simpleCommands("cat > f <<'EOF'\nit's\nEOF\nrm f").at(-1), ["rm", "f"]);
+		});
+	});
+
 	describe("the Teammate's own folders, worked out once for the hook and team_answer", () => {
 		it("reads Claude Code's config folder from `CLAUDE_CONFIG_DIR`, else `~/.claude`", () => {
 			assert.equal(claudeConfigDir({ CLAUDE_CONFIG_DIR: "/x" }, "/home/qa/.claude"), "/x");

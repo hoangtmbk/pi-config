@@ -208,6 +208,10 @@ function scan(text, context, depth) {
  * unknown folder is outside. So does a list that a `cd` led, past an `||`
  * (which runs when the `cd` failed), when it is backgrounded, or past a group
  * or subshell, whose separators after it the floor doesn't keep.
+ *
+ * A here-document's lines are skipped: a `cd` in them leaves the folder
+ * unknown, and the list goes on after them. One whose end never comes leaves
+ * the folder unknown from its start.
  */
 function moves(all, start, command) {
 	const cdpath = /CDPATH/.test(unquoted(command));
@@ -225,6 +229,7 @@ function moves(all, start, command) {
 			if (change) cwds = undefined;
 			return;
 		}
+		if (segment.unended) cwds = undefined;
 		const inner = segment.inner || segment.body;
 		const exits = segment.sep === "||" && exitsAfter(all, segment);
 		if (change) {
@@ -547,12 +552,19 @@ function expanded(word, context) {
  *
  * A process substitution, `<(…)` or `>(…)`, is read as a `$(…)` is.
  *
+ * A here-document's lines, up to its delimiter line, are data or a script for
+ * the command they feed: their commands are `nested`, listed after the line
+ * that began it, and the text goes on after the delimiter as if they weren't
+ * there. When its delimiter never comes, its lines and all after them are read
+ * as commands, each `inner`, and the first command from its start on is
+ * `unended`.
+ *
  * Each also has the separator after it as `sep` (`;` for a newline or the
  * end, `&&`, `||`, `|`, `&`, `(` or `)`), whether a `{` or `}` group word
  * other than a function body's came before it (`grouped`), whether it runs
  * inside a `( … )`, a `{ … }` group or a compound command (`if`, `while`,
- * `until`, `for`, `select`, `case`), comes after a here-document's start
- * (whose lines are read as commands, though they may be none), or is led by
+ * `until`, `for`, `select`, `case`), comes after the start of a
+ * here-document whose end never comes, or is led by
  * a compound command's word, `!`, `time` or `coproc` (`inner`), and per word
  * in `values`: for a plain assignment
  * word (`NAME=…`, the name and `=` unquoted and unescaped), the name its value
@@ -576,11 +588,15 @@ function segments(text) {
 	// How many `(` are open, and the compound commands (`if`, loops, `case`) open, by their opening word.
 	let parens = 0;
 	const compounds = [];
-	// Whether a here-document has begun: its lines are read as commands, though they may be none.
+	// The here-documents begun on this line, whose lines come after it: each with whether `<<-` strips
+	// leading tabs from them and its delimiter, once read. `out`'s length when the first began.
+	let pending = [];
+	let pendingFrom = 0;
+	// Whether a here-document whose end never comes has begun: the lines after it are read as commands.
 	let heredoc = false;
 	// Whether a command is in a subshell, a group other than a function body or a compound command, after
-	// a here-document's start, or is led by a compound command's word, `!`, `time` or `coproc`; this
-	// updates the open compound commands.
+	// the start of a here-document whose end never comes, or is led by a compound command's word, `!`,
+	// `time` or `coproc`; this updates the open compound commands.
 	const inner = (sep) => {
 		let led = false;
 		for (const word of words) {
@@ -606,8 +622,11 @@ function segments(text) {
 	let values = [];
 	const endWord = () => {
 		if (!inWord) return;
-		if (redirect) redirect = false;
-		else {
+		if (redirect) {
+			redirect = false;
+			const doc = pending.at(-1);
+			if (doc !== undefined && doc.delimiter === undefined) doc.delimiter = word;
+		} else {
 			words.push(`${mark}${word}`);
 			values.push(value);
 		}
@@ -656,6 +675,15 @@ function segments(text) {
 			else mark = "";
 		}
 		inWord = true;
+	};
+	// From a here-document whose end never comes, every command is read as one the floor can't place
+	// ({@link moves}), the first `unended`.
+	const unended = () => {
+		heredoc = true;
+		const lost = out.slice(pendingFrom).filter((segment) => !segment.nested);
+		for (const segment of lost) segment.inner = true;
+		if (lost.length > 0) lost[0].unended = true;
+		pending = [];
 	};
 	const substitution = (inner) => {
 		out.push(...segments(inner).map((segment) => ({ ...segment, nested: true })));
@@ -756,7 +784,11 @@ function segments(text) {
 			endWord();
 			const from = i;
 			while (i < text.length && "<>&|".includes(text[i])) i++;
-			if (text.startsWith("<<", from) && !text.startsWith("<<<", from)) heredoc = true;
+			if (text.startsWith("<<", from) && !text.startsWith("<<<", from) && !heredoc) {
+				if (pending.length === 0) pendingFrom = out.length;
+				pending.push({ strip: text[i] === "-", delimiter: undefined });
+				if (text[i] === "-") i++;
+			}
 			redirect = true;
 			// `2>&1` names a descriptor, not a file: nothing to skip.
 			if (/^\d/.test(text[i] ?? "") && text[i - 1] === "&") redirect = false;
@@ -779,6 +811,22 @@ function segments(text) {
 		}
 		if (c === "{" && !inWord && words.length === 2 && words[0] === "function" && isHeader(words) && /\s/.test(text[i + 1] ?? "")) {
 			openBody(header());
+			i++;
+			continue;
+		}
+		if (c === "\n" && pending.length > 0) {
+			// The lines of this line's here-documents are data, or a script for the command they feed:
+			// read as commands of their own, as a `$(…)` is, and skipped in this text.
+			endWord();
+			const docs = hereDocuments(text, i + 1, pending);
+			endSegment(";");
+			if (docs === undefined) unended();
+			else {
+				for (const body of docs.bodies) out.push(...segments(body).map((segment) => ({ ...segment, nested: true })));
+				pending = [];
+				i = docs.end;
+				continue;
+			}
 			i++;
 			continue;
 		}
@@ -809,8 +857,38 @@ function segments(text) {
 		}
 	}
 	endSegment();
+	if (pending.length > 0) unended();
 	for (const { segment } of bodies) segment.unreadable = true;
 	return out;
+}
+
+/**
+ * The bodies of the here-documents `docs`, in order, read from `from`: each
+ * runs to a line that is its delimiter (past leading tabs for `<<-`). With the
+ * index after the last one's delimiter line, or undefined when an end never
+ * comes.
+ */
+function hereDocuments(text, from, docs) {
+	const bodies = [];
+	let at = from;
+	for (const { strip, delimiter } of docs) {
+		if (delimiter === undefined) return undefined;
+		const start = at;
+		for (;;) {
+			if (at >= text.length) return undefined;
+			const newline = text.indexOf("\n", at);
+			const stop = newline < 0 ? text.length : newline;
+			const line = text.slice(at, stop);
+			const next = newline < 0 ? text.length : newline + 1;
+			if ((strip ? line.replace(/^\t+/, "") : line) === delimiter) {
+				bodies.push(text.slice(start, at));
+				at = next;
+				break;
+			}
+			at = next;
+		}
+	}
+	return { bodies, end: at };
 }
 
 /** The words that open a compound command, and those of them whose words up to the next separator are a header, not a command. */
