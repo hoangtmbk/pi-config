@@ -19,9 +19,8 @@
  * `$(…)` and backticks, `sh -c` and `eval` scripts, env assignments and
  * wrappers such as `sudo`, `env` and `npx`, a `cd` that surely runs in this
  * shell for where a relative delete lands, and simple assignments of a path
- * that a later delete uses. It is a
- * guardrail, not a security boundary: a command built to hide what it does
- * will get past it.
+ * that a later delete uses. It is a guardrail, not a security boundary: a
+ * command built to hide what it does will get past it.
  */
 
 import { homedir } from "node:os";
@@ -57,11 +56,15 @@ export function floorAction(command, where) {
 	const own = (where.roots ?? []).filter((root) => posix.isAbsolute(root)).map((root) => posix.resolve(root));
 	const roots = [workspace, ...own.filter((root) => root !== "/" && root !== home)];
 	const job = typeof where.jobDir === "string" && posix.isAbsolute(where.jobDir) && !namesJob(command) ? posix.resolve(where.jobDir) : undefined;
-	return scan(
+	const context = {
 		command,
-		{ command, roots, home: namesHome(command) ? undefined : home, job, bareJob: job === undefined || splittable(job, command) ? undefined : job, cwds: [where.cwd === undefined ? workspace : posix.resolve(where.cwd)] },
-		0,
-	);
+		roots,
+		home: namesHome(command) ? undefined : home,
+		job,
+		bareJob: job === undefined || splittable(job, command) ? undefined : job,
+		cwds: [where.cwd === undefined ? workspace : posix.resolve(where.cwd)],
+	};
+	return scan(command, context, 0);
 }
 
 /**
@@ -236,12 +239,11 @@ function moves(all, start, command) {
 			if (change.clean && !cdpath && head && !inner && (segment.sep === "&&" || segment.sep === ";" || exits)) {
 				if (!moved) before = cwds;
 				moved = true;
-				cwds = change.target === undefined ? undefined : changeDir(cwds, expanded(change.target, context));
+				cwds = changeDir(cwds, expanded(change.target, context));
 				guarded ||= exits;
 			} else cwds = undefined;
 		}
-		const assigns = !inner && segment.words.every((_, k) => segment.values[k] !== undefined);
-		head = head && (change?.clean || assigns) && segment.sep === "&&";
+		head = head && (change?.clean || (!inner && assignsOnly(segment))) && segment.sep === "&&";
 		if (moved && (inner || segment.sep === "&" || (segment.sep === "||" && !exits))) cwds = undefined;
 		if (LIST_END.has(segment.sep)) {
 			if (moved && !guarded) cwds = union(before, cwds);
@@ -266,6 +268,11 @@ function union(a, b) {
 
 /** The separators that end a list. */
 const LIST_END = new Set([";", "&", "(", ")"]);
+
+/** Whether a command is only plain assignments, as `A=/x B=$A/y` is. */
+function assignsOnly(segment) {
+	return segment.values.every((value) => value !== undefined);
+}
 
 /**
  * Whether a command may change the directory: a `cd`, `pushd` or `popd`, or
@@ -300,7 +307,7 @@ function exitsAfter(all, segment) {
 /** The floor action of one simple command, or undefined; a `sh -c` or `eval` script is scanned through. */
 function scanSegment(segment, context, depth) {
 	const { words, xargs } = unwrap(segment.words);
-	if (words.length === 0 || words[0] === "cd" || words[0] === "pushd" || words[0] === "popd") return undefined;
+	if (words.length === 0) return undefined;
 	const script = depth < MAX_DEPTH ? innerScript(words) : undefined;
 	if (script !== undefined) return scan(script, { ...context, vars: undefined, ...(words[0] === "eval" ? {} : { job: undefined, bareJob: undefined }) }, depth + 1);
 	const kind = classify(words, { ...context, xargs });
@@ -356,8 +363,7 @@ function bindings(all, command) {
 		return vars;
 	};
 	const after = (segment, context) => {
-		const assigns = !segment.body && segment.words.every((_, k) => segment.values[k] !== undefined);
-		if (tracking && assigns && !piped && segment.sep !== "|" && segment.sep !== "&") {
+		if (tracking && !segment.body && assignsOnly(segment) && !piped && segment.sep !== "|" && segment.sep !== "&") {
 			const vars = new Map(context.vars);
 			for (const [k, word] of segment.words.entries()) {
 				const name = word.slice(0, word.indexOf("="));
@@ -432,16 +438,23 @@ function mentions(name, command) {
  */
 function valuePath(from, value, context, command) {
 	if (from === "") return value.startsWith("/") && !value.includes("$") ? value : undefined;
-	const braced = `\${${from}}`;
-	const rest = value.slice(value.startsWith(braced) ? braced.length : from.length + 1);
+	const rest = pastName(value, from);
 	if (rest.includes("$")) return undefined;
-	const base = from === "CLAUDE_JOB_DIR" ? context.job : from === "PWD" ? (mentions("PWD", command) === 0 && context.cwds?.length === 1 ? context.cwds[0] : undefined) : SHELL_NAMES.has(from) ? undefined : context.vars.get(from);
+	let base;
+	if (from === "CLAUDE_JOB_DIR") base = context.job;
+	else if (from === "PWD") base = mentions("PWD", command) === 0 && context.cwds?.length === 1 ? context.cwds[0] : undefined;
+	else if (!SHELL_NAMES.has(from)) base = context.vars.get(from);
 	return base === undefined ? undefined : `${base}${rest}`;
+}
+
+/** What follows the `$name` or `${name}` that `word` starts with. */
+function pastName(word, name) {
+	return word.slice(word.startsWith(`\${${name}}`) ? name.length + 3 : name.length + 1);
 }
 
 /** The folders a `cd` to `target` lands in from each of `cwds`, or undefined when the floor can't tell. */
 function changeDir(cwds, target) {
-	if (target === undefined || target.startsWith("-") || target.startsWith("~") || target.includes("$")) return undefined;
+	if (target.startsWith("-") || target.startsWith("~") || target.includes("$")) return undefined;
 	if (target.startsWith("/")) return [posix.resolve(target)];
 	return cwds === undefined ? undefined : [...new Set(cwds.map((cwd) => posix.resolve(cwd, target)))];
 }
@@ -507,6 +520,23 @@ const BARE_JOB = "\u0002";
 const VAR = "\u0003";
 const BARE_VAR = "\u0004";
 
+/** The mark for the prefix a word that starts at `i` in `text` has, as {@link segments} reads it; "" for none. */
+function markAt(text, i) {
+	if (stickyMatch(HOME_START, text, i)) return HOME;
+	const job = stickyMatch(JOB_START, text, i);
+	if (job) return job[1] === undefined ? BARE_JOB : JOB;
+	const named = stickyMatch(VAR_START, text, i);
+	if (named) return `${VAR}${named[1] ?? named[2]}${VAR}`;
+	const bare = stickyMatch(BARE_VAR_START, text, i);
+	return bare ? `${BARE_VAR}${bare[1] ?? bare[2]}${BARE_VAR}` : "";
+}
+
+/** A sticky regular expression's match at `i` in `text`, or null. */
+function stickyMatch(regex, text, i) {
+	regex.lastIndex = i;
+	return regex.exec(text);
+}
+
 /** A word without its mark. */
 function plain(word) {
 	if (word.startsWith(VAR) || word.startsWith(BARE_VAR)) return word.slice(word.indexOf(word[0], 1) + 1);
@@ -526,8 +556,7 @@ function expanded(word, context) {
 		const name = word.slice(1, word.indexOf(word[0], 1));
 		const value = context.vars?.get(name);
 		if (value === undefined || (word.startsWith(BARE_VAR) && splittable(value, context.command))) return bare;
-		const braced = `\${${name}}`;
-		return value + bare.slice(bare.startsWith(braced) ? braced.length : name.length + 1);
+		return value + pastName(bare, name);
 	}
 	if (word.startsWith(HOME)) return context.home === undefined ? bare : bare.replace(HOME_PREFIX, () => context.home);
 	const job = word.startsWith(JOB) ? context.job : word.startsWith(BARE_JOB) ? context.bareJob : undefined;
@@ -563,11 +592,10 @@ function expanded(word, context) {
  * end, `&&`, `||`, `|`, `&`, `(` or `)`), whether a `{` or `}` group word
  * other than a function body's came before it (`grouped`), whether it runs
  * inside a `( … )`, a `{ … }` group or a compound command (`if`, `while`,
- * `until`, `for`, `select`, `case`), comes after the start of a
- * here-document whose end never comes, or is led by
- * a compound command's word, `!`, `time` or `coproc` (`inner`), and per word
- * in `values`: for a plain assignment
- * word (`NAME=…`, the name and `=` unquoted and unescaped), the name its value
+ * `until`, `for`, `select`, `case`), comes after the start of a here-document
+ * whose end never comes, or is led by a compound command's word, `!`, `time`
+ * or `coproc` (`inner`), and per word in `values`: for a plain assignment word
+ * (`NAME=…`, the name and `=` unquoted and unescaped), the name its value
  * starts with ({@link VALUE_START}), or "" for none; undefined for any other
  * word.
  */
@@ -636,44 +664,29 @@ function segments(text) {
 		literal = true;
 		value = undefined;
 	};
-	const endSegment = (sep = ";") => {
+	// Ends the command being read, if it has words, with `extra` on it; returns it.
+	const endSegment = (sep = ";", extra = undefined) => {
 		endWord();
-		if (words.length > 0) out.push({ words, values, text: text.slice(start, end).trim(), sep, nested: false, grouped, body: bodies.length > 0, inner: inner(sep) });
-		words = [];
-		values = [];
-		start = -1;
-		atCommandStart = true;
-	};
-	// The words so far as a function's header, its body read next.
-	const header = () => {
-		const segment = { words, values, text: text.slice(start, end).trim(), sep: ";", nested: false, grouped, body: bodies.length > 0, inner: inner(";"), define: true, unreadable: false };
-		out.push(segment);
+		let segment;
+		if (words.length > 0) {
+			segment = { words, values, text: text.slice(start, end).trim(), sep, nested: false, grouped, body: bodies.length > 0, inner: inner(sep), ...extra };
+			out.push(segment);
+		}
 		words = [];
 		values = [];
 		start = -1;
 		atCommandStart = true;
 		return segment;
 	};
+	// The words so far as a function's header, its body read next.
+	const header = () => endSegment(";", { define: true, unreadable: false });
 	const openBody = (segment) => {
 		depth++;
 		bodies.push({ depth, segment });
 	};
 	const begin = (i) => {
 		if (start < 0) start = i;
-		if (!inWord) {
-			HOME_START.lastIndex = i;
-			JOB_START.lastIndex = i;
-			VAR_START.lastIndex = i;
-			BARE_VAR_START.lastIndex = i;
-			const job = JOB_START.exec(text);
-			const named = VAR_START.exec(text);
-			const bare = BARE_VAR_START.exec(text);
-			if (HOME_START.test(text)) mark = HOME;
-			else if (job) mark = job[1] === undefined ? BARE_JOB : JOB;
-			else if (named) mark = `${VAR}${named[1] ?? named[2]}${VAR}`;
-			else if (bare) mark = `${BARE_VAR}${bare[1] ?? bare[2]}${BARE_VAR}`;
-			else mark = "";
-		}
+		if (!inWord) mark = markAt(text, i);
 		inWord = true;
 	};
 	// From a here-document whose end never comes, every command is read as one the floor can't place
@@ -685,9 +698,27 @@ function segments(text) {
 		if (lost.length > 0) lost[0].unended = true;
 		pending = [];
 	};
-	const substitution = (inner) => {
-		out.push(...segments(inner).map((segment) => ({ ...segment, nested: true })));
+	// A shell text that runs as data or in a shell of its own, read as commands of their own.
+	const nested = (inside) => out.push(...segments(inside).map((segment) => ({ ...segment, nested: true })));
+	// The `$(…)` or backtick substitution, or outside double quotes also the `<(…)` or `>(…)` process
+	// substitution, that starts at `i`: read as `nested` commands, its place in the word an unknown value.
+	// The index after it, or undefined when none starts there.
+	const substitution = (i, quoted) => {
+		let inside;
+		let after;
+		if (text[i] === "`") {
+			const close = text.indexOf("`", i + 1);
+			const stop = close < 0 ? text.length : close;
+			inside = text.slice(i + 1, stop);
+			after = stop + 1;
+		} else if (text[i + 1] === "(" && (text[i] === "$" || (!quoted && (text[i] === "<" || text[i] === ">")))) {
+			const close = matchParen(text, i + 1);
+			inside = text.slice(i + 2, close);
+			after = close + 1;
+		} else return undefined;
+		nested(inside);
 		word += "$(…)";
+		return after;
 	};
 	let i = 0;
 	while (i < text.length) {
@@ -721,37 +752,21 @@ function segments(text) {
 				if (text[i] === "\\" && '"\\$`'.includes(text[i + 1] ?? "")) {
 					word += text[i + 1];
 					i += 2;
-				} else if (text[i] === "$" && text[i + 1] === "(") {
-					const close = matchParen(text, i + 1);
-					substitution(text.slice(i + 2, close));
-					i = close + 1;
-				} else if (text[i] === "`") {
-					const close = text.indexOf("`", i + 1);
-					const stop = close < 0 ? text.length : close;
-					substitution(text.slice(i + 1, stop));
-					i = stop + 1;
-				} else word += text[i++];
+				} else {
+					const next = substitution(i, true);
+					if (next === undefined) word += text[i++];
+					else i = next;
+				}
 			}
 			i++;
 			end = i;
 			continue;
 		}
-		if (c === "$" && text[i + 1] === "(") {
+		const after = substitution(i, false);
+		if (after !== undefined) {
 			begin(i);
 			literal = false;
-			const close = matchParen(text, i + 1);
-			substitution(text.slice(i + 2, close));
-			i = close + 1;
-			end = i;
-			continue;
-		}
-		if (c === "`") {
-			begin(i);
-			literal = false;
-			const close = text.indexOf("`", i + 1);
-			const stop = close < 0 ? text.length : close;
-			substitution(text.slice(i + 1, stop));
-			i = stop + 1;
+			i = after;
 			end = i;
 			continue;
 		}
@@ -764,16 +779,6 @@ function segments(text) {
 			endWord();
 			if (words.length > 0) atCommandStart = false;
 			i++;
-			continue;
-		}
-		if ((c === "<" || c === ">") && text[i + 1] === "(") {
-			// A process substitution runs in a shell of its own, as a `$(…)` does.
-			begin(i);
-			literal = false;
-			const close = matchParen(text, i + 1);
-			substitution(text.slice(i + 2, close));
-			i = close + 1;
-			end = i;
 			continue;
 		}
 		if (c === ">" || c === "<" || (c === "&" && text[i + 1] === ">")) {
@@ -796,13 +801,11 @@ function segments(text) {
 		}
 		if (c === "(") {
 			endWord();
-			FUNCTION_PARENS.lastIndex = i;
-			if (isHeader(words) && FUNCTION_PARENS.test(text)) {
+			if (isHeader(words) && stickyMatch(FUNCTION_PARENS, text, i)) {
 				end = FUNCTION_PARENS.lastIndex;
 				const segment = header();
 				i = end;
-				BODY_OPEN.lastIndex = i;
-				if (BODY_OPEN.test(text)) {
+				if (stickyMatch(BODY_OPEN, text, i)) {
 					openBody(segment);
 					i = BODY_OPEN.lastIndex;
 				} else segment.unreadable = true;
@@ -820,14 +823,14 @@ function segments(text) {
 			endWord();
 			const docs = hereDocuments(text, i + 1, pending);
 			endSegment(";");
-			if (docs === undefined) unended();
-			else {
-				for (const body of docs.bodies) out.push(...segments(body).map((segment) => ({ ...segment, nested: true })));
+			if (docs === undefined) {
+				unended();
+				i++;
+			} else {
+				for (const body of docs.bodies) nested(body);
 				pending = [];
 				i = docs.end;
-				continue;
 			}
-			i++;
 			continue;
 		}
 		if (c === "\n" || c === ";" || c === "&" || c === "|" || c === "(" || c === ")") {
@@ -851,8 +854,7 @@ function segments(text) {
 		i++;
 		end = i;
 		if (c === "=" && literal && value === undefined && /^[A-Za-z_][A-Za-z0-9_]*=$/.test(word)) {
-			VALUE_START.lastIndex = i;
-			const named = VALUE_START.exec(text);
+			const named = stickyMatch(VALUE_START, text, i);
 			value = named ? (named[1] ?? named[2]) : "";
 		}
 	}
@@ -1146,7 +1148,6 @@ const PUBLISHERS = {
 	docker: ["push"],
 	podman: ["push"],
 	buildah: ["push"],
-	helm: ["push"],
 	vsce: ["publish", "unpublish"],
 	ovsx: ["publish"],
 	jsr: ["publish"],
@@ -1155,7 +1156,6 @@ const PUBLISHERS = {
 	gradle: ["publish"],
 	gradlew: ["publish"],
 	pod: ["trunk"],
-	dotnet: ["nuget"],
 	nuget: ["push"],
 	swift: ["package-registry"],
 };
@@ -1254,11 +1254,6 @@ function hostOf(word) {
 	return bare ? bare[1] : undefined;
 }
 
-/** The outside hosts among some words; a word that's no URL is no host. */
-function outsideHosts(words) {
-	return words.map(hostOf).filter((host) => host !== undefined && !isLocalHost(host));
-}
-
 const CURL_VALUES = ["-o", "--output", "-H", "--header", "-A", "--user-agent", "-u", "--user", "-e", "--referer", "-b", "--cookie", "-c", "--cookie-jar", "-x", "--proxy", "-w", "--write-out", "-m", "--max-time", "--connect-timeout", "-K", "--config", "--cacert", "--cert", "--key", "-r", "--range", "--retry", "-z", "--time-cond", "--resolve", "--connect-to", "-E", "--limit-rate", "-Y", "-y", "--max-redirs", "--interface", "--dns-servers", "-D", "--dump-header", "--trace", "--trace-ascii", "--stderr", "--unix-socket", "--abstract-unix-socket", "-X", "--request", "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii", "-F", "--form", "--form-string", "--json", "-T", "--upload-file", "--url", "-U", "--proxy-user", "--oauth2-bearer", "--aws-sigv4", "--variable", "--expand-url"];
 const CURL_DATA = ["-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii", "-F", "--form", "--form-string", "--json", "-T", "--upload-file"];
 
@@ -1302,8 +1297,9 @@ function wget(args) {
 		else if (/^--(post|body)-(data|file)/.test(word) && method === "GET") method = "POST";
 	}
 	if (method === "GET" || method === "HEAD") return undefined;
-	const hosts = outsideHosts(positionals(args, ["--method", "--post-data", "--post-file", "--body-data", "--body-file", "-O", "-o", "-P", "--header", "-U"]));
-	return hosts.length > 0 ? "send" : undefined;
+	// A word that's no URL is no host.
+	const hosts = positionals(args, ["--method", "--post-data", "--post-file", "--body-data", "--body-file", "-O", "-o", "-P", "--header", "-U"]).map(hostOf);
+	return hosts.some((host) => host !== undefined && !isLocalHost(host)) ? "send" : undefined;
 }
 
 const HTTPIE_METHODS = new Set(["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]);
@@ -1379,11 +1375,7 @@ function find(args, context) {
 
 function make(args) {
 	const targets = positionals(args, ["-C", "-f", "--file", "--directory", "-j", "-I", "-o", "-W"]).filter((word) => !ASSIGNMENT.test(word));
-	for (const target of targets) {
-		const kind = scriptKind(target);
-		if (kind) return kind;
-	}
-	return undefined;
+	return targets.map(scriptKind).find((kind) => kind !== undefined);
 }
 
 /** The floor kind of one simple command, past its wrappers, or undefined. Only deletes read the marks {@link segments} puts on words. */
@@ -1406,7 +1398,7 @@ function classify(marked, context) {
 	if (DELETERS.has(name)) return remove(name, marked.slice(1), context);
 	if (name === "find") return find(marked.slice(1), context);
 	if (name === "dotnet" && args[0] === "nuget" && args[1] === "push") return "publish";
-	if (name in PUBLISHERS && name !== "dotnet" && name !== "helm") {
+	if (name in PUBLISHERS) {
 		const [sub, ...rest] = positionals(args, ["--registry", "-r", "--token", "--repository", "--index", "-u", "--username", "-p", "--password"]);
 		if (PUBLISHERS[name].includes(sub)) return dryRun(rest) || has(args, "--dry-run") ? undefined : "publish";
 		if ((name === "docker" || name === "podman") && (sub === "buildx" || sub === "build") && has(args, "--push")) return "publish";
