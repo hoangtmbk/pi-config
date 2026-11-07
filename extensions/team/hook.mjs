@@ -36,8 +36,9 @@
  *     answer the human gave; a PostToolUse follows if it was allowed);
  *   - the hold time runs out, or no Lead is listening: journalled as
  *     `hold-expired` with a doorbell, the hook exits 0 printing nothing and
- *     the prompt is the human's alone. The hold time stops short of the hook's own timeout so the
- *     hook, not Claude Code's kill, decides how the hold ended.
+ *     the prompt is the human's alone. The hold time stops short of the
+ *     hook's own timeout so the hook, not Claude Code's kill, decides how the
+ *     hold ended.
  *
  * During a Takeover (`teammates/<id>/takeover` exists) a `PermissionRequest`
  * isn't held: it is journalled without a request id, the doorbell rings, and
@@ -89,7 +90,10 @@ function parse(text) {
 
 /**
  * One journal line. What the mod hands over, `{ mod, payload }` (the human's
- * input in the Teammate's terminal), is a mod line of that event. A `SessionStart` also carries the inbox socket and token, which reach hooks only through the environment. */
+ * input in the Teammate's terminal), is a mod line of that event. A
+ * `SessionStart` also carries the inbox socket and token, which reach hooks
+ * only through the environment.
+ */
 function journalLine(payload, request) {
 	if (typeof payload?.mod === "string" && payload.hook_event_name === undefined) return `${JSON.stringify({ from: "mod", at: new Date().toISOString(), event: payload.mod, payload: payload.payload ?? {} })}\n`;
 	const line = { from: "hook", at: new Date().toISOString(), event: payload?.hook_event_name, payload };

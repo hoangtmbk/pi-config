@@ -119,7 +119,10 @@ function effortIds(agentDir: string): string[] {
 
 /** The Efforts `/team resume` can adopt: those not yet ended, with no live Lead. */
 export function adoptable(agentDir: string): string[] {
-	return effortIds(agentDir).filter((id) => !liveLead(effortPaths(agentDir, id)) && !hasEnded(effortPaths(agentDir, id)));
+	return effortIds(agentDir).filter((id) => {
+		const paths = effortPaths(agentDir, id);
+		return !liveLead(paths) && !hasEnded(paths);
+	});
 }
 
 /** Whether the Effort is over, signed off or cancelled: one that has ended is never led again. */
