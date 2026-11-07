@@ -329,9 +329,14 @@ folder is a floor delete: one in a `( … )`, `$(…)`, `<(…)`, a `{ … }` gr
 an `if`, loop, `case` or `coproc`, a pipeline, a here-document's lines, behind `&&` or `||`,
 backgrounded with `&`, run by `env` or `xargs`, with an option, `popd`, and any `cd` in a line that
 names `CDPATH`. So do `eval`, `source` and `.`, and a list a `cd` led, past an `||`, a `&` or a
-group. So, from the Workspace, `cd sub && rm -rf build`, `cd sub; rm -rf build` and
-`cd sub || exit 1; rm -rf build` are inside; after `cd /`, `cd /ws/missing; rm -rf etc`,
-`(cd /ws); rm -rf etc`, `true || cd /ws; rm -rf etc` and `K(){ cd /ws; }; rm -rf etc` are not.
+group. A here-document's lines are data to the list around them: the floor skips them, so a `cd`'s
+list and the reading after it go on past the delimiter line as if they weren't there. Their
+commands are still read for floor actions, as a shell they feed would run them, and a `cd` written
+in them still makes the folder unknown; so does a here-document whose delimiter line never comes,
+from its start. So, from the Workspace, `cd sub && rm -rf build`, `cd sub; rm -rf build`,
+`cd sub || exit 1; rm -rf build` and `cd sub && cat > f <<'EOF'` ⏎ … ⏎ `EOF` ⏎ `rm f` are
+inside; after `cd /`, `cd /ws/missing; rm -rf etc`, `(cd /ws); rm -rf etc`,
+`true || cd /ws; rm -rf etc` and `K(){ cd /ws; }; rm -rf etc` are not.
 
 A request to a local host (`localhost`, `127.x`, `::1`, `0.0.0.0`) is no send, and the floor reads
 the host when it's written out, even with the port or path in a variable
