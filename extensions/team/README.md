@@ -292,14 +292,13 @@ temp folder and scratchpad)".
 The wake about a held `Bash` request says what the floor read of it, as `team_answer`'s guard reads
 it: the kind and the command that takes it. For a delete it says whether the floor read the target
 outside the Teammate's own folders, or couldn't read it (a name, `~`, a `cd` or `xargs` it can't
-follow), and names the folders by path. Whether it could read the target is asked of the floor
-itself: the command is read again with every top-level folder a path in it starts in counted as
-the Teammate's own, and a delete still found goes through something the floor can't follow. A
-delete the floor can't read stays a floor action even when the Lead sees it lands in the
+follow), and names the folders by path. The floor says which as it reads the delete: it couldn't
+read the target when none of the delete's targets is one it read outside, only ones it can't
+follow. A delete the floor can't read stays a floor action even when the Lead sees it lands in the
 Teammate's folders; the wake tells the Lead to escalate it for that reason, not because the folder
 is outside, or to deny it asking the Teammate to write the path out. A refused uncited allow says
-the same. Once trusted, `$CLAUDE_JOB_DIR` in a command reads as
-the job folder, unless the command sets it; unquoted, only where bash can't split it.
+the same. Once trusted, `$CLAUDE_JOB_DIR` in a command reads as the job folder, unless the command
+sets it; unquoted, only where bash can't split it.
 
 A name the command sets itself reads as the path it holds (`"$T"`, `"$T"/x`, `"${T}/x"`; unquoted
 `$T/x` or `${T}/x` under the `$CLAUDE_JOB_DIR` rule: a value with no whitespace or glob character,
@@ -591,6 +590,10 @@ a checklist of what needs a person or a real pi: a composer prompt journalling i
 
 ```
 index.ts         wiring: the /team command and its subcommand table
+lead-wakes.ts    when the Lead hears from the extension: at once, or held until its run settles
+stopping.ts      stopping Teammates by short id, and the sessions a worktree check spares
+dialogs.ts       the /team pending dialogs
+ending.ts        what an Effort's end does with its worktrees, and what the Lead is told (#132)
 definitions.ts   Teams, Roles and Playbooks: discovery, validation, adoption state
 start.ts         what /team start says, and what it asks the Lead (pure)
 core.ts          the Effort core: a pure state machine over effort.jsonl

@@ -93,6 +93,20 @@ describe("what the floor read, in the wake and the refusal (#145)", () => {
 		assert.doesNotMatch(askText(bash("rm -rf /tmp"), FOLDERS), /can't read/);
 	});
 
+	it("reads a delete it followed to a path outside as outside, wherever the command spells that path", () => {
+		for (const command of ["rm -rf ../other", "cd /; cd /work/app-ws; rm -rf etc", 'T=/etc && rm -rf "$T"', "rm -rf /etc/x $Q", "rm -rf / $Q"]) {
+			const text = askText(bash(command), FOLDERS);
+			assert.match(text, /The floor reads it as a delete outside dev-1's own folders/, command);
+			assert.doesNotMatch(text, /can't read/, command);
+		}
+	});
+
+	it("says it can't read the target of a delete through `~` it can't follow, a `cd` it can't follow, or `xargs`", () => {
+		for (const command of ["HOME=/x; rm -rf ~/y", "cd $X && rm -rf y", "ls | xargs rm", "find $X -delete", "rm -rf $(cat path)"]) {
+			assert.match(askText(bash(command), FOLDERS), /The floor reads it as a delete whose target it can't read/, command);
+		}
+	});
+
 	it("says nothing of the floor for a delete it reads inside the Teammate's own folders, or for no floor action", () => {
 		for (const command of [`rm -f ${JOB}/tmp/qa/merge.json`, "rm -rf build", "rm -rf /tmp/claude/scratchpad/clone", "npm test"]) {
 			assert.doesNotMatch(askText(bash(command), FOLDERS), /The floor reads/, command);
